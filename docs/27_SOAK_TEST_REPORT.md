@@ -1,6 +1,6 @@
 # 24 Hour Soak Test Report
 
-Status: smoke soak passed; full 24 hour run starting after reboot acceptance.
+Status: full 24 hour run in progress after reboot acceptance.
 
 ## Smoke Soak
 
@@ -59,3 +59,10 @@ SOAK_DURATION_SECONDS=86400 SOAK_INTERVAL_SECONDS=600 ./scripts/soak_test_24h.sh
 - Output: `soak-results-20260522-004432.jsonl`
 
 No completed 24 hour soak result has been recorded yet.
+
+## Current Full Run
+
+- Started at: 2026-05-22 01:25 Asia/Shanghai
+- Log: `logs/soak-24h-20260522-012530.log`
+- JSONL: `logs/soak-results-20260522-012530.jsonl`
+- First cycle: health, system health, memory, web research, tiny model call, and queue ack all passed.
