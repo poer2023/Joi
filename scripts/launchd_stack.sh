@@ -79,7 +79,7 @@ start_if_process_missing() {
   local pattern="$1"
   local name="$2"
   shift 2
-  if pgrep -f "$pattern" >/dev/null 2>&1; then
+  if ps ax -o command= | grep -E "$pattern" | grep -v grep >/dev/null 2>&1; then
     echo "$(ts) $name already running" >> "$LOG_DIR/launchd_stack.log"
     return 0
   fi
@@ -88,13 +88,20 @@ start_if_process_missing() {
 }
 
 start_cloudflared() {
+  existing_url="$(grep -Eo 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' "$LOG_DIR/cloudflared.log" 2>/dev/null | tail -1 || true)"
+  if [[ -n "$existing_url" ]]; then
+    printf 'PUBLIC_CONSOLE_URL=%s\nPUBLIC_BASE_URL=%s\nCONSOLE_BASE_URL=%s\n' "$existing_url" "$existing_url" "$existing_url" > /tmp/joi-public-url.env
+    export PUBLIC_CONSOLE_URL="$existing_url"
+    export PUBLIC_BASE_URL="$existing_url"
+    export CONSOLE_BASE_URL="$existing_url"
+  fi
   if pgrep -f 'cloudflared tunnel --url http://localhost:3000' >/dev/null 2>&1; then
     return 0
   fi
-  /opt/homebrew/bin/cloudflared tunnel --url http://localhost:3000 >> "$LOG_DIR/cloudflared.log" 2>&1 &
+  /opt/homebrew/bin/cloudflared tunnel --protocol http2 --url http://localhost:3000 >> "$LOG_DIR/cloudflared.log" 2>&1 &
   children+=("$!")
-  for _ in $(seq 1 45); do
-    public_url="$(grep -Eo 'https://[-a-zA-Z0-9]+\\.trycloudflare\\.com' "$LOG_DIR/cloudflared.log" | tail -1 || true)"
+  for _ in $(seq 1 20); do
+    public_url="$(grep -Eo 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' "$LOG_DIR/cloudflared.log" | tail -1 || true)"
     if [[ -n "$public_url" ]]; then
       printf 'PUBLIC_CONSOLE_URL=%s\nPUBLIC_BASE_URL=%s\nCONSOLE_BASE_URL=%s\n' "$public_url" "$public_url" "$public_url" > /tmp/joi-public-url.env
       export PUBLIC_CONSOLE_URL="$public_url"
@@ -124,14 +131,16 @@ start_docker_infra
 wait_for_port 5432 || echo "$(ts) postgres did not become ready before timeout" >> "$LOG_DIR/launchd_stack.log"
 wait_for_port 4222 || echo "$(ts) nats did not become ready before timeout" >> "$LOG_DIR/launchd_stack.log"
 
-start_if_port_free 3000 console-web bash -lc "cd '$ROOT/apps/console-web' && /opt/homebrew/bin/npm run dev -- --hostname 0.0.0.0 --port 3000"
-start_cloudflared
-start_ssh_tunnel
-
+if [[ ! -d "$ROOT/apps/console-web/node_modules" ]]; then
+  (cd "$ROOT/apps/console-web" && /opt/homebrew/bin/npm ci) >> "$LOG_DIR/console-web-install.log" 2>&1
+fi
 start_if_port_free 8080 orchestrator-core bash -lc "cd '$ROOT/services/orchestrator-core' && /opt/homebrew/bin/go run ./cmd/orchestrator"
 sleep 5
 start_if_process_missing 'go run ./cmd/worker|/exe/worker|/tmp/joi-worker' worker-runtime bash -lc "cd '$ROOT/services/worker-runtime' && /opt/homebrew/bin/go run ./cmd/worker"
 start_if_process_missing 'go run ./cmd/gateway|/exe/gateway|/tmp/joi-telegram-gateway' telegram-gateway bash -lc "cd '$ROOT/services/telegram-gateway' && /opt/homebrew/bin/go run ./cmd/gateway"
+start_if_port_free 3000 console-web bash -lc "cd '$ROOT/apps/console-web' && /opt/homebrew/bin/npm run dev -- --hostname 0.0.0.0 --port 3000"
+start_cloudflared
+start_ssh_tunnel
 
 echo "$(ts) Joi launchd stack started with ${#children[@]} child process(es)" >> "$LOG_DIR/launchd_stack.log"
 if [[ "${#children[@]}" == "0" ]]; then

@@ -1,6 +1,6 @@
 # 24 Hour Soak Test Report
 
-Status: smoke soak passed; pending full 24 hour run.
+Status: smoke soak passed; full 24 hour run starting after reboot acceptance.
 
 ## Smoke Soak
 

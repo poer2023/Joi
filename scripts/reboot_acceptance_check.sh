@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -f /tmp/joi-public-url.env ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source /tmp/joi-public-url.env
+  set +a
+fi
+
 API="${ORCHESTRATOR_URL:-http://localhost:8080}"
 CONSOLE="${CONSOLE_BASE_URL:-${PUBLIC_CONSOLE_URL:-http://localhost:3000}}"
 DATABASE="${DATABASE_URL:-postgres://agentos:agentos_password@localhost:5432/agentos?sslmode=disable}"

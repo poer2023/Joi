@@ -22,6 +22,10 @@ if [[ -f "$ROOT/configs/secrets.local.env" ]]; then
   chmod 600 "$RUNTIME_ROOT/configs/secrets.local.env"
 fi
 
+if [[ ! -d "$RUNTIME_ROOT/apps/console-web/node_modules" ]]; then
+  (cd "$RUNTIME_ROOT/apps/console-web" && npm ci)
+fi
+
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

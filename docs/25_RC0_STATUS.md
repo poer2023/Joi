@@ -34,7 +34,7 @@ Release tag target: `rc0-local-real-loop`
 - real_telegram_verified=true
 - real_vps_worker_verified=true
 - security_evals_verified=true
-- reboot_recovery_verified=false
+- reboot_recovery_verified=true
 - soak_24h_verified=false
 - console_external_auth_verified=true
 - reboot_acceptance_script_current_session_passed=true
@@ -42,9 +42,14 @@ Release tag target: `rc0-local-real-loop`
 
 ## Unverified Items
 
-- Full host reboot recovery has not been verified yet because the main machine has not been rebooted during this RC0 pass.
 - Full 24 hour soak test has not completed yet.
 - Console/API management endpoints are protected by `ADMIN_TOKEN`; current no-auth API access returns 401.
+
+## Reboot Acceptance
+
+- Verified at: 2026-05-22 01:25 Asia/Shanghai
+- Run Trace: `run_dc41e3126f3a86114f06797b`
+- Result: orchestrator, console, PostgreSQL, queue mode, Telegram, main-node, local-worker-1, vps-la-1, Cloudflare tunnel, and `system_health_check_v1` passed after reboot.
 
 ## Known Risks
 
