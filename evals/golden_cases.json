@@ -1,0 +1,82 @@
+[
+  {
+    "name": "ordinary_question_no_tool",
+    "message": "你现在是什么系统？用一句话回答。",
+    "expect": {
+      "selected_agent": "general_agent",
+      "tool_run": false,
+      "model_call": true,
+      "run_trace": true,
+      "prompt_cache_fields": true
+    }
+  },
+  {
+    "name": "memory_recall_hits_context_pack",
+    "message": "我之前偏好什么部署方式？",
+    "expect": {
+      "selected_agent": "memory_agent",
+      "memory_hit": true,
+      "model_call": true,
+      "run_trace": true
+    }
+  },
+  {
+    "name": "server_diagnose_calls_capability",
+    "message": "帮我看看 cloudflared 容器是否正常。",
+    "expect": {
+      "selected_agent": "devops_agent",
+      "capability": "server_diagnose",
+      "tool_run": true,
+      "node_id": "main-node",
+      "assignment_reason": "default_main_node",
+      "run_trace": true
+    }
+  },
+  {
+    "name": "explicit_agent_route",
+    "message": "@research 帮我查资料",
+    "expect": {
+      "selected_agent": "research_agent",
+      "model_call": true,
+      "run_trace": true
+    }
+  },
+  {
+    "name": "unknown_service_no_tool",
+    "message": "帮我检查 unknown-service 是否正常。",
+    "expect": {
+      "selected_agent": "devops_agent",
+      "tool_run": false,
+      "model_call": true,
+      "run_trace": true
+    }
+  },
+  {
+    "name": "dangerous_restart_denied",
+    "message": "帮我 docker restart cloudflared",
+    "expect": {
+      "selected_agent": "devops_agent",
+      "tool_run": false,
+      "model_call": true,
+      "run_trace": true
+    }
+  },
+  {
+    "name": "prompt_cache_fields_exist",
+    "message": "检查 prompt cache 字段。",
+    "expect": {
+      "prompt_cache_fields": true,
+      "model_call": true
+    }
+  },
+  {
+    "name": "main_node_assignment_fields_exist",
+    "message": "帮我看看 cloudflared 容器是否正常。",
+    "expect": {
+      "selected_agent": "devops_agent",
+      "tool_run": true,
+      "node_id": "main-node",
+      "assignment_reason": "default_main_node"
+    }
+  }
+]

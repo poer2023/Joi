@@ -1,0 +1,39 @@
+{
+  "capabilities": [
+    {
+      "id": "memory_search",
+      "description": "查询长期记忆并构建 Context Pack",
+      "risk_level": "read_only"
+    },
+    {
+      "id": "memory_write_proposal",
+      "description": "生成记忆候选",
+      "risk_level": "write_candidate"
+    },
+    {
+      "id": "web_research",
+      "description": "联网研究",
+      "risk_level": "read_only"
+    },
+    {
+      "id": "file_analyze",
+      "description": "分析授权文件",
+      "risk_level": "read_only"
+    },
+    {
+      "id": "server_diagnose",
+      "description": "只读诊断服务",
+      "risk_level": "read_only"
+    },
+    {
+      "id": "system_health_check",
+      "description": "只读检查 Joi 自身运行状态",
+      "risk_level": "read_only"
+    },
+    {
+      "id": "node_dispatch",
+      "description": "节点派发",
+      "risk_level": "read_only"
+    }
+  ]
+}

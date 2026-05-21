@@ -1,0 +1,29 @@
+include:
+  - compose.dev.yml
+
+services:
+  orchestrator-core:
+    build:
+      context: ../services/orchestrator-core
+    environment:
+      DATABASE_URL: postgres://agentos:agentos_password@postgres:5432/agentos?sslmode=disable
+      TASK_QUEUE_DRIVER: ${TASK_QUEUE_DRIVER:-nats}
+      NATS_URL: nats://nats:4222
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - nats
+
+  console-web:
+    build:
+      context: ../apps/console-web
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8080
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      - orchestrator-core

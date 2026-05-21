@@ -1,0 +1,150 @@
+{
+  "agents": [
+    {
+      "id": "general_agent",
+      "name": "通用 Agent",
+      "description": "默认问答和轻量任务处理",
+      "default_model_id": "model_default",
+      "fallback_model_id": "model_fallback",
+      "cheap_model_id": "model_cheap",
+      "capabilities": [
+        "memory_search",
+        "memory_write_proposal"
+      ],
+      "tool_policy": {
+        "read_only": "auto",
+        "write_candidate": "confirm",
+        "state_change": "confirm",
+        "destructive": "deny"
+      },
+      "route_hints": {
+        "keywords": []
+      },
+      "enabled": true
+    },
+    {
+      "id": "product_agent",
+      "name": "产品 Agent",
+      "description": "PRD、交互、产品设计",
+      "default_model_id": "model_default",
+      "fallback_model_id": "model_fallback",
+      "cheap_model_id": "model_cheap",
+      "capabilities": [
+        "memory_search",
+        "file_analyze",
+        "memory_write_proposal"
+      ],
+      "tool_policy": {
+        "read_only": "auto",
+        "write_candidate": "confirm",
+        "state_change": "confirm",
+        "destructive": "deny"
+      },
+      "route_hints": {
+        "keywords": [
+          "PRD",
+          "产品",
+          "交互",
+          "页面",
+          "需求"
+        ]
+      },
+      "enabled": true
+    },
+    {
+      "id": "devops_agent",
+      "name": "运维 Agent",
+      "description": "服务器、Docker、日志、部署",
+      "default_model_id": "model_default",
+      "fallback_model_id": "model_fallback",
+      "cheap_model_id": "model_cheap",
+      "capabilities": [
+        "memory_search",
+        "server_diagnose",
+        "system_health_check",
+        "file_analyze",
+        "memory_write_proposal"
+      ],
+      "tool_policy": {
+        "read_only": "auto",
+        "write_candidate": "confirm",
+        "state_change": "confirm",
+        "destructive": "deny"
+      },
+      "route_hints": {
+        "keywords": [
+          "docker",
+          "nginx",
+          "cloudflared",
+          "日志",
+          "端口",
+          "部署",
+          "报错",
+          "joi 自检",
+          "自检",
+          "system health",
+          "健康检查"
+        ]
+      },
+      "enabled": true
+    },
+    {
+      "id": "research_agent",
+      "name": "研究 Agent",
+      "description": "联网研究、资料整理、事实核查",
+      "default_model_id": "model_default",
+      "fallback_model_id": "model_fallback",
+      "cheap_model_id": "model_cheap",
+      "capabilities": [
+        "memory_search",
+        "web_research",
+        "file_analyze",
+        "memory_write_proposal"
+      ],
+      "tool_policy": {
+        "read_only": "auto",
+        "write_candidate": "confirm",
+        "state_change": "confirm",
+        "destructive": "deny"
+      },
+      "route_hints": {
+        "keywords": [
+          "搜",
+          "查",
+          "最新",
+          "资料",
+          "厂商",
+          "调研"
+        ]
+      },
+      "enabled": true
+    },
+    {
+      "id": "memory_agent",
+      "name": "记忆 Agent",
+      "description": "记忆抽取、治理和冲突处理",
+      "default_model_id": "model_default",
+      "fallback_model_id": "model_fallback",
+      "cheap_model_id": "model_cheap",
+      "capabilities": [
+        "memory_search",
+        "memory_write_proposal"
+      ],
+      "tool_policy": {
+        "read_only": "auto",
+        "write_candidate": "confirm",
+        "state_change": "deny",
+        "destructive": "deny"
+      },
+      "route_hints": {
+        "keywords": [
+          "记住",
+          "以后",
+          "偏好",
+          "不要再"
+        ]
+      },
+      "enabled": true
+    }
+  ]
+}

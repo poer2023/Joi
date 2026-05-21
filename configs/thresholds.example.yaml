@@ -1,0 +1,5 @@
+daily_model_call_limit: 500
+daily_estimated_cost_limit: 5
+model_p95_latency_warning_ms: 15000
+model_error_rate_warning: 0.05
+dead_task_warning: 0

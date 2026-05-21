@@ -1,0 +1,8 @@
+[
+  {"id": "health", "kind": "http", "path": "/ready"},
+  {"id": "system_health_check", "kind": "chat", "message": "Joi 自检"},
+  {"id": "memory", "kind": "chat", "message": "我之前偏好什么部署方式？"},
+  {"id": "web_research", "kind": "chat", "message": "@research 请读取 https://example.com 并总结来源"},
+  {"id": "model_tiny", "kind": "chat", "message": "用五个字回答：你正常吗？"},
+  {"id": "queue_ack", "kind": "chat", "message": "@devops 帮我看看 cloudflared 容器是否正常。"}
+]

@@ -1,0 +1,34 @@
+{
+  "models": [
+    {
+      "id": "model_default",
+      "provider": "openai_compatible",
+      "model_name": "replace",
+      "display_name": "Default Model",
+      "base_url_env": "MODEL_DEFAULT_BASE_URL",
+      "api_key_env": "MODEL_DEFAULT_API_KEY",
+      "supports_json_mode": true,
+      "enabled": true
+    },
+    {
+      "id": "model_fallback",
+      "provider": "openai_compatible",
+      "model_name": "replace",
+      "display_name": "Fallback Model",
+      "base_url_env": "MODEL_FALLBACK_BASE_URL",
+      "api_key_env": "MODEL_FALLBACK_API_KEY",
+      "supports_json_mode": true,
+      "enabled": true
+    },
+    {
+      "id": "model_cheap",
+      "provider": "openai_compatible",
+      "model_name": "replace",
+      "display_name": "Cheap Model",
+      "base_url_env": "MODEL_CHEAP_BASE_URL",
+      "api_key_env": "MODEL_CHEAP_API_KEY",
+      "supports_json_mode": true,
+      "enabled": true
+    }
+  ]
+}

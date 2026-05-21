@@ -1,0 +1,27 @@
+{
+  "risk_policy": {
+    "read_only": "allow_auto",
+    "write_candidate": "pending_or_confirm",
+    "state_change": "requires_confirmation",
+    "destructive": "deny_by_default",
+    "unsafe": "deny"
+  },
+  "privacy_policy": {
+    "public": {
+      "cloud_model": true,
+      "worker": true
+    },
+    "internal": {
+      "cloud_model": "summary_allowed",
+      "worker": "summary_allowed"
+    },
+    "private": {
+      "cloud_model": "sanitized_only",
+      "worker": false
+    },
+    "secret": {
+      "cloud_model": false,
+      "worker": false
+    }
+  }
+}

@@ -1,0 +1,16 @@
+models:
+  - provider: openai_compatible
+    model: deepseek-v4-flash
+    input_per_1m: 0.14
+    output_per_1m: 0.28
+    cached_input_per_1m: 0.028
+  - provider: openai_compatible
+    model: deepseek-v4-pro
+    input_per_1m: 1.74
+    output_per_1m: 3.48
+    cached_input_per_1m: 0.145
+  - provider: mock_provider
+    model: mock-model
+    input_per_1m: 0
+    output_per_1m: 0
+    cached_input_per_1m: 0

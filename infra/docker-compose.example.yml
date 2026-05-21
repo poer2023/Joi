@@ -1,0 +1,92 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agentos-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agentos}
+      POSTGRES_USER: ${POSTGRES_USER:-agentos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentos_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../database/001_init_schema.sql:/docker-entrypoint-initdb.d/001_init_schema.sql:ro
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: agentos-nats
+    command: ["-js", "-sd", "/data"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats_data:/data
+
+  orchestrator-core:
+    build:
+      context: ../services/orchestrator-core
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-agentos}:${POSTGRES_PASSWORD:-agentos_password}@postgres:5432/${POSTGRES_DB:-agentos}?sslmode=disable
+      TASK_QUEUE_DRIVER: ${TASK_QUEUE_DRIVER:-postgres}
+      NATS_URL: nats://nats:4222
+      NATS_STREAM: AGENTOS_TASKS
+      NATS_TASK_SUBJECT: agentos.tasks
+      AGENT_RUNTIME_URL: http://agent-runtime:8091
+      MEMORY_SERVICE_URL: http://memory-service:8092
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - nats
+
+  agent-runtime:
+    build:
+      context: ../services/agent-runtime
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-agentos}:${POSTGRES_PASSWORD:-agentos_password}@postgres:5432/${POSTGRES_DB:-agentos}?sslmode=disable
+    ports:
+      - "8091:8091"
+    depends_on:
+      - postgres
+
+  memory-service:
+    build:
+      context: ../services/memory-service
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-agentos}:${POSTGRES_PASSWORD:-agentos_password}@postgres:5432/${POSTGRES_DB:-agentos}?sslmode=disable
+    ports:
+      - "8092:8092"
+    depends_on:
+      - postgres
+
+  console-web:
+    build:
+      context: ../apps/console-web
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      - orchestrator-core
+
+  worker-runtime-main:
+    build:
+      context: ../services/worker-runtime
+    environment:
+      NODE_ID: main-node
+      NODE_ROLE: control_and_execution
+      TASK_QUEUE_DRIVER: ${TASK_QUEUE_DRIVER:-postgres}
+      DATABASE_URL: postgres://${POSTGRES_USER:-agentos}:${POSTGRES_PASSWORD:-agentos_password}@postgres:5432/${POSTGRES_DB:-agentos}?sslmode=disable
+      ORCHESTRATOR_URL: http://orchestrator-core:8080
+      NATS_URL: nats://nats:4222
+      NATS_STREAM: AGENTOS_TASKS
+      NATS_TASK_SUBJECT: agentos.tasks
+    depends_on:
+      - orchestrator-core
+      - nats
+
+volumes:
+  postgres_data:
+  nats_data:

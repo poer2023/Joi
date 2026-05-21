@@ -1,0 +1,36 @@
+server:
+  port: "8080"
+  config_dir: "../../configs"
+  migrations_dir: "../../database/migrations"
+
+database:
+  url: "postgres://agentos:agentos_password@localhost:5432/agentos?sslmode=disable"
+
+model:
+  provider: "openai_compatible"
+  base_url: "https://api.deepseek.com"
+  name: "deepseek-v4-flash"
+  timeout_seconds: 60
+  max_retries: 1
+
+telegram:
+  allowed_user_ids: ""
+  orchestrator_url: "http://localhost:8080"
+  console_base_url: "http://localhost:3000"
+
+task_queue:
+  driver: "postgres"
+  nats_url: "nats://localhost:4222"
+  nats_stream: "AGENTOS_TASKS"
+  nats_task_subject: "agentos.tasks"
+
+node:
+  node_id: "main-node"
+  public_base_url: "http://localhost:3000"
+
+worker:
+  node_id: "local-worker-1"
+  capabilities: "server_diagnose,web_research_v1,simple_http_fetch"
+  allow_auto_assign: true
+  allow_manual_assign: true
+  allowed_node_ids: "local-worker-1,vps-la-1"

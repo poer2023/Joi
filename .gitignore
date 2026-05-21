@@ -1,0 +1,15 @@
+node_modules/
+.next/
+dist/
+build/
+coverage/
+backups/
+soak-results-*.jsonl
+
+*.log
+.env
+.env.*
+!.env.example
+configs/secrets.local.env
+
+services/orchestrator-core/orchestrator

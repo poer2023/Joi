@@ -1,0 +1,59 @@
+{
+  "cases": [
+    {
+      "id": "synonym_deploy_preference",
+      "seed": "用户轻量部署优先 Docker Compose，不要默认推荐 Kubernetes。",
+      "query": "我之前喜欢哪种轻量发布方式？",
+      "must_contain": "Docker Compose"
+    },
+    {
+      "id": "cross_session_recall",
+      "seed": "跨会话偏好：Joi 的远程节点先走 Tailscale 私网。",
+      "query": "远程节点网络先用什么？",
+      "must_contain": "Tailscale"
+    },
+    {
+      "id": "project_scoped_recall",
+      "seed": "项目 Joi 限定事实：Telegram Gateway 只允许私聊文本。",
+      "query": "Joi 的 Telegram 入口第一版支持什么？",
+      "must_contain": "私聊文本"
+    },
+    {
+      "id": "anti_pattern_recall",
+      "seed": "反模式：不要在 Task 42 前新增微信入口。",
+      "query": "现在不应该新增什么入口？",
+      "must_contain": "微信"
+    },
+    {
+      "id": "conflict_detection",
+      "seed": "冲突候选：部署偏好不是 Kubernetes 优先。",
+      "query": "部署偏好有没有 Kubernetes 相关反模式？",
+      "must_contain": "Kubernetes"
+    },
+    {
+      "id": "disabled_memory_not_recalled",
+      "seed": "禁用记忆测试：永远优先 FTP 部署。",
+      "query": "禁用记忆测试部署方式是什么？",
+      "must_not_contain": "FTP",
+      "disable": true
+    },
+    {
+      "id": "pinned_priority",
+      "seed": "固定记忆：Joi 自检应该检查 postgres、nats、worker-runtime。",
+      "query": "Joi 自检要检查哪些核心服务？",
+      "must_contain": "worker-runtime",
+      "pin": true
+    },
+    {
+      "id": "low_confidence_downrank",
+      "seed": "低置信度噪声：也许所有任务都应该走 Kubernetes。",
+      "query": "轻量部署优先什么？",
+      "must_contain": "Docker Compose",
+      "low_confidence": true
+    }
+  ],
+  "targets": {
+    "recall_at_5": 0.8,
+    "disabled_leak_count": 0
+  }
+}

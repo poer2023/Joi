@@ -1,0 +1,16 @@
+{
+  "requirements": {
+    "allow_mock_provider": false,
+    "require_real_model": true,
+    "require_real_telegram": true
+  },
+  "cases": [
+    {"id": "orchestrator_ready", "type": "http", "url": "http://localhost:8080/ready"},
+    {"id": "console_ready", "type": "http", "url": "http://localhost:3000"},
+    {"id": "model_provider_health", "type": "http", "url": "http://localhost:8080/api/model-provider/health"},
+    {"id": "nodes", "type": "http", "url": "http://localhost:8080/api/nodes"},
+    {"id": "web_research", "type": "chat", "message": "@research 请读取 https://example.com 并总结来源"},
+    {"id": "server_diagnose", "type": "chat", "message": "@devops 帮我检查 cloudflared 服务是否正常"},
+    {"id": "run_trace", "type": "trace_required"}
+  ]
+}

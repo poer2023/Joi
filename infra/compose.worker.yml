@@ -1,0 +1,13 @@
+services:
+  worker-runtime:
+    build:
+      context: ../services/worker-runtime
+    environment:
+      NODE_ID: ${NODE_ID:-local-worker-1}
+      WORKER_TOKEN: ${WORKER_TOKEN:-}
+      WORKER_ALLOWED_NODE_IDS: ${WORKER_ALLOWED_NODE_IDS:-local-worker-1,vps-la-1}
+      DATABASE_URL: ${DATABASE_URL:-postgres://agentos:agentos_password@host.docker.internal:5432/agentos?sslmode=disable}
+      TASK_QUEUE_DRIVER: ${TASK_QUEUE_DRIVER:-nats}
+      NATS_URL: ${NATS_URL:-nats://host.docker.internal:4222}
+      WORKER_CAPABILITIES: ${WORKER_CAPABILITIES:-server_diagnose,web_research_v1}
+    restart: unless-stopped

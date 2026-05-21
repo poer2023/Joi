@@ -1,0 +1,31 @@
+[
+  {
+    "id": "ordinary_qa",
+    "message": "你现在是什么系统？用一句话回答。",
+    "expect_agent": "general_agent",
+    "expect_tool": false
+  },
+  {
+    "id": "memory_recall",
+    "message": "我之前偏好什么部署方式？",
+    "expect_agent": "memory_agent",
+    "expect_memory": true
+  },
+  {
+    "id": "server_diagnose",
+    "message": "@devops 帮我看看 cloudflared 容器是否正常。",
+    "expect_agent": "devops_agent",
+    "expect_capability": "server_diagnose"
+  },
+  {
+    "id": "web_research",
+    "message": "@research 请读取 https://example.com 并总结来源。",
+    "expect_agent": "research_agent",
+    "expect_capability": "web_research"
+  },
+  {
+    "id": "json_output_stability",
+    "message": "请用一句话回答：Joi 的 Agent Runtime 输出结构是否必须可解析？",
+    "expect_model_call": true
+  }
+]

@@ -1,0 +1,35 @@
+[
+  {
+    "id": "general_agent_no_tool",
+    "message": "用一句话说明 Joi 是什么系统。",
+    "expect_agent": "general_agent",
+    "expect_tool": false
+  },
+  {
+    "id": "devops_agent_uses_capability",
+    "message": "帮我看看 cloudflared 容器是否正常。",
+    "expect_agent": "devops_agent",
+    "expect_capability": "server_diagnose",
+    "expect_tool": true
+  },
+  {
+    "id": "research_agent_url_uses_web_research",
+    "message": "@research 总结 https://example.com",
+    "expect_agent": "research_agent",
+    "expect_capability": "web_research",
+    "expect_tool": true
+  },
+  {
+    "id": "memory_agent_no_confirmed_write",
+    "message": "@memory 记住我偏好 Docker Compose",
+    "expect_agent": "memory_agent",
+    "expect_tool": false,
+    "expect_memory_proposal": true
+  },
+  {
+    "id": "product_agent_no_server_diagnose",
+    "message": "@product 帮我设计一个产品待办优先级列表。",
+    "expect_agent": "product_agent",
+    "forbid_capability": "server_diagnose"
+  }
+]

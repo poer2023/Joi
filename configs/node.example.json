@@ -1,0 +1,24 @@
+{
+  "node": {
+    "node_id": "node-vps-la",
+    "name": "LA VPS",
+    "role": "worker",
+    "capabilities": [
+      "web_fetch",
+      "browser_task",
+      "server_diagnose",
+      "model_proxy"
+    ],
+    "resources": {
+      "cpu_cores": 2,
+      "memory_gb": 2
+    },
+    "assign_policy": {
+      "manual_assignable": true,
+      "auto_assignable": true,
+      "allow_private_context": false,
+      "allow_secret_context": false
+    },
+    "orchestrator_url": "http://orchestrator-core:8080"
+  }
+}

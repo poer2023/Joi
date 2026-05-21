@@ -1,0 +1,445 @@
+:root {
+  color-scheme: light;
+  --bg: #f5f7fb;
+  --panel: #ffffff;
+  --panel-border: #d8dee8;
+  --text: #152033;
+  --muted: #667084;
+  --accent: #0f766e;
+  --accent-dark: #115e59;
+  --danger: #b42318;
+  --code: #111827;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.nav {
+  display: flex;
+  gap: 14px;
+  padding: 12px 24px 0;
+  max-width: 1440px;
+  margin: 0 auto;
+  font-size: 14px;
+}
+
+.nav a {
+  color: var(--accent-dark);
+  text-decoration: none;
+}
+
+button,
+textarea,
+select {
+  font: inherit;
+}
+
+input {
+  font: inherit;
+}
+
+.authShell {
+  min-height: calc(100vh - 40px);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.authPanel {
+  width: min(420px, 100%);
+  display: grid;
+  gap: 12px;
+  padding: 20px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.authPanel h1,
+.authPanel p {
+  margin: 0;
+}
+
+.authPanel input {
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+}
+
+.authPanel button,
+.authBar button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.authPanel button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.authBar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+  max-width: 1440px;
+  margin: 10px auto 0;
+  padding: 0 24px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.authBar button {
+  padding: 0 10px;
+  background: var(--accent-dark);
+}
+
+.shell {
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.topbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  max-width: 1440px;
+  margin: 0 auto 18px;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 28px;
+  line-height: 1.1;
+}
+
+.topbar p,
+.paneHeader span,
+.status span,
+.metaGrid span {
+  color: var(--muted);
+}
+
+.topbar p {
+  margin: 6px 0 0;
+}
+
+.status {
+  display: grid;
+  gap: 4px;
+  text-align: right;
+  font-size: 13px;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.9fr) minmax(480px, 1.1fr);
+  gap: 18px;
+  max-width: 1440px;
+  margin: 0 auto;
+}
+
+.dashboard {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  max-width: 1440px;
+  margin: 0 auto 18px;
+}
+
+.dashboard div {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.dashboard span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dashboard strong {
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.shellInner {
+  max-width: 1440px;
+  margin: 18px auto 0;
+}
+
+.pane {
+  min-height: calc(100vh - 118px);
+  padding: 18px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+}
+
+.paneHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.paneHeader h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.paneHeader span {
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.composer {
+  display: grid;
+  gap: 12px;
+}
+
+.compactComposer {
+  margin-bottom: 16px;
+}
+
+.compactComposer textarea {
+  min-height: 90px;
+}
+
+.composer textarea {
+  width: 100%;
+  min-height: 160px;
+  resize: vertical;
+  padding: 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  line-height: 1.5;
+}
+
+.composer button {
+  justify-self: end;
+  min-width: 112px;
+  height: 40px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.smallButton {
+  min-width: 96px;
+  height: 32px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.composer button:hover {
+  background: var(--accent-dark);
+}
+
+.composer button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.error {
+  margin-top: 14px;
+  color: var(--danger);
+}
+
+.responseBlock,
+.empty,
+.traceSummary {
+  margin-top: 18px;
+  padding: 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.responseBlock p {
+  margin: 14px 0 0;
+  line-height: 1.6;
+}
+
+.metaGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.metaGrid div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.metaGrid strong {
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.empty {
+  color: var(--muted);
+}
+
+.traceSummary {
+  overflow-wrap: anywhere;
+  color: var(--accent-dark);
+  font-size: 13px;
+}
+
+.traceSummary strong,
+.traceSummary span {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.traceSummary p {
+  margin: 6px 0 0;
+}
+
+.memoryList {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--text);
+}
+
+.cardList {
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.itemCard {
+  padding: 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.itemCard p {
+  overflow-wrap: anywhere;
+}
+
+.buttonRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.buttonRow button {
+  width: auto;
+  min-height: 34px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.timeline {
+  display: grid;
+  gap: 12px;
+  padding: 0;
+  margin: 16px 0 0;
+  list-style: none;
+}
+
+.timeline li {
+  padding: 14px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.stepHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.stepHeader span {
+  color: var(--accent-dark);
+  font-size: 13px;
+}
+
+code {
+  display: inline-block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.jsonGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+pre {
+  min-height: 120px;
+  max-height: 260px;
+  margin: 0;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--code);
+  color: #eef2ff;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+@media (max-width: 960px) {
+  .shell {
+    padding: 16px;
+  }
+
+  .topbar,
+  .workspace,
+  .dashboard,
+  .jsonGrid,
+  .metaGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    display: grid;
+  }
+
+  .status {
+    text-align: left;
+  }
+
+  .pane {
+    min-height: auto;
+  }
+}
