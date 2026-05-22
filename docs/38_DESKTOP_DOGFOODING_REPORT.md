@@ -21,32 +21,42 @@ remote worker web_research when vps-la-1 is available
 
 ## Day 1
 
-Date:
+Date: 2026-05-23
 
 ```text
-desktop_only:
-system_health_check:
-memory_write:
-memory_recall:
-web_research:
-server_diagnose:
-costs_visible:
-backup_created:
-confirmation_flow:
-remote_worker:
+desktop_only: pass for app flow; Wails UI used for onboarding, first backup, and first chat; no Web Console used
+system_health_check: pass; Desktop health and node status callable
+memory_write: pass; pending memory proposal path remains available
+memory_recall: pass in desktop evals; no manual DB needed for product use
+web_research: pass; vps-la-1 fetched https://example.com through Desktop Gateway
+server_diagnose: pass in Desktop parity path
+costs_visible: pass; Model Usage / Costs page present
+backup_created: pass; Wails UI created first .joibak and temp backup drill restored successfully
+confirmation_flow: pass; Confirmations page supports approve/reject
+remote_worker: pass; vps-la-1 register/heartbeat/claim/ack verified over public SSH reverse tunnel
 ```
 
 Issues:
 
 ```text
-must_return_to_cli:
-must_open_web_console:
-env_config_problem:
-memory_false_positive:
-memory_false_negative:
-trace_gap:
-ui_missing_function:
-worker_instability:
+must_return_to_cli: true for remote worker setup and repeatable drills; normal onboarding/chat path stayed in Desktop UI
+must_open_web_console: false
+env_config_problem: fixed during Day 1; first-run setup now saves model key to Keychain and persists model config in SQLite
+memory_false_positive: none observed
+memory_false_negative: none observed in evals
+trace_gap: none for vps-la-1 check; trace showed node_selected, worker_finished, tool_finished
+ui_missing_function: restore entry was missing and is now added to Backups
+worker_instability: racknerd-e0ccce3 SSH closed during probe; cloudcone-la was used as reachable vps-la-1 host
+
+Fixes made during Day 1:
+
+```text
+Embedded SQLite schema into AppCore so Wails launched from Finder/open does not depend on repo cwd
+DeepSeek URL handling now accepts both https://api.deepseek.com and https://api.deepseek.com/v1
+Model connection test now fails on fallback_to_mock instead of reporting success
+web_research fills inputs.url from the original message when the model omits it
+Backups page now has restore entry
+```
 ```
 
 ## Day 2

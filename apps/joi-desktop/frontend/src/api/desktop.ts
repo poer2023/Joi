@@ -135,6 +135,25 @@ export type ConnectionTest = {
   error_summary?: string;
 };
 
+export type OnboardingStatus = {
+  required: boolean;
+  completed: boolean;
+  model_configured: boolean;
+  telegram_configured: boolean;
+  worker_configured: boolean;
+  first_backup_created: boolean;
+  backup_count: number;
+  missing?: string[];
+};
+
+export type ModelConfigRequest = {
+  provider: string;
+  base_url: string;
+  name: string;
+  timeout_seconds?: number;
+  max_retries?: number;
+};
+
 type DesktopBindings = {
   SendChat(req: ChatRequest): Promise<ChatResponse>;
   GetRunTrace(runID: string): Promise<RunTrace>;
@@ -147,7 +166,11 @@ type DesktopBindings = {
   DecideConfirmation(req: { id: string; approve: boolean; actor?: string; reason?: string }): Promise<void>;
   ListBackups(): Promise<{ backups: BackupRecord[] }>;
   CreateBackup(): Promise<{ path: string }>;
+  RestoreBackup(path: string): Promise<void>;
   GetSettings(): Promise<SettingsRecord>;
+  SaveModelConfig(req: ModelConfigRequest): Promise<void>;
+  GetOnboardingStatus(): Promise<OnboardingStatus>;
+  CompleteOnboarding(): Promise<void>;
   GetSecretStatus(): Promise<SecretStatus>;
   SaveSecret(req: { name: string; value: string }): Promise<void>;
   TestModelConnection(): Promise<ConnectionTest>;
@@ -220,6 +243,7 @@ function bindings(): DesktopBindings {
       async CreateBackup() {
         return { path: 'preview.joibak' };
       },
+      async RestoreBackup() {},
       async GetSettings() {
         return {
           app_mode: 'desktop',
@@ -236,6 +260,11 @@ function bindings(): DesktopBindings {
           docker_required: false,
         };
       },
+      async SaveModelConfig() {},
+      async GetOnboardingStatus() {
+        return { required: false, completed: true, model_configured: true, telegram_configured: false, worker_configured: false, first_backup_created: true, backup_count: 1 };
+      },
+      async CompleteOnboarding() {},
       async GetSecretStatus() {
         return { secrets: {} };
       },
@@ -266,7 +295,11 @@ export const desktopApi = {
   decideConfirmation: (req: { id: string; approve: boolean; actor?: string; reason?: string }) => bindings().DecideConfirmation(req),
   listBackups: () => bindings().ListBackups(),
   createBackup: () => bindings().CreateBackup(),
+  restoreBackup: (path: string) => bindings().RestoreBackup(path),
   getSettings: () => bindings().GetSettings(),
+  saveModelConfig: (req: ModelConfigRequest) => bindings().SaveModelConfig(req),
+  getOnboardingStatus: () => bindings().GetOnboardingStatus(),
+  completeOnboarding: () => bindings().CompleteOnboarding(),
   getSecretStatus: () => bindings().GetSecretStatus(),
   saveSecret: (req: { name: string; value: string }) => bindings().SaveSecret(req),
   testModelConnection: () => bindings().TestModelConnection(),

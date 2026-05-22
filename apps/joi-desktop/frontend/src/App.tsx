@@ -7,6 +7,7 @@ import {
   type MemoryRecord,
   type ModelCall,
   type NodeRecord,
+  type OnboardingStatus,
   type RunTrace,
   type SecretStatus,
   type SettingsRecord,
@@ -43,6 +44,7 @@ export default function App() {
   const [backups, setBackups] = useState<BackupRecord[]>([]);
   const [settings, setSettings] = useState<SettingsRecord | null>(null);
   const [secretStatus, setSecretStatus] = useState<SecretStatus | null>(null);
+  const [onboarding, setOnboarding] = useState<OnboardingStatus | null>(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
@@ -56,7 +58,7 @@ export default function App() {
   async function refreshAll() {
     setError('');
     try {
-      const [systemHealth, memoryList, nodeList, modelUsage, confirmationList, backupList, desktopSettings, secrets] = await Promise.all([
+      const [systemHealth, memoryList, nodeList, modelUsage, confirmationList, backupList, desktopSettings, secrets, onboardingStatus] = await Promise.all([
         desktopApi.getSystemHealth(),
         desktopApi.listMemories({ query: memoryQuery, limit: 50 }),
         desktopApi.listNodes(),
@@ -65,6 +67,7 @@ export default function App() {
         desktopApi.listBackups(),
         desktopApi.getSettings(),
         desktopApi.getSecretStatus(),
+        desktopApi.getOnboardingStatus(),
       ]);
       setHealth(systemHealth);
       setMemories(memoryList.memories ?? []);
@@ -74,6 +77,7 @@ export default function App() {
       setBackups(backupList.backups ?? []);
       setSettings(desktopSettings);
       setSecretStatus(secrets);
+      setOnboarding(onboardingStatus);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -118,6 +122,12 @@ export default function App() {
     await refreshAll();
   }
 
+  async function restoreBackup(path: string) {
+    await desktopApi.restoreBackup(path);
+    setNotice('Backup restored. Secrets remain in Keychain or must be reconfigured.');
+    await refreshAll();
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -148,7 +158,9 @@ export default function App() {
         {error && <div className="banner error">{error}</div>}
         {notice && <div className="banner notice">{notice}</div>}
 
-        {activeTab === 'chat' && (
+        {onboarding?.required && <OnboardingPanel createBackup={createBackup} refreshAll={refreshAll} setError={setError} setNotice={setNotice} status={onboarding} />}
+
+        {!onboarding?.required && activeTab === 'chat' && (
           <div className="content-grid">
             <section className="panel chat-panel">
               <form onSubmit={submit}>
@@ -182,16 +194,137 @@ export default function App() {
           </div>
         )}
 
-        {activeTab === 'trace' && <TraceDetail firstModelCall={firstModelCall} stepCount={stepCount} trace={trace} />}
-        {activeTab === 'system' && <SystemPanel health={health} />}
-        {activeTab === 'memory' && <MemoryPanel memories={memories} memoryQuery={memoryQuery} setMemoryQuery={setMemoryQuery} refreshAll={refreshAll} updateMemory={updateMemory} />}
-        {activeTab === 'nodes' && <NodesPanel nodes={nodes} />}
-        {activeTab === 'costs' && <CostsPanel calls={trace?.model_calls ?? []} usage={usage} health={health} />}
-        {activeTab === 'confirmations' && <ConfirmationsPanel confirmations={confirmations} decide={decideConfirmation} />}
-        {activeTab === 'settings' && <SettingsPanel refreshAll={refreshAll} secretStatus={secretStatus} setNotice={setNotice} settings={settings} />}
-        {activeTab === 'backups' && <BackupsPanel backups={backups} createBackup={createBackup} />}
+        {!onboarding?.required && activeTab === 'trace' && <TraceDetail firstModelCall={firstModelCall} stepCount={stepCount} trace={trace} />}
+        {!onboarding?.required && activeTab === 'system' && <SystemPanel health={health} />}
+        {!onboarding?.required && activeTab === 'memory' && <MemoryPanel memories={memories} memoryQuery={memoryQuery} setMemoryQuery={setMemoryQuery} refreshAll={refreshAll} updateMemory={updateMemory} />}
+        {!onboarding?.required && activeTab === 'nodes' && <NodesPanel nodes={nodes} />}
+        {!onboarding?.required && activeTab === 'costs' && <CostsPanel calls={trace?.model_calls ?? []} usage={usage} health={health} />}
+        {!onboarding?.required && activeTab === 'confirmations' && <ConfirmationsPanel confirmations={confirmations} decide={decideConfirmation} />}
+        {!onboarding?.required && activeTab === 'settings' && <SettingsPanel refreshAll={refreshAll} secretStatus={secretStatus} setNotice={setNotice} settings={settings} />}
+        {!onboarding?.required && activeTab === 'backups' && <BackupsPanel backups={backups} createBackup={createBackup} restoreBackup={restoreBackup} />}
       </section>
     </main>
+  );
+}
+
+function OnboardingPanel({
+  status,
+  createBackup,
+  refreshAll,
+  setError,
+  setNotice,
+}: {
+  status: OnboardingStatus;
+  createBackup: () => Promise<void>;
+  refreshAll: () => Promise<void>;
+  setError: (value: string) => void;
+  setNotice: (value: string) => void;
+}) {
+  const [provider, setProvider] = useState('openai_compatible');
+  const [baseURL, setBaseURL] = useState('https://api.deepseek.com');
+  const [modelName, setModelName] = useState('deepseek-chat');
+  const [apiKey, setApiKey] = useState('');
+  const [telegramToken, setTelegramToken] = useState('');
+  const [workerToken, setWorkerToken] = useState('');
+
+  async function runStep(action: () => Promise<void>, success: string) {
+    setError('');
+    try {
+      await action();
+      setNotice(success);
+      await refreshAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function saveAndTestModel() {
+    await runStep(async () => {
+      await desktopApi.saveModelConfig({ provider, base_url: baseURL, name: modelName, timeout_seconds: 60, max_retries: 1 });
+      if (apiKey.trim()) {
+        await desktopApi.saveSecret({ name: 'MODEL_API_KEY', value: apiKey.trim() });
+        setApiKey('');
+      }
+      const result = await desktopApi.testModelConnection();
+      if (!result.ok) {
+        throw new Error(result.error_summary || result.status);
+      }
+    }, 'Model connection verified.');
+  }
+
+  async function saveAndTestTelegram() {
+    await runStep(async () => {
+      if (telegramToken.trim()) {
+        await desktopApi.saveSecret({ name: 'TELEGRAM_BOT_TOKEN', value: telegramToken.trim() });
+        setTelegramToken('');
+      }
+      const result = await desktopApi.testTelegramConnection();
+      if (!result.ok) {
+        throw new Error(result.error_summary || result.status);
+      }
+    }, 'Telegram token verified.');
+  }
+
+  async function generateWorkerToken() {
+    await runStep(async () => {
+      const result = await desktopApi.generateWorkerToken();
+      setWorkerToken(result.token);
+    }, 'Worker token generated.');
+  }
+
+  async function finishOnboarding() {
+    await runStep(async () => {
+      await desktopApi.completeOnboarding();
+    }, 'Onboarding completed.');
+  }
+
+  return (
+    <section className="panel wide onboarding">
+      <h2>First-run setup</h2>
+      <dl className="metrics">
+        <KV label="Model" value={status.model_configured ? 'configured' : 'required'} />
+        <KV label="Backup" value={status.first_backup_created ? `${status.backup_count}` : 'required'} />
+        <KV label="Telegram" value={status.telegram_configured ? 'configured' : 'optional'} />
+        <KV label="Worker" value={status.worker_configured ? 'configured' : 'optional'} />
+      </dl>
+      <div className="settings-grid">
+        <section>
+          <h3>Model</h3>
+          <label>
+            Provider
+            <input value={provider} onChange={(event) => setProvider(event.target.value)} />
+          </label>
+          <label>
+            Base URL
+            <input value={baseURL} onChange={(event) => setBaseURL(event.target.value)} />
+          </label>
+          <label>
+            Model
+            <input value={modelName} onChange={(event) => setModelName(event.target.value)} />
+          </label>
+          <label>
+            API Key
+            <input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} />
+          </label>
+          <button type="button" onClick={saveAndTestModel}>Save & Test Model</button>
+        </section>
+        <section>
+          <h3>Optional</h3>
+          <label>
+            Telegram Token
+            <input type="password" value={telegramToken} onChange={(event) => setTelegramToken(event.target.value)} />
+          </label>
+          <button type="button" onClick={saveAndTestTelegram}>Test Telegram</button>
+          <button type="button" onClick={generateWorkerToken}>Generate Worker Token</button>
+          {workerToken && <code>{workerToken}</code>}
+        </section>
+        <section>
+          <h3>Backup</h3>
+          <button type="button" onClick={createBackup}>Create First Backup</button>
+          <button disabled={!status.model_configured || !status.first_backup_created} type="button" onClick={finishOnboarding}>Finish</button>
+        </section>
+      </div>
+    </section>
   );
 }
 
@@ -484,12 +617,17 @@ function SettingsPanel({
   );
 }
 
-function BackupsPanel({ backups, createBackup }: { backups: BackupRecord[]; createBackup: () => Promise<void> }) {
+function BackupsPanel({ backups, createBackup, restoreBackup }: { backups: BackupRecord[]; createBackup: () => Promise<void>; restoreBackup: (path: string) => Promise<void> }) {
+  const [path, setPath] = useState('');
   return (
     <section className="panel wide">
       <div className="section-header">
         <h2>Backups</h2>
         <button type="button" onClick={createBackup}>Create Backup</button>
+      </div>
+      <div className="control-row">
+        <input placeholder="Backup path" value={path} onChange={(event) => setPath(event.target.value)} />
+        <button disabled={!path.trim()} type="button" onClick={() => restoreBackup(path.trim())}>Restore</button>
       </div>
       <div className="table">
         {backups.map((backup) => (
@@ -497,6 +635,7 @@ function BackupsPanel({ backups, createBackup }: { backups: BackupRecord[]; crea
             <strong>{backup.name}</strong>
             <small>{backup.modified} · {Math.round(backup.size / 1024)} KB</small>
             <small>{backup.path}</small>
+            <button type="button" onClick={() => restoreBackup(backup.path)}>Restore</button>
           </article>
         ))}
       </div>

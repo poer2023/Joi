@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,8 @@ import (
 	"github.com/hao/agent-os/services/orchestrator-core/internal/runtimeconfig"
 	"github.com/hao/agent-os/services/orchestrator-core/internal/store"
 )
+
+var desktopURLPattern = regexp.MustCompile(`https?://[^\s<>"')\]]+`)
 
 type AppCore struct {
 	Store   Store
@@ -107,6 +111,18 @@ type DesktopSettingsResponse struct {
 	BackupDir       string `json:"backup_dir"`
 	DockerRequired  bool   `json:"docker_required"`
 }
+type DesktopModelConfigRequest struct {
+	Provider       string `json:"provider"`
+	BaseURL        string `json:"base_url"`
+	Name           string `json:"name"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	MaxRetries     int    `json:"max_retries"`
+}
+type DesktopOnboardingCoreStatus struct {
+	Completed          bool `json:"completed"`
+	FirstBackupCreated bool `json:"first_backup_created"`
+	BackupCount        int  `json:"backup_count"`
+}
 
 func NewAppCore(ctx context.Context, cfg runtimeconfig.Config, logger *slog.Logger) (*AppCore, error) {
 	if logger == nil {
@@ -140,13 +156,20 @@ func (a *AppCore) Start(ctx context.Context) error {
 	if a.isSQLite() {
 		schemaPath, err := sqliteSchemaPath()
 		if err != nil {
-			return err
-		}
-		if err := a.db.ApplySQLiteSchema(ctx, schemaPath); err != nil {
+			if embeddedSQLiteSchema == "" {
+				return err
+			}
+			if err := a.db.ApplySQLiteSchemaSQL(ctx, embeddedSQLiteSchema); err != nil {
+				return err
+			}
+		} else if err := a.db.ApplySQLiteSchema(ctx, schemaPath); err != nil {
 			return err
 		}
 		if err := a.db.SeedSQLiteDefaults(ctx); err != nil {
 			return err
+		}
+		if err := a.loadSQLiteRuntimeSettings(ctx); err != nil {
+			a.logger.Warn("sqlite runtime settings load skipped", "service", "appcore", "error", err)
 		}
 		if err := a.seedSQLiteRuntimeModel(ctx); err != nil {
 			return err
@@ -264,6 +287,7 @@ func (a *AppCore) ListNodes(ctx context.Context) (*NodeListResponse, error) {
 		return nil, errors.New("appcore db is not available")
 	}
 	if a.isSQLite() {
+		_ = a.markSQLiteOfflineNodes(ctx)
 		nodes, err := a.listSQLiteNodes(ctx)
 		if err != nil {
 			return nil, err
@@ -282,6 +306,7 @@ func (a *AppCore) GetSystemHealth(ctx context.Context) (*SystemHealthResponse, e
 		return nil, errors.New("appcore db is not available")
 	}
 	if a.isSQLite() {
+		_ = a.markSQLiteOfflineNodes(ctx)
 		nodes, _ := a.listSQLiteNodes(ctx)
 		health := &SystemHealthResponse{
 			ServiceStatus:   map[string]any{"orchestrator": "ok", "sqlite": a.db.Ping(ctx) == nil, "docker_required": false},
@@ -507,6 +532,34 @@ func (a *AppCore) CreateBackup(ctx context.Context) (*BackupCreateResponse, erro
 	return &BackupCreateResponse{Path: path}, nil
 }
 
+func (a *AppCore) RestoreBackup(ctx context.Context, backupPath string) error {
+	manager := backup.Manager{
+		AppDir:     filepath.Dir(a.Config.App.SQLitePath),
+		SQLitePath: a.Config.App.SQLitePath,
+		ConfigDir:  a.Config.Server.ConfigDir,
+		PromptsDir: "prompts",
+		BackupDir:  a.backupDir(),
+	}
+	if a.isSQLite() {
+		if a.Store != nil {
+			_ = a.Store.Close()
+		}
+		if err := manager.Restore(ctx, backupPath); err != nil {
+			return err
+		}
+		db, err := store.OpenSQLite(ctx, a.Config.App.SQLitePath)
+		if err != nil {
+			return err
+		}
+		a.Store = db
+		a.db = db
+		a.Queue = nil
+		a.started = false
+		return a.Start(ctx)
+	}
+	return manager.Restore(ctx, backupPath)
+}
+
 func (a *AppCore) GetDesktopSettings(ctx context.Context) (*DesktopSettingsResponse, error) {
 	_ = ctx
 	return &DesktopSettingsResponse{
@@ -523,6 +576,127 @@ func (a *AppCore) GetDesktopSettings(ctx context.Context) (*DesktopSettingsRespo
 		BackupDir:       a.backupDir(),
 		DockerRequired:  a.Config.App.DockerRequired,
 	}, nil
+}
+
+func (a *AppCore) SaveDesktopModelConfig(ctx context.Context, req DesktopModelConfigRequest) error {
+	if !a.isSQLite() {
+		return errors.New("desktop model config is only available in SQLite mode")
+	}
+	provider := valueOrDefault(req.Provider, "openai_compatible")
+	baseURL := valueOrDefault(req.BaseURL, "https://api.deepseek.com")
+	modelName := valueOrDefault(req.Name, "deepseek-chat")
+	timeoutSeconds := req.TimeoutSeconds
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 60
+	}
+	maxRetries := req.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 1
+	}
+	settings := map[string]string{
+		"model.provider":        provider,
+		"model.base_url":        baseURL,
+		"model.name":            modelName,
+		"model.timeout_seconds": strconv.Itoa(timeoutSeconds),
+		"model.max_retries":     strconv.Itoa(maxRetries),
+	}
+	for key, value := range settings {
+		if err := a.setDesktopSetting(ctx, key, value); err != nil {
+			return err
+		}
+	}
+	a.applyRuntimeModelConfig(provider, baseURL, modelName, timeoutSeconds, maxRetries)
+	return a.seedSQLiteRuntimeModel(ctx)
+}
+
+func (a *AppCore) CompleteOnboarding(ctx context.Context) error {
+	if !a.isSQLite() {
+		return errors.New("desktop onboarding is only available in SQLite mode")
+	}
+	return a.setDesktopSetting(ctx, "onboarding.completed", "true")
+}
+
+func (a *AppCore) GetOnboardingCoreStatus(ctx context.Context) (*DesktopOnboardingCoreStatus, error) {
+	if !a.isSQLite() {
+		return &DesktopOnboardingCoreStatus{Completed: true}, nil
+	}
+	completed := false
+	if value, err := a.getDesktopSetting(ctx, "onboarding.completed"); err == nil {
+		completed = value == "true"
+	}
+	backups, err := a.ListBackups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopOnboardingCoreStatus{
+		Completed:          completed,
+		FirstBackupCreated: len(backups.Backups) > 0,
+		BackupCount:        len(backups.Backups),
+	}, nil
+}
+
+func (a *AppCore) loadSQLiteRuntimeSettings(ctx context.Context) error {
+	settings := map[string]string{}
+	rows, err := a.db.SQL().QueryContext(ctx, `SELECT key, value FROM desktop_settings WHERE key LIKE 'model.%'`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return err
+		}
+		settings[key] = value
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(settings) == 0 {
+		return nil
+	}
+	timeoutSeconds := intFromString(settings["model.timeout_seconds"], a.Config.Model.TimeoutSeconds)
+	maxRetries := intFromString(settings["model.max_retries"], a.Config.Model.MaxRetries)
+	a.applyRuntimeModelConfig(settings["model.provider"], settings["model.base_url"], settings["model.name"], timeoutSeconds, maxRetries)
+	return nil
+}
+
+func (a *AppCore) applyRuntimeModelConfig(provider string, baseURL string, modelName string, timeoutSeconds int, maxRetries int) {
+	if provider != "" {
+		a.Config.Model.Provider = provider
+		_ = os.Setenv("MODEL_PROVIDER", provider)
+	}
+	if baseURL != "" {
+		a.Config.Model.BaseURL = baseURL
+		_ = os.Setenv("MODEL_BASE_URL", baseURL)
+	}
+	if modelName != "" {
+		a.Config.Model.Name = modelName
+		_ = os.Setenv("MODEL_NAME", modelName)
+	}
+	if timeoutSeconds > 0 {
+		a.Config.Model.TimeoutSeconds = timeoutSeconds
+		_ = os.Setenv("MODEL_TIMEOUT_SECONDS", strconv.Itoa(timeoutSeconds))
+	}
+	if maxRetries >= 0 {
+		a.Config.Model.MaxRetries = maxRetries
+		_ = os.Setenv("MODEL_MAX_RETRIES", strconv.Itoa(maxRetries))
+	}
+}
+
+func (a *AppCore) setDesktopSetting(ctx context.Context, key string, value string) error {
+	_, err := a.db.SQL().ExecContext(ctx, `
+		INSERT INTO desktop_settings (key, value, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')
+	`, key, value)
+	return err
+}
+
+func (a *AppCore) getDesktopSetting(ctx context.Context, key string) (string, error) {
+	var value string
+	err := a.db.SQL().QueryRowContext(ctx, `SELECT value FROM desktop_settings WHERE key=?`, key).Scan(&value)
+	return value, err
 }
 
 func (a *AppCore) backupDir() string {
@@ -830,6 +1004,11 @@ func (a *AppCore) runSQLiteAgentRuntime(ctx context.Context, tx *sql.Tx, input s
 			capability := store.CanonicalCapabilityName(parsed.Capability)
 			if parsed.Inputs == nil {
 				parsed.Inputs = map[string]any{}
+			}
+			if capability == "web_research" && strings.TrimSpace(stringFromAny(parsed.Inputs["url"])) == "" {
+				if url := firstURLFromText(input.Message); url != "" {
+					parsed.Inputs["url"] = url
+				}
 			}
 			if parsed.Risk == "" {
 				parsed.Risk = "read_only"
@@ -1504,6 +1683,27 @@ func insertSQLiteMemoryProposal(ctx context.Context, tx *sql.Tx, runID string, u
 	return memoryID, err
 }
 
+func (a *AppCore) markSQLiteOfflineNodes(ctx context.Context) error {
+	thresholdSeconds := intEnvDefault("WORKER_OFFLINE_AFTER_SECONDS", 90)
+	if thresholdSeconds < 5 {
+		thresholdSeconds = 5
+	}
+	modifier := fmt.Sprintf("-%d seconds", thresholdSeconds)
+	_, err := a.db.SQL().ExecContext(ctx, `
+		UPDATE nodes
+		SET status='offline',
+		    failed_heartbeat_count=failed_heartbeat_count+1,
+		    last_failure_at=datetime('now'),
+		    last_failure_reason='heartbeat_timeout',
+		    updated_at=datetime('now')
+		WHERE role='worker'
+		  AND status='healthy'
+		  AND last_heartbeat_at IS NOT NULL
+		  AND last_heartbeat_at < datetime('now', ?)
+	`, modifier)
+	return err
+}
+
 func (a *AppCore) listSQLiteNodes(ctx context.Context) ([]store.NodeRecord, error) {
 	rows, err := a.db.SQL().QueryContext(ctx, `SELECT id, name, role, status, capabilities, resources, network, assign_policy, auto_assign_enabled, manual_assign_enabled, failed_heartbeat_count, last_failure_at, COALESCE(last_failure_reason,''), last_heartbeat_at, COALESCE(version,''), metadata, created_at, updated_at FROM nodes ORDER BY id ASC`)
 	if err != nil {
@@ -1857,6 +2057,11 @@ func ftsQuery(query string) string {
 	return strings.Join(parts, " OR ")
 }
 
+func firstURLFromText(value string) string {
+	match := desktopURLPattern.FindString(value)
+	return strings.TrimRight(match, ".,;:!?")
+}
+
 func truncate(value string, limit int) string {
 	runes := []rune(value)
 	if len(runes) <= limit {
@@ -1870,6 +2075,30 @@ func valueOrDefault(value string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func intEnvDefault(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func intFromString(value string, fallback int) int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func mustJSON(value any) []byte {

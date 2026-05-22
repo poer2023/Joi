@@ -284,7 +284,11 @@ func callOpenAICompatible(ctx context.Context, baseURL string, apiKey string, mo
 func callOpenAICompatibleOnce(ctx context.Context, baseURL string, apiKey string, modelName string, jsonMode bool, request ModelRequest, timeoutSec int) (*ModelResponse, error) {
 	endpoint := strings.TrimRight(baseURL, "/")
 	if !strings.HasSuffix(endpoint, "/chat/completions") {
-		endpoint += "/v1/chat/completions"
+		if strings.HasSuffix(endpoint, "/v1") {
+			endpoint += "/chat/completions"
+		} else {
+			endpoint += "/v1/chat/completions"
+		}
 	}
 	body := map[string]any{
 		"model": modelName,

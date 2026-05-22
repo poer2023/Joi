@@ -1,16 +1,16 @@
 export namespace appcore {
-	
+
 	export class BackupRecord {
 	    path: string;
 	    name: string;
 	    size: number;
 	    modified: string;
 	    manifest: Record<string, any>;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new BackupRecord(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.path = source["path"];
@@ -24,14 +24,14 @@ export namespace appcore {
 }
 
 export namespace main {
-	
+
 	export class DesktopBackupCreateResponse {
 	    path: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopBackupCreateResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.path = source["path"];
@@ -39,16 +39,16 @@ export namespace main {
 	}
 	export class DesktopBackupListResponse {
 	    backups: appcore.BackupRecord[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopBackupListResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.backups = this.convertValues(source["backups"], appcore.BackupRecord);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -74,11 +74,11 @@ export namespace main {
 	    message: string;
 	    preferred_node: string;
 	    allow_worker: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopChatRequest(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.conversation_id = source["conversation_id"];
@@ -104,11 +104,11 @@ export namespace main {
 	    prefix_hash: string;
 	    dynamic_tail_hash: string;
 	    metadata: Record<string, any>;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopModelCall(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -135,11 +135,11 @@ export namespace main {
 	    input?: Record<string, any>;
 	    output?: Record<string, any>;
 	    error?: Record<string, any>;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopRunStep(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -160,11 +160,11 @@ export namespace main {
 	    response: string;
 	    steps: DesktopRunStep[];
 	    model_calls: DesktopModelCall[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopChatResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.conversation_id = source["conversation_id"];
@@ -176,7 +176,7 @@ export namespace main {
 	        this.steps = this.convertValues(source["steps"], DesktopRunStep);
 	        this.model_calls = this.convertValues(source["model_calls"], DesktopModelCall);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -206,11 +206,11 @@ export namespace main {
 	    approved_by: string;
 	    rejected_by: string;
 	    decision_reason: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopConfirmation(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -230,11 +230,11 @@ export namespace main {
 	    approve: boolean;
 	    actor: string;
 	    reason: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopConfirmationDecisionRequest(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -245,16 +245,16 @@ export namespace main {
 	}
 	export class DesktopConfirmationListResponse {
 	    items: DesktopConfirmation[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopConfirmationListResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.items = this.convertValues(source["items"], DesktopConfirmation);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -277,11 +277,11 @@ export namespace main {
 	    ok: boolean;
 	    status: string;
 	    error_summary: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopConnectionTestResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ok = source["ok"];
@@ -309,11 +309,11 @@ export namespace main {
 	    conflict_group_id: string;
 	    conflict_reason: string;
 	    metadata: Record<string, any>;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopMemory(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -344,11 +344,11 @@ export namespace main {
 	    comment: string;
 	    target_id: string;
 	    reason: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopMemoryActionRequest(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -371,11 +371,11 @@ export namespace main {
 	    open_issues: any[];
 	    dynamic_retrieval: any[];
 	    metadata: Record<string, any>;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopMemoryContextPack(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -394,11 +394,11 @@ export namespace main {
 	export class DesktopMemoryFilter {
 	    query: string;
 	    limit: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopMemoryFilter(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.query = source["query"];
@@ -407,16 +407,16 @@ export namespace main {
 	}
 	export class DesktopMemoryListResponse {
 	    memories: DesktopMemory[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopMemoryListResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.memories = this.convertValues(source["memories"], DesktopMemory);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -435,14 +435,34 @@ export namespace main {
 		    return a;
 		}
 	}
-	
+
+	export class DesktopModelConfigRequest {
+	    provider: string;
+	    base_url: string;
+	    name: string;
+	    timeout_seconds: number;
+	    max_retries: number;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopModelConfigRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.provider = source["provider"];
+	        this.base_url = source["base_url"];
+	        this.name = source["name"];
+	        this.timeout_seconds = source["timeout_seconds"];
+	        this.max_retries = source["max_retries"];
+	    }
+	}
 	export class DesktopModelUsageResponse {
 	    items: any[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopModelUsageResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.items = source["items"];
@@ -457,11 +477,11 @@ export namespace main {
 	    auto_assign_enabled: boolean;
 	    manual_assign_enabled: boolean;
 	    metadata: Record<string, any>;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopNode(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -476,16 +496,16 @@ export namespace main {
 	}
 	export class DesktopNodeListResponse {
 	    nodes: DesktopNode[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopNodeListResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.nodes = this.convertValues(source["nodes"], DesktopNode);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -504,6 +524,32 @@ export namespace main {
 		    return a;
 		}
 	}
+	export class DesktopOnboardingStatusResponse {
+	    required: boolean;
+	    completed: boolean;
+	    model_configured: boolean;
+	    telegram_configured: boolean;
+	    worker_configured: boolean;
+	    first_backup_created: boolean;
+	    backup_count: number;
+	    missing: string[];
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopOnboardingStatusResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.required = source["required"];
+	        this.completed = source["completed"];
+	        this.model_configured = source["model_configured"];
+	        this.telegram_configured = source["telegram_configured"];
+	        this.worker_configured = source["worker_configured"];
+	        this.first_backup_created = source["first_backup_created"];
+	        this.backup_count = source["backup_count"];
+	        this.missing = source["missing"];
+	    }
+	}
 	export class DesktopPromptAssembly {
 	    id: string;
 	    agent_id: string;
@@ -514,11 +560,11 @@ export namespace main {
 	    memory_profile_version: string;
 	    tool_schema_version: string;
 	    metadata: Record<string, any>;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopPromptAssembly(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -532,7 +578,7 @@ export namespace main {
 	        this.metadata = source["metadata"];
 	    }
 	}
-	
+
 	export class DesktopRunTrace {
 	    id: string;
 	    conversation_id: string;
@@ -545,11 +591,11 @@ export namespace main {
 	    model_calls: DesktopModelCall[];
 	    memory_context_packs: DesktopMemoryContextPack[];
 	    steps: DesktopRunStep[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopRunTrace(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -564,7 +610,7 @@ export namespace main {
 	        this.memory_context_packs = this.convertValues(source["memory_context_packs"], DesktopMemoryContextPack);
 	        this.steps = this.convertValues(source["steps"], DesktopRunStep);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -586,11 +632,11 @@ export namespace main {
 	export class DesktopSecretRequest {
 	    name: string;
 	    value: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopSecretRequest(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -599,11 +645,11 @@ export namespace main {
 	}
 	export class DesktopSecretStatusResponse {
 	    secrets: Record<string, boolean>;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopSecretStatusResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.secrets = source["secrets"];
@@ -622,11 +668,11 @@ export namespace main {
 	    worker_gateway: string;
 	    backup_dir: string;
 	    docker_required: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopSettingsResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.version = source["version"];
@@ -651,11 +697,11 @@ export namespace main {
 	    tool_failure_rate: Record<string, any>;
 	    token_cost_today: Record<string, any>;
 	    warnings: any[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopSystemHealthResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.service_status = source["service_status"];
@@ -666,7 +712,7 @@ export namespace main {
 	        this.token_cost_today = source["token_cost_today"];
 	        this.warnings = source["warnings"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -687,11 +733,11 @@ export namespace main {
 	}
 	export class DesktopWorkerTokenResponse {
 	    token: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new DesktopWorkerTokenResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.token = source["token"];

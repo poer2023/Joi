@@ -52,14 +52,18 @@ func (db *DB) ApplySQLitePragmas(ctx context.Context) error {
 }
 
 func (db *DB) ApplySQLiteSchema(ctx context.Context, schemaPath string) error {
-	if err := db.ApplySQLitePragmas(ctx); err != nil {
-		return err
-	}
 	raw, err := os.ReadFile(schemaPath)
 	if err != nil {
 		return err
 	}
-	_, err = db.sql.ExecContext(ctx, string(raw))
+	return db.ApplySQLiteSchemaSQL(ctx, string(raw))
+}
+
+func (db *DB) ApplySQLiteSchemaSQL(ctx context.Context, schemaSQL string) error {
+	if err := db.ApplySQLitePragmas(ctx); err != nil {
+		return err
+	}
+	_, err := db.sql.ExecContext(ctx, schemaSQL)
 	return err
 }
 

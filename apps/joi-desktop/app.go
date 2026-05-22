@@ -245,6 +245,25 @@ type DesktopWorkerTokenResponse struct {
 	Token string `json:"token"`
 }
 
+type DesktopModelConfigRequest struct {
+	Provider       string `json:"provider"`
+	BaseURL        string `json:"base_url"`
+	Name           string `json:"name"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	MaxRetries     int    `json:"max_retries"`
+}
+
+type DesktopOnboardingStatusResponse struct {
+	Required           bool     `json:"required"`
+	Completed          bool     `json:"completed"`
+	ModelConfigured    bool     `json:"model_configured"`
+	TelegramConfigured bool     `json:"telegram_configured"`
+	WorkerConfigured   bool     `json:"worker_configured"`
+	FirstBackupCreated bool     `json:"first_backup_created"`
+	BackupCount        int      `json:"backup_count"`
+	Missing            []string `json:"missing"`
+}
+
 func NewDesktopApp() *DesktopApp {
 	return &DesktopApp{logger: slog.New(slog.NewJSONHandler(os.Stdout, nil))}
 }
@@ -429,6 +448,13 @@ func (a *DesktopApp) CreateBackup() (*DesktopBackupCreateResponse, error) {
 	return &DesktopBackupCreateResponse{Path: result.Path}, nil
 }
 
+func (a *DesktopApp) RestoreBackup(path string) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	return a.core.RestoreBackup(context.Background(), path)
+}
+
 func (a *DesktopApp) GetSettings() (*DesktopSettingsResponse, error) {
 	if err := a.ensureReady(); err != nil {
 		return nil, err
@@ -438,6 +464,64 @@ func (a *DesktopApp) GetSettings() (*DesktopSettingsResponse, error) {
 		return nil, err
 	}
 	return &DesktopSettingsResponse{Version: settings.Version, AppMode: settings.AppMode, DataStore: settings.DataStore, TaskQueue: settings.TaskQueue, SQLitePath: settings.SQLitePath, ModelProvider: settings.ModelProvider, ModelName: settings.ModelName, ModelBaseURL: settings.ModelBaseURL, TelegramEnabled: settings.TelegramEnabled, WorkerGateway: settings.WorkerGateway, BackupDir: settings.BackupDir, DockerRequired: settings.DockerRequired}, nil
+}
+
+func (a *DesktopApp) SaveModelConfig(req DesktopModelConfigRequest) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	return a.core.SaveDesktopModelConfig(context.Background(), appcore.DesktopModelConfigRequest{
+		Provider:       req.Provider,
+		BaseURL:        req.BaseURL,
+		Name:           req.Name,
+		TimeoutSeconds: req.TimeoutSeconds,
+		MaxRetries:     req.MaxRetries,
+	})
+}
+
+func (a *DesktopApp) GetOnboardingStatus() (*DesktopOnboardingStatusResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	coreStatus, err := a.core.GetOnboardingCoreStatus(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	settings, err := a.core.GetDesktopSettings(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	secrets, err := a.GetSecretStatus()
+	if err != nil {
+		return nil, err
+	}
+	modelConfigured := settings.ModelProvider != "" && settings.ModelProvider != "mock_provider" && settings.ModelName != "" && settings.ModelBaseURL != "" && secrets.Secrets["MODEL_API_KEY"]
+	telegramConfigured := secrets.Secrets["TELEGRAM_BOT_TOKEN"]
+	workerConfigured := secrets.Secrets["WORKER_TOKEN"]
+	missing := []string{}
+	if !modelConfigured {
+		missing = append(missing, "model_provider_or_api_key")
+	}
+	if !coreStatus.FirstBackupCreated {
+		missing = append(missing, "first_backup")
+	}
+	return &DesktopOnboardingStatusResponse{
+		Required:           !coreStatus.Completed || !modelConfigured || !coreStatus.FirstBackupCreated,
+		Completed:          coreStatus.Completed,
+		ModelConfigured:    modelConfigured,
+		TelegramConfigured: telegramConfigured,
+		WorkerConfigured:   workerConfigured,
+		FirstBackupCreated: coreStatus.FirstBackupCreated,
+		BackupCount:        coreStatus.BackupCount,
+		Missing:            missing,
+	}, nil
+}
+
+func (a *DesktopApp) CompleteOnboarding() error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	return a.core.CompleteOnboarding(context.Background())
 }
 
 func (a *DesktopApp) GetSecretStatus() (*DesktopSecretStatusResponse, error) {
@@ -475,10 +559,22 @@ func (a *DesktopApp) TestModelConnection() (*DesktopConnectionTestResponse, erro
 	}
 	trace, _ := a.core.GetRunTrace(context.Background(), result.RunID)
 	status := "succeeded"
+	realModel := false
+	fallbackToMock := false
 	if trace != nil && len(trace.ModelCalls) > 0 {
-		status = trace.ModelCalls[len(trace.ModelCalls)-1].Status
+		call := trace.ModelCalls[len(trace.ModelCalls)-1]
+		status = call.Status
+		if value, ok := call.Metadata["real_model"].(bool); ok {
+			realModel = value
+		}
+		if value, ok := call.Metadata["fallback_to_mock"].(bool); ok {
+			fallbackToMock = value
+		}
 	}
-	return &DesktopConnectionTestResponse{OK: status == "succeeded" || status == "fallback_to_mock", Status: status}, nil
+	if status != "succeeded" || !realModel || fallbackToMock {
+		return &DesktopConnectionTestResponse{OK: false, Status: status, ErrorSummary: "model call did not complete with real_model=true and fallback_to_mock=false"}, nil
+	}
+	return &DesktopConnectionTestResponse{OK: true, Status: status}, nil
 }
 
 func (a *DesktopApp) TestTelegramConnection() (*DesktopConnectionTestResponse, error) {

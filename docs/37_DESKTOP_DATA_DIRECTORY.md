@@ -66,6 +66,35 @@ NODE_SECRET
 ADMIN_TOKEN
 ```
 
+## Restore Behavior
+
+Desktop restore is available from the Backups page. Restoring a `.joibak`:
+
+```text
+closes the current SQLite connection
+extracts SQLite/config/prompt files from the backup
+reopens SQLite
+re-runs schema initialization
+refreshes AppCore state
+```
+
+Secrets are not restored from `.joibak`. After restore, verify model, Telegram, and worker tokens from Settings because they must come from Keychain or be re-entered.
+
+## Restore Drill
+
+The non-destructive local drill uses a temporary data directory:
+
+```bash
+cd /Users/hao/Documents/Joi
+./scripts/desktop_backup_restore_drill.sh
+```
+
+Expected result:
+
+```text
+Desktop backup/restore drill passed without restoring plaintext secrets.
+```
+
 ## Move-App Verification
 
 To verify that app data survives moving the app:

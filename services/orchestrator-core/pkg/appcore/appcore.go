@@ -30,6 +30,8 @@ type BackupRecord = internal.BackupRecord
 type BackupListResponse = internal.BackupListResponse
 type BackupCreateResponse = internal.BackupCreateResponse
 type DesktopSettingsResponse = internal.DesktopSettingsResponse
+type DesktopModelConfigRequest = internal.DesktopModelConfigRequest
+type DesktopOnboardingCoreStatus = internal.DesktopOnboardingCoreStatus
 
 func NewAppCore(ctx context.Context, cfg runtimeconfig.Config, logger *slog.Logger) (*AppCore, error) {
 	return internal.NewAppCore(ctx, cfg, logger)
