@@ -25,7 +25,12 @@ export type ModelCall = {
   input_tokens: number;
   output_tokens: number;
   cached_input_tokens: number;
+  cacheable_prefix_tokens?: number;
+  dynamic_tail_tokens?: number;
   latency_ms: number;
+  prompt_cache_key?: string;
+  prefix_hash?: string;
+  dynamic_tail_hash?: string;
   metadata?: Record<string, unknown>;
 };
 
@@ -33,23 +38,121 @@ export type RunTrace = {
   id: string;
   status: string;
   selected_agent_id: string;
+  route_result?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
   model_calls?: ModelCall[];
   prompt_assemblies?: Array<{ id: string; prefix_hash: string; dynamic_tail_hash: string; prompt_cache_key: string }>;
-  memory_context_packs?: Array<{ id: string; memory_profile_version: string }>;
-  steps?: Array<{ id: string; step_type: string; title: string; status: string }>;
+  memory_context_packs?: Array<{ id: string; memory_profile_version: string; dynamic_retrieval?: unknown[] }>;
+  steps?: Array<{ id: string; step_type: string; title: string; status: string; input?: Record<string, unknown>; output?: Record<string, unknown> }>;
 };
 
 export type SystemHealth = {
   service_status?: Record<string, unknown>;
   queue_status?: Record<string, unknown>;
-  worker_status?: unknown[];
+  worker_status?: NodeRecord[];
+  model_latency?: Record<string, unknown>;
+  tool_failure_rate?: Record<string, unknown>;
+  token_cost_today?: Record<string, unknown>;
   warnings?: unknown[];
+};
+
+export type MemoryRecord = {
+  id: string;
+  type: string;
+  content: string;
+  summary: string;
+  status: string;
+  confidence: number;
+  pinned: boolean;
+  disabled: boolean;
+  usage_count: number;
+  success_count: number;
+  failure_count: number;
+  positive_feedback: number;
+  negative_feedback: number;
+  source_event_ids?: string[];
+  entities?: string[];
+  merged_into_memory_id?: string;
+  conflict_group_id?: string;
+  conflict_reason?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type NodeRecord = {
+  id: string;
+  name: string;
+  role: string;
+  status: string;
+  capabilities?: unknown[];
+  auto_assign_enabled: boolean;
+  manual_assign_enabled: boolean;
+  metadata?: Record<string, unknown>;
+};
+
+export type ConfirmationRecord = {
+  id: string;
+  run_id: string;
+  capability_id: string;
+  requested_action: string;
+  risk_level: string;
+  status: string;
+  input?: Record<string, unknown>;
+  approved_by?: string;
+  rejected_by?: string;
+  decision_reason?: string;
+};
+
+export type BackupRecord = {
+  path: string;
+  name: string;
+  size: number;
+  modified: string;
+  manifest?: Record<string, unknown>;
+};
+
+export type SettingsRecord = {
+  version: string;
+  app_mode: string;
+  data_store: string;
+  task_queue: string;
+  sqlite_path: string;
+  model_provider: string;
+  model_name: string;
+  model_base_url: string;
+  telegram_enabled: boolean;
+  worker_gateway: string;
+  backup_dir: string;
+  docker_required: boolean;
+};
+
+export type SecretStatus = {
+  secrets: Record<string, boolean>;
+};
+
+export type ConnectionTest = {
+  ok: boolean;
+  status: string;
+  error_summary?: string;
 };
 
 type DesktopBindings = {
   SendChat(req: ChatRequest): Promise<ChatResponse>;
   GetRunTrace(runID: string): Promise<RunTrace>;
   GetSystemHealth(): Promise<SystemHealth>;
+  ListMemories(filter: { query?: string; limit?: number }): Promise<{ memories: MemoryRecord[] }>;
+  UpdateMemory(req: { id: string; action: string; feedback?: string; comment?: string; target_id?: string; reason?: string }): Promise<void>;
+  ListNodes(): Promise<{ nodes: NodeRecord[] }>;
+  GetModelUsage(): Promise<{ items: Record<string, unknown>[] }>;
+  ListConfirmations(): Promise<{ items: ConfirmationRecord[] }>;
+  DecideConfirmation(req: { id: string; approve: boolean; actor?: string; reason?: string }): Promise<void>;
+  ListBackups(): Promise<{ backups: BackupRecord[] }>;
+  CreateBackup(): Promise<{ path: string }>;
+  GetSettings(): Promise<SettingsRecord>;
+  GetSecretStatus(): Promise<SecretStatus>;
+  SaveSecret(req: { name: string; value: string }): Promise<void>;
+  TestModelConnection(): Promise<ConnectionTest>;
+  TestTelegramConnection(): Promise<ConnectionTest>;
+  GenerateWorkerToken(): Promise<{ token: string }>;
 };
 
 declare global {
@@ -97,6 +200,55 @@ function bindings(): DesktopBindings {
           warnings: [],
         };
       },
+      async ListMemories() {
+        return { memories: [] };
+      },
+      async UpdateMemory() {},
+      async ListNodes() {
+        return { nodes: [] };
+      },
+      async GetModelUsage() {
+        return { items: [] };
+      },
+      async ListConfirmations() {
+        return { items: [] };
+      },
+      async DecideConfirmation() {},
+      async ListBackups() {
+        return { backups: [] };
+      },
+      async CreateBackup() {
+        return { path: 'preview.joibak' };
+      },
+      async GetSettings() {
+        return {
+          app_mode: 'desktop',
+          version: '0.1.0-rc0',
+          data_store: 'sqlite',
+          task_queue: 'sqlite',
+          sqlite_path: 'preview',
+          model_provider: 'mock_provider',
+          model_name: 'mock-model',
+          model_base_url: '',
+          telegram_enabled: false,
+          worker_gateway: '',
+          backup_dir: 'preview/backups',
+          docker_required: false,
+        };
+      },
+      async GetSecretStatus() {
+        return { secrets: {} };
+      },
+      async SaveSecret() {},
+      async TestModelConnection() {
+        return { ok: true, status: 'preview' };
+      },
+      async TestTelegramConnection() {
+        return { ok: false, status: 'preview' };
+      },
+      async GenerateWorkerToken() {
+        return { token: 'preview-token' };
+      },
     };
   }
   return desktop;
@@ -106,4 +258,18 @@ export const desktopApi = {
   sendChat: (req: ChatRequest) => bindings().SendChat(req),
   getRunTrace: (runID: string) => bindings().GetRunTrace(runID),
   getSystemHealth: () => bindings().GetSystemHealth(),
+  listMemories: (filter: { query?: string; limit?: number }) => bindings().ListMemories(filter),
+  updateMemory: (req: { id: string; action: string; feedback?: string; comment?: string; target_id?: string; reason?: string }) => bindings().UpdateMemory(req),
+  listNodes: () => bindings().ListNodes(),
+  getModelUsage: () => bindings().GetModelUsage(),
+  listConfirmations: () => bindings().ListConfirmations(),
+  decideConfirmation: (req: { id: string; approve: boolean; actor?: string; reason?: string }) => bindings().DecideConfirmation(req),
+  listBackups: () => bindings().ListBackups(),
+  createBackup: () => bindings().CreateBackup(),
+  getSettings: () => bindings().GetSettings(),
+  getSecretStatus: () => bindings().GetSecretStatus(),
+  saveSecret: (req: { name: string; value: string }) => bindings().SaveSecret(req),
+  testModelConnection: () => bindings().TestModelConnection(),
+  testTelegramConnection: () => bindings().TestTelegramConnection(),
+  generateWorkerToken: () => bindings().GenerateWorkerToken(),
 };

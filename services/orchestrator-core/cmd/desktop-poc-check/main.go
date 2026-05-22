@@ -23,7 +23,6 @@ func main() {
 	core, err := appcore.NewAppCore(ctx, cfg, logger)
 	must(err)
 	must(core.Start(ctx))
-	defer core.Shutdown(ctx)
 
 	chat, err := core.SendChat(ctx, appcore.ChatRequest{Channel: "desktop_check", UserID: "desktop_check", Message: "Desktop PoC check"})
 	must(err)
@@ -43,6 +42,14 @@ func main() {
 		BackupDir:  filepath.Join(appDir, "backups"),
 	}.CreateManualBackup(ctx)
 	must(err)
+	must(core.Shutdown(ctx))
+
+	reopened, err := appcore.NewAppCore(ctx, cfg, logger)
+	must(err)
+	must(reopened.Start(ctx))
+	defer reopened.Shutdown(ctx)
+	persistedTrace, err := reopened.GetRunTrace(ctx, chat.RunID)
+	must(err)
 
 	payload := map[string]any{
 		"ok":                     true,
@@ -59,6 +66,7 @@ func main() {
 		"memory_results":         len(memory.Results),
 		"system_health_services": health.ServiceStatus,
 		"backup_path":            backupPath,
+		"persisted_run_steps":    len(persistedTrace.Steps),
 	}
 	if len(trace.ModelCalls) > 0 {
 		payload["model_call_status"] = trace.ModelCalls[0].Status

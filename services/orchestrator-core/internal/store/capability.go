@@ -169,6 +169,7 @@ func executeServerDiagnose(ctx context.Context, request CapabilityRequest) (*Cap
 }
 
 func executeCapabilityLocally(ctx context.Context, request CapabilityRequest) (*CapabilityExecutionResult, error) {
+	request.Capability = CanonicalCapabilityName(request.Capability)
 	switch request.Capability {
 	case "server_diagnose":
 		return executeServerDiagnose(ctx, request)
@@ -179,6 +180,27 @@ func executeCapabilityLocally(ctx context.Context, request CapabilityRequest) (*
 	default:
 		return nil, fmt.Errorf("unsupported capability: %s", request.Capability)
 	}
+}
+
+func ExecuteCapabilityLocally(ctx context.Context, request CapabilityRequest) (*CapabilityExecutionResult, error) {
+	return executeCapabilityLocally(ctx, request)
+}
+
+func CanonicalCapabilityName(capability string) string {
+	switch capability {
+	case "server_diagnose_v1":
+		return "server_diagnose"
+	case "web_research_v1", "fetch_url":
+		return "web_research"
+	case "system_health_check_v1":
+		return "system_health_check"
+	default:
+		return capability
+	}
+}
+
+func FinalAnswerForCapabilityResult(capability string, normalized map[string]any) string {
+	return finalAnswerForCapabilityResult(CanonicalCapabilityName(capability), normalized)
 }
 
 func executeWebResearch(ctx context.Context, request CapabilityRequest) (*CapabilityExecutionResult, error) {
@@ -234,7 +256,8 @@ func fetchReadableURL(ctx context.Context, url string) map[string]any {
 		return map[string]any{"url": url, "fetch_status": "failed", "error": err.Error()}
 	}
 	req.Header.Set("User-Agent", "AgentOS-WebResearch/0.1")
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return map[string]any{"url": url, "fetch_status": "failed", "error": err.Error()}
 	}
@@ -515,7 +538,9 @@ func assignmentReason(request CapabilityRequest) string {
 }
 
 func dockerListContainers(ctx context.Context, serviceName string) map[string]any {
-	output, err := exec.CommandContext(ctx, "docker", "ps", "-a", "--filter", "name="+serviceName, "--format", "{{.Names}}|{{.Status}}|{{.Image}}").CombinedOutput()
+	cmdCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(cmdCtx, "docker", "ps", "-a", "--filter", "name="+serviceName, "--format", "{{.Names}}|{{.Status}}|{{.Image}}").CombinedOutput()
 	if err != nil {
 		return map[string]any{"available": false, "error": err.Error()}
 	}
@@ -524,7 +549,9 @@ func dockerListContainers(ctx context.Context, serviceName string) map[string]an
 }
 
 func dockerInspectContainer(ctx context.Context, serviceName string) map[string]any {
-	output, err := exec.CommandContext(ctx, "docker", "inspect", serviceName, "--format", "{{.State.Running}}|{{.RestartCount}}|{{.State.Status}}").CombinedOutput()
+	cmdCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(cmdCtx, "docker", "inspect", serviceName, "--format", "{{.State.Running}}|{{.RestartCount}}|{{.State.Status}}").CombinedOutput()
 	if err != nil {
 		return map[string]any{"available": false, "error": strings.TrimSpace(string(output))}
 	}
@@ -542,7 +569,9 @@ func dockerInspectContainer(ctx context.Context, serviceName string) map[string]
 }
 
 func dockerReadLogs(ctx context.Context, serviceName string, tail int) map[string]any {
-	output, err := exec.CommandContext(ctx, "docker", "logs", "--tail", fmt.Sprintf("%d", tail), serviceName).CombinedOutput()
+	cmdCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(cmdCtx, "docker", "logs", "--tail", fmt.Sprintf("%d", tail), serviceName).CombinedOutput()
 	if err != nil {
 		return map[string]any{"available": false, "error": err.Error(), "lines": nonEmptyLines(string(output))}
 	}

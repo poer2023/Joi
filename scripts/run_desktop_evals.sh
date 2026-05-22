@@ -2,13 +2,19 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-"$ROOT_DIR/scripts/desktop_poc_check.sh" >/tmp/joi-desktop-evals.log
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
 
-case_count="$(python3 - <<'PY' "$ROOT_DIR/evals/desktop_cases.json"
-import json, sys
-print(len(json.load(open(sys.argv[1]))))
-PY
-)"
+export APP_MODE=desktop
+export DATA_STORE=sqlite
+export TASK_QUEUE_DRIVER=sqlite
+export SQLITE_PATH="$TMP_DIR/joi-desktop-evals.db"
+export SQLITE_SCHEMA_PATH="$ROOT_DIR/database/sqlite/001_init_schema.sql"
+export RUNTIME_CONFIG_PATH="$ROOT_DIR/configs/runtime.example.yaml"
+export DOCKER_REQUIRED=false
+export MODEL_PROVIDER=mock_provider
+export ALLOW_MOCK_PROVIDER=true
 
-echo "$case_count passed / 0 failed"
+cd "$ROOT_DIR/services/orchestrator-core"
+go run ./cmd/desktop-evals "$ROOT_DIR/evals/desktop_cases.json" | tee /tmp/joi-desktop-evals.log
 echo "desktop eval output: /tmp/joi-desktop-evals.log"

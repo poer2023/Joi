@@ -24,5 +24,6 @@ grep -q '"docker_required": false' "$TMP_DIR/result.json"
 grep -q '"prompt_assemblies": 1' "$TMP_DIR/result.json"
 grep -q '"model_calls": 1' "$TMP_DIR/result.json"
 grep -q '"memory_context_packs": 1' "$TMP_DIR/result.json"
+grep -q '"persisted_run_steps":' "$TMP_DIR/result.json"
 
 echo "Desktop PoC passed: SQLite AppCore wrote chat, run trace, health, and backup without Docker/Postgres/NATS."

@@ -1,5 +1,72 @@
+export namespace appcore {
+	
+	export class BackupRecord {
+	    path: string;
+	    name: string;
+	    size: number;
+	    modified: string;
+	    manifest: Record<string, any>;
+	
+	    static createFrom(source: any = {}) {
+	        return new BackupRecord(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	        this.name = source["name"];
+	        this.size = source["size"];
+	        this.modified = source["modified"];
+	        this.manifest = source["manifest"];
+	    }
+	}
+
+}
+
 export namespace main {
 	
+	export class DesktopBackupCreateResponse {
+	    path: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopBackupCreateResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	    }
+	}
+	export class DesktopBackupListResponse {
+	    backups: appcore.BackupRecord[];
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopBackupListResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.backups = this.convertValues(source["backups"], appcore.BackupRecord);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class DesktopChatRequest {
 	    conversation_id: string;
 	    channel: string;
@@ -128,6 +195,100 @@ export namespace main {
 		    return a;
 		}
 	}
+	export class DesktopConfirmation {
+	    id: string;
+	    run_id: string;
+	    capability_id: string;
+	    requested_action: string;
+	    risk_level: string;
+	    status: string;
+	    input: Record<string, any>;
+	    approved_by: string;
+	    rejected_by: string;
+	    decision_reason: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopConfirmation(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.run_id = source["run_id"];
+	        this.capability_id = source["capability_id"];
+	        this.requested_action = source["requested_action"];
+	        this.risk_level = source["risk_level"];
+	        this.status = source["status"];
+	        this.input = source["input"];
+	        this.approved_by = source["approved_by"];
+	        this.rejected_by = source["rejected_by"];
+	        this.decision_reason = source["decision_reason"];
+	    }
+	}
+	export class DesktopConfirmationDecisionRequest {
+	    id: string;
+	    approve: boolean;
+	    actor: string;
+	    reason: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopConfirmationDecisionRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.approve = source["approve"];
+	        this.actor = source["actor"];
+	        this.reason = source["reason"];
+	    }
+	}
+	export class DesktopConfirmationListResponse {
+	    items: DesktopConfirmation[];
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopConfirmationListResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.items = this.convertValues(source["items"], DesktopConfirmation);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class DesktopConnectionTestResponse {
+	    ok: boolean;
+	    status: string;
+	    error_summary: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopConnectionTestResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.status = source["status"];
+	        this.error_summary = source["error_summary"];
+	    }
+	}
 	export class DesktopMemory {
 	    id: string;
 	    type: string;
@@ -136,7 +297,17 @@ export namespace main {
 	    status: string;
 	    confidence: number;
 	    pinned: boolean;
+	    disabled: boolean;
 	    usage_count: number;
+	    success_count: number;
+	    failure_count: number;
+	    positive_feedback: number;
+	    negative_feedback: number;
+	    source_event_ids: string[];
+	    entities: any[];
+	    merged_into_memory_id: string;
+	    conflict_group_id: string;
+	    conflict_reason: string;
 	    metadata: Record<string, any>;
 	
 	    static createFrom(source: any = {}) {
@@ -152,8 +323,40 @@ export namespace main {
 	        this.status = source["status"];
 	        this.confidence = source["confidence"];
 	        this.pinned = source["pinned"];
+	        this.disabled = source["disabled"];
 	        this.usage_count = source["usage_count"];
+	        this.success_count = source["success_count"];
+	        this.failure_count = source["failure_count"];
+	        this.positive_feedback = source["positive_feedback"];
+	        this.negative_feedback = source["negative_feedback"];
+	        this.source_event_ids = source["source_event_ids"];
+	        this.entities = source["entities"];
+	        this.merged_into_memory_id = source["merged_into_memory_id"];
+	        this.conflict_group_id = source["conflict_group_id"];
+	        this.conflict_reason = source["conflict_reason"];
 	        this.metadata = source["metadata"];
+	    }
+	}
+	export class DesktopMemoryActionRequest {
+	    id: string;
+	    action: string;
+	    feedback: string;
+	    comment: string;
+	    target_id: string;
+	    reason: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopMemoryActionRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.action = source["action"];
+	        this.feedback = source["feedback"];
+	        this.comment = source["comment"];
+	        this.target_id = source["target_id"];
+	        this.reason = source["reason"];
 	    }
 	}
 	export class DesktopMemoryContextPack {
@@ -233,6 +436,18 @@ export namespace main {
 		}
 	}
 	
+	export class DesktopModelUsageResponse {
+	    items: any[];
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopModelUsageResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.items = source["items"];
+	    }
+	}
 	export class DesktopNode {
 	    id: string;
 	    name: string;
@@ -368,6 +583,66 @@ export namespace main {
 		    return a;
 		}
 	}
+	export class DesktopSecretRequest {
+	    name: string;
+	    value: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopSecretRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.value = source["value"];
+	    }
+	}
+	export class DesktopSecretStatusResponse {
+	    secrets: Record<string, boolean>;
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopSecretStatusResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.secrets = source["secrets"];
+	    }
+	}
+	export class DesktopSettingsResponse {
+	    version: string;
+	    app_mode: string;
+	    data_store: string;
+	    task_queue: string;
+	    sqlite_path: string;
+	    model_provider: string;
+	    model_name: string;
+	    model_base_url: string;
+	    telegram_enabled: boolean;
+	    worker_gateway: string;
+	    backup_dir: string;
+	    docker_required: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopSettingsResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.version = source["version"];
+	        this.app_mode = source["app_mode"];
+	        this.data_store = source["data_store"];
+	        this.task_queue = source["task_queue"];
+	        this.sqlite_path = source["sqlite_path"];
+	        this.model_provider = source["model_provider"];
+	        this.model_name = source["model_name"];
+	        this.model_base_url = source["model_base_url"];
+	        this.telegram_enabled = source["telegram_enabled"];
+	        this.worker_gateway = source["worker_gateway"];
+	        this.backup_dir = source["backup_dir"];
+	        this.docker_required = source["docker_required"];
+	    }
+	}
 	export class DesktopSystemHealthResponse {
 	    service_status: Record<string, any>;
 	    queue_status: Record<string, any>;
@@ -409,6 +684,18 @@ export namespace main {
 		    }
 		    return a;
 		}
+	}
+	export class DesktopWorkerTokenResponse {
+	    token: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DesktopWorkerTokenResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.token = source["token"];
+	    }
 	}
 
 }

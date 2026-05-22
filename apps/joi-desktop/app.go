@@ -2,9 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
+	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/hao/agent-os/services/orchestrator-core/pkg/appcore"
 	"github.com/hao/agent-os/services/orchestrator-core/pkg/runtimeconfig"
@@ -114,15 +120,34 @@ type DesktopMemoryListResponse struct {
 }
 
 type DesktopMemory struct {
-	ID         string         `json:"id"`
-	Type       string         `json:"type"`
-	Content    string         `json:"content"`
-	Summary    string         `json:"summary"`
-	Status     string         `json:"status"`
-	Confidence float64        `json:"confidence"`
-	Pinned     bool           `json:"pinned"`
-	UsageCount int            `json:"usage_count"`
-	Metadata   map[string]any `json:"metadata"`
+	ID               string         `json:"id"`
+	Type             string         `json:"type"`
+	Content          string         `json:"content"`
+	Summary          string         `json:"summary"`
+	Status           string         `json:"status"`
+	Confidence       float64        `json:"confidence"`
+	Pinned           bool           `json:"pinned"`
+	Disabled         bool           `json:"disabled"`
+	UsageCount       int            `json:"usage_count"`
+	SuccessCount     int            `json:"success_count"`
+	FailureCount     int            `json:"failure_count"`
+	PositiveFeedback int            `json:"positive_feedback"`
+	NegativeFeedback int            `json:"negative_feedback"`
+	SourceEventIDs   []string       `json:"source_event_ids"`
+	Entities         []any          `json:"entities"`
+	MergedInto       string         `json:"merged_into_memory_id"`
+	ConflictGroupID  string         `json:"conflict_group_id"`
+	ConflictReason   string         `json:"conflict_reason"`
+	Metadata         map[string]any `json:"metadata"`
+}
+
+type DesktopMemoryActionRequest struct {
+	ID       string `json:"id"`
+	Action   string `json:"action"`
+	Feedback string `json:"feedback"`
+	Comment  string `json:"comment"`
+	TargetID string `json:"target_id"`
+	Reason   string `json:"reason"`
 }
 
 type DesktopNodeListResponse struct {
@@ -150,11 +175,82 @@ type DesktopSystemHealthResponse struct {
 	Warnings        []map[string]any `json:"warnings"`
 }
 
+type DesktopConfirmationListResponse struct {
+	Items []DesktopConfirmation `json:"items"`
+}
+
+type DesktopConfirmation struct {
+	ID              string         `json:"id"`
+	RunID           string         `json:"run_id"`
+	CapabilityID    string         `json:"capability_id"`
+	RequestedAction string         `json:"requested_action"`
+	RiskLevel       string         `json:"risk_level"`
+	Status          string         `json:"status"`
+	Input           map[string]any `json:"input"`
+	ApprovedBy      string         `json:"approved_by"`
+	RejectedBy      string         `json:"rejected_by"`
+	DecisionReason  string         `json:"decision_reason"`
+}
+
+type DesktopConfirmationDecisionRequest struct {
+	ID      string `json:"id"`
+	Approve bool   `json:"approve"`
+	Actor   string `json:"actor"`
+	Reason  string `json:"reason"`
+}
+
+type DesktopModelUsageResponse struct {
+	Items []map[string]any `json:"items"`
+}
+
+type DesktopBackupListResponse struct {
+	Backups []appcore.BackupRecord `json:"backups"`
+}
+
+type DesktopBackupCreateResponse struct {
+	Path string `json:"path"`
+}
+
+type DesktopSettingsResponse struct {
+	Version         string `json:"version"`
+	AppMode         string `json:"app_mode"`
+	DataStore       string `json:"data_store"`
+	TaskQueue       string `json:"task_queue"`
+	SQLitePath      string `json:"sqlite_path"`
+	ModelProvider   string `json:"model_provider"`
+	ModelName       string `json:"model_name"`
+	ModelBaseURL    string `json:"model_base_url"`
+	TelegramEnabled bool   `json:"telegram_enabled"`
+	WorkerGateway   string `json:"worker_gateway"`
+	BackupDir       string `json:"backup_dir"`
+	DockerRequired  bool   `json:"docker_required"`
+}
+
+type DesktopSecretRequest struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type DesktopSecretStatusResponse struct {
+	Secrets map[string]bool `json:"secrets"`
+}
+
+type DesktopConnectionTestResponse struct {
+	OK           bool   `json:"ok"`
+	Status       string `json:"status"`
+	ErrorSummary string `json:"error_summary"`
+}
+
+type DesktopWorkerTokenResponse struct {
+	Token string `json:"token"`
+}
+
 func NewDesktopApp() *DesktopApp {
 	return &DesktopApp{logger: slog.New(slog.NewJSONHandler(os.Stdout, nil))}
 }
 
 func (a *DesktopApp) Startup(ctx context.Context) {
+	loadKeychainSecrets()
 	if os.Getenv("APP_MODE") == "" {
 		_ = os.Setenv("APP_MODE", "desktop")
 	}
@@ -236,9 +332,16 @@ func (a *DesktopApp) ListMemories(filter DesktopMemoryFilter) (*DesktopMemoryLis
 	}
 	memories := make([]DesktopMemory, 0, len(result.Memories))
 	for _, memory := range result.Memories {
-		memories = append(memories, DesktopMemory{ID: memory.ID, Type: memory.Type, Content: memory.Content, Summary: memory.Summary, Status: memory.Status, Confidence: memory.Confidence, Pinned: memory.Pinned, UsageCount: memory.UsageCount, Metadata: memory.Metadata})
+		memories = append(memories, DesktopMemory{ID: memory.ID, Type: memory.Type, Content: memory.Content, Summary: memory.Summary, Status: memory.Status, Confidence: memory.Confidence, Pinned: memory.Pinned, Disabled: memory.DisabledAt != nil, UsageCount: memory.UsageCount, SuccessCount: memory.SuccessCount, FailureCount: memory.FailureCount, PositiveFeedback: memory.PositiveFeedback, NegativeFeedback: memory.NegativeFeedback, SourceEventIDs: memory.SourceEventIDs, Entities: memory.Entities, MergedInto: memory.MergedIntoMemoryID, ConflictGroupID: memory.ConflictGroupID, ConflictReason: memory.ConflictReason, Metadata: memory.Metadata})
 	}
 	return &DesktopMemoryListResponse{Memories: memories}, nil
+}
+
+func (a *DesktopApp) UpdateMemory(req DesktopMemoryActionRequest) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	return a.core.UpdateMemory(context.Background(), appcore.MemoryActionRequest{ID: req.ID, Action: req.Action, Feedback: req.Feedback, Comment: req.Comment, TargetID: req.TargetID, Reason: req.Reason})
 }
 
 func (a *DesktopApp) ListNodes() (*DesktopNodeListResponse, error) {
@@ -269,6 +372,151 @@ func (a *DesktopApp) GetSystemHealth() (*DesktopSystemHealthResponse, error) {
 		TokenCostToday:  health.TokenCostToday,
 		Warnings:        health.Warnings,
 	}, nil
+}
+
+func (a *DesktopApp) ListConfirmations() (*DesktopConfirmationListResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.ListConfirmations(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	items := make([]DesktopConfirmation, 0, len(result.Items))
+	for _, item := range result.Items {
+		items = append(items, DesktopConfirmation{ID: item.ID, RunID: item.RunID, CapabilityID: item.CapabilityID, RequestedAction: item.RequestedAction, RiskLevel: item.RiskLevel, Status: item.Status, Input: item.Input, ApprovedBy: item.ApprovedBy, RejectedBy: item.RejectedBy, DecisionReason: item.DecisionReason})
+	}
+	return &DesktopConfirmationListResponse{Items: items}, nil
+}
+
+func (a *DesktopApp) DecideConfirmation(req DesktopConfirmationDecisionRequest) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	return a.core.DecideConfirmation(context.Background(), appcore.ConfirmationDecisionRequest{ID: req.ID, Approve: req.Approve, Actor: req.Actor, Reason: req.Reason})
+}
+
+func (a *DesktopApp) GetModelUsage() (*DesktopModelUsageResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.ModelUsageSummary(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopModelUsageResponse{Items: result.Items}, nil
+}
+
+func (a *DesktopApp) ListBackups() (*DesktopBackupListResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.ListBackups(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopBackupListResponse{Backups: result.Backups}, nil
+}
+
+func (a *DesktopApp) CreateBackup() (*DesktopBackupCreateResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.CreateBackup(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopBackupCreateResponse{Path: result.Path}, nil
+}
+
+func (a *DesktopApp) GetSettings() (*DesktopSettingsResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	settings, err := a.core.GetDesktopSettings(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopSettingsResponse{Version: settings.Version, AppMode: settings.AppMode, DataStore: settings.DataStore, TaskQueue: settings.TaskQueue, SQLitePath: settings.SQLitePath, ModelProvider: settings.ModelProvider, ModelName: settings.ModelName, ModelBaseURL: settings.ModelBaseURL, TelegramEnabled: settings.TelegramEnabled, WorkerGateway: settings.WorkerGateway, BackupDir: settings.BackupDir, DockerRequired: settings.DockerRequired}, nil
+}
+
+func (a *DesktopApp) GetSecretStatus() (*DesktopSecretStatusResponse, error) {
+	status := map[string]bool{}
+	for _, name := range desktopSecretNames() {
+		value := os.Getenv(name)
+		if value == "" {
+			value, _ = keychainGet(name)
+		}
+		status[name] = value != ""
+	}
+	return &DesktopSecretStatusResponse{Secrets: status}, nil
+}
+
+func (a *DesktopApp) SaveSecret(req DesktopSecretRequest) error {
+	if !allowedDesktopSecret(req.Name) {
+		return errors.New("unsupported secret name")
+	}
+	if strings.TrimSpace(req.Value) == "" {
+		return errors.New("secret value is required")
+	}
+	if err := keychainSet(req.Name, req.Value); err != nil {
+		return err
+	}
+	return os.Setenv(req.Name, req.Value)
+}
+
+func (a *DesktopApp) TestModelConnection() (*DesktopConnectionTestResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.SendChat(context.Background(), appcore.ChatRequest{Channel: "desktop_settings", UserID: "desktop_settings", Message: "model connection smoke test"})
+	if err != nil {
+		return &DesktopConnectionTestResponse{OK: false, Status: "failed", ErrorSummary: err.Error()}, nil
+	}
+	trace, _ := a.core.GetRunTrace(context.Background(), result.RunID)
+	status := "succeeded"
+	if trace != nil && len(trace.ModelCalls) > 0 {
+		status = trace.ModelCalls[len(trace.ModelCalls)-1].Status
+	}
+	return &DesktopConnectionTestResponse{OK: status == "succeeded" || status == "fallback_to_mock", Status: status}, nil
+}
+
+func (a *DesktopApp) TestTelegramConnection() (*DesktopConnectionTestResponse, error) {
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if token == "" {
+		token, _ = keychainGet("TELEGRAM_BOT_TOKEN")
+	}
+	if token == "" {
+		return &DesktopConnectionTestResponse{OK: false, Status: "missing_token", ErrorSummary: "TELEGRAM_BOT_TOKEN is not configured"}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.telegram.org/bot"+token+"/getMe", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return &DesktopConnectionTestResponse{OK: false, Status: "failed", ErrorSummary: err.Error()}, nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &DesktopConnectionTestResponse{OK: false, Status: resp.Status, ErrorSummary: "telegram getMe returned non-2xx"}, nil
+	}
+	return &DesktopConnectionTestResponse{OK: true, Status: "succeeded"}, nil
+}
+
+func (a *DesktopApp) GenerateWorkerToken() (*DesktopWorkerTokenResponse, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, err
+	}
+	token := "joi_worker_" + hex.EncodeToString(raw)
+	if err := keychainSet("WORKER_TOKEN", token); err != nil {
+		return nil, err
+	}
+	_ = os.Setenv("WORKER_TOKEN", token)
+	return &DesktopWorkerTokenResponse{Token: token}, nil
 }
 
 func (a *DesktopApp) ensureReady() error {
@@ -321,4 +569,43 @@ func convertNodes(nodes []appcore.NodeRecord) []DesktopNode {
 		result = append(result, DesktopNode{ID: node.ID, Name: node.Name, Role: node.Role, Status: node.Status, Capabilities: node.Capabilities, AutoAssignEnabled: node.AutoAssignEnabled, ManualAssignEnabled: node.ManualAssignEnabled, Metadata: node.Metadata})
 	}
 	return result
+}
+
+const keychainService = "Joi Desktop"
+
+func desktopSecretNames() []string {
+	return []string{"MODEL_API_KEY", "TELEGRAM_BOT_TOKEN", "WORKER_TOKEN", "NODE_SECRET", "ADMIN_TOKEN"}
+}
+
+func allowedDesktopSecret(name string) bool {
+	for _, allowed := range desktopSecretNames() {
+		if name == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func loadKeychainSecrets() {
+	for _, name := range desktopSecretNames() {
+		if os.Getenv(name) != "" {
+			continue
+		}
+		value, ok := keychainGet(name)
+		if ok && value != "" {
+			_ = os.Setenv(name, value)
+		}
+	}
+}
+
+func keychainSet(account string, value string) error {
+	return exec.Command("security", "add-generic-password", "-a", account, "-s", keychainService, "-w", value, "-U").Run()
+}
+
+func keychainGet(account string) (string, bool) {
+	output, err := exec.Command("security", "find-generic-password", "-a", account, "-s", keychainService, "-w").Output()
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(output)), true
 }

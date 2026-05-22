@@ -1,42 +1,124 @@
 [
   {
-    "id": "desktop_chat",
-    "description": "Desktop AppCore can send chat without HTTP localhost self-call.",
-    "assert": ["chat_response", "run_id", "sqlite_write"]
+    "id": "desktop_final_answer",
+    "description": "普通问答应走 final_answer，不调用工具。",
+    "message": "你现在是什么系统？用一句话回答。",
+    "expect_agent": "general_agent",
+    "expect_step_types": ["input_received", "router_selected", "prompt_assembled", "model_call_finished", "agent_output_parsed", "response_generated"],
+    "expect_no_step_types": ["tool_finished", "task_dispatched"]
   },
   {
-    "id": "desktop_run_trace",
-    "description": "Desktop run trace includes run_steps.",
-    "assert": ["run_trace", "run_steps"]
+    "id": "desktop_trace_core_fields",
+    "description": "Run Trace 必须包含 prompt assembly、model call、memory context pack。",
+    "message": "Desktop trace 字段检查。",
+    "expect_agent": "general_agent",
+    "expect_min_model_calls": 1,
+    "expect_min_prompt_assemblies": 1,
+    "expect_min_memory_context_packs": 1
   },
   {
-    "id": "desktop_memory",
-    "description": "Desktop memory search is available through SQLite FTS5.",
-    "assert": ["memory_search"]
+    "id": "desktop_memory_search",
+    "description": "记忆召回应触发 memory_search，并生成第二轮模型调用。",
+    "message": "我之前偏好什么部署方式？",
+    "expect_agent": "memory_agent",
+    "expect_capability": "memory_search",
+    "expect_step_types": ["capability_requested", "memory_search_finished"],
+    "expect_min_model_calls": 2,
+    "expect_min_prompt_assemblies": 2,
+    "expect_min_memory_context_packs": 2,
+    "expect_memory_usage": true,
+    "expect_response_contains": "Docker Compose"
   },
   {
-    "id": "desktop_system_health",
-    "description": "Desktop system health reports sqlite and no Docker requirement.",
-    "assert": ["system_health", "docker_required_false"]
+    "id": "desktop_memory_write_proposal",
+    "description": "记忆写入只能产生待确认候选，不直接变 confirmed。",
+    "message": "请记住：我喜欢 Desktop-first 本地 App。",
+    "expect_agent": "memory_agent",
+    "expect_step_types": ["memory_proposed"],
+    "expect_memory_proposal": true
   },
   {
-    "id": "desktop_backup",
-    "description": "Desktop backup manager writes a joibak file without secrets.",
-    "assert": ["backup_file"]
+    "id": "desktop_system_health_capability",
+    "description": "Joi 自检应走 system_health_check_v1 只读 capability。",
+    "message": "Joi 自检",
+    "expect_agent": "devops_agent",
+    "expect_capability": "system_health_check",
+    "expect_step_types": ["capability_requested", "policy_checked", "tool_compiled", "node_selected", "tool_finished"],
+    "expect_node_id": "main-node",
+    "expect_assignment_reason": "default_main_node",
+    "expect_tool_run": true
   },
   {
-    "id": "desktop_sqlite_task_queue",
-    "description": "Desktop default task queue is sqlite.",
-    "assert": ["task_queue_sqlite"]
+    "id": "desktop_server_diagnose_capability",
+    "description": "服务诊断应走 server_diagnose_v1 只读 capability。",
+    "message": "帮我看看 cloudflared 容器是否正常。",
+    "expect_agent": "devops_agent",
+    "expect_capability": "server_diagnose",
+    "expect_step_types": ["capability_requested", "tool_compiled", "node_selected", "tool_finished"],
+    "expect_node_id": "main-node",
+    "expect_assignment_reason": "default_main_node",
+    "expect_tool_run": true
   },
   {
-    "id": "desktop_worker_gateway_mock",
-    "description": "Remote worker gateway is API based and does not expose SQLite directly.",
-    "assert": ["worker_gateway_api"]
+    "id": "desktop_web_research_capability",
+    "description": "URL 输入应走 web_research_v1 只读 fetch。",
+    "message": "@research 阅读 https://example.com 并总结。",
+    "expect_agent": "research_agent",
+    "expect_capability": "web_research",
+    "expect_step_types": ["capability_requested", "tool_compiled", "node_selected", "tool_finished"],
+    "expect_node_id": "main-node",
+    "expect_assignment_reason": "default_main_node",
+    "expect_tool_run": true
   },
   {
-    "id": "desktop_model_trace_fields",
-    "description": "Desktop Run Trace records prompt assembly, model call, cache fields, fallback flag, tokens, and latency.",
-    "assert": ["prompt_assembly", "model_call", "prompt_cache_key", "tokens", "latency", "fallback_flag"]
+    "id": "desktop_dangerous_operation_blocked",
+    "description": "危险 state_change 请求不得执行工具。",
+    "message": "请 docker restart cloudflared。",
+    "expect_agent": "devops_agent",
+    "expect_step_types": ["policy_blocked"],
+    "expect_no_step_types": ["tool_finished", "task_dispatched"]
+  },
+  {
+    "id": "desktop_unknown_service_clarifies",
+    "description": "未知服务诊断应返回澄清，不产生工具执行。",
+    "message": "帮我诊断 unknown-service。",
+    "expect_agent": "devops_agent",
+    "expect_no_step_types": ["tool_finished", "task_dispatched"],
+    "expect_response_contains": "unknown-service"
+  },
+  {
+    "id": "desktop_explicit_devops_route",
+    "description": "@agent 显式路由必须选择对应 agent。",
+    "message": "@devops Joi 自检",
+    "expect_agent": "devops_agent",
+    "expect_capability": "system_health_check",
+    "expect_step_types": ["capability_requested", "tool_finished"]
+  },
+  {
+    "id": "desktop_user_selected_remote_worker",
+    "description": "手动指定 vps-la-1 时，Desktop 应经 Worker Gateway 任务队列派发。",
+    "message": "@research 阅读 https://example.com 并总结。",
+    "preferred_node": "vps-la-1",
+    "expect_agent": "research_agent",
+    "expect_capability": "web_research",
+    "expect_step_types": ["node_selected", "task_dispatched"],
+    "expect_no_step_types": ["tool_finished"],
+    "expect_node_id": "vps-la-1",
+    "expect_assignment_reason": "user_selected",
+    "expect_min_tasks": 1
+  },
+  {
+    "id": "desktop_auto_local_worker",
+    "description": "preferred_node=auto 且 allow_worker=true 时派发 local-worker-1。",
+    "message": "@research 阅读 https://example.com 并总结。",
+    "preferred_node": "auto",
+    "allow_worker": true,
+    "expect_agent": "research_agent",
+    "expect_capability": "web_research",
+    "expect_step_types": ["node_selected", "task_dispatched"],
+    "expect_no_step_types": ["tool_finished"],
+    "expect_node_id": "local-worker-1",
+    "expect_assignment_reason": "auto_allow_worker",
+    "expect_min_tasks": 1
   }
 ]

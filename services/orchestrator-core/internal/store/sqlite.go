@@ -80,8 +80,11 @@ func (db *DB) SeedSQLiteDefaults(ctx context.Context) error {
 		INSERT INTO capabilities (id, name, description, risk_level, enabled, metadata)
 		VALUES
 		  ('memory_search', 'Memory Search', 'Search local memory context.', 'read_only', 1, '{"desktop_default":true}'),
+		  ('server_diagnose', 'Server Diagnose', 'Read-only server diagnostics capability alias.', 'read_only', 1, '{"desktop_default":true,"alias_for":"server_diagnose_v1"}'),
 		  ('server_diagnose_v1', 'Server Diagnose v1', 'Read-only server diagnostics.', 'read_only', 1, '{"desktop_default":true}'),
+		  ('system_health_check', 'System Health Check', 'Read-only Joi self-check capability alias.', 'read_only', 1, '{"desktop_default":true,"alias_for":"system_health_check_v1"}'),
 		  ('system_health_check_v1', 'System Health Check v1', 'Read-only Joi self-check.', 'read_only', 1, '{"desktop_default":true}'),
+		  ('web_research', 'Web Research', 'Read-only URL fetch capability alias.', 'read_only', 1, '{"desktop_default":true,"alias_for":"web_research_v1"}'),
 		  ('web_research_v1', 'Web Research v1', 'Read-only URL fetch and summarization.', 'read_only', 1, '{"desktop_default":true}')
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, risk_level=excluded.risk_level, enabled=excluded.enabled, updated_at=datetime('now');
 	`)

@@ -24,6 +24,7 @@ type runtimeConfig struct {
 		AllowAutoAssign   bool   `yaml:"allow_auto_assign"`
 		AllowManualAssign bool   `yaml:"allow_manual_assign"`
 		AllowedNodeIDs    string `yaml:"allowed_node_ids"`
+		GatewayURL        string `yaml:"gateway_url"`
 	} `yaml:"worker"`
 }
 
@@ -43,6 +44,7 @@ func loadRuntimeConfig() runtimeConfig {
 	cfg.Worker.AllowAutoAssign = boolEnv("WORKER_ALLOW_AUTO_ASSIGN", cfg.Worker.AllowAutoAssign)
 	cfg.Worker.AllowManualAssign = boolEnv("WORKER_ALLOW_MANUAL_ASSIGN", cfg.Worker.AllowManualAssign)
 	cfg.Worker.AllowedNodeIDs = env("WORKER_ALLOWED_NODE_IDS", cfg.Worker.AllowedNodeIDs)
+	cfg.Worker.GatewayURL = env("WORKER_GATEWAY_URL", cfg.Worker.GatewayURL)
 	return cfg
 }
 
@@ -58,6 +60,7 @@ func defaultRuntimeConfig() runtimeConfig {
 	cfg.Worker.AllowAutoAssign = true
 	cfg.Worker.AllowManualAssign = true
 	cfg.Worker.AllowedNodeIDs = "local-worker-1,vps-la-1"
+	cfg.Worker.GatewayURL = "http://127.0.0.1:18081"
 	return cfg
 }
 
@@ -70,6 +73,7 @@ func logRuntimeConfig(logger *slog.Logger, cfg runtimeConfig) {
 		"capabilities", cfg.Worker.Capabilities,
 		"allow_auto_assign", cfg.Worker.AllowAutoAssign,
 		"allow_manual_assign", cfg.Worker.AllowManualAssign,
+		"worker_gateway_url_configured", cfg.Worker.GatewayURL != "",
 		"node_secret_present", os.Getenv("NODE_SECRET") != "",
 		"worker_token_present", os.Getenv("WORKER_TOKEN") != "",
 	)

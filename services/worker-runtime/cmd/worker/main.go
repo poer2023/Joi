@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -35,6 +36,10 @@ func main() {
 	if err := validateWorkerAuthorization(cfg, nodeID); err != nil {
 		logger.Error("worker authorization failed", "node_id", nodeID, "error", err)
 		os.Exit(1)
+	}
+	if cfg.TaskQueue.Driver == "remote_gateway" || os.Getenv("WORKER_GATEWAY_URL") != "" {
+		runRemoteGatewayWorker(logger, cfg, nodeID)
+		return
 	}
 	db, err := sql.Open("pgx", cfg.Database.URL)
 	if err != nil {
@@ -97,11 +102,112 @@ func main() {
 	}
 }
 
+func runRemoteGatewayWorker(logger *slog.Logger, cfg runtimeConfig, nodeID string) {
+	client := &gatewayClient{baseURL: strings.TrimRight(cfg.Worker.GatewayURL, "/"), token: os.Getenv("WORKER_TOKEN"), http: &http.Client{Timeout: 30 * time.Second}}
+	if client.baseURL == "" {
+		logger.Error("remote gateway worker requires WORKER_GATEWAY_URL")
+		os.Exit(1)
+	}
+	if err := client.register(context.Background(), nodeID, cfg); err != nil {
+		logger.Error("worker gateway register failed", "node_id", nodeID, "error", err)
+		os.Exit(1)
+	}
+	logger.Info("worker-runtime started", "node_id", nodeID, "task_queue_driver", "remote_gateway")
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	for {
+		select {
+		case <-rootCtx.Done():
+			logger.Info("worker-runtime shutting down", "node_id", nodeID)
+			return
+		default:
+		}
+		ctx, cancel := context.WithTimeout(rootCtx, 45*time.Second)
+		_ = client.heartbeat(ctx, nodeID)
+		task, err := client.claim(ctx, nodeID)
+		if err != nil {
+			logger.Error("gateway claim task failed", "error", err)
+		}
+		if task != nil {
+			logger.Info("claimed gateway task", "task_id", task.ID, "run_id", task.RunID)
+			if !capabilityAllowed(cfg.Worker.Capabilities, task.CapabilityID) {
+				_ = client.fail(ctx, task.ID, map[string]any{"code": "permission_denied", "message": "capability is not allowed on this worker"})
+			} else {
+				result := executeWorkerCapability(ctx, *task)
+				if status, _ := result["fetch_status"].(string); status == "failed" || status == "policy_blocked" {
+					logger.Warn("gateway task completed with non-success fetch status", "task_id", task.ID, "status", status)
+				}
+				_ = client.ack(ctx, task.ID, result)
+			}
+		}
+		cancel()
+		time.Sleep(2 * time.Second)
+	}
+}
+
+type gatewayClient struct {
+	baseURL string
+	token   string
+	http    *http.Client
+}
+
+func (c *gatewayClient) register(ctx context.Context, nodeID string, cfg runtimeConfig) error {
+	return c.post(ctx, "/worker/register", map[string]any{"node_id": nodeID, "name": nodeDisplayName(nodeID), "capabilities": csvValues(cfg.Worker.Capabilities)}, nil)
+}
+
+func (c *gatewayClient) heartbeat(ctx context.Context, nodeID string) error {
+	return c.post(ctx, "/worker/heartbeat", map[string]any{"node_id": nodeID}, nil)
+}
+
+func (c *gatewayClient) claim(ctx context.Context, nodeID string) (*task, error) {
+	var response struct {
+		OK   bool  `json:"ok"`
+		Task *task `json:"task"`
+	}
+	if err := c.post(ctx, "/worker/tasks/claim", map[string]any{"node_id": nodeID}, &response); err != nil {
+		return nil, err
+	}
+	return response.Task, nil
+}
+
+func (c *gatewayClient) ack(ctx context.Context, taskID string, output map[string]any) error {
+	return c.post(ctx, "/worker/tasks/"+taskID+"/ack", map[string]any{"output": output}, nil)
+}
+
+func (c *gatewayClient) fail(ctx context.Context, taskID string, taskErr map[string]any) error {
+	return c.post(ctx, "/worker/tasks/"+taskID+"/fail", taskErr, nil)
+}
+
+func (c *gatewayClient) post(ctx context.Context, path string, payload any, response any) error {
+	raw, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return errors.New(resp.Status + ": " + string(body))
+	}
+	if response != nil {
+		return json.Unmarshal(body, response)
+	}
+	return nil
+}
+
 type task struct {
-	ID           string
-	RunID        string
-	CapabilityID string
-	Payload      map[string]any
+	ID           string         `json:"id"`
+	RunID        string         `json:"run_id"`
+	CapabilityID string         `json:"capability_id"`
+	Payload      map[string]any `json:"payload"`
 }
 
 func registerNode(ctx context.Context, db *sql.DB, nodeID string, cfg runtimeConfig) error {
