@@ -116,3 +116,9 @@ To verify that app data survives moving the app:
 4. Move `Joi.app` to a different folder.
 5. Launch it again.
 6. Confirm the previous run trace and memory data remain visible.
+
+The live package install dogfood checklist is tracked in:
+
+```text
+docs/41_DESKTOP_INSTALL_DOGFOOD_CHECK.md
+```

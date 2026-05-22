@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,7 +64,19 @@ func (db *DB) ApplySQLiteSchemaSQL(ctx context.Context, schemaSQL string) error 
 	if err := db.ApplySQLitePragmas(ctx); err != nil {
 		return err
 	}
-	_, err := db.sql.ExecContext(ctx, schemaSQL)
+	if _, err := db.sql.ExecContext(ctx, schemaSQL); err != nil {
+		return err
+	}
+	return db.RebuildSQLiteMemoryFTS(ctx)
+}
+
+func (db *DB) RebuildSQLiteMemoryFTS(ctx context.Context) error {
+	_, err := db.sql.ExecContext(ctx, `
+		DELETE FROM memory_fts;
+		INSERT INTO memory_fts(memory_id, content, summary, type)
+		SELECT id, content, COALESCE(summary, ''), type
+		FROM memories;
+	`)
 	return err
 }
 
@@ -121,11 +134,99 @@ func (db *DB) RegisterSQLiteMainNode(ctx context.Context) error {
 }
 
 func (db *DB) RecoverSQLiteTasks(ctx context.Context, maxAge time.Duration) error {
-	threshold := time.Now().Add(-maxAge).UTC().Format(time.RFC3339)
-	_, err := db.sql.ExecContext(ctx, `
-		UPDATE tasks
-		SET status='retrying', error='{"code":"worker_lost","message":"Recovered stale running task"}', finished_at=datetime('now')
-		WHERE status='running' AND started_at < ?
-	`, threshold)
-	return err
+	seconds := int(maxAge.Seconds())
+	if seconds <= 0 {
+		seconds = 120
+	}
+	cutoffModifier := "-" + strconv.Itoa(seconds) + " seconds"
+
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT id, COALESCE(run_id, ''), COALESCE(assigned_node_id, ''),
+		       COALESCE((SELECT COUNT(*) FROM task_attempts WHERE task_attempts.task_id = tasks.id), 0)
+		FROM tasks
+		WHERE status='running' AND started_at < datetime('now', ?)
+	`, cutoffModifier)
+	if err != nil {
+		return err
+	}
+	type interruptedTask struct {
+		id       string
+		runID    string
+		nodeID   string
+		attempts int
+	}
+	affected := []interruptedTask{}
+	for rows.Next() {
+		var item interruptedTask
+		if err := rows.Scan(&item.id, &item.runID, &item.nodeID, &item.attempts); err != nil {
+			rows.Close()
+			return err
+		}
+		affected = append(affected, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(affected) == 0 {
+		return nil
+	}
+
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, task := range affected {
+		nextStatus := "retrying"
+		title := "Interrupted task recovered"
+		if task.attempts >= 3 {
+			nextStatus = "dead"
+			title = "Interrupted task marked dead"
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE tasks
+			SET status=?,
+			    error='{"code":"worker_lost","message":"Recovered interrupted running task","recovered":true}',
+			    finished_at=CASE WHEN ?='dead' THEN datetime('now') ELSE NULL END
+			WHERE id=? AND status='running'
+		`, nextStatus, nextStatus, task.id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE task_attempts
+			SET status='failed',
+			    error='{"code":"worker_lost","message":"Task attempt interrupted by app shutdown","recovered":true}',
+			    finished_at=datetime('now')
+			WHERE task_id=? AND status='running'
+		`, task.id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE tool_runs
+			SET status='failed',
+			    error='{"code":"interrupted","message":"Tool run interrupted by app shutdown","recovered":true}',
+			    finished_at=datetime('now')
+			WHERE task_id=? AND status IN ('pending','running')
+		`, task.id); err != nil {
+			return err
+		}
+		if task.runID == "" {
+			continue
+		}
+		stepID, err := NewID("step_")
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO run_steps (id, run_id, step_type, title, status, input, output, finished_at, duration_ms)
+			VALUES (?, ?, 'recovered', ?, 'succeeded', ?, ?, datetime('now'), 0)
+		`, stepID, task.runID, title, mustJSON(map[string]any{"task_id": task.id, "node_id": task.nodeID}), mustJSON(map[string]any{"recovered": true, "interrupted": true, "next_status": nextStatus})); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

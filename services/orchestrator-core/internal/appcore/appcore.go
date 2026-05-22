@@ -414,17 +414,19 @@ func (a *AppCore) GetSystemHealth(ctx context.Context) (*SystemHealthResponse, e
 			TokenCostToday:  map[string]any{},
 			Warnings:        []map[string]any{},
 		}
-		var activeTasks, deadTasks, stuckTasks, modelCalls, modelErrors, inputTokens, outputTokens, cachedTokens int
+		var activeTasks, deadTasks, stuckTasks, recoveredSteps, modelCalls, modelErrors, inputTokens, outputTokens, cachedTokens int
 		var avgLatency sql.NullFloat64
 		_ = a.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE status IN ('pending','running','retrying')`).Scan(&activeTasks)
 		_ = a.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE status='dead'`).Scan(&deadTasks)
 		_ = a.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE status='running' AND started_at < datetime('now', '-10 minutes')`).Scan(&stuckTasks)
+		_ = a.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM run_steps WHERE step_type='recovered' AND created_at >= date('now')`).Scan(&recoveredSteps)
 		_ = a.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*), SUM(CASE WHEN status NOT IN ('succeeded','fallback_to_mock') THEN 1 ELSE 0 END) FROM model_calls WHERE created_at >= date('now')`).Scan(&modelCalls, &modelErrors)
 		_ = a.db.SQL().QueryRowContext(ctx, `SELECT COALESCE(AVG(latency_ms),0) FROM model_calls WHERE created_at >= date('now')`).Scan(&avgLatency)
 		_ = a.db.SQL().QueryRowContext(ctx, `SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cached_input_tokens),0) FROM model_calls WHERE created_at >= date('now')`).Scan(&inputTokens, &outputTokens, &cachedTokens)
 		health.QueueStatus["active_tasks"] = activeTasks
 		health.QueueStatus["dead_tasks"] = deadTasks
 		health.QueueStatus["stuck_running_tasks"] = stuckTasks
+		health.QueueStatus["recovered_tasks_today"] = recoveredSteps
 		health.ModelLatency["model_calls_today"] = modelCalls
 		health.ModelLatency["model_errors_today"] = modelErrors
 		health.ModelLatency["avg_latency_ms_today"] = avgLatency.Float64

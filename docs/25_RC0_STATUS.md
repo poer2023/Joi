@@ -4,6 +4,8 @@ Status date: 2026-05-23
 Release tag target: `rc0-local-real-loop`
 Desktop validation tag: `desktop-rc0-validation`
 Desktop validation commit: `2634854`
+Desktop hardened tag: `desktop-rc0-hardened`
+Desktop hardened commit: `43143d9`
 
 ## Completed Capabilities
 
@@ -46,6 +48,21 @@ Desktop validation commit: `2634854`
 - first_run_onboarding_verified=true
 - desktop_backup_restore_verified=true
 - desktop_rc0_validation_commit=2634854
+- desktop_rc0_hardened_commit=43143d9
+- diagnostics_export_verified=true
+- worker_gateway_security_verified=true
+- keychain_settings_verified=true
+- memory_inbox_verified=true
+- package_created=true
+- desktop_crash_recovery_verified=true
+- sqlite_migration_verified=true
+- vps_la_1_redeployed=true
+- vps_la_1_remote_gateway_verified=true
+- vps_la_1_manual_dispatch_verified=true
+- worker_gateway_duplicate_nonce_verified=true
+- desktop_package_install_dogfood_verified=true
+- desktop_package_quit_reopen_verified=true
+- desktop_package_keychain_after_reopen_verified=true
 
 ## Unverified Items
 
@@ -132,3 +149,4 @@ Backups include PostgreSQL, configs, prompts, runtime yaml, memory jsonl, agent 
 
 `rc0-local-real-loop` should point at the commit that contains this RC0 state document and the RC0 acceptance scripts.
 `desktop-rc0-validation` points at `2634854 Complete desktop RC0 validation`.
+`desktop-rc0-hardened` points at `43143d9 Harden desktop RC0 release path`.

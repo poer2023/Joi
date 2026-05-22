@@ -63,6 +63,8 @@ Backups page now has restore entry
 
 Date: 2026-05-24 scheduled
 
+Task 103 rule: this cannot be marked complete on 2026-05-23. It must be executed on the actual calendar day using only Joi Desktop App.
+
 ```text
 desktop_only: pending calendar-day run
 system_health_check: pending
@@ -92,6 +94,8 @@ worker_instability: pending
 ## Day 3
 
 Date: 2026-05-25 scheduled
+
+Task 103 rule: this cannot be marked complete before 2026-05-25. It must be executed on the actual calendar day using only Joi Desktop App.
 
 ```text
 desktop_only: pending calendar-day run

@@ -64,6 +64,13 @@ func main() {
 	if status, body := workerGatewayRequest(client, baseURL, "allowed-node", "token-one", "/worker/register", map[string]any{"node_id": "allowed-node", "name": "Allowed Node", "capabilities": []string{"web_research_v1"}}, nil); status != http.StatusOK {
 		fail(fmt.Errorf("register status = %d body=%s, want 200", status, body))
 	}
+	replayNonce := randomNonce()
+	if status, body := workerGatewayRequestWithNonce(client, baseURL, "allowed-node", "token-one", "/worker/heartbeat", map[string]any{"node_id": "allowed-node"}, replayNonce, nil); status != http.StatusOK {
+		fail(fmt.Errorf("first nonce heartbeat status = %d body=%s, want 200", status, body))
+	}
+	if status, _ := workerGatewayRequestWithNonce(client, baseURL, "allowed-node", "token-one", "/worker/heartbeat", map[string]any{"node_id": "allowed-node"}, replayNonce, nil); status != http.StatusUnauthorized {
+		fail(fmt.Errorf("duplicate nonce heartbeat status = %d, want 401", status))
+	}
 	taskID := "task_security_check"
 	if err := core.Queue.Enqueue(ctx, store.Task{ID: taskID, CapabilityID: "web_research_v1", AssignedNodeID: "allowed-node", Payload: map[string]any{"url": "https://example.com"}}); err != nil {
 		fail(err)
@@ -105,6 +112,7 @@ func main() {
 		"old_token_rejected":         true,
 		"disabled_node_claim_denied": true,
 		"duplicate_ack_ineffective":  true,
+		"duplicate_nonce_rejected":   true,
 		"audit_events":               len(audit.Items),
 	}
 	raw, _ := json.MarshalIndent(result, "", "  ")
@@ -112,6 +120,10 @@ func main() {
 }
 
 func workerGatewayRequest(client *http.Client, baseURL string, nodeID string, token string, path string, payload any, response any) (int, string) {
+	return workerGatewayRequestWithNonce(client, baseURL, nodeID, token, path, payload, randomNonce(), response)
+}
+
+func workerGatewayRequestWithNonce(client *http.Client, baseURL string, nodeID string, token string, path string, payload any, nonce string, response any) (int, string) {
 	raw, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, baseURL+path, bytes.NewReader(raw))
 	if err != nil {
@@ -121,7 +133,7 @@ func workerGatewayRequest(client *http.Client, baseURL string, nodeID string, to
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Worker-Node-ID", nodeID)
 	req.Header.Set("X-Worker-Timestamp", time.Now().UTC().Format(time.RFC3339))
-	req.Header.Set("X-Worker-Nonce", randomNonce())
+	req.Header.Set("X-Worker-Nonce", nonce)
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err.Error()

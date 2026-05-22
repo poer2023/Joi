@@ -25,6 +25,13 @@ Desktop eval: required before release
 Backup restore: temporary data drill passed; UI first backup created
 Package: dist/desktop/Joi-0.1.0-rc0-macos-arm64.zip
 Package manifest: dist/desktop/Joi-0.1.0-rc0-macos-arm64.manifest.json
+Crash/restart recovery: scripts/desktop_crash_recovery_check.sh passed
+SQLite migration/upgrade: scripts/sqlite_migration_check.sh passed
+Package install dogfood: /Applications/Joi.app opened from Finder and completed first-run flow
+Install dogfood first message: run_eddb1c1e1939ebdab96c4ee4
+Install dogfood memory confirmation: run_9617cae0cb615f2dc312069b
+Install dogfood self-check: run_a52f867c150f20bbdca5adb9
+Install dogfood web summary: run_c06caaed2552da85bbca0695
 Docker dependency: none in Desktop Mode
 Postgres dependency: none in Desktop Mode
 NATS dependency: none in Desktop Mode
@@ -44,6 +51,13 @@ Diagnostics directory: verified
 Keychain MODEL_API_KEY: present without printing value
 Keychain WORKER_TOKEN: present without printing value
 Remote worker config: code path preserved through Worker Gateway token header, timestamp, nonce, and node allowlist
+vps-la-1 redeploy: current worker-runtime from 43143d9+local hardening build deployed to cloudcone-la
+vps-la-1 binary sha256: a3f9b7ea522bc5ddf82cda9b37a1f98cb020029977bdab630cf04af1532ee3ac
+vps-la-1 manual dispatch: run_018c5bf5c332b888e74e2910 / task_2351883e21eb7768ca8d0ee9 succeeded
+vps-la-1 post-install-restore dispatch: run_88ccbab2c5961780ab212953 / task_bc1ea6d08221e3d757ddc435 succeeded
+vps-la-1 assignment: node_id=vps-la-1, assignment_reason=user_selected
+vps-la-1 gateway protocol: timestamp and nonce headers used by remote_gateway worker
+Gateway security negatives: wrong token rejected, old token rejected after rotation, duplicate nonce rejected, disabled node claim denied, duplicate ack ineffective
 ```
 
 ## Current Verdict
@@ -70,6 +84,21 @@ desktop_rc0_validation_tag=desktop-rc0-validation
 app_version=0.1.0-rc0
 desktop_diagnostics_export_verified=true
 worker_gateway_security_verified=true
+desktop_rc0_hardened_commit=43143d9
+desktop_rc0_hardened_tag=desktop-rc0-hardened
+diagnostics_export_verified=true
+keychain_settings_verified=true
+memory_inbox_verified=true
+package_created=true
+desktop_crash_recovery_verified=true
+sqlite_migration_verified=true
+vps_la_1_redeployed=true
+vps_la_1_remote_gateway_verified=true
+vps_la_1_manual_dispatch_verified=true
+worker_gateway_duplicate_nonce_verified=true
+desktop_package_install_dogfood_verified=true
+desktop_package_quit_reopen_verified=true
+desktop_package_keychain_after_reopen_verified=true
 ```
 
 ## Release Gate
