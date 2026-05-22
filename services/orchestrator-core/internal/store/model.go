@@ -147,6 +147,23 @@ func dispatchModel(ctx context.Context, config modelConfig, request ModelRequest
 	return response, nil
 }
 
+func InvokeModelDirect(ctx context.Context, request ModelRequest) (*ModelResponse, error) {
+	config := applyGenericModelEnv(modelConfig{
+		ID:           valueOrDefault(request.ModelID, "model_default"),
+		Provider:     valueOrDefault(request.Provider, "openai_compatible"),
+		ModelName:    request.ModelName,
+		BaseURLEnv:   "MODEL_DEFAULT_BASE_URL",
+		APIKeyEnv:    "MODEL_DEFAULT_API_KEY",
+		SupportsJSON: true,
+	})
+	started := time.Now()
+	response, err := dispatchModel(ctx, config, request)
+	if response != nil {
+		response.LatencyMs = int(time.Since(started).Milliseconds())
+	}
+	return response, err
+}
+
 func allowMockProvider() bool {
 	value := strings.ToLower(strings.TrimSpace(os.Getenv("ALLOW_MOCK_PROVIDER")))
 	return value == "" || value == "true" || value == "1" || value == "yes"

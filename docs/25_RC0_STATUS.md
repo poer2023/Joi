@@ -1,6 +1,6 @@
 # RC0 Status
 
-Status date: 2026-05-22
+Status date: 2026-05-23
 Release tag target: `rc0-local-real-loop`
 
 ## Completed Capabilities
@@ -35,14 +35,13 @@ Release tag target: `rc0-local-real-loop`
 - real_vps_worker_verified=true
 - security_evals_verified=true
 - reboot_recovery_verified=true
-- soak_24h_verified=false
+- soak_24h_verified=true
 - console_external_auth_verified=true
 - reboot_acceptance_script_current_session_passed=true
 - smoke_soak_verified=true
 
 ## Unverified Items
 
-- Full 24 hour soak test has not completed yet.
 - Console/API management endpoints are protected by `ADMIN_TOKEN`; current no-auth API access returns 401.
 
 ## Reboot Acceptance
@@ -50,6 +49,24 @@ Release tag target: `rc0-local-real-loop`
 - Verified at: 2026-05-22 01:25 Asia/Shanghai
 - Run Trace: `run_dc41e3126f3a86114f06797b`
 - Result: orchestrator, console, PostgreSQL, queue mode, Telegram, main-node, local-worker-1, vps-la-1, Cloudflare tunnel, and `system_health_check_v1` passed after reboot.
+
+## 24 Hour Soak
+
+- Verified at: 2026-05-23 01:21 Asia/Shanghai
+- Log: `logs/soak-24h-20260522-012530.log`
+- JSONL: `logs/soak-results-20260522-012530.jsonl`
+- Measured active cases: 840
+- Success: 840
+- Failures: 0
+- Success rate: 100%
+- Average latency: 3246.74 ms
+- p95 latency: 7828 ms
+- dead_task: 0
+- stuck_running_task: 0
+- worker_offline: 0
+- model_error: 0
+- telegram_error: 0
+- nats_reconnect: 0
 
 ## Known Risks
 

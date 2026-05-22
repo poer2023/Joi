@@ -1,0 +1,42 @@
+[
+  {
+    "id": "desktop_chat",
+    "description": "Desktop AppCore can send chat without HTTP localhost self-call.",
+    "assert": ["chat_response", "run_id", "sqlite_write"]
+  },
+  {
+    "id": "desktop_run_trace",
+    "description": "Desktop run trace includes run_steps.",
+    "assert": ["run_trace", "run_steps"]
+  },
+  {
+    "id": "desktop_memory",
+    "description": "Desktop memory search is available through SQLite FTS5.",
+    "assert": ["memory_search"]
+  },
+  {
+    "id": "desktop_system_health",
+    "description": "Desktop system health reports sqlite and no Docker requirement.",
+    "assert": ["system_health", "docker_required_false"]
+  },
+  {
+    "id": "desktop_backup",
+    "description": "Desktop backup manager writes a joibak file without secrets.",
+    "assert": ["backup_file"]
+  },
+  {
+    "id": "desktop_sqlite_task_queue",
+    "description": "Desktop default task queue is sqlite.",
+    "assert": ["task_queue_sqlite"]
+  },
+  {
+    "id": "desktop_worker_gateway_mock",
+    "description": "Remote worker gateway is API based and does not expose SQLite directly.",
+    "assert": ["worker_gateway_api"]
+  },
+  {
+    "id": "desktop_model_trace_fields",
+    "description": "Desktop Run Trace records prompt assembly, model call, cache fields, fallback flag, tokens, and latency.",
+    "assert": ["prompt_assembly", "model_call", "prompt_cache_key", "tokens", "latency", "fallback_flag"]
+  }
+]

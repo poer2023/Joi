@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: dev-up dev-down prod-up worker-up e2e-real model-baseline cost-latency-baseline telegram-check vps-worker-check prod-status soak-test test build backup restore
+.PHONY: dev-up dev-down prod-up worker-up desktop-poc desktop-real-model desktop-evals e2e-real model-baseline cost-latency-baseline telegram-check vps-worker-check prod-status soak-test test build backup restore
 
 dev-up:
 	./scripts/dev_up.sh
@@ -13,6 +13,15 @@ prod-up:
 
 worker-up:
 	./scripts/worker_up.sh
+
+desktop-poc:
+	./scripts/desktop_poc_check.sh
+
+desktop-real-model:
+	./scripts/desktop_real_model_check.sh
+
+desktop-evals:
+	./scripts/run_desktop_evals.sh
 
 e2e-real:
 	ALLOW_MOCK_PROVIDER=false REQUIRE_REAL_MODEL=true REQUIRE_REAL_TELEGRAM=true ./scripts/e2e_real_check.sh
@@ -46,6 +55,7 @@ test:
 
 build:
 	cd apps/console-web && npm run build
+	cd apps/joi-desktop/frontend && npm run build
 
 backup:
 	./scripts/backup.sh

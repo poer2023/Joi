@@ -3,12 +3,20 @@ package runtimeconfig
 import (
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
+	App struct {
+		Mode           string `yaml:"mode"`
+		DataStore      string `yaml:"data_store"`
+		UI             string `yaml:"ui"`
+		DockerRequired bool   `yaml:"docker_required"`
+		SQLitePath     string `yaml:"sqlite_path"`
+	} `yaml:"app"`
 	Server struct {
 		Port          string `yaml:"port"`
 		ConfigDir     string `yaml:"config_dir"`
@@ -61,6 +69,10 @@ func Load() Config {
 
 func LogCheck(logger *slog.Logger, cfg Config) {
 	logger.Info("runtime config check",
+		"app_mode", cfg.App.Mode,
+		"data_store", cfg.App.DataStore,
+		"ui", cfg.App.UI,
+		"docker_required", cfg.App.DockerRequired,
 		"database_url_configured", cfg.Database.URL != "",
 		"model_provider", cfg.Model.Provider,
 		"model_name", cfg.Model.Name,
@@ -78,6 +90,11 @@ func LogCheck(logger *slog.Logger, cfg Config) {
 
 func defaults() Config {
 	var cfg Config
+	cfg.App.Mode = "desktop"
+	cfg.App.DataStore = "sqlite"
+	cfg.App.UI = "embedded"
+	cfg.App.DockerRequired = false
+	cfg.App.SQLitePath = defaultSQLitePath()
 	cfg.Server.Port = "8080"
 	cfg.Server.ConfigDir = "../../configs"
 	cfg.Server.MigrationsDir = "../../database/migrations"
@@ -86,7 +103,7 @@ func defaults() Config {
 	cfg.Model.Name = "mock-model"
 	cfg.Model.TimeoutSeconds = 60
 	cfg.Model.MaxRetries = 1
-	cfg.TaskQueue.Driver = "postgres"
+	cfg.TaskQueue.Driver = "sqlite"
 	cfg.TaskQueue.NATSURL = "nats://localhost:4222"
 	cfg.TaskQueue.NATSStream = "AGENTOS_TASKS"
 	cfg.TaskQueue.NATSTaskSubject = "agentos.tasks"
@@ -102,6 +119,24 @@ func defaults() Config {
 }
 
 func applyEnv(cfg *Config) {
+	cfg.App.Mode = env("APP_MODE", cfg.App.Mode)
+	cfg.App.DataStore = env("DATA_STORE", cfg.App.DataStore)
+	cfg.App.UI = env("UI", cfg.App.UI)
+	cfg.App.SQLitePath = env("SQLITE_PATH", cfg.App.SQLitePath)
+	if strings.TrimSpace(cfg.App.SQLitePath) == "" {
+		cfg.App.SQLitePath = defaultSQLitePath()
+	}
+	cfg.App.SQLitePath = expandHome(cfg.App.SQLitePath)
+	if cfg.App.Mode == "server" {
+		cfg.App.DataStore = env("DATA_STORE", valueOrDefault(os.Getenv("DATA_STORE"), "postgres"))
+		cfg.App.UI = env("UI", valueOrDefault(os.Getenv("UI"), "web"))
+		cfg.App.DockerRequired = boolEnv("DOCKER_REQUIRED", false)
+	}
+	if cfg.App.Mode == "worker" {
+		cfg.App.DataStore = env("DATA_STORE", "none")
+		cfg.App.UI = env("UI", "none")
+		cfg.App.DockerRequired = boolEnv("DOCKER_REQUIRED", false)
+	}
 	cfg.Server.Port = env("PORT", cfg.Server.Port)
 	cfg.Server.ConfigDir = env("CONFIG_DIR", cfg.Server.ConfigDir)
 	cfg.Server.MigrationsDir = env("MIGRATIONS_DIR", cfg.Server.MigrationsDir)
@@ -111,7 +146,14 @@ func applyEnv(cfg *Config) {
 	cfg.Model.Name = env("MODEL_NAME", cfg.Model.Name)
 	cfg.Model.TimeoutSeconds = intEnv("MODEL_TIMEOUT_SECONDS", cfg.Model.TimeoutSeconds)
 	cfg.Model.MaxRetries = intEnv("MODEL_MAX_RETRIES", cfg.Model.MaxRetries)
-	cfg.TaskQueue.Driver = env("TASK_QUEUE_DRIVER", cfg.TaskQueue.Driver)
+	queueDriver := cfg.TaskQueue.Driver
+	if os.Getenv("TASK_QUEUE_DRIVER") == "" {
+		queueDriver = defaultQueueDriver(cfg.App.Mode)
+	}
+	if strings.TrimSpace(queueDriver) == "" {
+		queueDriver = defaultQueueDriver(cfg.App.Mode)
+	}
+	cfg.TaskQueue.Driver = env("TASK_QUEUE_DRIVER", queueDriver)
 	cfg.TaskQueue.NATSURL = env("NATS_URL", cfg.TaskQueue.NATSURL)
 	cfg.TaskQueue.NATSStream = env("NATS_STREAM", cfg.TaskQueue.NATSStream)
 	cfg.TaskQueue.NATSTaskSubject = env("NATS_TASK_SUBJECT", cfg.TaskQueue.NATSTaskSubject)
@@ -124,18 +166,71 @@ func applyEnv(cfg *Config) {
 }
 
 func seedProcessEnv(cfg Config) {
+	setDefaultEnv("APP_MODE", cfg.App.Mode)
+	setDefaultEnv("DATA_STORE", cfg.App.DataStore)
+	setDefaultEnv("TASK_QUEUE_DRIVER", cfg.TaskQueue.Driver)
+	setDefaultEnv("SQLITE_PATH", cfg.App.SQLitePath)
 	setDefaultEnv("DATABASE_URL", cfg.Database.URL)
 	setDefaultEnv("MODEL_PROVIDER", cfg.Model.Provider)
 	setDefaultEnv("MODEL_BASE_URL", cfg.Model.BaseURL)
 	setDefaultEnv("MODEL_NAME", cfg.Model.Name)
 	setDefaultEnv("MODEL_TIMEOUT_SECONDS", itoa(cfg.Model.TimeoutSeconds))
 	setDefaultEnv("MODEL_MAX_RETRIES", itoa(cfg.Model.MaxRetries))
-	setDefaultEnv("TASK_QUEUE_DRIVER", cfg.TaskQueue.Driver)
 	setDefaultEnv("NATS_URL", cfg.TaskQueue.NATSURL)
 	setDefaultEnv("NATS_STREAM", cfg.TaskQueue.NATSStream)
 	setDefaultEnv("NATS_TASK_SUBJECT", cfg.TaskQueue.NATSTaskSubject)
 	setDefaultEnv("PUBLIC_BASE_URL", cfg.Node.PublicBaseURL)
 	setDefaultEnv("CONSOLE_BASE_URL", cfg.Telegram.ConsoleBaseURL)
+}
+
+func defaultQueueDriver(appMode string) string {
+	switch appMode {
+	case "desktop":
+		return "sqlite"
+	case "server":
+		return "nats"
+	case "worker":
+		return "remote_gateway"
+	default:
+		return "sqlite"
+	}
+}
+
+func boolEnv(key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	return value == "1" || value == "true" || value == "yes"
+}
+
+func defaultSQLitePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "joi.db"
+	}
+	switch runtime.GOOS {
+	case "linux":
+		return home + "/.local/share/joi/joi.db"
+	default:
+		return home + "/Library/Application Support/Joi/joi.db"
+	}
+}
+
+func expandHome(path string) string {
+	if path == "~" {
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			return home
+		}
+	}
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			return home + path[1:]
+		}
+	}
+	return path
 }
 
 func env(key string, fallback string) string {

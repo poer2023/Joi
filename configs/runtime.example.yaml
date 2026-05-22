@@ -1,3 +1,10 @@
+app:
+  mode: "desktop"
+  data_store: "sqlite"
+  ui: "embedded"
+  docker_required: false
+  sqlite_path: "~/Library/Application Support/Joi/joi.db"
+
 server:
   port: "8080"
   config_dir: "../../configs"
@@ -19,7 +26,7 @@ telegram:
   console_base_url: "http://localhost:3000"
 
 task_queue:
-  driver: "postgres"
+  driver: "sqlite"
   nats_url: "nats://localhost:4222"
   nats_stream: "AGENTOS_TASKS"
   nats_task_subject: "agentos.tasks"

@@ -9,46 +9,32 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hao/agent-os/services/orchestrator-core/internal/api"
+	"github.com/hao/agent-os/services/orchestrator-core/internal/appcore"
 	"github.com/hao/agent-os/services/orchestrator-core/internal/runtimeconfig"
-	"github.com/hao/agent-os/services/orchestrator-core/internal/store"
+	coreserver "github.com/hao/agent-os/services/orchestrator-core/internal/server"
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if os.Getenv("APP_MODE") == "" {
+		_ = os.Setenv("APP_MODE", "server")
+	}
 	cfg := runtimeconfig.Load()
 	runtimeconfig.LogCheck(logger, cfg)
 
-	db, err := store.Open(context.Background(), cfg.Database.URL)
+	ctx := context.Background()
+	core, err := appcore.NewAppCore(ctx, cfg, logger)
 	if err != nil {
-		logger.Error("failed to open database", "service", "orchestrator-core", "error", err)
+		logger.Error("failed to initialize app core", "service", "orchestrator-core", "error", err)
 		os.Exit(1)
 	}
-	defer db.Close()
-
-	if err := db.ApplyMigrations(context.Background(), cfg.Server.MigrationsDir); err != nil {
-		logger.Error("failed to apply migrations", "service", "orchestrator-core", "error", err, "migrations_dir", cfg.Server.MigrationsDir)
-		os.Exit(1)
-	}
-
-	if err := db.SeedRegistryFromDir(context.Background(), cfg.Server.ConfigDir); err != nil {
-		logger.Warn("registry seed skipped", "service", "orchestrator-core", "error", err, "config_dir", cfg.Server.ConfigDir)
-	}
-	if err := db.RecoverInterruptedTasks(context.Background()); err != nil {
-		logger.Warn("task recovery skipped", "service", "orchestrator-core", "error", err)
-	}
-	_ = db.RecoverStuckTasks(context.Background(), 2*time.Minute)
-	_ = db.MarkOfflineNodes(context.Background(), 90*time.Second)
-	if err := db.RegisterMainNode(context.Background()); err != nil {
-		logger.Error("failed to register main-node", "service", "orchestrator-core", "error", err)
+	defer core.Shutdown(context.Background())
+	if err := core.Start(ctx); err != nil {
+		logger.Error("failed to start app core", "service", "orchestrator-core", "error", err)
 		os.Exit(1)
 	}
 
-	server := &http.Server{
-		Addr:              normalizePort(cfg.Server.Port),
-		Handler:           api.NewRouter(db, logger),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	server := coreserver.NewHTTPServer(core, logger, normalizePort(cfg.Server.Port))
 
 	logger.Info("orchestrator-core listening", "service", "orchestrator-core", "addr", server.Addr)
 	errCh := make(chan error, 1)
