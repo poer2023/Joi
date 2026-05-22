@@ -1,6 +1,6 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
-  "name": "joi-desktop",
+  "name": "Joi",
   "outputfilename": "Joi",
   "frontend:install": "npm install",
   "frontend:build": "npm run build",
@@ -8,5 +8,11 @@
   "frontend:dev:serverUrl": "auto",
   "author": {
     "name": "Joi"
+  },
+  "info": {
+    "companyName": "Joi",
+    "productName": "Joi",
+    "productVersion": "0.1.0-rc0",
+    "copyright": "Copyright 2026 Joi"
   }
 }

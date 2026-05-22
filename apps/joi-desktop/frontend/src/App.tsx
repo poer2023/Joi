@@ -12,6 +12,7 @@ import {
   type SecretStatus,
   type SettingsRecord,
   type SystemHealth,
+  type WorkerGatewayAuditRecord,
 } from './api/desktop';
 
 type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
@@ -39,6 +40,7 @@ export default function App() {
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
   const [memoryQuery, setMemoryQuery] = useState('');
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
+  const [gatewayAudit, setGatewayAudit] = useState<WorkerGatewayAuditRecord[]>([]);
   const [usage, setUsage] = useState<Record<string, unknown>[]>([]);
   const [confirmations, setConfirmations] = useState<ConfirmationRecord[]>([]);
   const [backups, setBackups] = useState<BackupRecord[]>([]);
@@ -58,10 +60,11 @@ export default function App() {
   async function refreshAll() {
     setError('');
     try {
-      const [systemHealth, memoryList, nodeList, modelUsage, confirmationList, backupList, desktopSettings, secrets, onboardingStatus] = await Promise.all([
+      const [systemHealth, memoryList, nodeList, gatewayAuditList, modelUsage, confirmationList, backupList, desktopSettings, secrets, onboardingStatus] = await Promise.all([
         desktopApi.getSystemHealth(),
         desktopApi.listMemories({ query: memoryQuery, limit: 50 }),
         desktopApi.listNodes(),
+        desktopApi.listWorkerGatewayAuditLogs(),
         desktopApi.getModelUsage(),
         desktopApi.listConfirmations(),
         desktopApi.listBackups(),
@@ -72,6 +75,7 @@ export default function App() {
       setHealth(systemHealth);
       setMemories(memoryList.memories ?? []);
       setNodes(nodeList.nodes ?? []);
+      setGatewayAudit(gatewayAuditList.items ?? []);
       setUsage(modelUsage.items ?? []);
       setConfirmations(confirmationList.items ?? []);
       setBackups(backupList.backups ?? []);
@@ -106,13 +110,30 @@ export default function App() {
     }
   }
 
-  async function updateMemory(id: string, action: string) {
-    await desktopApi.updateMemory({ id, action, reason: 'desktop_ui' });
+  async function updateMemory(id: string, action: string, extra: Partial<MemoryRecord> = {}) {
+    await desktopApi.updateMemory({ id, action, reason: 'desktop_ui', content: extra.content, summary: extra.summary });
     await refreshAll();
   }
 
   async function decideConfirmation(id: string, approve: boolean) {
     await desktopApi.decideConfirmation({ id, approve, actor: 'desktop_admin', reason: approve ? 'approved_in_desktop' : 'rejected_in_desktop' });
+    await refreshAll();
+  }
+
+  async function setNodeDisabled(nodeID: string, disabled: boolean) {
+    if (disabled) {
+      await desktopApi.disableNode(nodeID);
+      setNotice(`Node disabled: ${nodeID}`);
+    } else {
+      await desktopApi.enableNode(nodeID);
+      setNotice(`Node enabled: ${nodeID}`);
+    }
+    await refreshAll();
+  }
+
+  async function rotateWorkerToken() {
+    const result = await desktopApi.generateWorkerToken();
+    setNotice(`Worker token rotated: ${result.token}`);
     await refreshAll();
   }
 
@@ -197,7 +218,7 @@ export default function App() {
         {!onboarding?.required && activeTab === 'trace' && <TraceDetail firstModelCall={firstModelCall} stepCount={stepCount} trace={trace} />}
         {!onboarding?.required && activeTab === 'system' && <SystemPanel health={health} />}
         {!onboarding?.required && activeTab === 'memory' && <MemoryPanel memories={memories} memoryQuery={memoryQuery} setMemoryQuery={setMemoryQuery} refreshAll={refreshAll} updateMemory={updateMemory} />}
-        {!onboarding?.required && activeTab === 'nodes' && <NodesPanel nodes={nodes} />}
+        {!onboarding?.required && activeTab === 'nodes' && <NodesPanel audit={gatewayAudit} nodes={nodes} rotateWorkerToken={rotateWorkerToken} setNodeDisabled={setNodeDisabled} />}
         {!onboarding?.required && activeTab === 'costs' && <CostsPanel calls={trace?.model_calls ?? []} usage={usage} health={health} />}
         {!onboarding?.required && activeTab === 'confirmations' && <ConfirmationsPanel confirmations={confirmations} decide={decideConfirmation} />}
         {!onboarding?.required && activeTab === 'settings' && <SettingsPanel refreshAll={refreshAll} secretStatus={secretStatus} setNotice={setNotice} settings={settings} />}
@@ -416,8 +437,16 @@ function MemoryPanel({
   memoryQuery: string;
   setMemoryQuery: (value: string) => void;
   refreshAll: () => Promise<void>;
-  updateMemory: (id: string, action: string) => Promise<void>;
+  updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
 }) {
+  const inbox = memories.filter((memory) => memory.status !== 'confirmed' || memory.confidence < 0.6 || Boolean(memory.conflict_group_id) || Boolean(memory.merged_into_memory_id));
+
+  async function editAndConfirm(memory: MemoryRecord) {
+    const edited = window.prompt('Edit memory before confirming', memory.content);
+    if (edited === null) return;
+    await updateMemory(memory.id, 'edit_confirm', { content: edited, summary: memory.summary });
+  }
+
   return (
     <section className="panel wide">
       <div className="section-header">
@@ -427,6 +456,28 @@ function MemoryPanel({
           <button type="button" onClick={refreshAll}>Search</button>
         </div>
       </div>
+      <h3>Memory Inbox</h3>
+      <div className="table">
+        {inbox.map((memory) => (
+          <article key={`inbox-${memory.id}`} className="row-card">
+            <div>
+              <strong>{memory.summary || memory.type}</strong>
+              <p>{memory.content}</p>
+              <small>{memory.status} · confidence {memory.confidence.toFixed(2)} · duplicate {memory.merged_into_memory_id || 'no'} · conflict {memory.conflict_group_id || 'no'}</small>
+            </div>
+            <div className="row-actions">
+              <button type="button" onClick={() => updateMemory(memory.id, 'confirm')}>Confirm</button>
+              <button type="button" onClick={() => editAndConfirm(memory)}>Edit & Confirm</button>
+              <button type="button" onClick={() => updateMemory(memory.id, 'mark_global')}>Global</button>
+              <button type="button" onClick={() => updateMemory(memory.id, 'mark_project')}>Project</button>
+              <button type="button" onClick={() => updateMemory(memory.id, 'disable')}>Disable</button>
+              <button type="button" onClick={() => updateMemory(memory.id, 'delete')}>Delete</button>
+            </div>
+          </article>
+        ))}
+        {inbox.length === 0 && <p className="empty">No pending memory candidates.</p>}
+      </div>
+      <h3>Confirmed & Search Results</h3>
       <div className="table">
         {memories.map((memory) => (
           <article key={memory.id} className="row-card">
@@ -451,10 +502,23 @@ function MemoryPanel({
   );
 }
 
-function NodesPanel({ nodes }: { nodes: NodeRecord[] }) {
+function NodesPanel({
+  nodes,
+  audit,
+  setNodeDisabled,
+  rotateWorkerToken,
+}: {
+  nodes: NodeRecord[];
+  audit: WorkerGatewayAuditRecord[];
+  setNodeDisabled: (nodeID: string, disabled: boolean) => Promise<void>;
+  rotateWorkerToken: () => Promise<void>;
+}) {
   return (
     <section className="panel wide">
-      <h2>Nodes</h2>
+      <div className="section-header">
+        <h2>Nodes</h2>
+        <button type="button" onClick={rotateWorkerToken}>Reset Worker Token</button>
+      </div>
       <div className="table">
         {nodes.map((node) => (
           <article key={node.id} className="row-card">
@@ -464,6 +528,23 @@ function NodesPanel({ nodes }: { nodes: NodeRecord[] }) {
               <small>auto {String(node.auto_assign_enabled)} · manual {String(node.manual_assign_enabled)}</small>
               <small>{(node.capabilities ?? []).join(', ')}</small>
             </div>
+            <div className="row-actions">
+              {node.status === 'disabled' ? (
+                <button type="button" onClick={() => setNodeDisabled(node.id, false)}>Enable</button>
+              ) : (
+                <button type="button" onClick={() => setNodeDisabled(node.id, true)}>Disable</button>
+              )}
+            </div>
+          </article>
+        ))}
+      </div>
+      <h3>Gateway Audit</h3>
+      <div className="table">
+        {audit.map((item) => (
+          <article key={item.id} className="row-card compact">
+            <strong>{item.node_id || 'unknown'} · {item.action} · {item.status}</strong>
+            <small>{item.reason}</small>
+            <small>{compact(item.metadata ?? {})}</small>
           </article>
         ))}
       </div>
@@ -538,6 +619,27 @@ function SettingsPanel({
   const [secretName, setSecretName] = useState('MODEL_API_KEY');
   const [secretValue, setSecretValue] = useState('');
   const [testStatus, setTestStatus] = useState('');
+  const [provider, setProvider] = useState(settings?.model_provider ?? 'openai_compatible');
+  const [baseURL, setBaseURL] = useState(settings?.model_base_url ?? 'https://api.deepseek.com');
+  const [modelName, setModelName] = useState(settings?.model_name ?? 'deepseek-chat');
+  const [telegramToken, setTelegramToken] = useState('');
+  const [telegramAllowed, setTelegramAllowed] = useState(settings?.telegram_allowed_user_ids ?? '');
+  const [telegramEnabled, setTelegramEnabled] = useState(settings?.telegram_enabled ?? false);
+  const [telegramChatID, setTelegramChatID] = useState('');
+  const [workerGatewayEnabled, setWorkerGatewayEnabled] = useState(settings?.worker_gateway_enabled ?? true);
+  const [backupDir, setBackupDir] = useState(settings?.backup_dir ?? '');
+  const [autoBackupEnabled, setAutoBackupEnabled] = useState(settings?.auto_backup_enabled ?? false);
+
+  useEffect(() => {
+    setProvider(settings?.model_provider ?? 'openai_compatible');
+    setBaseURL(settings?.model_base_url ?? 'https://api.deepseek.com');
+    setModelName(settings?.model_name ?? 'deepseek-chat');
+    setTelegramAllowed(settings?.telegram_allowed_user_ids ?? '');
+    setTelegramEnabled(settings?.telegram_enabled ?? false);
+    setWorkerGatewayEnabled(settings?.worker_gateway_enabled ?? true);
+    setBackupDir(settings?.backup_dir ?? '');
+    setAutoBackupEnabled(settings?.auto_backup_enabled ?? false);
+  }, [settings?.model_provider, settings?.model_base_url, settings?.model_name, settings?.telegram_allowed_user_ids, settings?.telegram_enabled, settings?.worker_gateway_enabled, settings?.backup_dir, settings?.auto_backup_enabled]);
 
   async function saveSecret() {
     await desktopApi.saveSecret({ name: secretName, value: secretValue });
@@ -551,15 +653,50 @@ function SettingsPanel({
     setTestStatus(`model: ${result.status}${result.error_summary ? ` · ${result.error_summary}` : ''}`);
   }
 
+  async function saveModel() {
+    await desktopApi.saveModelConfig({ provider, base_url: baseURL, name: modelName, timeout_seconds: 60, max_retries: 1 });
+    setNotice('Model provider saved');
+    await refreshAll();
+  }
+
+  async function saveOperationalSettings() {
+    await desktopApi.saveOperationalSettings({
+      telegram_enabled: telegramEnabled,
+      telegram_allowed_user_ids: telegramAllowed,
+      worker_gateway_enabled: workerGatewayEnabled,
+      backup_dir: backupDir,
+      auto_backup_enabled: autoBackupEnabled,
+    });
+    setNotice('Desktop settings saved');
+    await refreshAll();
+  }
+
+  async function saveTelegram() {
+    await desktopApi.saveTelegramConfig({ token: telegramToken, allowed_user_ids: telegramAllowed, enabled: telegramEnabled });
+    setTelegramToken('');
+    setNotice('Telegram config saved');
+    await refreshAll();
+  }
+
   async function testTelegram() {
     const result = await desktopApi.testTelegramConnection();
     setTestStatus(`telegram: ${result.status}${result.error_summary ? ` · ${result.error_summary}` : ''}`);
+  }
+
+  async function sendTelegramTest() {
+    const result = await desktopApi.sendTestTelegramMessage({ chat_id: telegramChatID, message: 'Joi Desktop Telegram test' });
+    setTestStatus(`telegram message: ${result.status}${result.error_summary ? ` · ${result.error_summary}` : ''}`);
   }
 
   async function generateWorkerToken() {
     const result = await desktopApi.generateWorkerToken();
     setNotice(`Worker token generated: ${result.token}`);
     await refreshAll();
+  }
+
+  async function exportDiagnostics() {
+    const result = await desktopApi.exportDiagnostics();
+    setNotice(`Diagnostics exported: ${result.path}`);
   }
 
   return (
@@ -577,6 +714,68 @@ function SettingsPanel({
         <KV label="Worker Gateway" value={settings?.worker_gateway ?? ''} />
       </dl>
       <div className="settings-grid">
+        <section>
+          <h3>Model Provider</h3>
+          <div className="control-row">
+            <label>
+              Provider
+              <input value={provider} onChange={(event) => setProvider(event.target.value)} />
+            </label>
+            <label>
+              Base URL
+              <input value={baseURL} onChange={(event) => setBaseURL(event.target.value)} />
+            </label>
+            <label>
+              Model
+              <input value={modelName} onChange={(event) => setModelName(event.target.value)} />
+            </label>
+            <button type="button" onClick={saveModel}>Save Provider</button>
+          </div>
+        </section>
+        <section>
+          <h3>Telegram</h3>
+          <div className="control-row">
+            <label className="check">
+              <input checked={telegramEnabled} type="checkbox" onChange={(event) => setTelegramEnabled(event.target.checked)} />
+              enabled
+            </label>
+            <label>
+              Bot Token
+              <input type="password" value={telegramToken} onChange={(event) => setTelegramToken(event.target.value)} />
+            </label>
+            <label>
+              Allowed User IDs
+              <input value={telegramAllowed} onChange={(event) => setTelegramAllowed(event.target.value)} />
+            </label>
+            <button type="button" onClick={saveTelegram}>Save Telegram</button>
+          </div>
+          <div className="control-row">
+            <label>
+              Test Chat ID
+              <input value={telegramChatID} onChange={(event) => setTelegramChatID(event.target.value)} />
+            </label>
+            <button type="button" onClick={testTelegram}>Test Bot</button>
+            <button type="button" onClick={sendTelegramTest}>Send Test Message</button>
+          </div>
+        </section>
+        <section>
+          <h3>Runtime</h3>
+          <div className="control-row">
+            <label className="check">
+              <input checked={workerGatewayEnabled} type="checkbox" onChange={(event) => setWorkerGatewayEnabled(event.target.checked)} />
+              worker gateway
+            </label>
+            <label className="check">
+              <input checked={autoBackupEnabled} type="checkbox" onChange={(event) => setAutoBackupEnabled(event.target.checked)} />
+              auto backup
+            </label>
+            <label>
+              Backup Path
+              <input value={backupDir} onChange={(event) => setBackupDir(event.target.value)} />
+            </label>
+            <button type="button" onClick={saveOperationalSettings}>Save Runtime</button>
+          </div>
+        </section>
         <section>
           <h3>Secrets</h3>
           <div className="control-row">
@@ -606,13 +805,13 @@ function SettingsPanel({
           <h3>Connection Tests</h3>
           <div className="control-row">
             <button type="button" onClick={testModel}>Test Model</button>
-            <button type="button" onClick={testTelegram}>Test Telegram</button>
             <button type="button" onClick={generateWorkerToken}>Generate Worker Token</button>
+            <button type="button" onClick={exportDiagnostics}>Export Diagnostics</button>
           </div>
           {testStatus && <p className="empty">{testStatus}</p>}
         </section>
       </div>
-      <JsonPreview value={{ sqlite_path: settings?.sqlite_path, backup_dir: settings?.backup_dir, model_base_url: settings?.model_base_url }} />
+      <JsonPreview value={{ sqlite_path: settings?.sqlite_path, log_dir: settings?.log_dir, backup_dir: settings?.backup_dir, model_base_url: settings?.model_base_url }} />
     </section>
   );
 }

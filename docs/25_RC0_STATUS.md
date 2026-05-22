@@ -2,6 +2,8 @@
 
 Status date: 2026-05-23
 Release tag target: `rc0-local-real-loop`
+Desktop validation tag: `desktop-rc0-validation`
+Desktop validation commit: `2634854`
 
 ## Completed Capabilities
 
@@ -27,6 +29,7 @@ Release tag target: `rc0-local-real-loop`
 - Current VPS worker: `vps-la-1` on the RackNerd/Coolify host.
 - Current remote worker network: public SSH reverse tunnel to private Postgres/NATS endpoints; database and queue are not exposed directly.
 - Current remote worker allowed capabilities: `web_research_v1`, `fetch_url`, `server_diagnose_self`, `system_health_check_self`.
+- Desktop Gateway remote worker path: `vps-la-1` verified through Desktop Worker Gateway with `assignment_reason=user_selected`.
 
 ## Verification Flags
 
@@ -39,6 +42,10 @@ Release tag target: `rc0-local-real-loop`
 - console_external_auth_verified=true
 - reboot_acceptance_script_current_session_passed=true
 - smoke_soak_verified=true
+- desktop_gateway_vps_verified=true
+- first_run_onboarding_verified=true
+- desktop_backup_restore_verified=true
+- desktop_rc0_validation_commit=2634854
 
 ## Unverified Items
 
@@ -124,3 +131,4 @@ Backups include PostgreSQL, configs, prompts, runtime yaml, memory jsonl, agent 
 ## Tagging
 
 `rc0-local-real-loop` should point at the commit that contains this RC0 state document and the RC0 acceptance scripts.
+`desktop-rc0-validation` points at `2634854 Complete desktop RC0 validation`.

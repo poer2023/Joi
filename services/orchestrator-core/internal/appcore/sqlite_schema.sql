@@ -292,6 +292,22 @@ CREATE TABLE IF NOT EXISTS task_attempts (
   finished_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS worker_gateway_nonces (
+  nonce TEXT PRIMARY KEY,
+  node_id TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS worker_gateway_audit_logs (
+  id TEXT PRIMARY KEY,
+  node_id TEXT,
+  action TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS tool_runs (
   id TEXT PRIMARY KEY,
   run_id TEXT REFERENCES runs(id),
@@ -436,6 +452,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_assign_enabled ON nodes(status, auto_assign
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_claim_pending ON tasks(status, assigned_node_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_attempts_task_id ON task_attempts(task_id, attempt_number);
+CREATE INDEX IF NOT EXISTS idx_worker_gateway_audit_node ON worker_gateway_audit_logs(node_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_run_id ON tool_runs(run_id);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_node_id ON tool_runs(node_id);
 CREATE INDEX IF NOT EXISTS idx_memory_usage_run_id ON memory_usage_logs(run_id);

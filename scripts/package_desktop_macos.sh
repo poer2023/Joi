@@ -4,7 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${APP_VERSION:-0.1.0-rc0}"
 DIST_DIR="$ROOT_DIR/dist/desktop"
-APP_BUNDLE="$ROOT_DIR/apps/joi-desktop/build/bin/joi-desktop.app"
+APP_BUNDLE="$ROOT_DIR/apps/joi-desktop/build/bin/Joi.app"
+if [[ ! -d "$APP_BUNDLE" ]]; then
+  APP_BUNDLE="$ROOT_DIR/apps/joi-desktop/build/bin/joi-desktop.app"
+fi
 PACKAGE="$DIST_DIR/Joi-$VERSION-macos-arm64.zip"
 MANIFEST="$DIST_DIR/Joi-$VERSION-macos-arm64.manifest.json"
 

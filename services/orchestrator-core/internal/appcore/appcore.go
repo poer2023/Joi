@@ -1,6 +1,7 @@
 package appcore
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -63,14 +65,29 @@ type MemoryListResponse struct {
 type NodeListResponse struct {
 	Nodes []store.NodeRecord `json:"nodes"`
 }
+type WorkerGatewayAuditRecord struct {
+	ID        string         `json:"id"`
+	NodeID    string         `json:"node_id"`
+	Action    string         `json:"action"`
+	Status    string         `json:"status"`
+	Reason    string         `json:"reason"`
+	Metadata  map[string]any `json:"metadata"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+type WorkerGatewayAuditResponse struct {
+	Items []WorkerGatewayAuditRecord `json:"items"`
+}
 type SystemHealthResponse = store.SystemHealthRecord
 type MemoryActionRequest struct {
-	ID       string `json:"id"`
-	Action   string `json:"action"`
-	Feedback string `json:"feedback"`
-	Comment  string `json:"comment"`
-	TargetID string `json:"target_id"`
-	Reason   string `json:"reason"`
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+	Feedback  string `json:"feedback"`
+	Comment   string `json:"comment"`
+	TargetID  string `json:"target_id"`
+	Reason    string `json:"reason"`
+	Content   string `json:"content"`
+	Summary   string `json:"summary"`
+	ScopeType string `json:"scope_type"`
 }
 type ConfirmationDecisionRequest struct {
 	ID      string `json:"id"`
@@ -97,19 +114,26 @@ type BackupListResponse struct {
 type BackupCreateResponse struct {
 	Path string `json:"path"`
 }
+type DiagnosticsExportResponse struct {
+	Path string `json:"path"`
+}
 type DesktopSettingsResponse struct {
-	Version         string `json:"version"`
-	AppMode         string `json:"app_mode"`
-	DataStore       string `json:"data_store"`
-	TaskQueue       string `json:"task_queue"`
-	SQLitePath      string `json:"sqlite_path"`
-	ModelProvider   string `json:"model_provider"`
-	ModelName       string `json:"model_name"`
-	ModelBaseURL    string `json:"model_base_url"`
-	TelegramEnabled bool   `json:"telegram_enabled"`
-	WorkerGateway   string `json:"worker_gateway"`
-	BackupDir       string `json:"backup_dir"`
-	DockerRequired  bool   `json:"docker_required"`
+	Version                string `json:"version"`
+	AppMode                string `json:"app_mode"`
+	DataStore              string `json:"data_store"`
+	TaskQueue              string `json:"task_queue"`
+	SQLitePath             string `json:"sqlite_path"`
+	LogDir                 string `json:"log_dir"`
+	ModelProvider          string `json:"model_provider"`
+	ModelName              string `json:"model_name"`
+	ModelBaseURL           string `json:"model_base_url"`
+	TelegramEnabled        bool   `json:"telegram_enabled"`
+	TelegramAllowedUserIDs string `json:"telegram_allowed_user_ids"`
+	WorkerGateway          string `json:"worker_gateway"`
+	WorkerGatewayEnabled   bool   `json:"worker_gateway_enabled"`
+	BackupDir              string `json:"backup_dir"`
+	AutoBackupEnabled      bool   `json:"auto_backup_enabled"`
+	DockerRequired         bool   `json:"docker_required"`
 }
 type DesktopModelConfigRequest struct {
 	Provider       string `json:"provider"`
@@ -117,6 +141,13 @@ type DesktopModelConfigRequest struct {
 	Name           string `json:"name"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	MaxRetries     int    `json:"max_retries"`
+}
+type DesktopOperationalSettingsRequest struct {
+	TelegramEnabled        bool   `json:"telegram_enabled"`
+	TelegramAllowedUserIDs string `json:"telegram_allowed_user_ids"`
+	WorkerGatewayEnabled   bool   `json:"worker_gateway_enabled"`
+	BackupDir              string `json:"backup_dir"`
+	AutoBackupEnabled      bool   `json:"auto_backup_enabled"`
 }
 type DesktopOnboardingCoreStatus struct {
 	Completed          bool `json:"completed"`
@@ -301,6 +332,71 @@ func (a *AppCore) ListNodes(ctx context.Context) (*NodeListResponse, error) {
 	return &NodeListResponse{Nodes: nodes}, nil
 }
 
+func (a *AppCore) DisableNode(ctx context.Context, nodeID string) error {
+	if a.db == nil {
+		return errors.New("appcore db is not available")
+	}
+	if strings.TrimSpace(nodeID) == "" {
+		return errors.New("node_id is required")
+	}
+	if !a.isSQLite() {
+		_, err := a.db.SQL().ExecContext(ctx, `UPDATE nodes SET status='disabled', auto_assign_enabled=false, manual_assign_enabled=false, updated_at=NOW() WHERE id=$1`, nodeID)
+		return err
+	}
+	_, err := a.db.SQL().ExecContext(ctx, `UPDATE nodes SET status='disabled', auto_assign_enabled=0, manual_assign_enabled=0, updated_at=datetime('now') WHERE id=?`, nodeID)
+	if err == nil {
+		_ = a.recordWorkerGatewayAudit(ctx, nodeID, "node_admin", "allowed", "node_disabled", map[string]any{"source": "desktop_ui"})
+	}
+	return err
+}
+
+func (a *AppCore) EnableNode(ctx context.Context, nodeID string) error {
+	if a.db == nil {
+		return errors.New("appcore db is not available")
+	}
+	if strings.TrimSpace(nodeID) == "" {
+		return errors.New("node_id is required")
+	}
+	if !a.isSQLite() {
+		_, err := a.db.SQL().ExecContext(ctx, `UPDATE nodes SET status='healthy', manual_assign_enabled=true, updated_at=NOW() WHERE id=$1`, nodeID)
+		return err
+	}
+	_, err := a.db.SQL().ExecContext(ctx, `UPDATE nodes SET status='healthy', manual_assign_enabled=1, updated_at=datetime('now') WHERE id=?`, nodeID)
+	if err == nil {
+		_ = a.recordWorkerGatewayAudit(ctx, nodeID, "node_admin", "allowed", "node_enabled", map[string]any{"source": "desktop_ui"})
+	}
+	return err
+}
+
+func (a *AppCore) ListWorkerGatewayAuditLogs(ctx context.Context, limit int) (*WorkerGatewayAuditResponse, error) {
+	if a.db == nil {
+		return nil, errors.New("appcore db is not available")
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	if !a.isSQLite() {
+		return &WorkerGatewayAuditResponse{Items: []WorkerGatewayAuditRecord{}}, nil
+	}
+	rows, err := a.db.SQL().QueryContext(ctx, `SELECT id, COALESCE(node_id,''), action, status, COALESCE(reason,''), metadata, created_at FROM worker_gateway_audit_logs ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkerGatewayAuditRecord{}
+	for rows.Next() {
+		var item WorkerGatewayAuditRecord
+		var metadataRaw, createdAt string
+		if err := rows.Scan(&item.ID, &item.NodeID, &item.Action, &item.Status, &item.Reason, &metadataRaw, &createdAt); err != nil {
+			return nil, err
+		}
+		item.Metadata = decodeObject([]byte(metadataRaw))
+		item.CreatedAt = parseSQLiteTime(createdAt)
+		items = append(items, item)
+	}
+	return &WorkerGatewayAuditResponse{Items: items}, rows.Err()
+}
+
 func (a *AppCore) GetSystemHealth(ctx context.Context) (*SystemHealthResponse, error) {
 	if a.db == nil {
 		return nil, errors.New("appcore db is not available")
@@ -349,6 +445,28 @@ func (a *AppCore) UpdateMemory(ctx context.Context, req MemoryActionRequest) err
 		return errors.New("desktop memory actions are currently implemented for SQLite mode")
 	}
 	switch req.Action {
+	case "confirm":
+		_, err := a.db.SQL().ExecContext(ctx, `UPDATE memories SET status='confirmed', updated_at=datetime('now') WHERE id=?`, req.ID)
+		return err
+	case "edit_confirm":
+		if strings.TrimSpace(req.Content) == "" {
+			return errors.New("edit_confirm requires content")
+		}
+		summary := req.Summary
+		if strings.TrimSpace(summary) == "" {
+			summary = truncate(req.Content, 120)
+		}
+		_, err := a.db.SQL().ExecContext(ctx, `UPDATE memories SET content=?, summary=?, status='confirmed', updated_at=datetime('now') WHERE id=?`, req.Content, summary, req.ID)
+		return err
+	case "delete":
+		_, err := a.db.SQL().ExecContext(ctx, `DELETE FROM memories WHERE id=?`, req.ID)
+		return err
+	case "mark_global":
+		_, err := a.db.SQL().ExecContext(ctx, `UPDATE memories SET scope_type='global', scope_id=NULL, updated_at=datetime('now') WHERE id=?`, req.ID)
+		return err
+	case "mark_project":
+		_, err := a.db.SQL().ExecContext(ctx, `UPDATE memories SET scope_type='project', scope_id=COALESCE(NULLIF(scope_id,''), 'default_project'), updated_at=datetime('now') WHERE id=?`, req.ID)
+		return err
 	case "pin":
 		_, err := a.db.SQL().ExecContext(ctx, `UPDATE memories SET pinned=1, updated_at=datetime('now') WHERE id=?`, req.ID)
 		return err
@@ -560,21 +678,95 @@ func (a *AppCore) RestoreBackup(ctx context.Context, backupPath string) error {
 	return manager.Restore(ctx, backupPath)
 }
 
+func (a *AppCore) ExportDiagnostics(ctx context.Context) (*DiagnosticsExportResponse, error) {
+	if a.db == nil {
+		return nil, errors.New("appcore db is not available")
+	}
+	dir := a.diagnosticsDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	stamp := time.Now().Format("20060102-150405")
+	path := filepath.Join(dir, "joi-diagnostics-"+stamp+".zip")
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	archive := zip.NewWriter(file)
+	defer archive.Close()
+
+	settings, _ := a.GetDesktopSettings(ctx)
+	health, _ := a.GetSystemHealth(ctx)
+	backups, _ := a.ListBackups(ctx)
+	nodes, _ := a.ListNodes(ctx)
+	modelUsage, _ := a.ModelUsageSummary(ctx)
+	manifest := map[string]any{
+		"generated_at":    time.Now().UTC().Format(time.RFC3339),
+		"app_version":     valueOrDefault(os.Getenv("APP_VERSION"), "0.1.0-rc0"),
+		"app_mode":        a.Config.App.Mode,
+		"goos":            runtime.GOOS,
+		"goarch":          runtime.GOARCH,
+		"data_directory":  filepath.Dir(a.Config.App.SQLitePath),
+		"sqlite_path":     a.Config.App.SQLitePath,
+		"secrets_policy":  "redacted; keychain and environment secret values are never exported",
+		"memory_policy":   "full memory text, prompt text, and model raw responses are redacted",
+		"diagnostics_v":   "desktop_diagnostics_v1",
+		"docker_required": a.Config.App.DockerRequired,
+	}
+	payloads := map[string]any{
+		"manifest.json":              manifest,
+		"settings.json":              settings,
+		"sqlite_health.json":         map[string]any{"ping": a.db.Ping(ctx) == nil, "driver": a.Config.App.DataStore},
+		"system_health.json":         health,
+		"recent_runs.json":           a.diagnosticRows(ctx, `SELECT id, status, COALESCE(selected_agent_id,'') AS selected_agent_id, COALESCE(selected_node_id,'') AS selected_node_id, started_at, finished_at, COALESCE(error_code,'') AS error_code, COALESCE(error_message,'') AS error_message, metadata FROM runs ORDER BY created_at DESC LIMIT 25`),
+		"recent_errors.json":         a.diagnosticRows(ctx, `SELECT 'run' AS source, id, COALESCE(error_code,'') AS error_code, COALESCE(error_message,'') AS error_message, created_at FROM runs WHERE error_code IS NOT NULL OR error_message IS NOT NULL ORDER BY created_at DESC LIMIT 50`),
+		"worker_status.json":         nodes,
+		"model_provider_status.json": map[string]any{"provider": a.Config.Model.Provider, "model": a.Config.Model.Name, "base_url": a.Config.Model.BaseURL, "usage": modelUsage},
+		"telegram_status.json":       map[string]any{"configured": os.Getenv("TELEGRAM_BOT_TOKEN") != "", "allowed_user_ids_configured": strings.TrimSpace(a.Config.Telegram.AllowedUserIDs) != ""},
+		"backup_status.json":         backups,
+		"last_100_run_steps.json":    a.diagnosticRows(ctx, `SELECT id, run_id, step_type, title, status, input, output, COALESCE(error,'') AS error, started_at, finished_at, created_at FROM run_steps ORDER BY created_at DESC LIMIT 100`),
+		"last_100_tool_runs.json":    a.diagnosticRows(ctx, `SELECT id, COALESCE(run_id,'') AS run_id, COALESCE(task_id,'') AS task_id, capability_id, workflow_name, tool_name, node_id, assignment_reason, risk_level, status, input, output, COALESCE(error,'') AS error, started_at, finished_at, created_at FROM tool_runs ORDER BY created_at DESC LIMIT 100`),
+		"last_100_model_calls.json":  a.diagnosticRows(ctx, `SELECT id, COALESCE(run_id,'') AS run_id, COALESCE(agent_id,'') AS agent_id, COALESCE(provider,'') AS provider, COALESCE(model_name,'') AS model_name, COALESCE(prompt_cache_key,'') AS prompt_cache_key, COALESCE(prefix_hash,'') AS prefix_hash, COALESCE(dynamic_tail_hash,'') AS dynamic_tail_hash, COALESCE(input_tokens,0) AS input_tokens, COALESCE(output_tokens,0) AS output_tokens, COALESCE(cached_input_tokens,0) AS cached_input_tokens, COALESCE(latency_ms,0) AS latency_ms, status, COALESCE(error_code,'') AS error_code, COALESCE(error_message,'') AS error_message, metadata, created_at FROM model_calls ORDER BY created_at DESC LIMIT 100`),
+	}
+	for name, payload := range payloads {
+		writer, err := archive.Create(name)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := json.MarshalIndent(sanitizeDiagnosticValue(payload), "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		if _, err := writer.Write(raw); err != nil {
+			return nil, err
+		}
+	}
+	return &DiagnosticsExportResponse{Path: path}, nil
+}
+
 func (a *AppCore) GetDesktopSettings(ctx context.Context) (*DesktopSettingsResponse, error) {
-	_ = ctx
+	telegramAllowed := valueOrDefault(a.desktopSettingOrDefault(ctx, "telegram.allowed_user_ids", ""), a.Config.Telegram.AllowedUserIDs)
+	telegramEnabled := a.desktopBoolSetting(ctx, "telegram.enabled", os.Getenv("TELEGRAM_BOT_TOKEN") != "" || strings.TrimSpace(telegramAllowed) != "")
+	workerGatewayEnabled := a.desktopBoolSetting(ctx, "worker_gateway.enabled", true)
+	autoBackupEnabled := a.desktopBoolSetting(ctx, "backup.auto_enabled", false)
 	return &DesktopSettingsResponse{
-		Version:         valueOrDefault(os.Getenv("APP_VERSION"), "0.1.0-rc0"),
-		AppMode:         a.Config.App.Mode,
-		DataStore:       a.Config.App.DataStore,
-		TaskQueue:       a.Config.TaskQueue.Driver,
-		SQLitePath:      a.Config.App.SQLitePath,
-		ModelProvider:   a.Config.Model.Provider,
-		ModelName:       a.Config.Model.Name,
-		ModelBaseURL:    a.Config.Model.BaseURL,
-		TelegramEnabled: os.Getenv("TELEGRAM_BOT_TOKEN") != "" || strings.TrimSpace(a.Config.Telegram.AllowedUserIDs) != "",
-		WorkerGateway:   "http://" + valueOrDefault(os.Getenv("WORKER_GATEWAY_ADDR"), "127.0.0.1:18081"),
-		BackupDir:       a.backupDir(),
-		DockerRequired:  a.Config.App.DockerRequired,
+		Version:                valueOrDefault(os.Getenv("APP_VERSION"), "0.1.0-rc0"),
+		AppMode:                a.Config.App.Mode,
+		DataStore:              a.Config.App.DataStore,
+		TaskQueue:              a.Config.TaskQueue.Driver,
+		SQLitePath:             a.Config.App.SQLitePath,
+		LogDir:                 filepath.Join(filepath.Dir(a.Config.App.SQLitePath), "logs"),
+		ModelProvider:          a.Config.Model.Provider,
+		ModelName:              a.Config.Model.Name,
+		ModelBaseURL:           a.Config.Model.BaseURL,
+		TelegramEnabled:        telegramEnabled,
+		TelegramAllowedUserIDs: telegramAllowed,
+		WorkerGateway:          "http://" + valueOrDefault(os.Getenv("WORKER_GATEWAY_ADDR"), "127.0.0.1:18081"),
+		WorkerGatewayEnabled:   workerGatewayEnabled,
+		BackupDir:              a.backupDir(),
+		AutoBackupEnabled:      autoBackupEnabled,
+		DockerRequired:         a.Config.App.DockerRequired,
 	}, nil
 }
 
@@ -609,6 +801,34 @@ func (a *AppCore) SaveDesktopModelConfig(ctx context.Context, req DesktopModelCo
 	return a.seedSQLiteRuntimeModel(ctx)
 }
 
+func (a *AppCore) SaveDesktopOperationalSettings(ctx context.Context, req DesktopOperationalSettingsRequest) error {
+	if !a.isSQLite() {
+		return errors.New("desktop operational settings are only available in SQLite mode")
+	}
+	settings := map[string]string{
+		"telegram.enabled":          boolString(req.TelegramEnabled),
+		"telegram.allowed_user_ids": strings.TrimSpace(req.TelegramAllowedUserIDs),
+		"worker_gateway.enabled":    boolString(req.WorkerGatewayEnabled),
+		"backup.auto_enabled":       boolString(req.AutoBackupEnabled),
+	}
+	if strings.TrimSpace(req.BackupDir) != "" {
+		settings["backup.dir"] = filepath.Clean(req.BackupDir)
+	}
+	for key, value := range settings {
+		if err := a.setDesktopSetting(ctx, key, value); err != nil {
+			return err
+		}
+	}
+	a.Config.Telegram.AllowedUserIDs = strings.TrimSpace(req.TelegramAllowedUserIDs)
+	if backupDir := strings.TrimSpace(req.BackupDir); backupDir != "" {
+		_ = os.Setenv("JOI_BACKUP_DIR", filepath.Clean(backupDir))
+	}
+	_ = os.Setenv("TELEGRAM_ALLOWED_USER_IDS", strings.TrimSpace(req.TelegramAllowedUserIDs))
+	_ = os.Setenv("WORKER_GATEWAY_ENABLED", boolString(req.WorkerGatewayEnabled))
+	_ = os.Setenv("JOI_AUTO_BACKUP_ENABLED", boolString(req.AutoBackupEnabled))
+	return nil
+}
+
 func (a *AppCore) CompleteOnboarding(ctx context.Context) error {
 	if !a.isSQLite() {
 		return errors.New("desktop onboarding is only available in SQLite mode")
@@ -637,7 +857,7 @@ func (a *AppCore) GetOnboardingCoreStatus(ctx context.Context) (*DesktopOnboardi
 
 func (a *AppCore) loadSQLiteRuntimeSettings(ctx context.Context) error {
 	settings := map[string]string{}
-	rows, err := a.db.SQL().QueryContext(ctx, `SELECT key, value FROM desktop_settings WHERE key LIKE 'model.%'`)
+	rows, err := a.db.SQL().QueryContext(ctx, `SELECT key, value FROM desktop_settings`)
 	if err != nil {
 		return err
 	}
@@ -658,6 +878,19 @@ func (a *AppCore) loadSQLiteRuntimeSettings(ctx context.Context) error {
 	timeoutSeconds := intFromString(settings["model.timeout_seconds"], a.Config.Model.TimeoutSeconds)
 	maxRetries := intFromString(settings["model.max_retries"], a.Config.Model.MaxRetries)
 	a.applyRuntimeModelConfig(settings["model.provider"], settings["model.base_url"], settings["model.name"], timeoutSeconds, maxRetries)
+	if value := strings.TrimSpace(settings["telegram.allowed_user_ids"]); value != "" {
+		a.Config.Telegram.AllowedUserIDs = value
+		_ = os.Setenv("TELEGRAM_ALLOWED_USER_IDS", value)
+	}
+	if value := strings.TrimSpace(settings["backup.dir"]); value != "" {
+		_ = os.Setenv("JOI_BACKUP_DIR", filepath.Clean(value))
+	}
+	if value := strings.TrimSpace(settings["worker_gateway.enabled"]); value != "" {
+		_ = os.Setenv("WORKER_GATEWAY_ENABLED", value)
+	}
+	if value := strings.TrimSpace(settings["backup.auto_enabled"]); value != "" {
+		_ = os.Setenv("JOI_AUTO_BACKUP_ENABLED", value)
+	}
 	return nil
 }
 
@@ -700,11 +933,144 @@ func (a *AppCore) getDesktopSetting(ctx context.Context, key string) (string, er
 }
 
 func (a *AppCore) backupDir() string {
+	if configured := strings.TrimSpace(os.Getenv("JOI_BACKUP_DIR")); configured != "" {
+		return configured
+	}
 	base := filepath.Dir(a.Config.App.SQLitePath)
 	if strings.TrimSpace(base) == "." || strings.TrimSpace(base) == "" {
 		base = filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "Joi")
 	}
 	return filepath.Join(base, "backups")
+}
+
+func (a *AppCore) desktopSettingOrDefault(ctx context.Context, key string, fallback string) string {
+	if !a.isSQLite() || a.db == nil {
+		return fallback
+	}
+	value, err := a.getDesktopSetting(ctx, key)
+	if err != nil || strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func (a *AppCore) desktopBoolSetting(ctx context.Context, key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(a.desktopSettingOrDefault(ctx, key, "")))
+	if value == "" {
+		return fallback
+	}
+	return value == "1" || value == "true" || value == "yes" || value == "enabled"
+}
+
+func boolString(value bool) string {
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
+func (a *AppCore) diagnosticsDir() string {
+	base := filepath.Dir(a.Config.App.SQLitePath)
+	if strings.TrimSpace(base) == "." || strings.TrimSpace(base) == "" {
+		base = filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "Joi")
+	}
+	return filepath.Join(base, "diagnostics")
+}
+
+func (a *AppCore) diagnosticRows(ctx context.Context, query string, args ...any) []map[string]any {
+	rows, err := a.db.SQL().QueryContext(ctx, query, args...)
+	if err != nil {
+		return []map[string]any{{"error": err.Error()}}
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return []map[string]any{{"error": err.Error()}}
+	}
+	result := []map[string]any{}
+	for rows.Next() {
+		values := make([]any, len(columns))
+		pointers := make([]any, len(columns))
+		for i := range values {
+			pointers[i] = &values[i]
+		}
+		if err := rows.Scan(pointers...); err != nil {
+			result = append(result, map[string]any{"error": err.Error()})
+			continue
+		}
+		item := map[string]any{}
+		for i, column := range columns {
+			item[column] = normalizeDiagnosticDBValue(values[i])
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func normalizeDiagnosticDBValue(value any) any {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case []byte:
+		return string(typed)
+	case time.Time:
+		return typed.UTC().Format(time.RFC3339)
+	default:
+		return typed
+	}
+}
+
+func sanitizeDiagnosticValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		result := map[string]any{}
+		for key, item := range typed {
+			if diagnosticSensitiveKey(key) {
+				result[key] = "[REDACTED]"
+				continue
+			}
+			result[key] = sanitizeDiagnosticValue(item)
+		}
+		return result
+	case []map[string]any:
+		result := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if sanitized, ok := sanitizeDiagnosticValue(item).(map[string]any); ok {
+				result = append(result, sanitized)
+			}
+		}
+		return result
+	case []any:
+		result := make([]any, 0, len(typed))
+		for _, item := range typed {
+			result = append(result, sanitizeDiagnosticValue(item))
+		}
+		return result
+	case string:
+		text := strings.TrimSpace(typed)
+		if strings.HasPrefix(text, "{") || strings.HasPrefix(text, "[") {
+			var parsed any
+			if err := json.Unmarshal([]byte(text), &parsed); err == nil {
+				return sanitizeDiagnosticValue(parsed)
+			}
+		}
+		if len(typed) > 600 {
+			return typed[:600] + "...[truncated]"
+		}
+		return typed
+	default:
+		return typed
+	}
+}
+
+func diagnosticSensitiveKey(key string) bool {
+	normalized := strings.ToLower(key)
+	for _, marker := range []string{"api_key", "apikey", "authorization", "bearer", "token", "secret", "password", "node_secret", "worker_token", "telegram_bot_token", "model_api_key", "cacheable_prefix", "dynamic_tail", "raw_response", "content", "memory", "prompt"} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *AppCore) DB() *store.DB {
@@ -1563,9 +1929,9 @@ func (a *AppCore) searchSQLiteMemories(ctx context.Context, params MemorySearchR
 	var rows *sql.Rows
 	var err error
 	if query == "" {
-		rows, err = a.db.SQL().QueryContext(ctx, `SELECT id, type, content, COALESCE(summary,''), scope_type, COALESCE(scope_id,''), privacy_level, confidence, status, source_event_ids, entities, success_count, failure_count, usage_count, positive_feedback, negative_feedback, pinned, disabled_at, COALESCE(merged_into_memory_id,''), COALESCE(conflict_group_id,''), COALESCE(conflict_reason,''), metadata, created_at, updated_at, last_used_at, 0.5 AS score FROM memories WHERE status IN ('confirmed','pending','conflicted') AND disabled_at IS NULL AND merged_into_memory_id IS NULL ORDER BY pinned DESC, confidence DESC, updated_at DESC LIMIT ?`, limit)
+		rows, err = a.db.SQL().QueryContext(ctx, `SELECT id, type, content, COALESCE(summary,''), scope_type, COALESCE(scope_id,''), privacy_level, confidence, status, source_event_ids, entities, success_count, failure_count, usage_count, positive_feedback, negative_feedback, pinned, disabled_at, COALESCE(merged_into_memory_id,''), COALESCE(conflict_group_id,''), COALESCE(conflict_reason,''), metadata, created_at, updated_at, last_used_at, 0.5 AS score FROM memories WHERE status='confirmed' AND disabled_at IS NULL AND merged_into_memory_id IS NULL ORDER BY pinned DESC, confidence DESC, updated_at DESC LIMIT ?`, limit)
 	} else {
-		rows, err = a.db.SQL().QueryContext(ctx, `SELECT m.id, m.type, m.content, COALESCE(m.summary,''), m.scope_type, COALESCE(m.scope_id,''), m.privacy_level, m.confidence, m.status, m.source_event_ids, m.entities, m.success_count, m.failure_count, m.usage_count, m.positive_feedback, m.negative_feedback, m.pinned, m.disabled_at, COALESCE(m.merged_into_memory_id,''), COALESCE(m.conflict_group_id,''), COALESCE(m.conflict_reason,''), m.metadata, m.created_at, m.updated_at, m.last_used_at, bm25(memory_fts) * -1 AS score FROM memory_fts JOIN memories m ON m.id = memory_fts.memory_id WHERE memory_fts MATCH ? AND m.status IN ('confirmed','pending','conflicted') AND m.disabled_at IS NULL AND m.merged_into_memory_id IS NULL ORDER BY m.pinned DESC, score DESC, m.confidence DESC LIMIT ?`, ftsQuery(query), limit)
+		rows, err = a.db.SQL().QueryContext(ctx, `SELECT m.id, m.type, m.content, COALESCE(m.summary,''), m.scope_type, COALESCE(m.scope_id,''), m.privacy_level, m.confidence, m.status, m.source_event_ids, m.entities, m.success_count, m.failure_count, m.usage_count, m.positive_feedback, m.negative_feedback, m.pinned, m.disabled_at, COALESCE(m.merged_into_memory_id,''), COALESCE(m.conflict_group_id,''), COALESCE(m.conflict_reason,''), m.metadata, m.created_at, m.updated_at, m.last_used_at, bm25(memory_fts) * -1 AS score FROM memory_fts JOIN memories m ON m.id = memory_fts.memory_id WHERE memory_fts MATCH ? AND m.status='confirmed' AND m.disabled_at IS NULL AND m.merged_into_memory_id IS NULL ORDER BY m.pinned DESC, score DESC, m.confidence DESC LIMIT ?`, ftsQuery(query), limit)
 	}
 	if err != nil {
 		return nil, err

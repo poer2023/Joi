@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -142,16 +143,32 @@ type DesktopMemory struct {
 }
 
 type DesktopMemoryActionRequest struct {
-	ID       string `json:"id"`
-	Action   string `json:"action"`
-	Feedback string `json:"feedback"`
-	Comment  string `json:"comment"`
-	TargetID string `json:"target_id"`
-	Reason   string `json:"reason"`
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+	Feedback  string `json:"feedback"`
+	Comment   string `json:"comment"`
+	TargetID  string `json:"target_id"`
+	Reason    string `json:"reason"`
+	Content   string `json:"content"`
+	Summary   string `json:"summary"`
+	ScopeType string `json:"scope_type"`
 }
 
 type DesktopNodeListResponse struct {
 	Nodes []DesktopNode `json:"nodes"`
+}
+
+type DesktopWorkerGatewayAuditResponse struct {
+	Items []DesktopWorkerGatewayAuditRecord `json:"items"`
+}
+
+type DesktopWorkerGatewayAuditRecord struct {
+	ID       string         `json:"id"`
+	NodeID   string         `json:"node_id"`
+	Action   string         `json:"action"`
+	Status   string         `json:"status"`
+	Reason   string         `json:"reason"`
+	Metadata map[string]any `json:"metadata"`
 }
 
 type DesktopNode struct {
@@ -211,19 +228,27 @@ type DesktopBackupCreateResponse struct {
 	Path string `json:"path"`
 }
 
+type DesktopDiagnosticsExportResponse struct {
+	Path string `json:"path"`
+}
+
 type DesktopSettingsResponse struct {
-	Version         string `json:"version"`
-	AppMode         string `json:"app_mode"`
-	DataStore       string `json:"data_store"`
-	TaskQueue       string `json:"task_queue"`
-	SQLitePath      string `json:"sqlite_path"`
-	ModelProvider   string `json:"model_provider"`
-	ModelName       string `json:"model_name"`
-	ModelBaseURL    string `json:"model_base_url"`
-	TelegramEnabled bool   `json:"telegram_enabled"`
-	WorkerGateway   string `json:"worker_gateway"`
-	BackupDir       string `json:"backup_dir"`
-	DockerRequired  bool   `json:"docker_required"`
+	Version                string `json:"version"`
+	AppMode                string `json:"app_mode"`
+	DataStore              string `json:"data_store"`
+	TaskQueue              string `json:"task_queue"`
+	SQLitePath             string `json:"sqlite_path"`
+	LogDir                 string `json:"log_dir"`
+	ModelProvider          string `json:"model_provider"`
+	ModelName              string `json:"model_name"`
+	ModelBaseURL           string `json:"model_base_url"`
+	TelegramEnabled        bool   `json:"telegram_enabled"`
+	TelegramAllowedUserIDs string `json:"telegram_allowed_user_ids"`
+	WorkerGateway          string `json:"worker_gateway"`
+	WorkerGatewayEnabled   bool   `json:"worker_gateway_enabled"`
+	BackupDir              string `json:"backup_dir"`
+	AutoBackupEnabled      bool   `json:"auto_backup_enabled"`
+	DockerRequired         bool   `json:"docker_required"`
 }
 
 type DesktopSecretRequest struct {
@@ -251,6 +276,25 @@ type DesktopModelConfigRequest struct {
 	Name           string `json:"name"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	MaxRetries     int    `json:"max_retries"`
+}
+
+type DesktopOperationalSettingsRequest struct {
+	TelegramEnabled        bool   `json:"telegram_enabled"`
+	TelegramAllowedUserIDs string `json:"telegram_allowed_user_ids"`
+	WorkerGatewayEnabled   bool   `json:"worker_gateway_enabled"`
+	BackupDir              string `json:"backup_dir"`
+	AutoBackupEnabled      bool   `json:"auto_backup_enabled"`
+}
+
+type DesktopTelegramConfigRequest struct {
+	Token          string `json:"token"`
+	AllowedUserIDs string `json:"allowed_user_ids"`
+	Enabled        bool   `json:"enabled"`
+}
+
+type DesktopTelegramTestMessageRequest struct {
+	ChatID  string `json:"chat_id"`
+	Message string `json:"message"`
 }
 
 type DesktopOnboardingStatusResponse struct {
@@ -360,7 +404,7 @@ func (a *DesktopApp) UpdateMemory(req DesktopMemoryActionRequest) error {
 	if err := a.ensureReady(); err != nil {
 		return err
 	}
-	return a.core.UpdateMemory(context.Background(), appcore.MemoryActionRequest{ID: req.ID, Action: req.Action, Feedback: req.Feedback, Comment: req.Comment, TargetID: req.TargetID, Reason: req.Reason})
+	return a.core.UpdateMemory(context.Background(), appcore.MemoryActionRequest{ID: req.ID, Action: req.Action, Feedback: req.Feedback, Comment: req.Comment, TargetID: req.TargetID, Reason: req.Reason, Content: req.Content, Summary: req.Summary, ScopeType: req.ScopeType})
 }
 
 func (a *DesktopApp) ListNodes() (*DesktopNodeListResponse, error) {
@@ -372,6 +416,35 @@ func (a *DesktopApp) ListNodes() (*DesktopNodeListResponse, error) {
 		return nil, err
 	}
 	return &DesktopNodeListResponse{Nodes: convertNodes(result.Nodes)}, nil
+}
+
+func (a *DesktopApp) DisableNode(nodeID string) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	return a.core.DisableNode(context.Background(), nodeID)
+}
+
+func (a *DesktopApp) EnableNode(nodeID string) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	return a.core.EnableNode(context.Background(), nodeID)
+}
+
+func (a *DesktopApp) ListWorkerGatewayAuditLogs() (*DesktopWorkerGatewayAuditResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.ListWorkerGatewayAuditLogs(context.Background(), 50)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]DesktopWorkerGatewayAuditRecord, 0, len(result.Items))
+	for _, item := range result.Items {
+		items = append(items, DesktopWorkerGatewayAuditRecord{ID: item.ID, NodeID: item.NodeID, Action: item.Action, Status: item.Status, Reason: item.Reason, Metadata: item.Metadata})
+	}
+	return &DesktopWorkerGatewayAuditResponse{Items: items}, nil
 }
 
 func (a *DesktopApp) GetSystemHealth() (*DesktopSystemHealthResponse, error) {
@@ -455,6 +528,17 @@ func (a *DesktopApp) RestoreBackup(path string) error {
 	return a.core.RestoreBackup(context.Background(), path)
 }
 
+func (a *DesktopApp) ExportDiagnostics() (*DesktopDiagnosticsExportResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.ExportDiagnostics(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopDiagnosticsExportResponse{Path: result.Path}, nil
+}
+
 func (a *DesktopApp) GetSettings() (*DesktopSettingsResponse, error) {
 	if err := a.ensureReady(); err != nil {
 		return nil, err
@@ -463,7 +547,7 @@ func (a *DesktopApp) GetSettings() (*DesktopSettingsResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DesktopSettingsResponse{Version: settings.Version, AppMode: settings.AppMode, DataStore: settings.DataStore, TaskQueue: settings.TaskQueue, SQLitePath: settings.SQLitePath, ModelProvider: settings.ModelProvider, ModelName: settings.ModelName, ModelBaseURL: settings.ModelBaseURL, TelegramEnabled: settings.TelegramEnabled, WorkerGateway: settings.WorkerGateway, BackupDir: settings.BackupDir, DockerRequired: settings.DockerRequired}, nil
+	return &DesktopSettingsResponse{Version: settings.Version, AppMode: settings.AppMode, DataStore: settings.DataStore, TaskQueue: settings.TaskQueue, SQLitePath: settings.SQLitePath, LogDir: settings.LogDir, ModelProvider: settings.ModelProvider, ModelName: settings.ModelName, ModelBaseURL: settings.ModelBaseURL, TelegramEnabled: settings.TelegramEnabled, TelegramAllowedUserIDs: settings.TelegramAllowedUserIDs, WorkerGateway: settings.WorkerGateway, WorkerGatewayEnabled: settings.WorkerGatewayEnabled, BackupDir: settings.BackupDir, AutoBackupEnabled: settings.AutoBackupEnabled, DockerRequired: settings.DockerRequired}, nil
 }
 
 func (a *DesktopApp) SaveModelConfig(req DesktopModelConfigRequest) error {
@@ -477,6 +561,27 @@ func (a *DesktopApp) SaveModelConfig(req DesktopModelConfigRequest) error {
 		TimeoutSeconds: req.TimeoutSeconds,
 		MaxRetries:     req.MaxRetries,
 	})
+}
+
+func (a *DesktopApp) SaveOperationalSettings(req DesktopOperationalSettingsRequest) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	return a.core.SaveDesktopOperationalSettings(context.Background(), appcore.DesktopOperationalSettingsRequest{TelegramEnabled: req.TelegramEnabled, TelegramAllowedUserIDs: req.TelegramAllowedUserIDs, WorkerGatewayEnabled: req.WorkerGatewayEnabled, BackupDir: req.BackupDir, AutoBackupEnabled: req.AutoBackupEnabled})
+}
+
+func (a *DesktopApp) SaveTelegramConfig(req DesktopTelegramConfigRequest) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(req.Token) != "" {
+		if err := keychainSet("TELEGRAM_BOT_TOKEN", strings.TrimSpace(req.Token)); err != nil {
+			return err
+		}
+		_ = os.Setenv("TELEGRAM_BOT_TOKEN", strings.TrimSpace(req.Token))
+	}
+	settings, _ := a.core.GetDesktopSettings(context.Background())
+	return a.core.SaveDesktopOperationalSettings(context.Background(), appcore.DesktopOperationalSettingsRequest{TelegramEnabled: req.Enabled, TelegramAllowedUserIDs: req.AllowedUserIDs, WorkerGatewayEnabled: settings == nil || settings.WorkerGatewayEnabled, BackupDir: valueOrDefault(settingsValue(settings, "backup_dir"), ""), AutoBackupEnabled: settings != nil && settings.AutoBackupEnabled})
 }
 
 func (a *DesktopApp) GetOnboardingStatus() (*DesktopOnboardingStatusResponse, error) {
@@ -602,6 +707,44 @@ func (a *DesktopApp) TestTelegramConnection() (*DesktopConnectionTestResponse, e
 	return &DesktopConnectionTestResponse{OK: true, Status: "succeeded"}, nil
 }
 
+func (a *DesktopApp) SendTestTelegramMessage(req DesktopTelegramTestMessageRequest) (*DesktopConnectionTestResponse, error) {
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if token == "" {
+		token, _ = keychainGet("TELEGRAM_BOT_TOKEN")
+	}
+	if token == "" {
+		return &DesktopConnectionTestResponse{OK: false, Status: "missing_token", ErrorSummary: "TELEGRAM_BOT_TOKEN is not configured"}, nil
+	}
+	chatID := strings.TrimSpace(req.ChatID)
+	if chatID == "" {
+		settings, _ := a.core.GetDesktopSettings(context.Background())
+		if settings != nil {
+			chatID = firstCSV(settings.TelegramAllowedUserIDs)
+		}
+	}
+	if chatID == "" {
+		return &DesktopConnectionTestResponse{OK: false, Status: "missing_chat_id", ErrorSummary: "No Telegram chat ID or allowed user ID configured"}, nil
+	}
+	message := valueOrDefault(req.Message, "Joi Desktop Telegram test")
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	body := strings.NewReader("chat_id=" + url.QueryEscape(chatID) + "&text=" + url.QueryEscape(message))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/sendMessage", body)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return &DesktopConnectionTestResponse{OK: false, Status: "failed", ErrorSummary: err.Error()}, nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &DesktopConnectionTestResponse{OK: false, Status: resp.Status, ErrorSummary: "telegram sendMessage returned non-2xx"}, nil
+	}
+	return &DesktopConnectionTestResponse{OK: true, Status: "succeeded"}, nil
+}
+
 func (a *DesktopApp) GenerateWorkerToken() (*DesktopWorkerTokenResponse, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
@@ -704,4 +847,32 @@ func keychainGet(account string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(string(output)), true
+}
+
+func settingsValue(settings *appcore.DesktopSettingsResponse, key string) string {
+	if settings == nil {
+		return ""
+	}
+	switch key {
+	case "backup_dir":
+		return settings.BackupDir
+	default:
+		return ""
+	}
+}
+
+func firstCSV(value string) string {
+	for _, item := range strings.Split(value, ",") {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func valueOrDefault(value string, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }

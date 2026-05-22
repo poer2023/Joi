@@ -103,7 +103,7 @@ func main() {
 }
 
 func runRemoteGatewayWorker(logger *slog.Logger, cfg runtimeConfig, nodeID string) {
-	client := &gatewayClient{baseURL: strings.TrimRight(cfg.Worker.GatewayURL, "/"), token: os.Getenv("WORKER_TOKEN"), http: &http.Client{Timeout: 30 * time.Second}}
+	client := &gatewayClient{baseURL: strings.TrimRight(cfg.Worker.GatewayURL, "/"), token: os.Getenv("WORKER_TOKEN"), nodeID: nodeID, http: &http.Client{Timeout: 30 * time.Second}}
 	if client.baseURL == "" {
 		logger.Error("remote gateway worker requires WORKER_GATEWAY_URL")
 		os.Exit(1)
@@ -148,6 +148,7 @@ func runRemoteGatewayWorker(logger *slog.Logger, cfg runtimeConfig, nodeID strin
 type gatewayClient struct {
 	baseURL string
 	token   string
+	nodeID  string
 	http    *http.Client
 }
 
@@ -185,6 +186,9 @@ func (c *gatewayClient) post(ctx context.Context, path string, payload any, resp
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Worker-Node-ID", c.nodeID)
+	req.Header.Set("X-Worker-Timestamp", time.Now().UTC().Format(time.RFC3339))
+	req.Header.Set("X-Worker-Nonce", randomGatewayNonce())
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
@@ -201,6 +205,14 @@ func (c *gatewayClient) post(ctx context.Context, path string, payload any, resp
 		return json.Unmarshal(body, response)
 	}
 	return nil
+}
+
+func randomGatewayNonce() string {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return hex.EncodeToString([]byte(time.Now().UTC().Format(time.RFC3339Nano)))
+	}
+	return hex.EncodeToString(raw)
 }
 
 type task struct {

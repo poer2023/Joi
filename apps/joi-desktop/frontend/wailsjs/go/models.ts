@@ -289,6 +289,18 @@ export namespace main {
 	        this.error_summary = source["error_summary"];
 	    }
 	}
+	export class DesktopDiagnosticsExportResponse {
+	    path: string;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopDiagnosticsExportResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	    }
+	}
 	export class DesktopMemory {
 	    id: string;
 	    type: string;
@@ -344,6 +356,9 @@ export namespace main {
 	    comment: string;
 	    target_id: string;
 	    reason: string;
+	    content: string;
+	    summary: string;
+	    scope_type: string;
 
 	    static createFrom(source: any = {}) {
 	        return new DesktopMemoryActionRequest(source);
@@ -357,6 +372,9 @@ export namespace main {
 	        this.comment = source["comment"];
 	        this.target_id = source["target_id"];
 	        this.reason = source["reason"];
+	        this.content = source["content"];
+	        this.summary = source["summary"];
+	        this.scope_type = source["scope_type"];
 	    }
 	}
 	export class DesktopMemoryContextPack {
@@ -550,6 +568,26 @@ export namespace main {
 	        this.missing = source["missing"];
 	    }
 	}
+	export class DesktopOperationalSettingsRequest {
+	    telegram_enabled: boolean;
+	    telegram_allowed_user_ids: string;
+	    worker_gateway_enabled: boolean;
+	    backup_dir: string;
+	    auto_backup_enabled: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopOperationalSettingsRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.telegram_enabled = source["telegram_enabled"];
+	        this.telegram_allowed_user_ids = source["telegram_allowed_user_ids"];
+	        this.worker_gateway_enabled = source["worker_gateway_enabled"];
+	        this.backup_dir = source["backup_dir"];
+	        this.auto_backup_enabled = source["auto_backup_enabled"];
+	    }
+	}
 	export class DesktopPromptAssembly {
 	    id: string;
 	    agent_id: string;
@@ -661,12 +699,16 @@ export namespace main {
 	    data_store: string;
 	    task_queue: string;
 	    sqlite_path: string;
+	    log_dir: string;
 	    model_provider: string;
 	    model_name: string;
 	    model_base_url: string;
 	    telegram_enabled: boolean;
+	    telegram_allowed_user_ids: string;
 	    worker_gateway: string;
+	    worker_gateway_enabled: boolean;
 	    backup_dir: string;
+	    auto_backup_enabled: boolean;
 	    docker_required: boolean;
 
 	    static createFrom(source: any = {}) {
@@ -680,12 +722,16 @@ export namespace main {
 	        this.data_store = source["data_store"];
 	        this.task_queue = source["task_queue"];
 	        this.sqlite_path = source["sqlite_path"];
+	        this.log_dir = source["log_dir"];
 	        this.model_provider = source["model_provider"];
 	        this.model_name = source["model_name"];
 	        this.model_base_url = source["model_base_url"];
 	        this.telegram_enabled = source["telegram_enabled"];
+	        this.telegram_allowed_user_ids = source["telegram_allowed_user_ids"];
 	        this.worker_gateway = source["worker_gateway"];
+	        this.worker_gateway_enabled = source["worker_gateway_enabled"];
 	        this.backup_dir = source["backup_dir"];
+	        this.auto_backup_enabled = source["auto_backup_enabled"];
 	        this.docker_required = source["docker_required"];
 	    }
 	}
@@ -711,6 +757,88 @@ export namespace main {
 	        this.tool_failure_rate = source["tool_failure_rate"];
 	        this.token_cost_today = source["token_cost_today"];
 	        this.warnings = source["warnings"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class DesktopTelegramConfigRequest {
+	    token: string;
+	    allowed_user_ids: string;
+	    enabled: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopTelegramConfigRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.token = source["token"];
+	        this.allowed_user_ids = source["allowed_user_ids"];
+	        this.enabled = source["enabled"];
+	    }
+	}
+	export class DesktopTelegramTestMessageRequest {
+	    chat_id: string;
+	    message: string;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopTelegramTestMessageRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.chat_id = source["chat_id"];
+	        this.message = source["message"];
+	    }
+	}
+	export class DesktopWorkerGatewayAuditRecord {
+	    id: string;
+	    node_id: string;
+	    action: string;
+	    status: string;
+	    reason: string;
+	    metadata: Record<string, any>;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopWorkerGatewayAuditRecord(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.node_id = source["node_id"];
+	        this.action = source["action"];
+	        this.status = source["status"];
+	        this.reason = source["reason"];
+	        this.metadata = source["metadata"];
+	    }
+	}
+	export class DesktopWorkerGatewayAuditResponse {
+	    items: DesktopWorkerGatewayAuditRecord[];
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopWorkerGatewayAuditResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.items = this.convertValues(source["items"], DesktopWorkerGatewayAuditRecord);
 	    }
 
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

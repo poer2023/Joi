@@ -8,6 +8,12 @@ export function CreateBackup():Promise<main.DesktopBackupCreateResponse>;
 
 export function DecideConfirmation(arg1:main.DesktopConfirmationDecisionRequest):Promise<void>;
 
+export function DisableNode(arg1:string):Promise<void>;
+
+export function EnableNode(arg1:string):Promise<void>;
+
+export function ExportDiagnostics():Promise<main.DesktopDiagnosticsExportResponse>;
+
 export function GenerateWorkerToken():Promise<main.DesktopWorkerTokenResponse>;
 
 export function GetModelUsage():Promise<main.DesktopModelUsageResponse>;
@@ -30,13 +36,21 @@ export function ListMemories(arg1:main.DesktopMemoryFilter):Promise<main.Desktop
 
 export function ListNodes():Promise<main.DesktopNodeListResponse>;
 
+export function ListWorkerGatewayAuditLogs():Promise<main.DesktopWorkerGatewayAuditResponse>;
+
 export function RestoreBackup(arg1:string):Promise<void>;
 
 export function SaveModelConfig(arg1:main.DesktopModelConfigRequest):Promise<void>;
 
+export function SaveOperationalSettings(arg1:main.DesktopOperationalSettingsRequest):Promise<void>;
+
 export function SaveSecret(arg1:main.DesktopSecretRequest):Promise<void>;
 
+export function SaveTelegramConfig(arg1:main.DesktopTelegramConfigRequest):Promise<void>;
+
 export function SendChat(arg1:main.DesktopChatRequest):Promise<main.DesktopChatResponse>;
+
+export function SendTestTelegramMessage(arg1:main.DesktopTelegramTestMessageRequest):Promise<main.DesktopConnectionTestResponse>;
 
 export function TestModelConnection():Promise<main.DesktopConnectionTestResponse>;
 

@@ -17,7 +17,10 @@ npm run build
 cd "$APP_DIR"
 go run github.com/wailsapp/wails/v2/cmd/wails@v2.10.2 build
 
-APP_BUNDLE="$APP_DIR/build/bin/joi-desktop.app"
+APP_BUNDLE="$APP_DIR/build/bin/Joi.app"
+if [[ ! -d "$APP_BUNDLE" ]]; then
+  APP_BUNDLE="$APP_DIR/build/bin/joi-desktop.app"
+fi
 test -d "$APP_BUNDLE"
 test -x "$APP_BUNDLE/Contents/MacOS/Joi"
 

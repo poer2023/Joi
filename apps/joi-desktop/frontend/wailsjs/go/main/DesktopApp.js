@@ -14,6 +14,18 @@ export function DecideConfirmation(arg1) {
   return window['go']['main']['DesktopApp']['DecideConfirmation'](arg1);
 }
 
+export function DisableNode(arg1) {
+  return window['go']['main']['DesktopApp']['DisableNode'](arg1);
+}
+
+export function EnableNode(arg1) {
+  return window['go']['main']['DesktopApp']['EnableNode'](arg1);
+}
+
+export function ExportDiagnostics() {
+  return window['go']['main']['DesktopApp']['ExportDiagnostics']();
+}
+
 export function GenerateWorkerToken() {
   return window['go']['main']['DesktopApp']['GenerateWorkerToken']();
 }
@@ -58,6 +70,10 @@ export function ListNodes() {
   return window['go']['main']['DesktopApp']['ListNodes']();
 }
 
+export function ListWorkerGatewayAuditLogs() {
+  return window['go']['main']['DesktopApp']['ListWorkerGatewayAuditLogs']();
+}
+
 export function RestoreBackup(arg1) {
   return window['go']['main']['DesktopApp']['RestoreBackup'](arg1);
 }
@@ -66,12 +82,24 @@ export function SaveModelConfig(arg1) {
   return window['go']['main']['DesktopApp']['SaveModelConfig'](arg1);
 }
 
+export function SaveOperationalSettings(arg1) {
+  return window['go']['main']['DesktopApp']['SaveOperationalSettings'](arg1);
+}
+
 export function SaveSecret(arg1) {
   return window['go']['main']['DesktopApp']['SaveSecret'](arg1);
 }
 
+export function SaveTelegramConfig(arg1) {
+  return window['go']['main']['DesktopApp']['SaveTelegramConfig'](arg1);
+}
+
 export function SendChat(arg1) {
   return window['go']['main']['DesktopApp']['SendChat'](arg1);
+}
+
+export function SendTestTelegramMessage(arg1) {
+  return window['go']['main']['DesktopApp']['SendTestTelegramMessage'](arg1);
 }
 
 export function TestModelConnection() {

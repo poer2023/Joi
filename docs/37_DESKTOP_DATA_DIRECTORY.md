@@ -20,6 +20,9 @@ Backups:
 
 Logs:
 ~/Library/Application Support/Joi/logs
+
+Diagnostics:
+~/Library/Application Support/Joi/diagnostics
 ```
 
 ## Secrets
@@ -41,6 +44,14 @@ ADMIN_TOKEN
 ```
 
 Secrets are not written to logs, normal backups, package manifests, or `.joibak` archives.
+
+Diagnostics exports are written as:
+
+```text
+joi-diagnostics-YYYYMMDD-HHMMSS.zip
+```
+
+They include version, mode, OS, SQLite health, recent run summaries, recent errors, worker status, model provider status, Telegram configured state, backup status, last 100 run steps, last 100 tool runs, and last 100 model calls. They redact API keys, Telegram bot tokens, worker/node secrets, prompt bodies, raw model responses, and full memory text.
 
 ## Backup Contents
 

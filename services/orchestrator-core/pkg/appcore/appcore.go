@@ -18,6 +18,8 @@ type MemorySearchResponse = internal.MemorySearchResponse
 type MemoryFilter = internal.MemoryFilter
 type MemoryListResponse = internal.MemoryListResponse
 type NodeListResponse = internal.NodeListResponse
+type WorkerGatewayAuditRecord = internal.WorkerGatewayAuditRecord
+type WorkerGatewayAuditResponse = internal.WorkerGatewayAuditResponse
 type SystemHealthResponse = internal.SystemHealthResponse
 type LifecycleManager = internal.LifecycleManager
 type ModelCallRecord = store.ModelCallRecord
@@ -29,8 +31,10 @@ type ModelUsageResponse = internal.ModelUsageResponse
 type BackupRecord = internal.BackupRecord
 type BackupListResponse = internal.BackupListResponse
 type BackupCreateResponse = internal.BackupCreateResponse
+type DiagnosticsExportResponse = internal.DiagnosticsExportResponse
 type DesktopSettingsResponse = internal.DesktopSettingsResponse
 type DesktopModelConfigRequest = internal.DesktopModelConfigRequest
+type DesktopOperationalSettingsRequest = internal.DesktopOperationalSettingsRequest
 type DesktopOnboardingCoreStatus = internal.DesktopOnboardingCoreStatus
 
 func NewAppCore(ctx context.Context, cfg runtimeconfig.Config, logger *slog.Logger) (*AppCore, error) {

@@ -61,62 +61,62 @@ Backups page now has restore entry
 
 ## Day 2
 
-Date:
+Date: 2026-05-24 scheduled
 
 ```text
-desktop_only:
-system_health_check:
-memory_write:
-memory_recall:
-web_research:
-server_diagnose:
-costs_visible:
-backup_created:
-confirmation_flow:
-remote_worker:
+desktop_only: pending calendar-day run
+system_health_check: pending
+memory_write: pending
+memory_recall: pending
+web_research: pending
+server_diagnose: pending
+costs_visible: pending
+backup_created: pending
+confirmation_flow: pending
+remote_worker: pending
 ```
 
 Issues:
 
 ```text
-must_return_to_cli:
-must_open_web_console:
-env_config_problem:
-memory_false_positive:
-memory_false_negative:
-trace_gap:
-ui_missing_function:
-worker_instability:
+must_return_to_cli: pending
+must_open_web_console: pending
+env_config_problem: pending
+memory_false_positive: pending
+memory_false_negative: pending
+trace_gap: pending
+ui_missing_function: Settings, diagnostics export, Telegram config, Worker token rotation, and Memory Inbox were hardened before this run
+worker_instability: pending
 ```
 
 ## Day 3
 
-Date:
+Date: 2026-05-25 scheduled
 
 ```text
-desktop_only:
-system_health_check:
-memory_write:
-memory_recall:
-web_research:
-server_diagnose:
-costs_visible:
-backup_created:
-confirmation_flow:
-remote_worker:
+desktop_only: pending calendar-day run
+system_health_check: pending
+memory_write: pending
+memory_recall: pending
+web_research: pending
+server_diagnose: pending
+costs_visible: pending
+backup_created: pending
+confirmation_flow: pending
+remote_worker: pending
 ```
 
 Issues:
 
 ```text
-must_return_to_cli:
-must_open_web_console:
-env_config_problem:
-memory_false_positive:
-memory_false_negative:
-trace_gap:
-ui_missing_function:
-worker_instability:
+must_return_to_cli: pending
+must_open_web_console: pending
+env_config_problem: pending
+memory_false_positive: pending
+memory_false_negative: pending
+trace_gap: pending
+ui_missing_function: pending
+worker_instability: pending
 ```
 
 ## Exit Criteria
