@@ -245,7 +245,7 @@ func safetyBlockForMessage(message string) safetyBlock {
 			Response: "confirmation_required：涉及 state_change 的操作必须先在 Console 创建并批准 confirmation request；不会执行绕过确认的请求。",
 		}
 	}
-	if containsAny(normalized, "rm -rf", "docker restart", "docker stop", "docker rm", "chmod ", "chown ", " restart ", " stop ") {
+	if containsAny(normalized, "rm -rf", "docker restart", "docker stop", "docker rm", "chmod ", "chown ", " restart ", " stop ", "file_write", "file write", "写入文件", "raw shell", "shell command", "执行 shell", "执行 sql", "raw sql") {
 		return safetyBlock{
 			Policy:   "rejected",
 			Reason:   "dangerous_state_change_or_destructive_command",
@@ -266,11 +266,11 @@ func safetyBlockForMessage(message string) safetyBlock {
 			Response: "permission_denied：Worker、Node 和 Telegram 访问必须经过授权校验，且 Worker 不允许读取完整长期记忆。",
 		}
 	}
-	if containsAny(normalized, "file://", "ftp://", "127.0.0.1", "localhost", "0.0.0.0", "169.254.169.254", "http://10.", "https://10.", "http://192.168.", "https://192.168.", "http://172.16.", "https://172.16.") {
+	if containsAny(normalized, "file://", "ftp://", "0.0.0.0", "169.254.169.254") {
 		return safetyBlock{
 			Policy:   "policy_blocked",
 			Reason:   "blocked_url_scheme_or_private_network_target",
-			Response: "policy_blocked：web_research 不允许访问 file://、ftp://、localhost、metadata IP 或私网地址。",
+			Response: "policy_blocked：web_research 不允许访问 file://、ftp://、metadata IP 或未指定地址；localhost/私网地址只能通过 web_research allowlist 策略放行。",
 		}
 	}
 	return safetyBlock{}
@@ -346,6 +346,41 @@ func finalAnswerForCapabilityResult(capability string, normalized map[string]any
 			abnormal = append(abnormal, "无")
 		}
 		return fmt.Sprintf("状态：%s。异常项：%s。关键服务：postgres、nats、orchestrator、console、worker-runtime 已检查。节点/队列/模型/成本摘要已写入 Run Trace。建议：如需排障，打开 Trace 查看 checks、recent_errors 和 thresholds。", status, strings.Join(abnormal, ", "))
+	case "workspace_search":
+		query := stringFromMap(normalized, "query", "")
+		summary := stringFromMap(normalized, "summary", "")
+		results := mapSliceFromAny(normalized["results"])
+		lines := []string{}
+		for i, item := range results {
+			if i >= 5 {
+				break
+			}
+			path := stringFromMap(item, "path", "unknown")
+			line := intFromMap(item, "line", 0)
+			snippet := truncateRunes(stringFromMap(item, "snippet", ""), 140)
+			lines = append(lines, fmt.Sprintf("%s:%d %s", path, line, snippet))
+		}
+		if len(lines) == 0 {
+			return fmt.Sprintf("搜索完成：未在授权 workspace 中找到 %q。完整 Run Trace 已记录 capability_requested、policy_checked、tool_compiled、node_selected、tool_started、tool_finished。", query)
+		}
+		return fmt.Sprintf("搜索完成：%s 前 %d 条：%s。完整 Run Trace 已记录文件、行号、摘要和执行链路。", summary, len(lines), strings.Join(lines, " | "))
+	case "file_analyze":
+		path := stringFromMap(normalized, "path", "unknown")
+		summary := stringFromMap(normalized, "summary", "")
+		extension := stringFromMap(normalized, "extension", "")
+		size := intFromMap(normalized, "size", 0)
+		truncated := boolFromMap(normalized, "truncated")
+		excerpts := mapSliceFromAny(normalized["excerpts"])
+		lines := []string{}
+		for i, item := range excerpts {
+			if i >= 6 {
+				break
+			}
+			line := intFromMap(item, "line", 0)
+			snippet := truncateRunes(stringFromMap(item, "snippet", ""), 160)
+			lines = append(lines, fmt.Sprintf("L%d %s", line, snippet))
+		}
+		return fmt.Sprintf("文件分析完成：%s，extension=%s，size=%d，truncated=%t。摘要：%s 关键摘录：%s", path, extension, size, truncated, summary, strings.Join(lines, " | "))
 	default:
 		return ""
 	}
@@ -376,6 +411,52 @@ func stringFromMap(values map[string]any, key string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func intFromMap(values map[string]any, key string, fallback int) int {
+	if values == nil {
+		return fallback
+	}
+	switch value := values[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case json.Number:
+		if parsed, err := value.Int64(); err == nil {
+			return int(parsed)
+		}
+	}
+	return fallback
+}
+
+func mapSliceFromAny(value any) []map[string]any {
+	switch typed := value.(type) {
+	case []map[string]any:
+		return typed
+	case []any:
+		items := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if mapped, ok := item.(map[string]any); ok {
+				items = append(items, mapped)
+			}
+		}
+		return items
+	case nil:
+		return nil
+	default:
+		raw, err := json.Marshal(typed)
+		if err != nil {
+			return nil
+		}
+		items := []map[string]any{}
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return nil
+		}
+		return items
+	}
 }
 
 func boolFromMap(values map[string]any, key string) bool {

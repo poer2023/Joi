@@ -25,6 +25,9 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
+var workerHTMLScriptPattern = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
+var workerHTMLStylePattern = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
+var workerHTMLNoScriptPattern = regexp.MustCompile(`(?is)<noscript[^>]*>.*?</noscript>`)
 var workerHTMLTagPattern = regexp.MustCompile(`<[^>]+>`)
 var workerLinkPattern = regexp.MustCompile(`href=["']([^"']+)["']`)
 
@@ -349,9 +352,11 @@ func diagnose(ctx context.Context, service string) map[string]any {
 func executeWorkerCapability(ctx context.Context, t task) map[string]any {
 	inputs, _ := t.Payload["inputs"].(map[string]any)
 	switch t.CapabilityID {
-	case "web_research":
+	case "web_research", "web_research_v1", "web_research_v2", "fetch_url":
 		url, _ := inputs["url"].(string)
 		return workerFetchURL(ctx, url)
+	case "system_health_check", "system_health_check_v1", "system_health_check_self":
+		return workerSystemHealthCheck()
 	default:
 		service := "unknown"
 		if value, ok := inputs["service_name"].(string); ok {
@@ -361,29 +366,57 @@ func executeWorkerCapability(ctx context.Context, t task) map[string]any {
 	}
 }
 
+func workerSystemHealthCheck() map[string]any {
+	return map[string]any{
+		"status": "completed",
+		"checks": map[string]any{
+			"worker_runtime": map[string]any{"ok": true, "source": "worker_process"},
+			"process":        map[string]any{"pid": os.Getpid(), "ok": true},
+		},
+		"mode": "system_health_check_v1_worker_readonly",
+	}
+}
+
 func workerFetchURL(ctx context.Context, url string) map[string]any {
 	if url == "" {
-		return map[string]any{"fetch_status": "failed", "error": "url is required", "mode": "web_research_v1_readonly_fetch"}
+		return map[string]any{"fetch_status": "failed", "error": "url is required", "mode": "web_research_v2_readonly_fetch"}
 	}
 	if blocked, reason := blockedWorkerURL(url); blocked {
-		return map[string]any{"url": url, "fetch_status": "policy_blocked", "reason": reason, "mode": "web_research_v1_readonly_fetch"}
+		return map[string]any{"url": url, "fetch_status": "policy_blocked", "reason": reason, "mode": "web_research_v2_readonly_fetch"}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return map[string]any{"url": url, "fetch_status": "failed", "error": err.Error(), "mode": "web_research_v1_readonly_fetch"}
+		return map[string]any{"url": url, "fetch_status": "failed", "error": err.Error(), "mode": "web_research_v2_readonly_fetch"}
 	}
 	req.Header.Set("User-Agent", "AgentOS-Worker-WebResearch/0.1")
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("redirect_limit_exceeded")
+			}
+			if blocked, reason := blockedWorkerURL(req.URL.String()); blocked {
+				return errors.New(reason)
+			}
+			return nil
+		},
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return map[string]any{"url": url, "fetch_status": "failed", "error": err.Error(), "mode": "web_research_v1_readonly_fetch"}
+		return map[string]any{"url": url, "fetch_status": "failed", "error": err.Error(), "mode": "web_research_v2_readonly_fetch"}
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024+1))
 	if err != nil {
-		return map[string]any{"url": url, "fetch_status": "failed", "status_code": resp.StatusCode, "error": err.Error(), "mode": "web_research_v1_readonly_fetch"}
+		return map[string]any{"url": url, "fetch_status": "failed", "status_code": resp.StatusCode, "error": err.Error(), "mode": "web_research_v2_readonly_fetch"}
+	}
+	truncated := false
+	if len(raw) > 1024*1024 {
+		raw = raw[:1024*1024]
+		truncated = true
 	}
 	body := string(raw)
-	text := strings.Join(strings.Fields(workerHTMLTagPattern.ReplaceAllString(body, " ")), " ")
+	text := workerReadableHTMLText(body)
 	if len(text) > 1200 {
 		text = text[:1200]
 	}
@@ -397,7 +430,14 @@ func workerFetchURL(ctx context.Context, url string) map[string]any {
 	if len(summary) > 280 {
 		summary = summary[:280]
 	}
-	return map[string]any{"url": url, "fetch_status": "succeeded", "status_code": resp.StatusCode, "content_type": resp.Header.Get("Content-Type"), "readable_text": text, "links": links, "summary": summary, "mode": "web_research_v1_readonly_fetch"}
+	return map[string]any{"url": url, "fetch_status": "succeeded", "status_code": resp.StatusCode, "content_type": resp.Header.Get("Content-Type"), "readable_text": text, "links": links, "summary": summary, "truncated": truncated, "mode": "web_research_v2_readonly_fetch"}
+}
+
+func workerReadableHTMLText(body string) string {
+	body = workerHTMLScriptPattern.ReplaceAllString(body, " ")
+	body = workerHTMLStylePattern.ReplaceAllString(body, " ")
+	body = workerHTMLNoScriptPattern.ReplaceAllString(body, " ")
+	return strings.Join(strings.Fields(workerHTMLTagPattern.ReplaceAllString(body, " ")), " ")
 }
 
 func blockedWorkerURL(rawURL string) (bool, string) {
@@ -414,11 +454,17 @@ func blockedWorkerURL(rawURL string) (bool, string) {
 	}
 	lowerHost := strings.ToLower(host)
 	if lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost") {
-		return true, "localhost_blocked"
+		return true, "private_host_not_allowed"
 	}
 	if ip, err := netip.ParseAddr(lowerHost); err == nil {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-			return true, "internal_ip_blocked"
+		if ip.IsUnspecified() {
+			return true, "unspecified_ip_blocked"
+		}
+		if ip == netip.MustParseAddr("169.254.169.254") || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return true, "metadata_ip_blocked"
+		}
+		if ip.IsLoopback() || ip.IsPrivate() {
+			return true, "private_host_not_allowed"
 		}
 	}
 	return false, ""
@@ -426,7 +472,10 @@ func blockedWorkerURL(rawURL string) (bool, string) {
 
 func workflowName(capabilityID string) string {
 	if capabilityID == "web_research" {
-		return "web_research_v1"
+		return "web_research_v2"
+	}
+	if capabilityID == "system_health_check" {
+		return "system_health_check_v1"
 	}
 	return "server_diagnose_v1"
 }
@@ -487,11 +536,12 @@ func validateWorkerAuthorization(cfg runtimeConfig, nodeID string) error {
 func capabilityAllowed(csv string, capabilityID string) bool {
 	allowed := csvValues(csv)
 	aliases := map[string][]string{
-		"web_research":         {"web_research", "web_research_v1", "fetch_url"},
+		"web_research":         {"web_research", "web_research_v1", "web_research_v2", "fetch_url"},
 		"server_diagnose":      {"server_diagnose", "server_diagnose_v1", "server_diagnose_self"},
 		"system_health_check":  {"system_health_check", "system_health_check_v1", "system_health_check_self"},
 		"simple_http_fetch":    {"simple_http_fetch", "fetch_url"},
-		"web_research_v1":      {"web_research", "web_research_v1", "fetch_url"},
+		"web_research_v1":      {"web_research", "web_research_v1", "web_research_v2", "fetch_url"},
+		"web_research_v2":      {"web_research", "web_research_v1", "web_research_v2", "fetch_url"},
 		"server_diagnose_self": {"server_diagnose", "server_diagnose_self"},
 	}
 	for _, item := range allowed {

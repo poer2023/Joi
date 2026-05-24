@@ -134,7 +134,123 @@ func (db *DB) SeedRegistryFromDir(ctx context.Context, configDir string) error {
 		}
 	}
 
+	if err := seedDefaultCapabilityKernel(ctx, tx); err != nil {
+		return err
+	}
+
 	return tx.Commit()
+}
+
+type toolSeed struct {
+	ID             string
+	Name           string
+	Description    string
+	RiskLevel      string
+	AllowedNodes   []string
+	TimeoutSeconds int
+}
+
+type workflowSeed struct {
+	ID           string
+	CapabilityID string
+	Name         string
+	Version      string
+	RiskLevel    string
+	Steps        []ToolWorkflowStep
+}
+
+func seedDefaultCapabilityKernel(ctx context.Context, tx *sql.Tx) error {
+	for _, capability := range []CapabilityRecord{
+		{ID: "memory_search", Name: "Memory Search", Description: "Search local memory context.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
+		{ID: "server_diagnose", Name: "Server Diagnose", Description: "Read-only server diagnostics.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
+		{ID: "system_health_check", Name: "System Health Check", Description: "Read-only Joi self-check.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
+		{ID: "web_research", Name: "Web Research", Description: "Read-only public HTTP/HTTPS research.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
+		{ID: "workspace_search", Name: "Workspace Search", Description: "Search authorized workspace source and documents.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
+		{ID: "file_analyze", Name: "File Analyze", Description: "Analyze an authorized workspace file.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
+	} {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO capabilities (id, name, description, risk_level, enabled, metadata)
+			VALUES ($1, $2, $3, $4, TRUE, $5)
+			ON CONFLICT (id) DO UPDATE SET
+				name = EXCLUDED.name,
+				description = EXCLUDED.description,
+				risk_level = EXCLUDED.risk_level,
+				enabled = EXCLUDED.enabled,
+				metadata = EXCLUDED.metadata,
+				updated_at = NOW()
+		`, capability.ID, capability.Name, capability.Description, capability.RiskLevel, mustJSON(capability.Metadata)); err != nil {
+			return err
+		}
+	}
+	for _, tool := range defaultToolSeeds() {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO tools (id, name, description, risk_level, allowed_nodes, timeout_seconds, enabled, metadata)
+			VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)
+			ON CONFLICT (id) DO UPDATE SET
+				name = EXCLUDED.name,
+				description = EXCLUDED.description,
+				risk_level = EXCLUDED.risk_level,
+				allowed_nodes = EXCLUDED.allowed_nodes,
+				timeout_seconds = EXCLUDED.timeout_seconds,
+				enabled = EXCLUDED.enabled,
+				metadata = EXCLUDED.metadata,
+				updated_at = NOW()
+		`, tool.ID, tool.Name, tool.Description, tool.RiskLevel, mustJSON(tool.AllowedNodes), tool.TimeoutSeconds, mustJSON(map[string]any{"kernel_default": true})); err != nil {
+			return err
+		}
+	}
+	for _, workflow := range defaultWorkflowSeeds() {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO tool_workflows (id, capability_id, name, version, risk_level, steps, enabled, metadata)
+			VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)
+			ON CONFLICT (id) DO UPDATE SET
+				capability_id = EXCLUDED.capability_id,
+				name = EXCLUDED.name,
+				version = EXCLUDED.version,
+				risk_level = EXCLUDED.risk_level,
+				steps = EXCLUDED.steps,
+				enabled = EXCLUDED.enabled,
+				metadata = EXCLUDED.metadata,
+				updated_at = NOW()
+		`, workflow.ID, workflow.CapabilityID, workflow.Name, workflow.Version, workflow.RiskLevel, mustJSON(workflow.Steps), mustJSON(map[string]any{"kernel_default": true})); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func defaultToolSeeds() []toolSeed {
+	return []toolSeed{
+		{ID: "memory_search_index", Name: "Memory Search Index", Description: "Read memory FTS index and build context excerpts.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 10},
+		{ID: "docker_list_containers", Name: "Docker List Containers", Description: "List containers with fixed read-only arguments.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 5},
+		{ID: "docker_inspect_container", Name: "Docker Inspect Container", Description: "Inspect a named container read-only.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 5},
+		{ID: "docker_read_logs", Name: "Docker Read Logs", Description: "Read bounded container logs.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 5},
+		{ID: "check_port", Name: "Check Port", Description: "Probe a TCP port without state changes.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 3},
+		{ID: "http_probe", Name: "HTTP Probe", Description: "Probe a URL with a bounded GET request.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 5},
+		{ID: "system_disk_usage", Name: "System Disk Usage", Description: "Read filesystem usage metadata.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 3},
+		{ID: "system_memory_usage", Name: "System Memory Usage", Description: "Read process memory metadata.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 3},
+		{ID: "postgres_ping", Name: "Postgres Ping", Description: "Read database health status.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 5},
+		{ID: "nats_port_check", Name: "NATS Port Check", Description: "Read NATS port reachability.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 3},
+		{ID: "console_http_probe", Name: "Console HTTP Probe", Description: "Probe console health endpoint.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 5},
+		{ID: "fetch_url", Name: "Fetch URL", Description: "Fetch a public HTTP/HTTPS URL with bounded redirects and response size.", RiskLevel: "read_only", AllowedNodes: []string{"main-node", "local-worker-1"}, TimeoutSeconds: 15},
+		{ID: "extract_readable_text", Name: "Extract Readable Text", Description: "Extract bounded readable text from fetched content.", RiskLevel: "read_only", AllowedNodes: []string{"main-node", "local-worker-1"}, TimeoutSeconds: 5},
+		{ID: "extract_links", Name: "Extract Links", Description: "Extract bounded links from fetched content.", RiskLevel: "read_only", AllowedNodes: []string{"main-node", "local-worker-1"}, TimeoutSeconds: 5},
+		{ID: "summarize_sources", Name: "Summarize Sources", Description: "Summarize fetched public content.", RiskLevel: "read_only", AllowedNodes: []string{"main-node", "local-worker-1"}, TimeoutSeconds: 5},
+		{ID: "workspace_walk_search", Name: "Workspace Walk Search", Description: "Search authorized workspace paths without arbitrary shell flags.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 10},
+		{ID: "file_read_authorized", Name: "File Read Authorized", Description: "Read a bounded authorized workspace file.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 10},
+		{ID: "file_summarize_excerpts", Name: "File Summarize Excerpts", Description: "Summarize bounded file excerpts.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 10},
+	}
+}
+
+func defaultWorkflowSeeds() []workflowSeed {
+	return []workflowSeed{
+		{ID: "workflow_memory_search_v1", CapabilityID: "memory_search", Name: "memory_search_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "memory_search_index", Args: map[string]any{}, RiskLevel: "read_only"}}},
+		{ID: "workflow_server_diagnose_v1", CapabilityID: "server_diagnose", Name: "server_diagnose_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "docker_list_containers", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "docker_inspect_container", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "docker_read_logs", Args: map[string]any{"tail": 200}, RiskLevel: "read_only"}, {Tool: "check_port", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "http_probe", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "system_disk_usage", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "system_memory_usage", Args: map[string]any{}, RiskLevel: "read_only"}}},
+		{ID: "workflow_system_health_check_v1", CapabilityID: "system_health_check", Name: "system_health_check_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "postgres_ping", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "nats_port_check", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "console_http_probe", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "system_disk_usage", Args: map[string]any{}, RiskLevel: "read_only"}}},
+		{ID: "workflow_web_research_v2", CapabilityID: "web_research", Name: "web_research_v2", Version: "v2", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "fetch_url", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "extract_readable_text", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "extract_links", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "summarize_sources", Args: map[string]any{}, RiskLevel: "read_only"}}},
+		{ID: "workflow_workspace_search_v1", CapabilityID: "workspace_search", Name: "workspace_search_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "workspace_walk_search", Args: map[string]any{}, RiskLevel: "read_only"}}},
+		{ID: "workflow_file_analyze_v1", CapabilityID: "file_analyze", Name: "file_analyze_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "file_read_authorized", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "file_summarize_excerpts", Args: map[string]any{}, RiskLevel: "read_only"}}},
+	}
 }
 
 func (db *DB) ListAgents(ctx context.Context) ([]AgentRecord, error) {

@@ -6,18 +6,20 @@ import (
 	"os"
 	"strings"
 
-	"github.com/hao/agent-os/services/orchestrator-core/internal/store"
+	"github.com/hao/agent-os/services/orchestrator-core/internal/appcore"
 )
 
-func NewRouter(db *store.DB, logger *slog.Logger) http.Handler {
+func NewRouter(core *appcore.AppCore, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
-	handlers := NewHandlers(db, logger)
+	handlers := NewHandlers(core, logger)
 
 	mux.HandleFunc("GET /health", handlers.Health)
 	mux.HandleFunc("GET /ready", handlers.Ready)
 	mux.HandleFunc("GET /metrics", handlers.Metrics)
 	mux.HandleFunc("GET /api/system-health", handlers.SystemHealth)
 	mux.HandleFunc("POST /api/chat/send", handlers.SendChat)
+	mux.HandleFunc("GET /api/conversations", handlers.ListConversations)
+	mux.HandleFunc("GET /api/conversations/{id}", handlers.GetConversation)
 	mux.HandleFunc("GET /api/runs/{id}", handlers.GetRun)
 	mux.HandleFunc("GET /api/runs/{id}/steps", handlers.GetRunSteps)
 	mux.HandleFunc("GET /api/agents", handlers.ListAgents)
@@ -28,6 +30,8 @@ func NewRouter(db *store.DB, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /api/memories/{id}/feedback", handlers.RecordMemoryFeedback)
 	mux.HandleFunc("PATCH /api/memories/{id}", handlers.UpdateMemoryGovernance)
 	mux.HandleFunc("GET /api/capabilities", handlers.ListCapabilities)
+	mux.HandleFunc("GET /api/tool-workflows", handlers.ListToolWorkflows)
+	mux.HandleFunc("GET /api/tool-runs", handlers.ListToolRuns)
 	mux.HandleFunc("POST /api/capabilities/{id}/test", handlers.TestCapability)
 	mux.HandleFunc("GET /api/model-calls", handlers.ListModelCalls)
 	mux.HandleFunc("GET /api/model-usage-summary", handlers.ModelUsageSummary)
@@ -65,8 +69,11 @@ func withAdminAuth(next http.Handler) http.Handler {
 func adminProtectedPath(path string) bool {
 	protectedPrefixes := []string{
 		"/api/runs/",
+		"/api/conversations",
 		"/api/memories",
 		"/api/nodes",
+		"/api/tool-workflows",
+		"/api/tool-runs",
 		"/api/model-calls",
 		"/api/model-usage-summary",
 		"/api/provider-cache-stats",

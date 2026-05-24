@@ -64,7 +64,7 @@ func createPromptAssembly(ctx context.Context, tx *sql.Tx, input PromptAssemblyI
 - Agent is a role; model is an execution engine.
 - The model must only output one JSON object with output_type: final_answer, capability_request, or memory_write_proposal.
 - final_answer schema: {"output_type":"final_answer","content":"..."}.
-- capability_request schema: {"output_type":"capability_request","capability":"server_diagnose|web_research|memory_search|system_health_check","goal":"...","inputs":{...},"risk":"read_only","confidence":0.0}.
+- capability_request schema: {"output_type":"capability_request","capability":"memory_search|server_diagnose|system_health_check|web_research|workspace_search|file_analyze","goal":"...","inputs":{...},"risk":"read_only","confidence":0.0}.
 - memory_write_proposal schema: {"output_type":"memory_write_proposal","memory":{"type":"...","content":"...","confidence":0.0}}.
 - The model must not output raw shell, SQL, file_write, service_restart, restart, stop, rm, delete, chmod, or chown for execution.
 - Tool access is only through capability_request and deterministic Tool Compiler.
@@ -90,7 +90,7 @@ open_issues: %s
 
 Tool Schema Version
 %s
-`, input.AgentID, agentName, description, systemPrompt, string(capabilitiesRaw), memoryProfileVersion, string(mustJSON(contextPack.Profile)), string(mustJSON(contextPack.ProjectFacts)), string(mustJSON(contextPack.Heuristics)), string(mustJSON(contextPack.AntiPatterns)), string(mustJSON(contextPack.OpenIssues)), toolSchemaVersion)
+`, input.AgentID, RedactSensitiveText(agentName), RedactSensitiveText(description), RedactSensitiveText(systemPrompt), string(capabilitiesRaw), memoryProfileVersion, string(mustJSON(SanitizeForTrace(contextPack.Profile))), string(mustJSON(SanitizeForTrace(contextPack.ProjectFacts))), string(mustJSON(SanitizeForTrace(contextPack.Heuristics))), string(mustJSON(SanitizeForTrace(contextPack.AntiPatterns))), string(mustJSON(SanitizeForTrace(contextPack.OpenIssues))), toolSchemaVersion)
 
 	routeRaw, _ := json.Marshal(input.RouteResult)
 	dynamicTail := fmt.Sprintf(`Current Run
@@ -108,7 +108,7 @@ Dynamic Memory Retrieval
 %s
 
 Return JSON only.
-`, input.RunID, input.AgentID, string(routeRaw), input.UserMessage, input.DynamicContext, string(mustJSON(contextPack.DynamicRetrieval)))
+`, input.RunID, input.AgentID, string(routeRaw), RedactSensitiveText(input.UserMessage), RedactSensitiveText(input.DynamicContext), string(mustJSON(SanitizeForTrace(contextPack.DynamicRetrieval))))
 
 	prefixHash := sha256Hex(cacheablePrefix)
 	dynamicTailHash := sha256Hex(dynamicTail)

@@ -12,6 +12,9 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/hao/agent-os/services/orchestrator-core/pkg/appcore"
+	"github.com/hao/agent-os/services/orchestrator-core/pkg/runtimeconfig"
 )
 
 func main() {
@@ -21,18 +24,33 @@ func main() {
 		logger.Error("TELEGRAM_BOT_TOKEN is required")
 		os.Exit(1)
 	}
+	ctx := context.Background()
 	gateway := gateway{
 		httpClient: &http.Client{Timeout: 75 * time.Second},
 		config:     config,
 		logger:     logger,
 	}
-	if err := gateway.run(context.Background()); err != nil {
+	if config.Mode == "desktop" {
+		core, err := newDesktopCore(ctx, logger)
+		if err != nil {
+			logger.Error("desktop appcore startup failed", "error", err)
+			os.Exit(1)
+		}
+		gateway.desktopCore = core
+	}
+	defer func() {
+		if gateway.desktopCore != nil {
+			_ = gateway.desktopCore.Shutdown(ctx)
+		}
+	}()
+	if err := gateway.run(ctx); err != nil {
 		logger.Error("telegram gateway stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
 type config struct {
+	Mode            string
 	Token           string
 	AdminToken      string
 	AllowedUserIDs  map[int64]bool
@@ -42,9 +60,10 @@ type config struct {
 }
 
 type gateway struct {
-	httpClient *http.Client
-	config     config
-	logger     *slog.Logger
+	httpClient  *http.Client
+	config      config
+	logger      *slog.Logger
+	desktopCore *appcore.AppCore
 }
 
 type telegramUpdateResponse struct {
@@ -99,7 +118,7 @@ type runDetail struct {
 	} `json:"tasks"`
 }
 
-func (g gateway) run(ctx context.Context) error {
+func (g *gateway) run(ctx context.Context) error {
 	offset := int64(0)
 	for {
 		updates, err := g.getUpdates(ctx, offset)
@@ -117,7 +136,7 @@ func (g gateway) run(ctx context.Context) error {
 	}
 }
 
-func (g gateway) handleUpdate(ctx context.Context, update telegramUpdate) {
+func (g *gateway) handleUpdate(ctx context.Context, update telegramUpdate) {
 	if update.Message == nil || strings.TrimSpace(update.Message.Text) == "" {
 		return
 	}
@@ -136,8 +155,7 @@ func (g gateway) handleUpdate(ctx context.Context, update telegramUpdate) {
 		return
 	}
 	nodeID := g.nodeForRun(ctx, result.RunID)
-	traceURL := strings.TrimRight(g.config.ConsoleBaseURL, "/") + "/?run_id=" + result.RunID
-	reply := fmt.Sprintf("结论：%s\n证据：%s / %s\n建议：需要更多细节时打开 Trace 查看 Run Trace、工具结果和模型调用。\nTrace：%s", compactTelegramText(result.Response), result.SelectedAgentID, nodeID, traceURL)
+	reply := fmt.Sprintf("结论：%s\n证据：%s / %s\n建议：需要更多细节时打开 Trace 查看 Run Trace、工具结果和模型调用。\nTrace：%s", compactTelegramText(result.Response), result.SelectedAgentID, nodeID, g.traceReference(result.RunID))
 	_ = g.sendMessage(ctx, message.Chat.ID, reply)
 }
 
@@ -149,11 +167,20 @@ func compactTelegramText(value string) string {
 	return value
 }
 
-func (g gateway) sendToOrchestrator(ctx context.Context, message *telegramMessage) (*chatResult, error) {
-	text := message.Text
-	if strings.TrimSpace(strings.ToLower(text)) == "/joi_status" {
-		text = "Joi 自检"
+func (g *gateway) sendToOrchestrator(ctx context.Context, message *telegramMessage) (*chatResult, error) {
+	if g.config.Mode == "desktop" {
+		return g.sendToDesktop(ctx, message)
 	}
+	result, err := g.sendToHTTPOrchestrator(ctx, message)
+	if err == nil || g.config.Mode == "http" || !shouldFallbackToDesktop(err) {
+		return result, err
+	}
+	g.logger.Warn("orchestrator request failed; falling back to desktop appcore", "error", err)
+	return g.sendToDesktop(ctx, message)
+}
+
+func (g *gateway) sendToHTTPOrchestrator(ctx context.Context, message *telegramMessage) (*chatResult, error) {
+	text := telegramChatText(message.Text)
 	body := map[string]any{
 		"channel": "telegram",
 		"message": text,
@@ -172,7 +199,43 @@ func (g gateway) sendToOrchestrator(ctx context.Context, message *telegramMessag
 	return &payload.Data, nil
 }
 
-func (g gateway) nodeForRun(ctx context.Context, runID string) string {
+func (g *gateway) sendToDesktop(ctx context.Context, message *telegramMessage) (*chatResult, error) {
+	core, err := g.ensureDesktopCore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result, err := core.SendChat(ctx, appcore.ChatRequest{
+		Channel:       "telegram",
+		UserID:        fmt.Sprintf("telegram:%d", message.From.ID),
+		Message:       telegramChatText(message.Text),
+		PreferredNode: "main-node",
+		AllowWorker:   false,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &chatResult{RunID: result.RunID, SelectedAgentID: result.SelectedAgentID, Response: result.Response}, nil
+}
+
+func telegramChatText(text string) string {
+	if strings.TrimSpace(strings.ToLower(text)) == "/joi_status" {
+		return "Joi 自检"
+	}
+	return text
+}
+
+func (g *gateway) nodeForRun(ctx context.Context, runID string) string {
+	if g.desktopCore != nil {
+		trace, err := g.desktopCore.GetRunTrace(ctx, runID)
+		if err == nil {
+			for _, task := range trace.Tasks {
+				if task.AssignedNodeID != "" {
+					return task.AssignedNodeID
+				}
+			}
+		}
+		return "main-node"
+	}
 	var payload apiResponse[runDetail]
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(g.config.OrchestratorURL, "/")+"/api/runs/"+runID, nil)
 	if err != nil {
@@ -200,7 +263,63 @@ func (g gateway) nodeForRun(ctx context.Context, runID string) string {
 	return "main-node"
 }
 
-func (g gateway) getUpdates(ctx context.Context, offset int64) ([]telegramUpdate, error) {
+func (g *gateway) traceReference(runID string) string {
+	if g.desktopCore != nil {
+		return "Joi Desktop Run Trace：" + runID
+	}
+	return strings.TrimRight(g.config.ConsoleBaseURL, "/") + "/?run_id=" + runID
+}
+
+func shouldFallbackToDesktop(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"database_error",
+		"failed to create chat run",
+		"connection refused",
+		"connect: connection refused",
+		"no such host",
+	} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *gateway) ensureDesktopCore(ctx context.Context) (*appcore.AppCore, error) {
+	if g.desktopCore != nil {
+		return g.desktopCore, nil
+	}
+	core, err := newDesktopCore(ctx, g.logger)
+	if err != nil {
+		return nil, err
+	}
+	g.desktopCore = core
+	return core, nil
+}
+
+func newDesktopCore(ctx context.Context, logger *slog.Logger) (*appcore.AppCore, error) {
+	cfg := runtimeconfig.Load()
+	cfg.App.Mode = "desktop"
+	cfg.App.DataStore = "sqlite"
+	cfg.App.DockerRequired = false
+	cfg.TaskQueue.Driver = "sqlite"
+	runtimeconfig.LogCheck(logger, cfg)
+	core, err := appcore.NewAppCore(ctx, cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+	if err := core.Start(ctx); err != nil {
+		_ = core.Shutdown(ctx)
+		return nil, err
+	}
+	return core, nil
+}
+
+func (g *gateway) getUpdates(ctx context.Context, offset int64) ([]telegramUpdate, error) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?timeout=%d&offset=%d&allowed_updates=[\"message\"]", g.config.Token, g.config.PollTimeoutSec, offset)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -225,13 +344,13 @@ func (g gateway) getUpdates(ctx context.Context, offset int64) ([]telegramUpdate
 	return payload.Result, nil
 }
 
-func (g gateway) sendMessage(ctx context.Context, chatID int64, text string) error {
+func (g *gateway) sendMessage(ctx context.Context, chatID int64, text string) error {
 	body := map[string]any{"chat_id": chatID, "text": text, "disable_web_page_preview": true}
 	var payload map[string]any
 	return g.postJSON(ctx, fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", g.config.Token), body, &payload)
 }
 
-func (g gateway) postJSON(ctx context.Context, url string, body any, target any) error {
+func (g *gateway) postJSON(ctx context.Context, url string, body any, target any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err

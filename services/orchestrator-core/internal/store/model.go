@@ -198,14 +198,23 @@ func callFallbackMock(request ModelRequest, reason string) *ModelResponse {
 func mockAgentRuntimeContent(dynamicTail string) string {
 	userMessage := extractUserMessage(dynamicTail)
 	lower := strings.ToLower(userMessage)
-	if strings.Contains(lower, ".env") || strings.Contains(lower, "api key") || strings.Contains(lower, "apikey") || strings.Contains(lower, "secret") || strings.Contains(lower, "node_secret") || strings.Contains(lower, "private key") || strings.Contains(lower, "ssh key") || strings.Contains(lower, ".ssh") || strings.Contains(lower, "/etc/passwd") || strings.Contains(lower, "/etc/shadow") || strings.Contains(lower, "密钥") || strings.Contains(lower, "完整 memory") || strings.Contains(lower, "full memory") || strings.Contains(lower, "non whitelist") || strings.Contains(lower, "非白名单") || strings.Contains(lower, "fake-node") || strings.Contains(lower, "伪造 node") || strings.Contains(lower, "注册 fake") || strings.Contains(lower, "file://") || strings.Contains(lower, "ftp://") || strings.Contains(lower, "localhost") || strings.Contains(lower, "127.0.0.1") || strings.Contains(lower, "0.0.0.0") || strings.Contains(lower, "169.254.169.254") || strings.Contains(lower, "内网") {
+	if strings.Contains(lower, ".env") || strings.Contains(lower, "api key") || strings.Contains(lower, "apikey") || strings.Contains(lower, "secret") || strings.Contains(lower, "node_secret") || strings.Contains(lower, "private key") || strings.Contains(lower, "ssh key") || strings.Contains(lower, ".ssh") || strings.Contains(lower, "/etc/passwd") || strings.Contains(lower, "/etc/shadow") || strings.Contains(lower, "密钥") || strings.Contains(lower, "完整 memory") || strings.Contains(lower, "full memory") || strings.Contains(lower, "non whitelist") || strings.Contains(lower, "非白名单") || strings.Contains(lower, "fake-node") || strings.Contains(lower, "伪造 node") || strings.Contains(lower, "注册 fake") || strings.Contains(lower, "file://") || strings.Contains(lower, "ftp://") || strings.Contains(lower, "内网") {
 		return `{"output_type":"final_answer","content":"已拒绝该请求：当前安全策略禁止读取密钥、完整长期记忆、伪造节点、非白名单入口、file:// 或内网地址；外部研究只能访问明确允许的公开 HTTP/HTTPS URL。"}`
 	}
-	if strings.Contains(lower, "restart") || strings.Contains(lower, " stop ") || strings.Contains(lower, " rm ") || strings.Contains(lower, "delete") || strings.Contains(lower, "chmod") || strings.Contains(lower, "chown") || strings.Contains(userMessage, "重启") || strings.Contains(userMessage, "停止") || strings.Contains(userMessage, "删除") {
+	if strings.Contains(lower, "restart") || strings.Contains(lower, " stop ") || strings.Contains(lower, " rm ") || strings.Contains(lower, "delete") || strings.Contains(lower, "chmod") || strings.Contains(lower, "chown") || strings.Contains(lower, "file_write") || strings.Contains(lower, "file write") || strings.Contains(lower, "raw shell") || strings.Contains(lower, "shell command") || strings.Contains(lower, "raw sql") || strings.Contains(userMessage, "重启") || strings.Contains(userMessage, "停止") || strings.Contains(userMessage, "删除") || strings.Contains(userMessage, "写入文件") || strings.Contains(userMessage, "执行 shell") || strings.Contains(userMessage, "执行 SQL") {
 		return `{"output_type":"final_answer","content":"已拒绝危险操作请求：当前阶段禁止 restart、stop、rm、write、delete、chmod、chown 等修改操作；如需诊断只能执行只读能力。"}`
 	}
 	lower = strings.ToLower(dynamicTail)
+	hasConfirmedRecall := strings.Contains(dynamicTail, "Confirmed Memories Available For This Reply\n- ")
+	if hasConfirmedRecall && strings.Contains(dynamicTail, "伙伴式前台") && strings.Contains(dynamicTail, "严肃执行后台") &&
+		!strings.Contains(userMessage, "记住") &&
+		(strings.Contains(userMessage, "记得") || strings.Contains(userMessage, "做成什么") || strings.Contains(userMessage, "方向")) {
+		return `{"output_type":"final_answer","content":"你想把 Joi 做成伙伴式前台 + 严肃执行后台：平时陪你想，严肃任务时能可追踪、可交付、可审计地干活。"}`
+	}
 	if strings.Contains(dynamicTail, "MEMORY_SEARCH_RESULT") {
+		if strings.Contains(dynamicTail, "伙伴式前台") && strings.Contains(dynamicTail, "严肃执行后台") {
+			return `{"output_type":"final_answer","content":"你想把 Joi 做成伙伴式前台 + 严肃执行后台：平时陪你想，严肃任务时能可追踪、可交付、可审计地干活。"}`
+		}
 		return `{"output_type":"final_answer","content":"根据已召回的记忆：轻量部署问题应优先考虑 Docker Compose，并避免默认推荐 Kubernetes。"}`
 	}
 	if strings.Contains(dynamicTail, "SERVER_DIAGNOSE_QUEUED") {
@@ -220,6 +229,12 @@ func mockAgentRuntimeContent(dynamicTail string) string {
 	if strings.Contains(dynamicTail, "SYSTEM_HEALTH_RESULT") {
 		return `{"output_type":"final_answer","content":"Joi 自检已完成。结果包含 postgres、nats、orchestrator、console、worker-runtime、磁盘和最近错误，详情已写入 Run Trace。"}`
 	}
+	if strings.Contains(lower, "当前项目") && (strings.Contains(lower, "run trace") || strings.Contains(dynamicTail, "Run Trace")) && (strings.Contains(dynamicTail, "找") || strings.Contains(lower, "search")) {
+		return `{"output_type":"capability_request","capability":"workspace_search","goal":"在授权 workspace 中搜索 Run Trace 设计文档","inputs":{"query":"Run Trace","root":"/Users/hao/Documents/Joi","glob":"*.md","max_results":20},"risk":"read_only","confidence":0.9}`
+	}
+	if strings.Contains(dynamicTail, "AGENTS.md") && (strings.Contains(dynamicTail, "读一下") || strings.Contains(lower, "read")) {
+		return `{"output_type":"capability_request","capability":"file_analyze","goal":"读取 AGENTS.md 并总结 capability 实现红线","inputs":{"path":"AGENTS.md","question":"总结 capability 实现不能违反哪些红线"},"risk":"read_only","confidence":0.9}`
+	}
 	if strings.Contains(lower, "joi 自检") || strings.Contains(lower, "系统自检") || strings.Contains(lower, "system health") || strings.Contains(lower, "健康检查") {
 		return `{"output_type":"capability_request","capability":"system_health_check","goal":"执行 Joi 只读系统自检","inputs":{},"risk":"read_only","confidence":0.9}`
 	}
@@ -231,6 +246,9 @@ func mockAgentRuntimeContent(dynamicTail string) string {
 	}
 	if url := firstURL(userMessage); url != "" {
 		return `{"output_type":"capability_request","capability":"web_research","goal":"读取并总结用户提供的 URL","inputs":{"url":"` + url + `"},"risk":"read_only","confidence":0.86}`
+	}
+	if strings.Contains(userMessage, "伙伴式前台") && strings.Contains(userMessage, "严肃执行后台") && strings.Contains(userMessage, "记住") {
+		return `{"output_type":"memory_write_proposal","memory":{"type":"project_fact","summary":"Joi 的产品方向","content":"用户希望把 Joi 做成伙伴式前台 + 严肃执行后台：平时陪用户想，严肃任务时能可追踪、可交付、可审计地干活。","confidence":0.92,"entities":["Joi","产品方向","伙伴式前台","严肃执行后台"]}}`
 	}
 	if strings.Contains(dynamicTail, "记忆") || strings.Contains(dynamicTail, "记住") {
 		return `{"output_type":"memory_write_proposal","memory":{"type":"user_preference","content":"用户希望把明确要求记住的偏好写入 Memory OS。","confidence":0.8}}`
@@ -354,6 +372,8 @@ func insertModelCall(ctx context.Context, tx *sql.Tx, assembly PromptAssemblyRec
 	modelName := request.ModelName
 	rawResponse := map[string]any{}
 	if response != nil {
+		response.Content = RedactSensitiveText(response.Content)
+		response.RawResponse = SanitizeForTrace(response.RawResponse).(map[string]any)
 		inputTokens = response.InputTokens
 		outputTokens = response.OutputTokens
 		cachedInputTokens = response.CachedInputTokens

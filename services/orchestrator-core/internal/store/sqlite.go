@@ -91,7 +91,8 @@ func (db *DB) SeedSQLiteDefaults(ctx context.Context) error {
 		  ('general_agent', 'General Agent', 'General purpose desktop agent.', 'mock-model', '["memory_search"]', '{"keywords":[]}', 1, '{"desktop_default":true}'),
 		  ('devops_agent', 'DevOps Agent', 'Read-only diagnostics agent.', 'mock-model', '["server_diagnose_v1","system_health_check_v1"]', '{"keywords":["服务","容器","诊断","自检"]}', 1, '{"desktop_default":true}'),
 		  ('research_agent', 'Research Agent', 'Read-only URL research agent.', 'mock-model', '["web_research_v1","fetch_url"]', '{"keywords":["http","https","url","research"]}', 1, '{"desktop_default":true}'),
-		  ('memory_agent', 'Memory Agent', 'Memory governance agent.', 'mock-model', '["memory_search","memory_write_proposal"]', '{"keywords":["记忆","偏好","之前"]}', 1, '{"desktop_default":true}')
+		  ('memory_agent', 'Memory Agent', 'Memory governance agent.', 'mock-model', '["memory_search","memory_write_proposal"]', '{"keywords":["记忆","偏好","之前"]}', 1, '{"desktop_default":true}'),
+		  ('product_agent', 'Product Agent', 'Product planning agent without tool execution by default.', 'mock-model', '[]', '{"keywords":["产品","优先级","roadmap","product"]}', 1, '{"desktop_default":true}')
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, default_model_id=excluded.default_model_id, capabilities=excluded.capabilities, route_hints=excluded.route_hints, enabled=excluded.enabled, updated_at=datetime('now');
 
 		INSERT INTO capabilities (id, name, description, risk_level, enabled, metadata)
@@ -101,9 +102,44 @@ func (db *DB) SeedSQLiteDefaults(ctx context.Context) error {
 		  ('server_diagnose_v1', 'Server Diagnose v1', 'Read-only server diagnostics.', 'read_only', 1, '{"desktop_default":true}'),
 		  ('system_health_check', 'System Health Check', 'Read-only Joi self-check capability alias.', 'read_only', 1, '{"desktop_default":true,"alias_for":"system_health_check_v1"}'),
 		  ('system_health_check_v1', 'System Health Check v1', 'Read-only Joi self-check.', 'read_only', 1, '{"desktop_default":true}'),
-		  ('web_research', 'Web Research', 'Read-only URL fetch capability alias.', 'read_only', 1, '{"desktop_default":true,"alias_for":"web_research_v1"}'),
-		  ('web_research_v1', 'Web Research v1', 'Read-only URL fetch and summarization.', 'read_only', 1, '{"desktop_default":true}')
+		  ('web_research', 'Web Research', 'Read-only URL fetch capability alias.', 'read_only', 1, '{"desktop_default":true,"alias_for":"web_research_v2"}'),
+		  ('web_research_v1', 'Web Research v1', 'Read-only URL fetch and summarization legacy alias.', 'read_only', 1, '{"desktop_default":true,"alias_for":"web_research_v2"}'),
+		  ('web_research_v2', 'Web Research v2', 'Read-only public HTTP/HTTPS fetch and summarization.', 'read_only', 1, '{"desktop_default":true}'),
+		  ('workspace_search', 'Workspace Search', 'Search authorized workspace source and documents.', 'read_only', 1, '{"desktop_default":true}'),
+		  ('file_analyze', 'File Analyze', 'Analyze an authorized workspace file.', 'read_only', 1, '{"desktop_default":true}')
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, risk_level=excluded.risk_level, enabled=excluded.enabled, updated_at=datetime('now');
+
+		INSERT INTO tools (id, name, description, risk_level, allowed_nodes, timeout_seconds, enabled, metadata)
+		VALUES
+		  ('memory_search_index', 'Memory Search Index', 'Read memory FTS index and build context excerpts.', 'read_only', '["main-node"]', 10, 1, '{"desktop_default":true}'),
+		  ('docker_list_containers', 'Docker List Containers', 'List containers with fixed read-only arguments.', 'read_only', '["main-node"]', 5, 1, '{"desktop_default":true}'),
+		  ('docker_inspect_container', 'Docker Inspect Container', 'Inspect a named container read-only.', 'read_only', '["main-node"]', 5, 1, '{"desktop_default":true}'),
+		  ('docker_read_logs', 'Docker Read Logs', 'Read bounded container logs.', 'read_only', '["main-node"]', 5, 1, '{"desktop_default":true}'),
+		  ('check_port', 'Check Port', 'Probe a TCP port without state changes.', 'read_only', '["main-node"]', 3, 1, '{"desktop_default":true}'),
+		  ('http_probe', 'HTTP Probe', 'Probe a URL with a bounded GET request.', 'read_only', '["main-node"]', 5, 1, '{"desktop_default":true}'),
+		  ('system_disk_usage', 'System Disk Usage', 'Read filesystem usage metadata.', 'read_only', '["main-node"]', 3, 1, '{"desktop_default":true}'),
+		  ('system_memory_usage', 'System Memory Usage', 'Read process memory metadata.', 'read_only', '["main-node"]', 3, 1, '{"desktop_default":true}'),
+		  ('postgres_ping', 'Postgres Ping', 'Read database health status.', 'read_only', '["main-node"]', 5, 1, '{"desktop_default":true}'),
+		  ('nats_port_check', 'NATS Port Check', 'Read NATS port reachability.', 'read_only', '["main-node"]', 3, 1, '{"desktop_default":true}'),
+		  ('console_http_probe', 'Console HTTP Probe', 'Probe console health endpoint.', 'read_only', '["main-node"]', 5, 1, '{"desktop_default":true}'),
+		  ('fetch_url', 'Fetch URL', 'Fetch a public HTTP/HTTPS URL with bounded redirects and response size.', 'read_only', '["main-node","local-worker-1"]', 15, 1, '{"desktop_default":true}'),
+		  ('extract_readable_text', 'Extract Readable Text', 'Extract bounded readable text from fetched content.', 'read_only', '["main-node","local-worker-1"]', 5, 1, '{"desktop_default":true}'),
+		  ('extract_links', 'Extract Links', 'Extract bounded links from fetched content.', 'read_only', '["main-node","local-worker-1"]', 5, 1, '{"desktop_default":true}'),
+		  ('summarize_sources', 'Summarize Sources', 'Summarize fetched public content.', 'read_only', '["main-node","local-worker-1"]', 5, 1, '{"desktop_default":true}'),
+		  ('workspace_walk_search', 'Workspace Walk Search', 'Search authorized workspace paths without arbitrary shell flags.', 'read_only', '["main-node"]', 10, 1, '{"desktop_default":true}'),
+		  ('file_read_authorized', 'File Read Authorized', 'Read a bounded authorized workspace file.', 'read_only', '["main-node"]', 10, 1, '{"desktop_default":true}'),
+		  ('file_summarize_excerpts', 'File Summarize Excerpts', 'Summarize bounded file excerpts.', 'read_only', '["main-node"]', 10, 1, '{"desktop_default":true}')
+		ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, risk_level=excluded.risk_level, allowed_nodes=excluded.allowed_nodes, timeout_seconds=excluded.timeout_seconds, enabled=excluded.enabled, updated_at=datetime('now');
+
+		INSERT INTO tool_workflows (id, capability_id, name, version, risk_level, steps, enabled, metadata)
+		VALUES
+		  ('workflow_memory_search_v1', 'memory_search', 'memory_search_v1', 'v1', 'read_only', '[{"tool":"memory_search_index","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
+		  ('workflow_server_diagnose_v1', 'server_diagnose', 'server_diagnose_v1', 'v1', 'read_only', '[{"tool":"docker_list_containers","args":{},"risk_level":"read_only"},{"tool":"docker_inspect_container","args":{},"risk_level":"read_only"},{"tool":"docker_read_logs","args":{"tail":200},"risk_level":"read_only"},{"tool":"check_port","args":{},"risk_level":"read_only"},{"tool":"http_probe","args":{},"risk_level":"read_only"},{"tool":"system_disk_usage","args":{},"risk_level":"read_only"},{"tool":"system_memory_usage","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
+		  ('workflow_system_health_check_v1', 'system_health_check', 'system_health_check_v1', 'v1', 'read_only', '[{"tool":"postgres_ping","args":{},"risk_level":"read_only"},{"tool":"nats_port_check","args":{},"risk_level":"read_only"},{"tool":"console_http_probe","args":{},"risk_level":"read_only"},{"tool":"system_disk_usage","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
+		  ('workflow_web_research_v2', 'web_research', 'web_research_v2', 'v2', 'read_only', '[{"tool":"fetch_url","args":{},"risk_level":"read_only"},{"tool":"extract_readable_text","args":{},"risk_level":"read_only"},{"tool":"extract_links","args":{},"risk_level":"read_only"},{"tool":"summarize_sources","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
+		  ('workflow_workspace_search_v1', 'workspace_search', 'workspace_search_v1', 'v1', 'read_only', '[{"tool":"workspace_walk_search","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
+		  ('workflow_file_analyze_v1', 'file_analyze', 'file_analyze_v1', 'v1', 'read_only', '[{"tool":"file_read_authorized","args":{},"risk_level":"read_only"},{"tool":"file_summarize_excerpts","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}')
+		ON CONFLICT(id) DO UPDATE SET capability_id=excluded.capability_id, name=excluded.name, version=excluded.version, risk_level=excluded.risk_level, steps=excluded.steps, enabled=excluded.enabled, metadata=excluded.metadata, updated_at=datetime('now');
 	`)
 	if err != nil {
 		return err
@@ -129,7 +165,7 @@ func (db *DB) RegisterSQLiteMainNode(ctx context.Context) error {
 			version=excluded.version,
 			metadata=excluded.metadata,
 			updated_at=datetime('now')
-	`, mustJSON([]string{"memory_search", "server_diagnose_v1", "system_health_check_v1", "web_research_v1"}), mustJSON(map[string]any{"execution": "local"}), mustJSON(map[string]any{"scope": "local"}), mustJSON(map[string]any{"manual_assignable": true, "auto_assignable": true, "allow_private_context": true, "allow_secret_context": false}), mustJSON(map[string]any{"registered_by": "desktop_appcore"}))
+	`, mustJSON([]string{"memory_search", "server_diagnose", "system_health_check", "web_research", "workspace_search", "file_analyze"}), mustJSON(map[string]any{"execution": "local"}), mustJSON(map[string]any{"scope": "local"}), mustJSON(map[string]any{"manual_assignable": true, "auto_assignable": true, "allow_private_context": true, "allow_secret_context": false}), mustJSON(map[string]any{"registered_by": "desktop_appcore"}))
 	return err
 }
 

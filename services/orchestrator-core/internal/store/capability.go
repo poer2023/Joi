@@ -18,6 +18,9 @@ import (
 	"time"
 )
 
+var htmlScriptPattern = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
+var htmlStylePattern = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
+var htmlNoScriptPattern = regexp.MustCompile(`(?is)<noscript[^>]*>.*?</noscript>`)
 var htmlTagPattern = regexp.MustCompile(`<[^>]+>`)
 var linkPattern = regexp.MustCompile(`href=["']([^"']+)["']`)
 
@@ -56,15 +59,24 @@ type CapabilityExecutionResult struct {
 	NormalizedResult  map[string]any    `json:"normalized_result"`
 }
 
+type WebResearchPolicy struct {
+	AllowPrivateHosts bool     `json:"allow_private_hosts"`
+	AllowedHosts      []string `json:"allowed_hosts"`
+}
+
 func (db *DB) CompileAndRecordCapability(ctx context.Context, request CapabilityRequest) (*CapabilityExecutionResult, error) {
-	if request.Risk != "" && request.Risk != "read_only" {
-		_, _ = db.CreateConfirmationRequest(ctx, request)
-		return nil, ErrPolicyDenied
+	compiled, err := CompileCapability(ctx, db.sql, request)
+	if err != nil {
+		return nil, err
 	}
+	request = compiled.CapabilityRequest
 	result, err := executeCapabilityLocally(ctx, request)
 	if err != nil {
 		return nil, err
 	}
+	result.PolicyDecision = compiled.PolicyDecision
+	result.Workflow = compiled.Workflow
+	result.SelectedNodeID = "main-node"
 
 	toolRunID, err := NewID("toolrun_")
 	if err != nil {
@@ -73,7 +85,7 @@ func (db *DB) CompileAndRecordCapability(ctx context.Context, request Capability
 	if _, err := db.sql.ExecContext(ctx, `
 		INSERT INTO tool_runs (id, run_id, capability_id, workflow_name, tool_name, node_id, risk_level, status, input, output, finished_at, duration_ms, assignment_reason)
 		VALUES ($1, $2, $3, $4, $4, 'main-node', 'read_only', 'succeeded', $5, $6, NOW(), 0, 'default_main_node')
-	`, toolRunID, nullString(request.RunID), request.Capability, result.Workflow.WorkflowName, mustJSON(request), mustJSON(result.NormalizedResult)); err != nil {
+	`, toolRunID, nullString(request.RunID), request.Capability, result.Workflow.WorkflowName, mustJSON(SanitizeForTrace(request)), mustJSON(SanitizeForTrace(result.NormalizedResult))); err != nil {
 		return nil, err
 	}
 	result.ToolRunID = toolRunID
@@ -94,7 +106,7 @@ func executeServerDiagnose(ctx context.Context, request CapabilityRequest) (*Cap
 	if request.Capability != "server_diagnose" {
 		return nil, fmt.Errorf("unsupported capability: %s", request.Capability)
 	}
-	if request.Risk != "read_only" {
+	if normalizedRisk(request.Risk) != "read_only" {
 		return nil, ErrPolicyDenied
 	}
 
@@ -190,7 +202,7 @@ func CanonicalCapabilityName(capability string) string {
 	switch capability {
 	case "server_diagnose_v1":
 		return "server_diagnose"
-	case "web_research_v1", "fetch_url":
+	case "web_research_v1", "web_research_v2", "fetch_url":
 		return "web_research"
 	case "system_health_check_v1":
 		return "system_health_check"
@@ -204,30 +216,34 @@ func FinalAnswerForCapabilityResult(capability string, normalized map[string]any
 }
 
 func executeWebResearch(ctx context.Context, request CapabilityRequest) (*CapabilityExecutionResult, error) {
+	return ExecuteWebResearchWithPolicy(ctx, request, WebResearchPolicy{})
+}
+
+func ExecuteWebResearchWithPolicy(ctx context.Context, request CapabilityRequest, policy WebResearchPolicy) (*CapabilityExecutionResult, error) {
 	if request.Type == "" {
 		request.Type = "capability_request"
 	}
 	if request.Risk == "" {
 		request.Risk = "read_only"
 	}
-	if request.Risk != "read_only" {
+	if normalizedRisk(request.Risk) != "read_only" {
 		return nil, ErrPolicyDenied
 	}
 	url := stringInput(request.Inputs, "url", "")
 	if url == "" {
 		return nil, errors.New("web_research requires url")
 	}
-	if blocked, reason := blockedResearchURL(url); blocked {
+	if blocked, reason := blockedResearchURLWithPolicy(url, policy); blocked {
 		return &CapabilityExecutionResult{
 			CapabilityRequest: request,
 			PolicyDecision:    map[string]any{"risk": "read_only", "decision": "policy_blocked", "reason": reason},
-			Workflow:          ToolWorkflow{WorkflowName: "web_research_v1", Capability: "web_research", RiskLevel: "read_only"},
+			Workflow:          ToolWorkflow{WorkflowName: "web_research_v2", Capability: "web_research", RiskLevel: "read_only"},
 			SelectedNodeID:    "main-node",
-			NormalizedResult:  map[string]any{"url": url, "fetch_status": "policy_blocked", "reason": reason, "mode": "web_research_v1_readonly_fetch"},
+			NormalizedResult:  map[string]any{"url": url, "fetch_status": "policy_blocked", "reason": reason, "mode": "web_research_v2_readonly_fetch"},
 		}, nil
 	}
 	workflow := ToolWorkflow{
-		WorkflowName: "web_research_v1",
+		WorkflowName: "web_research_v2",
 		Capability:   "web_research",
 		RiskLevel:    "read_only",
 		Steps: []ToolWorkflowStep{
@@ -237,10 +253,10 @@ func executeWebResearch(ctx context.Context, request CapabilityRequest) (*Capabi
 			{Tool: "summarize_sources", Args: map[string]any{}, RiskLevel: "read_only"},
 		},
 	}
-	result := fetchReadableURL(ctx, url)
+	result := FetchReadableURLWithPolicy(ctx, url, policy)
 	return &CapabilityExecutionResult{
 		CapabilityRequest: request,
-		PolicyDecision:    map[string]any{"risk": "read_only", "decision": "allow", "reason": "web_research_v1 only performs read-only HTTP fetch and extraction"},
+		PolicyDecision:    map[string]any{"risk": "read_only", "decision": "allow", "reason": "web_research_v2 only performs read-only HTTP fetch and extraction"},
 		Workflow:          workflow,
 		SelectedNodeID:    "main-node",
 		NormalizedResult:  result,
@@ -248,26 +264,46 @@ func executeWebResearch(ctx context.Context, request CapabilityRequest) (*Capabi
 }
 
 func fetchReadableURL(ctx context.Context, url string) map[string]any {
-	if blocked, reason := blockedResearchURL(url); blocked {
-		return map[string]any{"url": url, "fetch_status": "policy_blocked", "reason": reason, "mode": "web_research_v1_readonly_fetch"}
+	return FetchReadableURLWithPolicy(ctx, url, WebResearchPolicy{})
+}
+
+func FetchReadableURLWithPolicy(ctx context.Context, url string, policy WebResearchPolicy) map[string]any {
+	if blocked, reason := blockedResearchURLWithPolicy(url, policy); blocked {
+		return map[string]any{"url": url, "fetch_status": "policy_blocked", "reason": reason, "mode": "web_research_v2_readonly_fetch"}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return map[string]any{"url": url, "fetch_status": "failed", "error": err.Error()}
 	}
 	req.Header.Set("User-Agent", "AgentOS-WebResearch/0.1")
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("redirect_limit_exceeded")
+			}
+			if blocked, reason := blockedResearchURLWithPolicy(req.URL.String(), policy); blocked {
+				return errors.New(reason)
+			}
+			return nil
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return map[string]any{"url": url, "fetch_status": "failed", "error": err.Error()}
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024+1))
 	if err != nil {
 		return map[string]any{"url": url, "fetch_status": "failed", "status_code": resp.StatusCode, "error": err.Error()}
 	}
+	truncated := false
+	if len(raw) > 1024*1024 {
+		raw = raw[:1024*1024]
+		truncated = true
+	}
 	body := string(raw)
-	text := strings.Join(strings.Fields(htmlTagPattern.ReplaceAllString(body, " ")), " ")
+	text := readableHTMLText(body)
 	if len(text) > 1200 {
 		text = text[:1200]
 	}
@@ -285,8 +321,16 @@ func fetchReadableURL(ctx context.Context, url string) map[string]any {
 		"readable_text": text,
 		"links":         links,
 		"summary":       summarizeText(text),
-		"mode":          "web_research_v1_readonly_fetch",
+		"truncated":     truncated,
+		"mode":          "web_research_v2_readonly_fetch",
 	}
+}
+
+func readableHTMLText(body string) string {
+	body = htmlScriptPattern.ReplaceAllString(body, " ")
+	body = htmlStylePattern.ReplaceAllString(body, " ")
+	body = htmlNoScriptPattern.ReplaceAllString(body, " ")
+	return strings.Join(strings.Fields(htmlTagPattern.ReplaceAllString(body, " ")), " ")
 }
 
 func summarizeText(text string) string {
@@ -306,7 +350,7 @@ func executeSystemHealthCheck(ctx context.Context, tx execTx, request Capability
 	if request.Risk == "" {
 		request.Risk = "read_only"
 	}
-	if request.Risk != "read_only" {
+	if normalizedRisk(request.Risk) != "read_only" {
 		return nil, ErrPolicyDenied
 	}
 	checks := map[string]any{
@@ -361,6 +405,10 @@ func executeSystemHealthCheck(ctx context.Context, tx execTx, request Capability
 }
 
 func blockedResearchURL(rawURL string) (bool, string) {
+	return blockedResearchURLWithPolicy(rawURL, WebResearchPolicy{})
+}
+
+func blockedResearchURLWithPolicy(rawURL string, policy WebResearchPolicy) (bool, string) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return true, "invalid_url"
@@ -373,15 +421,50 @@ func blockedResearchURL(rawURL string) (bool, string) {
 		return true, "missing_host"
 	}
 	lowerHost := strings.ToLower(host)
+	lowerHostPort := strings.ToLower(parsed.Host)
 	if lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost") {
-		return true, "localhost_blocked"
+		if privateResearchHostAllowed(lowerHost, lowerHostPort, policy) {
+			return false, ""
+		}
+		return true, "private_host_not_allowed"
 	}
 	if ip, err := netip.ParseAddr(lowerHost); err == nil {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-			return true, "internal_ip_blocked"
+		if ip.IsUnspecified() {
+			return true, "unspecified_ip_blocked"
+		}
+		if isMetadataAddr(ip) || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return true, "metadata_ip_blocked"
+		}
+		if ip.IsLoopback() || ip.IsPrivate() {
+			if privateResearchHostAllowed(lowerHost, lowerHostPort, policy) {
+				return false, ""
+			}
+			return true, "private_host_not_allowed"
 		}
 	}
 	return false, ""
+}
+
+func privateResearchHostAllowed(host string, hostPort string, policy WebResearchPolicy) bool {
+	if !policy.AllowPrivateHosts {
+		return false
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	hostPort = strings.ToLower(strings.TrimSpace(hostPort))
+	for _, allowed := range policy.AllowedHosts {
+		allowed = strings.ToLower(strings.TrimSpace(allowed))
+		if allowed == "" {
+			continue
+		}
+		if allowed == host || allowed == hostPort {
+			return true
+		}
+	}
+	return false
+}
+
+func isMetadataAddr(ip netip.Addr) bool {
+	return ip == netip.MustParseAddr("169.254.169.254")
 }
 
 func (db *DB) writeCapabilityTraceSteps(ctx context.Context, runID string, result *CapabilityExecutionResult) error {
@@ -390,6 +473,7 @@ func (db *DB) writeCapabilityTraceSteps(ctx context.Context, runID string, resul
 		{stepType: "policy_checked", title: "Policy checked", input: map[string]any{"risk": result.CapabilityRequest.Risk}, output: result.PolicyDecision},
 		{stepType: "tool_compiled", title: "Tool workflow compiled", input: map[string]any{"capability": result.CapabilityRequest.Capability}, output: map[string]any{"workflow": result.Workflow}},
 		{stepType: "node_selected", title: "Node selected", input: map[string]any{"capability": result.CapabilityRequest.Capability}, output: map[string]any{"node_id": result.SelectedNodeID, "assignment_reason": "default_main_node"}},
+		{stepType: "tool_started", title: "Tool runtime started", input: map[string]any{"workflow_name": result.Workflow.WorkflowName, "tool_run_id": result.ToolRunID}, output: map[string]any{"node_id": result.SelectedNodeID}},
 		{stepType: "tool_finished", title: "Tool runtime finished", input: map[string]any{"workflow_name": result.Workflow.WorkflowName}, output: result.NormalizedResult},
 	}
 	for _, step := range steps {
@@ -400,7 +484,7 @@ func (db *DB) writeCapabilityTraceSteps(ctx context.Context, runID string, resul
 		if _, err := db.sql.ExecContext(ctx, `
 			INSERT INTO run_steps (id, run_id, step_type, title, status, input, output, finished_at, duration_ms)
 			VALUES ($1, $2, $3, $4, 'succeeded', $5, $6, NOW(), 0)
-		`, stepID, runID, step.stepType, step.title, mustJSON(step.input), mustJSON(step.output)); err != nil {
+		`, stepID, runID, step.stepType, step.title, mustJSON(SanitizeForTrace(step.input)), mustJSON(SanitizeForTrace(step.output))); err != nil {
 			return err
 		}
 	}
@@ -408,19 +492,29 @@ func (db *DB) writeCapabilityTraceSteps(ctx context.Context, runID string, resul
 }
 
 func executeAndRecordCapabilityInTx(ctx context.Context, tx execTx, request CapabilityRequest) (*CapabilityExecutionResult, error) {
-	if request.Risk != "" && request.Risk != "read_only" {
-		confirmationID, _ := NewID("confirm_")
-		_, _ = tx.ExecContext(ctx, `
-			INSERT INTO confirmation_requests (id, run_id, capability_id, requested_action, risk_level, input)
-			VALUES ($1, NULLIF($2, ''), $3, $4, $5, $6)
-		`, confirmationID, request.RunID, request.Capability, request.Goal, request.Risk, mustJSON(request.Inputs))
-		return nil, ErrPolicyDenied
+	compilerTx, ok := tx.(capabilityCompilerTx)
+	if !ok {
+		return nil, errors.New("capability compiler requires queryable transaction")
+	}
+	compiled, err := CompileCapability(ctx, compilerTx, request)
+	if err != nil {
+		return nil, err
+	}
+	request = compiled.CapabilityRequest
+	schedule, err := ScheduleWorkerNode(ctx, tx, request, NodeSchedulerDialectPostgres)
+	if err != nil {
+		return nil, err
+	}
+	if schedule.UseWorker {
+		return enqueueWorkerTask(ctx, tx, request, schedule, compiled)
 	}
 	if request.Capability == "system_health_check" {
 		result, err := executeSystemHealthCheck(ctx, tx, request)
 		if err != nil {
 			return nil, err
 		}
+		result.PolicyDecision = compiled.PolicyDecision
+		result.Workflow = compiled.Workflow
 		result.NormalizedResult["node_id"] = "main-node"
 		result.NormalizedResult["assignment_reason"] = "default_main_node"
 		toolRunID, err := NewID("toolrun_")
@@ -430,19 +524,18 @@ func executeAndRecordCapabilityInTx(ctx context.Context, tx execTx, request Capa
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO tool_runs (id, run_id, capability_id, workflow_name, tool_name, node_id, risk_level, status, input, output, finished_at, duration_ms, assignment_reason)
 			VALUES ($1, $2, $3, $4, $4, 'main-node', 'read_only', 'succeeded', $5, $6, NOW(), 0, 'default_main_node')
-		`, toolRunID, nullString(request.RunID), request.Capability, result.Workflow.WorkflowName, mustJSON(request), mustJSON(result.NormalizedResult)); err != nil {
+		`, toolRunID, nullString(request.RunID), request.Capability, result.Workflow.WorkflowName, mustJSON(SanitizeForTrace(request)), mustJSON(SanitizeForTrace(result.NormalizedResult))); err != nil {
 			return nil, err
 		}
 		result.ToolRunID = toolRunID
 		return result, nil
 	}
-	if nodeID, ok := workerDispatchNode(request); ok {
-		return enqueueWorkerTask(ctx, tx, request, nodeID)
-	}
 	result, err := executeCapabilityLocally(ctx, request)
 	if err != nil {
 		return nil, err
 	}
+	result.PolicyDecision = compiled.PolicyDecision
+	result.Workflow = compiled.Workflow
 	result.NormalizedResult["node_id"] = "main-node"
 	result.NormalizedResult["assignment_reason"] = "default_main_node"
 	toolRunID, err := NewID("toolrun_")
@@ -452,24 +545,14 @@ func executeAndRecordCapabilityInTx(ctx context.Context, tx execTx, request Capa
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO tool_runs (id, run_id, capability_id, workflow_name, tool_name, node_id, risk_level, status, input, output, finished_at, duration_ms, assignment_reason)
 		VALUES ($1, $2, $3, $4, $4, 'main-node', 'read_only', 'succeeded', $5, $6, NOW(), 0, 'default_main_node')
-	`, toolRunID, nullString(request.RunID), request.Capability, result.Workflow.WorkflowName, mustJSON(request), mustJSON(result.NormalizedResult)); err != nil {
+	`, toolRunID, nullString(request.RunID), request.Capability, result.Workflow.WorkflowName, mustJSON(SanitizeForTrace(request)), mustJSON(SanitizeForTrace(result.NormalizedResult))); err != nil {
 		return nil, err
 	}
 	result.ToolRunID = toolRunID
 	return result, nil
 }
 
-func workerDispatchNode(request CapabilityRequest) (string, bool) {
-	if request.PreferredNode != "" && request.PreferredNode != "main-node" && request.PreferredNode != "auto" {
-		return request.PreferredNode, true
-	}
-	if request.PreferredNode == "auto" && request.AllowWorker {
-		return "local-worker-1", true
-	}
-	return "", false
-}
-
-func enqueueWorkerTask(ctx context.Context, tx execTx, request CapabilityRequest, nodeID string) (*CapabilityExecutionResult, error) {
+func enqueueWorkerTask(ctx context.Context, tx execTx, request CapabilityRequest, schedule NodeScheduleDecision, compiled *CapabilityExecutionResult) (*CapabilityExecutionResult, error) {
 	taskID, err := NewID("task_")
 	if err != nil {
 		return nil, err
@@ -483,38 +566,35 @@ func enqueueWorkerTask(ctx context.Context, tx execTx, request CapabilityRequest
 		RunID:           request.RunID,
 		CapabilityID:    request.Capability,
 		PreferredNodeID: request.PreferredNode,
-		AssignedNodeID:  nodeID,
-		PrivacyLevel:    "internal",
-		Payload:         map[string]any{"type": request.Type, "capability": request.Capability, "goal": request.Goal, "inputs": request.Inputs, "risk": request.Risk, "run_id": request.RunID, "preferred_node": request.PreferredNode, "allow_worker": request.AllowWorker},
+		AssignedNodeID:  schedule.NodeID,
+		PrivacyLevel:    valueOrDefault(schedule.PrivacyLevel, "public"),
+		Payload:         SanitizeForTrace(map[string]any{"type": request.Type, "capability": request.Capability, "goal": request.Goal, "inputs": request.Inputs, "risk": request.Risk, "run_id": request.RunID, "preferred_node": request.PreferredNode, "allow_worker": request.AllowWorker, "privacy_level": valueOrDefault(schedule.PrivacyLevel, "public")}).(map[string]any),
 		TimeoutSeconds:  120,
 	}); err != nil {
 		return nil, err
 	}
 	if request.RunID != "" {
-		if err := insertRunStep(ctx, tx, request.RunID, "node_selected", "Node selected", map[string]any{"capability": request.Capability, "preferred_node": request.PreferredNode}, map[string]any{"node_id": nodeID, "assignment_reason": assignmentReason(request)}); err != nil {
+		if err := insertRunStep(ctx, tx, request.RunID, "node_selected", "Node selected", map[string]any{"capability": request.Capability, "preferred_node": request.PreferredNode, "privacy_level": valueOrDefault(schedule.PrivacyLevel, "public")}, map[string]any{"node_id": schedule.NodeID, "assignment_reason": schedule.AssignmentReason, "running_tasks": schedule.RunningTasks, "scheduler": schedule.Scheduler}); err != nil {
 			return nil, err
 		}
-		if err := insertRunStep(ctx, tx, request.RunID, "task_dispatched", "Task dispatched to worker", map[string]any{"task_id": taskID, "allow_worker": request.AllowWorker}, map[string]any{"node_id": nodeID, "assignment_reason": assignmentReason(request), "task_attempts": 0}); err != nil {
+		if err := insertRunStep(ctx, tx, request.RunID, "task_dispatched", "Task dispatched to worker", map[string]any{"task_id": taskID, "allow_worker": request.AllowWorker}, map[string]any{"node_id": schedule.NodeID, "assignment_reason": schedule.AssignmentReason, "privacy_level": valueOrDefault(schedule.PrivacyLevel, "public"), "scheduler": schedule.Scheduler, "task_attempts": 0}); err != nil {
 			return nil, err
 		}
 	}
-	workflowName := request.Capability + "_v1"
-	if request.Capability == "server_diagnose" {
-		workflowName = "server_diagnose_v1"
-	}
-	workflow := ToolWorkflow{WorkflowName: workflowName, Capability: request.Capability, RiskLevel: "read_only"}
+	workflow := compiled.Workflow
 	result := &CapabilityExecutionResult{
 		CapabilityRequest: request,
-		PolicyDecision:    map[string]any{"risk": "read_only", "decision": "allow", "reason": "queued for local worker"},
+		PolicyDecision:    compiled.PolicyDecision,
 		Workflow:          workflow,
-		SelectedNodeID:    nodeID,
-		NormalizedResult:  map[string]any{"status": "queued", "task_id": taskID, "node_id": nodeID, "assignment_reason": assignmentReason(request)},
+		SelectedNodeID:    schedule.NodeID,
+		NormalizedResult:  map[string]any{"status": "queued", "task_id": taskID, "node_id": schedule.NodeID, "assignment_reason": schedule.AssignmentReason, "privacy_level": valueOrDefault(schedule.PrivacyLevel, "public"), "running_tasks": schedule.RunningTasks, "scheduler": schedule.Scheduler},
 	}
 	return result, nil
 }
 
 type execTx interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
@@ -526,15 +606,8 @@ func insertRunStep(ctx context.Context, tx execTx, runID string, stepType string
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO run_steps (id, run_id, step_type, title, status, input, output, finished_at, duration_ms)
 		VALUES ($1, $2, $3, $4, 'succeeded', $5, $6, NOW(), 0)
-	`, stepID, runID, stepType, title, mustJSON(input), mustJSON(output))
+	`, stepID, runID, stepType, title, mustJSON(SanitizeForTrace(input)), mustJSON(SanitizeForTrace(output)))
 	return err
-}
-
-func assignmentReason(request CapabilityRequest) string {
-	if request.PreferredNode == "auto" {
-		return "auto_allow_worker"
-	}
-	return "user_selected"
 }
 
 func dockerListContainers(ctx context.Context, serviceName string) map[string]any {

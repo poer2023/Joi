@@ -6,7 +6,12 @@ coverage/
 backups/
 logs/
 soak-results-*.jsonl
+output/
+blind-test-runs/
+services/orchestrator-core/blind-test-runs/
+JoiBlindTestWorkspace/
 
+.DS_Store
 *.log
 .env
 .env.*

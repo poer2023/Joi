@@ -14,6 +14,10 @@ export function DecideConfirmation(arg1) {
   return window['go']['main']['DesktopApp']['DecideConfirmation'](arg1);
 }
 
+export function DecideProactiveMessage(arg1) {
+  return window['go']['main']['DesktopApp']['DecideProactiveMessage'](arg1);
+}
+
 export function DisableNode(arg1) {
   return window['go']['main']['DesktopApp']['DisableNode'](arg1);
 }
@@ -30,12 +34,24 @@ export function GenerateWorkerToken() {
   return window['go']['main']['DesktopApp']['GenerateWorkerToken']();
 }
 
+export function GetArtifact(arg1) {
+  return window['go']['main']['DesktopApp']['GetArtifact'](arg1);
+}
+
+export function GetConversation(arg1) {
+  return window['go']['main']['DesktopApp']['GetConversation'](arg1);
+}
+
 export function GetModelUsage() {
   return window['go']['main']['DesktopApp']['GetModelUsage']();
 }
 
 export function GetOnboardingStatus() {
   return window['go']['main']['DesktopApp']['GetOnboardingStatus']();
+}
+
+export function GetProductTask(arg1) {
+  return window['go']['main']['DesktopApp']['GetProductTask'](arg1);
 }
 
 export function GetRunTrace(arg1) {
@@ -54,12 +70,28 @@ export function GetSystemHealth() {
   return window['go']['main']['DesktopApp']['GetSystemHealth']();
 }
 
+export function GetWorkspaceSettings() {
+  return window['go']['main']['DesktopApp']['GetWorkspaceSettings']();
+}
+
+export function ListArtifacts(arg1) {
+  return window['go']['main']['DesktopApp']['ListArtifacts'](arg1);
+}
+
 export function ListBackups() {
   return window['go']['main']['DesktopApp']['ListBackups']();
 }
 
+export function ListCapabilities() {
+  return window['go']['main']['DesktopApp']['ListCapabilities']();
+}
+
 export function ListConfirmations() {
   return window['go']['main']['DesktopApp']['ListConfirmations']();
+}
+
+export function ListConversations() {
+  return window['go']['main']['DesktopApp']['ListConversations']();
 }
 
 export function ListMemories(arg1) {
@@ -68,6 +100,26 @@ export function ListMemories(arg1) {
 
 export function ListNodes() {
   return window['go']['main']['DesktopApp']['ListNodes']();
+}
+
+export function ListOpenLoops(arg1) {
+  return window['go']['main']['DesktopApp']['ListOpenLoops'](arg1);
+}
+
+export function ListProactiveMessages(arg1) {
+  return window['go']['main']['DesktopApp']['ListProactiveMessages'](arg1);
+}
+
+export function ListProductTasks(arg1) {
+  return window['go']['main']['DesktopApp']['ListProductTasks'](arg1);
+}
+
+export function ListToolRuns() {
+  return window['go']['main']['DesktopApp']['ListToolRuns']();
+}
+
+export function ListToolWorkflows() {
+  return window['go']['main']['DesktopApp']['ListToolWorkflows']();
 }
 
 export function ListWorkerGatewayAuditLogs() {
@@ -82,6 +134,10 @@ export function SaveModelConfig(arg1) {
   return window['go']['main']['DesktopApp']['SaveModelConfig'](arg1);
 }
 
+export function SaveModelSettings(arg1) {
+  return window['go']['main']['DesktopApp']['SaveModelSettings'](arg1);
+}
+
 export function SaveOperationalSettings(arg1) {
   return window['go']['main']['DesktopApp']['SaveOperationalSettings'](arg1);
 }
@@ -94,6 +150,10 @@ export function SaveTelegramConfig(arg1) {
   return window['go']['main']['DesktopApp']['SaveTelegramConfig'](arg1);
 }
 
+export function SaveWorkspaceSettings(arg1) {
+  return window['go']['main']['DesktopApp']['SaveWorkspaceSettings'](arg1);
+}
+
 export function SendChat(arg1) {
   return window['go']['main']['DesktopApp']['SendChat'](arg1);
 }
@@ -102,8 +162,12 @@ export function SendTestTelegramMessage(arg1) {
   return window['go']['main']['DesktopApp']['SendTestTelegramMessage'](arg1);
 }
 
-export function TestModelConnection() {
-  return window['go']['main']['DesktopApp']['TestModelConnection']();
+export function SetToolWorkflowEnabled(arg1) {
+  return window['go']['main']['DesktopApp']['SetToolWorkflowEnabled'](arg1);
+}
+
+export function TestModelConnection(arg1) {
+  return window['go']['main']['DesktopApp']['TestModelConnection'](arg1);
 }
 
 export function TestTelegramConnection() {

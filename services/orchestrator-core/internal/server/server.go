@@ -11,7 +11,7 @@ import (
 func NewHTTPServer(core *appcore.AppCore, logger *slog.Logger, addr string) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           api.NewRouter(core.DB(), logger),
+		Handler:           api.NewRouter(core, logger),
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 	}
 }

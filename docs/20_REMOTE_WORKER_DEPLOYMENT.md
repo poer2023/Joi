@@ -1,8 +1,8 @@
 # Remote Worker Deployment
 
-Phase 3 remote workers connect back to the main node over the public Internet using an authenticated SSH reverse tunnel. The first supported remote node is `vps-la-1`.
+Phase 3 remote workers connect back to the main node over the public Internet using an authenticated SSH reverse tunnel to the Desktop Worker Gateway. The first supported remote node is `vps-la-1`.
 
-Do not expose PostgreSQL or NATS directly to the public Internet. The public path is the VPS SSH endpoint; database and queue traffic stays inside the encrypted SSH tunnel.
+Do not expose PostgreSQL, NATS, or the Worker Gateway directly to the public Internet. The public path is the VPS SSH endpoint; worker traffic stays inside the encrypted SSH tunnel and is authenticated by `WORKER_TOKEN`.
 
 ## Main Node
 
@@ -11,23 +11,23 @@ Start Postgres, NATS, Orchestrator, and Console on the Mac. The remote worker re
 Required main-node env:
 
 ```bash
-TASK_QUEUE_DRIVER=postgres
-DATABASE_URL=postgres://agentos:...@localhost:5432/agentos?sslmode=disable
 NODE_SECRET=...
+WORKER_TOKEN=...
+WORKER_ALLOWED_NODE_IDS=local-worker-1,vps-la-1
 ```
 
-Start the reverse tunnel from the Mac:
+Start the reverse tunnel from the Mac. This makes the Mac's `127.0.0.1:18081` Desktop Worker Gateway available as `127.0.0.1:18081` on the VPS:
 
 ```bash
 ssh -N \
   -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=30 \
   -o ServerAliveCountMax=3 \
-  -R 15432:127.0.0.1:5432 \
-  racknerd-e0ccce3
+  -R 127.0.0.1:18081:127.0.0.1:18081 \
+  cloudcone-la
 ```
 
-If `TASK_QUEUE_DRIVER=nats` is enabled later, also add `-R 14222:127.0.0.1:4222` and set the worker's `NATS_URL` to `nats://127.0.0.1:14222`.
+The launchd stack starts this tunnel automatically through `scripts/launchd_stack.sh`. Override the host with `WORKER_GATEWAY_SSH_TARGET` if the active VPS changes.
 
 ## Worker Node
 
@@ -36,9 +36,10 @@ Install the worker binary and configure:
 ```bash
 NODE_ID=vps-la-1
 WORKER_TOKEN=...
+NODE_SECRET=...
 WORKER_ALLOWED_NODE_IDS=local-worker-1,vps-la-1
-TASK_QUEUE_DRIVER=postgres
-DATABASE_URL=postgres://agentos:...@127.0.0.1:15432/agentos?sslmode=disable
+TASK_QUEUE_DRIVER=remote_gateway
+WORKER_GATEWAY_URL=http://127.0.0.1:18081
 WORKER_CAPABILITIES=web_research_v1,fetch_url,server_diagnose_self,system_health_check_self
 ```
 

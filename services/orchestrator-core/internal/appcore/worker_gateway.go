@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -271,6 +272,7 @@ func (a *AppCore) upsertWorkerNode(ctx context.Context, req workerRegisterReques
 }
 
 func (a *AppCore) ackWorkerGatewayTask(ctx context.Context, nodeID string, taskID string, result store.TaskResult) error {
+	result.Output = sanitizeWorkerGatewayOutput(result.Output)
 	if !a.isSQLite() {
 		return a.Queue.Ack(ctx, taskID, result)
 	}
@@ -308,6 +310,40 @@ func (a *AppCore) ackWorkerGatewayTask(ctx context.Context, nodeID string, taskI
 		}
 	}
 	return nil
+}
+
+var plainCSSBlockPattern = regexp.MustCompile(`(?m)(^|[\s}])(?:[a-z0-9_#.*:,.>+~\[\]="'\(\)-]+(?:\s+[a-z0-9_#.*:,.>+~\[\]="'\(\)-]+)*)\{[^{}]*\}`)
+
+func sanitizeWorkerGatewayOutput(output map[string]any) map[string]any {
+	if output == nil {
+		return nil
+	}
+	contentType, _ := output["content_type"].(string)
+	mode, _ := output["mode"].(string)
+	if !strings.Contains(strings.ToLower(contentType), "html") && !strings.Contains(mode, "web_research") {
+		return output
+	}
+	cleaned := make(map[string]any, len(output))
+	for key, value := range output {
+		cleaned[key] = value
+	}
+	if text, ok := output["readable_text"].(string); ok {
+		cleaned["readable_text"] = stripPlainCSSBlocks(text)
+	}
+	if summary, ok := output["summary"].(string); ok {
+		cleaned["summary"] = stripPlainCSSBlocks(summary)
+	}
+	return cleaned
+}
+
+func stripPlainCSSBlocks(text string) string {
+	for {
+		next := plainCSSBlockPattern.ReplaceAllString(text, "$1")
+		if next == text {
+			return strings.Join(strings.Fields(next), " ")
+		}
+		text = next
+	}
 }
 
 func (a *AppCore) failWorkerGatewayTask(ctx context.Context, nodeID string, taskID string, taskErr store.TaskError) error {
@@ -425,13 +461,7 @@ func (a *AppCore) workerNodeCapabilityAllowed(ctx context.Context, nodeID string
 	if err != nil {
 		return false
 	}
-	capability = store.CanonicalCapabilityName(capability)
-	for _, item := range decodeArray([]byte(raw)) {
-		if store.CanonicalCapabilityName(stringFromAny(item)) == capability {
-			return true
-		}
-	}
-	return false
+	return store.WorkerCapabilityMatches(decodeArray([]byte(raw)), capability)
 }
 
 func (a *AppCore) acceptWorkerGatewayNonce(ctx context.Context, nodeID string, timestampHeader string, nonce string) error {

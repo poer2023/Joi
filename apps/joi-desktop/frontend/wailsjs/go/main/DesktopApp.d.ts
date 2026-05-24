@@ -8,6 +8,8 @@ export function CreateBackup():Promise<main.DesktopBackupCreateResponse>;
 
 export function DecideConfirmation(arg1:main.DesktopConfirmationDecisionRequest):Promise<void>;
 
+export function DecideProactiveMessage(arg1:main.DesktopProactiveDecisionRequest):Promise<void>;
+
 export function DisableNode(arg1:string):Promise<void>;
 
 export function EnableNode(arg1:string):Promise<void>;
@@ -16,9 +18,15 @@ export function ExportDiagnostics():Promise<main.DesktopDiagnosticsExportRespons
 
 export function GenerateWorkerToken():Promise<main.DesktopWorkerTokenResponse>;
 
+export function GetArtifact(arg1:string):Promise<main.DesktopArtifactDetail>;
+
+export function GetConversation(arg1:string):Promise<main.DesktopConversationDetailResponse>;
+
 export function GetModelUsage():Promise<main.DesktopModelUsageResponse>;
 
 export function GetOnboardingStatus():Promise<main.DesktopOnboardingStatusResponse>;
+
+export function GetProductTask(arg1:string):Promise<main.DesktopProductTaskDetail>;
 
 export function GetRunTrace(arg1:string):Promise<main.DesktopRunTrace>;
 
@@ -28,13 +36,31 @@ export function GetSettings():Promise<main.DesktopSettingsResponse>;
 
 export function GetSystemHealth():Promise<main.DesktopSystemHealthResponse>;
 
+export function GetWorkspaceSettings():Promise<main.DesktopWorkspaceSettings>;
+
+export function ListArtifacts(arg1:main.DesktopArtifactFilter):Promise<main.DesktopArtifactListResponse>;
+
 export function ListBackups():Promise<main.DesktopBackupListResponse>;
 
+export function ListCapabilities():Promise<main.DesktopCapabilityListResponse>;
+
 export function ListConfirmations():Promise<main.DesktopConfirmationListResponse>;
+
+export function ListConversations():Promise<main.DesktopConversationListResponse>;
 
 export function ListMemories(arg1:main.DesktopMemoryFilter):Promise<main.DesktopMemoryListResponse>;
 
 export function ListNodes():Promise<main.DesktopNodeListResponse>;
+
+export function ListOpenLoops(arg1:main.DesktopOpenLoopFilter):Promise<main.DesktopOpenLoopListResponse>;
+
+export function ListProactiveMessages(arg1:main.DesktopProactiveMessageFilter):Promise<main.DesktopProactiveMessageListResponse>;
+
+export function ListProductTasks(arg1:main.DesktopProductTaskFilter):Promise<main.DesktopProductTaskListResponse>;
+
+export function ListToolRuns():Promise<main.DesktopToolRunListResponse>;
+
+export function ListToolWorkflows():Promise<main.DesktopToolWorkflowListResponse>;
 
 export function ListWorkerGatewayAuditLogs():Promise<main.DesktopWorkerGatewayAuditResponse>;
 
@@ -42,17 +68,23 @@ export function RestoreBackup(arg1:string):Promise<void>;
 
 export function SaveModelConfig(arg1:main.DesktopModelConfigRequest):Promise<void>;
 
+export function SaveModelSettings(arg1:main.DesktopModelSettingsRequest):Promise<void>;
+
 export function SaveOperationalSettings(arg1:main.DesktopOperationalSettingsRequest):Promise<void>;
 
 export function SaveSecret(arg1:main.DesktopSecretRequest):Promise<void>;
 
 export function SaveTelegramConfig(arg1:main.DesktopTelegramConfigRequest):Promise<void>;
 
+export function SaveWorkspaceSettings(arg1:main.DesktopWorkspaceSettings):Promise<void>;
+
 export function SendChat(arg1:main.DesktopChatRequest):Promise<main.DesktopChatResponse>;
 
 export function SendTestTelegramMessage(arg1:main.DesktopTelegramTestMessageRequest):Promise<main.DesktopConnectionTestResponse>;
 
-export function TestModelConnection():Promise<main.DesktopConnectionTestResponse>;
+export function SetToolWorkflowEnabled(arg1:main.DesktopToolWorkflowEnabledRequest):Promise<void>;
+
+export function TestModelConnection(arg1:main.DesktopModelConnectionTestRequest):Promise<main.DesktopConnectionTestResponse>;
 
 export function TestTelegramConnection():Promise<main.DesktopConnectionTestResponse>;
 

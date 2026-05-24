@@ -26,6 +26,7 @@ func loadGatewayConfig(logger *slog.Logger) config {
 		_ = yaml.Unmarshal(raw, &runtime)
 	}
 	cfg := config{
+		Mode:            gatewayMode(),
 		Token:           os.Getenv("TELEGRAM_BOT_TOKEN"),
 		AdminToken:      os.Getenv("ADMIN_TOKEN"),
 		AllowedUserIDs:  parseAllowedUserIDs(valueOrDefault(os.Getenv("TELEGRAM_ALLOWED_USER_IDS"), runtime.Telegram.AllowedUserIDs)),
@@ -34,6 +35,7 @@ func loadGatewayConfig(logger *slog.Logger) config {
 		PollTimeoutSec:  50,
 	}
 	logger.Info("runtime config check",
+		"gateway_mode", cfg.Mode,
 		"telegram_bot_token_present", cfg.Token != "",
 		"admin_token_present", cfg.AdminToken != "",
 		"telegram_allowed_user_count", len(cfg.AllowedUserIDs),
@@ -41,6 +43,24 @@ func loadGatewayConfig(logger *slog.Logger) config {
 		"console_base_url", cfg.ConsoleBaseURL,
 	)
 	return cfg
+}
+
+func gatewayMode() string {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("TELEGRAM_GATEWAY_MODE")))
+	switch mode {
+	case "desktop", "sqlite":
+		return "desktop"
+	case "http", "server", "orchestrator":
+		return "http"
+	case "auto":
+		return "auto"
+	}
+	appMode := strings.ToLower(strings.TrimSpace(os.Getenv("APP_MODE")))
+	dataStore := strings.ToLower(strings.TrimSpace(os.Getenv("DATA_STORE")))
+	if appMode == "desktop" || dataStore == "sqlite" {
+		return "desktop"
+	}
+	return "auto"
 }
 
 func parseAllowedUserIDs(value string) map[int64]bool {

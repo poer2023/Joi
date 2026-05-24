@@ -15,10 +15,18 @@ fi
 export CONFIG_DIR="$ROOT/configs"
 export MIGRATIONS_DIR="$ROOT/database/migrations"
 export RUNTIME_CONFIG_PATH="$ROOT/configs/runtime.yaml"
+export APP_MODE="${APP_MODE:-desktop}"
+export DATA_STORE="${DATA_STORE:-sqlite}"
+export TASK_QUEUE_DRIVER="${TASK_QUEUE_DRIVER:-sqlite}"
 export ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://localhost:8080}"
 export CONSOLE_BASE_URL="${CONSOLE_BASE_URL:-http://localhost:3000}"
 export ALLOW_MOCK_PROVIDER="${ALLOW_MOCK_PROVIDER:-false}"
 export REQUIRE_REAL_MODEL="${REQUIRE_REAL_MODEL:-true}"
+if [[ "${APP_MODE}" == "desktop" || "${DATA_STORE}" == "sqlite" ]]; then
+  export TELEGRAM_GATEWAY_MODE="${TELEGRAM_GATEWAY_MODE:-desktop}"
+else
+  export TELEGRAM_GATEWAY_MODE="${TELEGRAM_GATEWAY_MODE:-http}"
+fi
 
 children=()
 
@@ -114,18 +122,32 @@ start_cloudflared() {
 }
 
 start_ssh_tunnel() {
-  if pgrep -f 'ssh .* -R 15432:127.0.0.1:5432 .*racknerd-e0ccce3' >/dev/null 2>&1; then
+  local target="${WORKER_GATEWAY_SSH_TARGET:-cloudcone-la}"
+  if pgrep -f "ssh .* -R 127.0.0.1:18081:127.0.0.1:18081 .*$target" >/dev/null 2>&1; then
     return 0
   fi
   /usr/bin/ssh -N \
     -o ExitOnForwardFailure=yes \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
-    -R 15432:127.0.0.1:5432 \
-    -R 14222:127.0.0.1:4222 \
-    racknerd-e0ccce3 >> "$LOG_DIR/ssh_reverse_tunnel.log" 2>&1 &
+    -R 127.0.0.1:18081:127.0.0.1:18081 \
+    "$target" >> "$LOG_DIR/ssh_reverse_tunnel.log" 2>&1 &
   children+=("$!")
 }
+
+if [[ "${APP_MODE}" == "desktop" || "${DATA_STORE}" == "sqlite" ]]; then
+  start_if_process_missing 'go run ./cmd/gateway|/exe/gateway|/tmp/joi-telegram-gateway' telegram-gateway bash -lc "cd '$ROOT/services/telegram-gateway' && APP_MODE=desktop DATA_STORE=sqlite TASK_QUEUE_DRIVER=sqlite TELEGRAM_GATEWAY_MODE=desktop /opt/homebrew/bin/go run ./cmd/gateway"
+  start_ssh_tunnel
+
+  echo "$(ts) Joi desktop launchd stack started with ${#children[@]} child process(es)" >> "$LOG_DIR/launchd_stack.log"
+  if [[ "${#children[@]}" == "0" ]]; then
+    while true; do
+      sleep 3600
+    done
+  fi
+  wait
+  exit 0
+fi
 
 start_docker_infra
 wait_for_port 5432 || echo "$(ts) postgres did not become ready before timeout" >> "$LOG_DIR/launchd_stack.log"

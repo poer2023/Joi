@@ -21,3 +21,15 @@ Prompt 文件在 `prompts/` 下。
 ## 5. 输出修复
 
 JSON 解析失败时最多 repair 两次，仍失败则返回 STRUCTURED_OUTPUT_FAILED。
+
+## 6. conversation_reflection.md
+
+用途：对话或任务结束后生成可审核的结构化候选，不直接回复用户。
+
+约束：
+
+- 不做无来源心理推断。
+- 不提取 secret、token、密码或私钥。
+- 只生成 pending memory、open loop、proactive draft 或 task candidate。
+- 高风险操作只能生成确认需求，不能生成执行指令。
+- 输出必须是 JSON，并写入 Run Trace。

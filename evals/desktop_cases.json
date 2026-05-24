@@ -30,12 +30,43 @@
     "expect_response_contains": "Docker Compose"
   },
   {
+    "id": "desktop_confirmed_memory_recall",
+    "description": "confirmed memory 应在 Prompt Assembly 中自动召回，并体现在下一轮回答。",
+    "message": "你记得我现在想把 Joi 做成什么吗？",
+    "expect_agent": "memory_agent",
+    "expect_step_types": ["memory_context_recalled"],
+    "expect_memory_usage": true,
+    "expect_response_contains": "伙伴式前台"
+  },
+  {
     "id": "desktop_memory_write_proposal",
     "description": "记忆写入只能产生待确认候选，不直接变 confirmed。",
     "message": "请记住：我喜欢 Desktop-first 本地 App。",
     "expect_agent": "memory_agent",
     "expect_step_types": ["memory_proposed"],
     "expect_memory_proposal": true
+  },
+  {
+    "id": "companion_direction_reflection",
+    "description": "产品方向对话应生成 memory/open loop/proactive draft，但不创建严肃产品任务。",
+    "message": "我想把 Joi 做成伙伴式前台 + 严肃执行后台，记住这个方向。",
+    "expect_agent": "memory_agent",
+    "expect_step_types": ["conversation_reflection", "proactive_candidate_created"],
+    "expect_memory_proposal": true,
+    "expect_open_loop": true,
+    "expect_proactive_draft": true,
+    "expect_no_product_task": true
+  },
+  {
+    "id": "serious_task_creates_product_task",
+    "description": "严肃任务应创建 Product Task、步骤、Artifact，并写入 Run Trace。",
+    "message": "帮我分析 Alma 和 Joi 的差距，并给出下一步。",
+    "expect_step_types": ["task_classified", "product_task_created", "artifact_created", "conversation_reflection"],
+    "expect_product_task": true,
+    "expect_min_product_task_steps": 3,
+    "expect_artifact": true,
+    "expect_open_loop": true,
+    "expect_proactive_draft": true
   },
   {
     "id": "desktop_system_health_capability",
@@ -69,6 +100,30 @@
     "expect_node_id": "main-node",
     "expect_assignment_reason": "default_main_node",
     "expect_tool_run": true
+  },
+  {
+    "id": "desktop_workspace_search_capability",
+    "description": "当前项目搜索应走 workspace_search_v1 只读 Go walk。",
+    "message": "在当前项目里找 Run Trace 的设计文档",
+    "expect_agent": "general_agent",
+    "expect_capability": "workspace_search",
+    "expect_step_types": ["capability_requested", "policy_checked", "tool_compiled", "node_selected", "tool_started", "tool_finished"],
+    "expect_node_id": "main-node",
+    "expect_assignment_reason": "default_main_node",
+    "expect_tool_run": true,
+    "expect_response_contains": "Run Trace"
+  },
+  {
+    "id": "desktop_file_analyze_capability",
+    "description": "授权文件读取应走 file_analyze_v1，返回摘要和摘录。",
+    "message": "读一下 AGENTS.md，总结 capability 实现不能违反哪些红线",
+    "expect_agent": "general_agent",
+    "expect_capability": "file_analyze",
+    "expect_step_types": ["capability_requested", "policy_checked", "tool_compiled", "node_selected", "tool_started", "tool_finished"],
+    "expect_node_id": "main-node",
+    "expect_assignment_reason": "default_main_node",
+    "expect_tool_run": true,
+    "expect_response_contains": "Tool Compiler"
   },
   {
     "id": "desktop_dangerous_operation_blocked",

@@ -10,16 +10,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hao/agent-os/services/orchestrator-core/internal/appcore"
 	"github.com/hao/agent-os/services/orchestrator-core/internal/store"
 )
 
 type Handlers struct {
+	core   *appcore.AppCore
 	db     *store.DB
 	logger *slog.Logger
 }
 
-func NewHandlers(db *store.DB, logger *slog.Logger) *Handlers {
-	return &Handlers{db: db, logger: logger}
+func NewHandlers(core *appcore.AppCore, logger *slog.Logger) *Handlers {
+	return &Handlers{core: core, db: core.DB(), logger: logger}
 }
 
 func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +56,7 @@ func (h *Handlers) Metrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) SystemHealth(w http.ResponseWriter, r *http.Request) {
-	health, err := h.db.SystemHealth(r.Context())
+	health, err := h.core.GetSystemHealth(r.Context())
 	if err != nil {
 		writeStoreReadError(w, err, "")
 		return
@@ -90,7 +92,7 @@ func (h *Handlers) SendChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.db.SendChat(r.Context(), store.SendChatParams{
+	result, err := h.core.SendChat(r.Context(), appcore.ChatRequest{
 		ConversationID: request.ConversationID,
 		Channel:        request.Channel,
 		UserID:         "default_user",
@@ -107,9 +109,28 @@ func (h *Handlers) SendChat(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, http.StatusOK, result, result.RunID)
 }
 
+func (h *Handlers) ListConversations(w http.ResponseWriter, r *http.Request) {
+	result, err := h.core.ListConversations(r.Context(), 100)
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, result, "")
+}
+
+func (h *Handlers) GetConversation(w http.ResponseWriter, r *http.Request) {
+	conversationID := r.PathValue("id")
+	result, err := h.core.GetConversation(r.Context(), conversationID)
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, result, result.Conversation.LatestRunID)
+}
+
 func (h *Handlers) GetRun(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
-	run, err := h.db.GetRun(r.Context(), runID)
+	run, err := h.core.GetRunTrace(r.Context(), runID)
 	if err != nil {
 		writeStoreReadError(w, err, runID)
 		return
@@ -120,7 +141,7 @@ func (h *Handlers) GetRun(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) GetRunSteps(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
-	steps, err := h.db.ListRunSteps(r.Context(), runID)
+	run, err := h.core.GetRunTrace(r.Context(), runID)
 	if err != nil {
 		writeStoreReadError(w, err, runID)
 		return
@@ -128,7 +149,7 @@ func (h *Handlers) GetRunSteps(w http.ResponseWriter, r *http.Request) {
 
 	writeOK(w, http.StatusOK, map[string]any{
 		"run_id": runID,
-		"steps":  steps,
+		"steps":  run.Steps,
 	}, runID)
 }
 
@@ -179,14 +200,14 @@ type UpdateMemoryGovernanceRequest struct {
 }
 
 func (h *Handlers) ListMemories(w http.ResponseWriter, r *http.Request) {
-	memories, err := h.db.ListMemories(r.Context())
+	result, err := h.core.ListMemories(r.Context(), appcore.MemoryFilter{Limit: 500})
 	if err != nil {
 		writeStoreReadError(w, err, "")
 		return
 	}
 
 	writeOK(w, http.StatusOK, map[string]any{
-		"memories": memories,
+		"memories": result.Memories,
 	}, "")
 }
 
@@ -201,7 +222,7 @@ func (h *Handlers) SearchMemories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.db.SearchMemories(r.Context(), store.SearchMemoriesParams{
+	result, err := h.core.SearchMemories(r.Context(), appcore.MemorySearchRequest{
 		Query:   request.Query,
 		RunID:   request.RunID,
 		AgentID: request.AgentID,
@@ -235,7 +256,7 @@ func (h *Handlers) ProposeMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	memory, err := h.db.ProposeMemory(r.Context(), store.ProposeMemoryParams{
+	memory, err := h.core.ProposeMemory(r.Context(), appcore.MemoryProposalRequest{
 		Type:           request.Type,
 		Content:        request.Content,
 		Summary:        request.Summary,
@@ -260,18 +281,14 @@ func (h *Handlers) RecordMemoryFeedback(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	memoryID := r.PathValue("id")
-	if err := h.db.RecordMemoryFeedback(r.Context(), store.MemoryFeedbackParams{
-		MemoryID: memoryID,
-		RunID:    request.RunID,
-		Feedback: request.Feedback,
-		Comment:  request.Comment,
-	}); err != nil {
-		writeStoreReadError(w, err, "")
-		return
-	}
 	feedback := request.Feedback
 	if feedback == "" {
 		feedback = "neutral"
+	}
+	action := "feedback_" + feedback
+	if err := h.core.UpdateMemory(r.Context(), appcore.MemoryActionRequest{ID: memoryID, Action: action, Comment: request.Comment}); err != nil {
+		writeStoreReadError(w, err, "")
+		return
 	}
 	writeOK(w, http.StatusOK, map[string]any{"memory_id": memoryID, "feedback": feedback}, "")
 }
@@ -282,21 +299,46 @@ func (h *Handlers) UpdateMemoryGovernance(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid JSON request body", map[string]any{}, "")
 		return
 	}
-	memory, err := h.db.UpdateMemoryGovernance(r.Context(), store.UpdateMemoryGovernanceParams{
-		MemoryID:          r.PathValue("id"),
-		Pinned:            request.Pinned,
-		Disabled:          request.Disabled,
-		MergeIntoMemoryID: request.MergeIntoMemoryID,
-		ConflictGroupID:   request.ConflictGroupID,
-		ConflictReason:    request.ConflictReason,
-		MarkConflict:      request.MarkConflict,
-		Outcome:           request.Outcome,
-	})
+	memoryID := r.PathValue("id")
+	actions := []appcore.MemoryActionRequest{}
+	if request.Pinned != nil {
+		action := "unpin"
+		if *request.Pinned {
+			action = "pin"
+		}
+		actions = append(actions, appcore.MemoryActionRequest{ID: memoryID, Action: action})
+	}
+	if request.Disabled != nil {
+		action := "enable"
+		if *request.Disabled {
+			action = "disable"
+		}
+		actions = append(actions, appcore.MemoryActionRequest{ID: memoryID, Action: action})
+	}
+	if request.MergeIntoMemoryID != "" {
+		actions = append(actions, appcore.MemoryActionRequest{ID: memoryID, Action: "merge_into", TargetID: request.MergeIntoMemoryID})
+	}
+	if request.MarkConflict != nil && *request.MarkConflict {
+		actions = append(actions, appcore.MemoryActionRequest{ID: memoryID, Action: "mark_conflict", TargetID: request.ConflictGroupID, Reason: request.ConflictReason})
+	}
+	for _, action := range actions {
+		if err := h.core.UpdateMemory(r.Context(), action); err != nil {
+			writeStoreReadError(w, err, "")
+			return
+		}
+	}
+	memories, err := h.core.ListMemories(r.Context(), appcore.MemoryFilter{Limit: 500})
 	if err != nil {
 		writeStoreReadError(w, err, "")
 		return
 	}
-	writeOK(w, http.StatusOK, map[string]any{"memory": memory}, "")
+	for _, memory := range memories.Memories {
+		if memory.ID == memoryID {
+			writeOK(w, http.StatusOK, map[string]any{"memory": memory}, "")
+			return
+		}
+	}
+	writeOK(w, http.StatusOK, map[string]any{"memory_id": memoryID}, "")
 }
 
 type TestCapabilityRequest struct {
@@ -307,15 +349,31 @@ type TestCapabilityRequest struct {
 }
 
 func (h *Handlers) ListCapabilities(w http.ResponseWriter, r *http.Request) {
-	capabilities, err := h.db.ListCapabilities(r.Context())
+	result, err := h.core.ListCapabilities(r.Context())
 	if err != nil {
 		writeStoreReadError(w, err, "")
 		return
 	}
 
-	writeOK(w, http.StatusOK, map[string]any{
-		"capabilities": capabilities,
-	}, "")
+	writeOK(w, http.StatusOK, result, "")
+}
+
+func (h *Handlers) ListToolWorkflows(w http.ResponseWriter, r *http.Request) {
+	result, err := h.core.ListToolWorkflows(r.Context())
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, result, "")
+}
+
+func (h *Handlers) ListToolRuns(w http.ResponseWriter, r *http.Request) {
+	result, err := h.core.ListToolRuns(r.Context(), 100)
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, result, "")
 }
 
 func (h *Handlers) TestCapability(w http.ResponseWriter, r *http.Request) {

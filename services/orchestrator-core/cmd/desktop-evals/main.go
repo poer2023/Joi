@@ -14,25 +14,32 @@ import (
 )
 
 type desktopCase struct {
-	ID                   string   `json:"id"`
-	Description          string   `json:"description"`
-	Message              string   `json:"message"`
-	PreferredNode        string   `json:"preferred_node"`
-	AllowWorker          bool     `json:"allow_worker"`
-	ExpectAgent          string   `json:"expect_agent"`
-	ExpectCapability     string   `json:"expect_capability"`
-	ExpectNodeID         string   `json:"expect_node_id"`
-	ExpectAssignment     string   `json:"expect_assignment_reason"`
-	ExpectStepTypes      []string `json:"expect_step_types"`
-	ExpectNoStepTypes    []string `json:"expect_no_step_types"`
-	ExpectMinModelCalls  int      `json:"expect_min_model_calls"`
-	ExpectMinAssemblies  int      `json:"expect_min_prompt_assemblies"`
-	ExpectMinMemoryPacks int      `json:"expect_min_memory_context_packs"`
-	ExpectMinTasks       int      `json:"expect_min_tasks"`
-	ExpectToolRun        bool     `json:"expect_tool_run"`
-	ExpectMemoryUsage    bool     `json:"expect_memory_usage"`
-	ExpectMemoryProposal bool     `json:"expect_memory_proposal"`
-	ExpectResponseSubstr string   `json:"expect_response_contains"`
+	ID                        string   `json:"id"`
+	Description               string   `json:"description"`
+	Message                   string   `json:"message"`
+	InputMode                 string   `json:"input_mode"`
+	PreferredNode             string   `json:"preferred_node"`
+	AllowWorker               bool     `json:"allow_worker"`
+	ExpectAgent               string   `json:"expect_agent"`
+	ExpectCapability          string   `json:"expect_capability"`
+	ExpectNodeID              string   `json:"expect_node_id"`
+	ExpectAssignment          string   `json:"expect_assignment_reason"`
+	ExpectStepTypes           []string `json:"expect_step_types"`
+	ExpectNoStepTypes         []string `json:"expect_no_step_types"`
+	ExpectMinModelCalls       int      `json:"expect_min_model_calls"`
+	ExpectMinAssemblies       int      `json:"expect_min_prompt_assemblies"`
+	ExpectMinMemoryPacks      int      `json:"expect_min_memory_context_packs"`
+	ExpectMinTasks            int      `json:"expect_min_tasks"`
+	ExpectToolRun             bool     `json:"expect_tool_run"`
+	ExpectMemoryUsage         bool     `json:"expect_memory_usage"`
+	ExpectMemoryProposal      bool     `json:"expect_memory_proposal"`
+	ExpectProductTask         bool     `json:"expect_product_task"`
+	ExpectNoProductTask       bool     `json:"expect_no_product_task"`
+	ExpectMinProductTaskSteps int      `json:"expect_min_product_task_steps"`
+	ExpectArtifact            bool     `json:"expect_artifact"`
+	ExpectOpenLoop            bool     `json:"expect_open_loop"`
+	ExpectProactiveDraft      bool     `json:"expect_proactive_draft"`
+	ExpectResponseSubstr      string   `json:"expect_response_contains"`
 }
 
 func main() {
@@ -94,8 +101,9 @@ func seedDesktopEvalData(ctx context.Context, core *appcore.AppCore) error {
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, pinned, metadata, updated_at)
 		VALUES
-		  ('mem_desktop_deploy_pref', 'profile', '用户偏好轻量部署，优先 Docker Compose，避免默认推荐 Kubernetes。', '轻量部署偏好', 'global', 'internal', 0.95, 'confirmed', '[]', '["deploy","docker compose"]', 1, '{"seed":"desktop_eval"}', datetime('now')),
-		  ('mem_desktop_antipattern_k8s', 'anti_pattern', '除非明确要求，不要把个人本地 App 默认引到 Kubernetes 或复杂运维路径。', '避免复杂运维默认路径', 'global', 'internal', 0.9, 'confirmed', '[]', '["kubernetes","ops"]', 0, '{"seed":"desktop_eval"}', datetime('now'))
+			  ('mem_desktop_deploy_pref', 'profile', '用户偏好轻量部署，优先 Docker Compose，避免默认推荐 Kubernetes。', '轻量部署偏好', 'global', 'internal', 0.95, 'confirmed', '[]', '["deploy","docker compose"]', 1, '{"seed":"desktop_eval"}', datetime('now')),
+			  ('mem_desktop_antipattern_k8s', 'anti_pattern', '除非明确要求，不要把个人本地 App 默认引到 Kubernetes 或复杂运维路径。', '避免复杂运维默认路径', 'global', 'internal', 0.9, 'confirmed', '[]', '["kubernetes","ops"]', 0, '{"seed":"desktop_eval"}', datetime('now')),
+			  ('mem_desktop_joi_direction', 'project_fact', '用户希望把 Joi 做成伙伴式前台 + 严肃执行后台：平时陪用户想，严肃任务时能可追踪、可交付、可审计地干活。', 'Joi 的产品方向', 'global', 'internal', 0.96, 'confirmed', '[]', '["Joi","伙伴式前台","严肃执行后台"]', 1, '{"seed":"desktop_eval"}', datetime('now'))
 		ON CONFLICT(id) DO UPDATE SET content=excluded.content, summary=excluded.summary, confidence=excluded.confidence, status=excluded.status, pinned=excluded.pinned, updated_at=datetime('now');
 
 		INSERT INTO nodes (id, name, role, status, capabilities, resources, network, assign_policy, auto_assign_enabled, manual_assign_enabled, last_heartbeat_at, version, metadata, updated_at)
@@ -112,6 +120,7 @@ func runCase(ctx context.Context, core *appcore.AppCore, tc desktopCase) error {
 		Channel:       "desktop_eval",
 		UserID:        "desktop_eval",
 		Message:       tc.Message,
+		InputMode:     tc.InputMode,
 		PreferredNode: tc.PreferredNode,
 		AllowWorker:   tc.AllowWorker,
 	})
@@ -181,6 +190,64 @@ func runCase(ctx context.Context, core *appcore.AppCore, tc desktopCase) error {
 		}
 		if count == 0 {
 			return fmt.Errorf("expected pending memory proposal")
+		}
+	}
+	if tc.ExpectProductTask || tc.ExpectNoProductTask || tc.ExpectMinProductTaskSteps > 0 {
+		var productTaskID string
+		err := core.DB().SQL().QueryRowContext(ctx, `SELECT id FROM product_tasks WHERE latest_run_id=? ORDER BY created_at DESC LIMIT 1`, chat.RunID).Scan(&productTaskID)
+		if tc.ExpectNoProductTask {
+			if err == nil {
+				return fmt.Errorf("unexpected product_task %s", productTaskID)
+			}
+			if err != nil && !strings.Contains(err.Error(), "no rows") {
+				return err
+			}
+		} else {
+			if err != nil {
+				return fmt.Errorf("expected product_task: %w", err)
+			}
+			if tc.ExpectMinProductTaskSteps > 0 {
+				var stepCount int
+				if err := core.DB().SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM product_task_steps WHERE product_task_id=?`, productTaskID).Scan(&stepCount); err != nil {
+					return err
+				}
+				if stepCount < tc.ExpectMinProductTaskSteps {
+					return fmt.Errorf("product_task_steps got %d want at least %d", stepCount, tc.ExpectMinProductTaskSteps)
+				}
+			}
+		}
+	}
+	if tc.ExpectArtifact {
+		var count int
+		if err := core.DB().SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM artifacts WHERE source_run_id=?`, chat.RunID).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			return fmt.Errorf("expected artifact linked to run")
+		}
+	}
+	if tc.ExpectOpenLoop {
+		var count int
+		if err := core.DB().SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM open_loops WHERE source_run_id=?`, chat.RunID).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			return fmt.Errorf("expected open_loop linked to run")
+		}
+	}
+	if tc.ExpectProactiveDraft {
+		var count int
+		if err := core.DB().SQL().QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM proactive_messages p
+			LEFT JOIN open_loops o ON o.id=p.source_open_loop_id
+			WHERE p.status='draft'
+			  AND (o.source_run_id=? OR p.source_product_task_id IN (SELECT id FROM product_tasks WHERE latest_run_id=?))
+		`, chat.RunID, chat.RunID).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			return fmt.Errorf("expected proactive draft linked to run")
 		}
 	}
 	return nil
