@@ -16,20 +16,65 @@ type ConversationListResponse struct {
 	Conversations []ConversationSummary `json:"conversations"`
 }
 
+type ConversationFilter struct {
+	View    string `json:"view"`
+	GroupID string `json:"group_id"`
+	Limit   int    `json:"limit"`
+}
+
+type ConversationGroup struct {
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
+	SortOrder int            `json:"sort_order"`
+	Collapsed bool           `json:"collapsed"`
+	Metadata  map[string]any `json:"metadata"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+}
+
+type ConversationGroupListResponse struct {
+	Groups []ConversationGroup `json:"groups"`
+}
+
+type ConversationGroupRequest struct {
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
+	SortOrder int            `json:"sort_order"`
+	Collapsed bool           `json:"collapsed"`
+	Metadata  map[string]any `json:"metadata"`
+}
+
+type ConversationActionRequest struct {
+	ID      string `json:"id"`
+	Reason  string `json:"reason"`
+	GroupID string `json:"group_id"`
+}
+
+type ConversationActionResponse struct {
+	Conversation ConversationSummary `json:"conversation"`
+}
+
 type ConversationSummary struct {
-	ID            string         `json:"id"`
-	Channel       string         `json:"channel"`
-	UserID        string         `json:"user_id"`
-	Title         string         `json:"title"`
-	ActiveAgentID string         `json:"active_agent_id"`
-	Topic         string         `json:"topic"`
-	LastMessage   string         `json:"last_message"`
-	LastRole      string         `json:"last_role"`
-	LatestRunID   string         `json:"latest_run_id"`
-	MessageCount  int            `json:"message_count"`
-	Metadata      map[string]any `json:"metadata"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
+	ID              string         `json:"id"`
+	Channel         string         `json:"channel"`
+	UserID          string         `json:"user_id"`
+	Title           string         `json:"title"`
+	ActiveAgentID   string         `json:"active_agent_id"`
+	Topic           string         `json:"topic"`
+	GroupID         string         `json:"group_id"`
+	LifecycleStatus string         `json:"lifecycle_status"`
+	Pinned          bool           `json:"pinned"`
+	LastMessage     string         `json:"last_message"`
+	LastRole        string         `json:"last_role"`
+	LatestRunID     string         `json:"latest_run_id"`
+	MessageCount    int            `json:"message_count"`
+	Metadata        map[string]any `json:"metadata"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+	ArchivedAt      *time.Time     `json:"archived_at,omitempty"`
+	TrashedAt       *time.Time     `json:"trashed_at,omitempty"`
+	PurgeAfter      *time.Time     `json:"purge_after,omitempty"`
+	RestoredAt      *time.Time     `json:"restored_at,omitempty"`
 }
 
 type ConversationDetail struct {
@@ -94,10 +139,16 @@ type ToolRunRecord struct {
 	CreatedAt        time.Time      `json:"created_at"`
 }
 
-func (a *AppCore) ListConversations(ctx context.Context, limit int) (*ConversationListResponse, error) {
+func (a *AppCore) ListConversations(ctx context.Context, filter ConversationFilter) (*ConversationListResponse, error) {
 	if a.db == nil {
 		return nil, errors.New("appcore db is not available")
 	}
+	if a.isSQLite() {
+		if err := a.db.EnsureSQLiteConversationLifecycle(ctx); err != nil {
+			return nil, err
+		}
+	}
+	limit := filter.Limit
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
@@ -107,18 +158,22 @@ func (a *AppCore) ListConversations(ctx context.Context, limit int) (*Conversati
 		lastMessageOrder = "m.created_at DESC, m.id DESC"
 		latestRunOrder = "r.created_at DESC, r.id DESC"
 	}
+	where, args := conversationListWhere(a.isSQLite(), filter)
 	query := fmt.Sprintf(`
 		SELECT c.id, c.channel, c.user_id, COALESCE(c.title, ''), COALESCE(c.active_agent_id, ''),
-		       COALESCE(c.topic, ''), c.metadata, c.created_at, c.updated_at,
+		       COALESCE(c.topic, ''), COALESCE(c.group_id, ''), COALESCE(c.lifecycle_status, 'active'),
+		       c.pinned, c.archived_at, c.trashed_at, c.purge_after, c.restored_at,
+		       c.metadata, c.created_at, c.updated_at,
 		       COALESCE((SELECT m.content FROM messages m WHERE m.conversation_id=c.id ORDER BY %s LIMIT 1), '') AS last_message,
 		       COALESCE((SELECT m.role FROM messages m WHERE m.conversation_id=c.id ORDER BY %s LIMIT 1), '') AS last_role,
 		       COALESCE((SELECT r.id FROM runs r WHERE r.conversation_id=c.id ORDER BY %s LIMIT 1), '') AS latest_run_id,
 		       (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id) AS message_count
 		FROM conversations c
-		ORDER BY c.updated_at DESC, c.created_at DESC
+		%s
+		ORDER BY c.pinned DESC, c.updated_at DESC, c.created_at DESC
 		LIMIT %d
-	`, lastMessageOrder, lastMessageOrder, latestRunOrder, limit)
-	rows, err := a.db.SQL().QueryContext(ctx, query)
+	`, lastMessageOrder, lastMessageOrder, latestRunOrder, where, limit)
+	rows, err := a.db.SQL().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +362,9 @@ func (a *AppCore) getConversationSummary(ctx context.Context, conversationID str
 	}
 	rows, err := a.db.SQL().QueryContext(ctx, fmt.Sprintf(`
 		SELECT c.id, c.channel, c.user_id, COALESCE(c.title, ''), COALESCE(c.active_agent_id, ''),
-		       COALESCE(c.topic, ''), c.metadata, c.created_at, c.updated_at,
+		       COALESCE(c.topic, ''), COALESCE(c.group_id, ''), COALESCE(c.lifecycle_status, 'active'),
+		       c.pinned, c.archived_at, c.trashed_at, c.purge_after, c.restored_at,
+		       c.metadata, c.created_at, c.updated_at,
 		       COALESCE((SELECT m.content FROM messages m WHERE m.conversation_id=c.id ORDER BY %s LIMIT 1), '') AS last_message,
 		       COALESCE((SELECT m.role FROM messages m WHERE m.conversation_id=c.id ORDER BY %s LIMIT 1), '') AS last_role,
 		       COALESCE((SELECT r.id FROM runs r WHERE r.conversation_id=c.id ORDER BY %s LIMIT 1), '') AS latest_run_id,
@@ -339,13 +396,79 @@ type conversationSummaryScanner interface {
 func scanConversationSummary(scanner conversationSummaryScanner) (ConversationSummary, error) {
 	var conversation ConversationSummary
 	var metadataRaw, createdAt, updatedAt string
-	if err := scanner.Scan(&conversation.ID, &conversation.Channel, &conversation.UserID, &conversation.Title, &conversation.ActiveAgentID, &conversation.Topic, &metadataRaw, &createdAt, &updatedAt, &conversation.LastMessage, &conversation.LastRole, &conversation.LatestRunID, &conversation.MessageCount); err != nil {
+	var archivedAt, trashedAt, purgeAfter, restoredAt sql.NullString
+	if err := scanner.Scan(&conversation.ID, &conversation.Channel, &conversation.UserID, &conversation.Title, &conversation.ActiveAgentID, &conversation.Topic, &conversation.GroupID, &conversation.LifecycleStatus, &conversation.Pinned, &archivedAt, &trashedAt, &purgeAfter, &restoredAt, &metadataRaw, &createdAt, &updatedAt, &conversation.LastMessage, &conversation.LastRole, &conversation.LatestRunID, &conversation.MessageCount); err != nil {
 		return ConversationSummary{}, err
+	}
+	if conversation.LifecycleStatus == "" {
+		conversation.LifecycleStatus = "active"
 	}
 	conversation.Metadata = decodeObject([]byte(metadataRaw))
 	conversation.CreatedAt = parseSQLiteTime(createdAt)
 	conversation.UpdatedAt = parseSQLiteTime(updatedAt)
+	conversation.ArchivedAt = nullSQLiteTimePtr(archivedAt)
+	conversation.TrashedAt = nullSQLiteTimePtr(trashedAt)
+	conversation.PurgeAfter = nullSQLiteTimePtr(purgeAfter)
+	conversation.RestoredAt = nullSQLiteTimePtr(restoredAt)
 	return conversation, nil
+}
+
+func conversationListWhere(sqlite bool, filter ConversationFilter) (string, []any) {
+	view := normalizeConversationView(filter.View)
+	clauses := []string{}
+	args := []any{}
+	switch view {
+	case "archived":
+		clauses = append(clauses, "COALESCE(c.lifecycle_status, 'active')='archived'")
+	case "trash":
+		clauses = append(clauses, "COALESCE(c.lifecycle_status, 'active')='trashed'")
+	case "all":
+		clauses = append(clauses, "COALESCE(c.lifecycle_status, 'active')<>'purged'")
+	case "purged":
+		clauses = append(clauses, "COALESCE(c.lifecycle_status, 'active')='purged'")
+	default:
+		clauses = append(clauses, "COALESCE(c.lifecycle_status, 'active')='active'")
+	}
+	groupID := strings.TrimSpace(filter.GroupID)
+	if groupID != "" {
+		if groupID == "__ungrouped" {
+			clauses = append(clauses, "(c.group_id IS NULL OR c.group_id='')")
+		} else {
+			placeholder := "?"
+			if !sqlite {
+				placeholder = fmt.Sprintf("$%d", len(args)+1)
+			}
+			clauses = append(clauses, "c.group_id="+placeholder)
+			args = append(args, groupID)
+		}
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func normalizeConversationView(view string) string {
+	switch strings.TrimSpace(strings.ToLower(view)) {
+	case "archive", "archived":
+		return "archived"
+	case "trash", "trashed", "recycle_bin":
+		return "trash"
+	case "all":
+		return "all"
+	case "purged":
+		return "purged"
+	default:
+		return "active"
+	}
+}
+
+func nullSQLiteTimePtr(value sql.NullString) *time.Time {
+	if !value.Valid || strings.TrimSpace(value.String) == "" {
+		return nil
+	}
+	t := parseSQLiteTime(value.String)
+	return &t
 }
 
 func unmarshalJSONString(raw string, dest any) error {

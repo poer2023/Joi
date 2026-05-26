@@ -76,6 +76,7 @@ type ChatOptions struct {
 	PreferredNode string `json:"preferred_node"`
 	AllowTools    bool   `json:"allow_tools"`
 	AllowWorker   bool   `json:"allow_worker"`
+	ModelName     string `json:"model_name"`
 }
 
 func (h *Handlers) SendChat(w http.ResponseWriter, r *http.Request) {
@@ -99,6 +100,7 @@ func (h *Handlers) SendChat(w http.ResponseWriter, r *http.Request) {
 		Message:        request.Message,
 		PreferredNode:  request.Options.PreferredNode,
 		AllowWorker:    request.Options.AllowWorker,
+		ModelName:      request.Options.ModelName,
 	})
 	if err != nil {
 		h.logger.Error("chat send failed", "service", "orchestrator-core", "error", err)
@@ -110,7 +112,11 @@ func (h *Handlers) SendChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) ListConversations(w http.ResponseWriter, r *http.Request) {
-	result, err := h.core.ListConversations(r.Context(), 100)
+	result, err := h.core.ListConversations(r.Context(), appcore.ConversationFilter{
+		View:    r.URL.Query().Get("view"),
+		GroupID: r.URL.Query().Get("group_id"),
+		Limit:   100,
+	})
 	if err != nil {
 		writeStoreReadError(w, err, "")
 		return
@@ -126,6 +132,72 @@ func (h *Handlers) GetConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOK(w, http.StatusOK, result, result.Conversation.LatestRunID)
+}
+
+func (h *Handlers) ArchiveConversation(w http.ResponseWriter, r *http.Request) {
+	h.handleConversationAction(w, r, h.core.ArchiveConversation)
+}
+
+func (h *Handlers) TrashConversation(w http.ResponseWriter, r *http.Request) {
+	h.handleConversationAction(w, r, h.core.TrashConversation)
+}
+
+func (h *Handlers) RestoreConversation(w http.ResponseWriter, r *http.Request) {
+	h.handleConversationAction(w, r, h.core.RestoreConversation)
+}
+
+func (h *Handlers) PurgeConversation(w http.ResponseWriter, r *http.Request) {
+	h.handleConversationAction(w, r, h.core.PurgeConversation)
+}
+
+func (h *Handlers) MoveConversationToGroup(w http.ResponseWriter, r *http.Request) {
+	h.handleConversationAction(w, r, h.core.MoveConversationToGroup)
+}
+
+func (h *Handlers) handleConversationAction(w http.ResponseWriter, r *http.Request, action func(context.Context, appcore.ConversationActionRequest) (*appcore.ConversationActionResponse, error)) {
+	var request appcore.ConversationActionRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&request)
+	}
+	request.ID = r.PathValue("id")
+	result, err := action(r.Context(), request)
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	traceID := result.Conversation.LatestRunID
+	writeOK(w, http.StatusOK, result, traceID)
+}
+
+func (h *Handlers) ListConversationGroups(w http.ResponseWriter, r *http.Request) {
+	result, err := h.core.ListConversationGroups(r.Context())
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, result, "")
+}
+
+func (h *Handlers) SaveConversationGroup(w http.ResponseWriter, r *http.Request) {
+	var request appcore.ConversationGroupRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid JSON request body", map[string]any{}, "")
+		return
+	}
+	group, err := h.core.SaveConversationGroup(r.Context(), request)
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, map[string]any{"group": group}, "")
+}
+
+func (h *Handlers) DeleteConversationGroup(w http.ResponseWriter, r *http.Request) {
+	if err := h.core.DeleteConversationGroup(r.Context(), r.PathValue("id")); err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, map[string]any{"deleted": true}, "")
 }
 
 func (h *Handlers) GetRun(w http.ResponseWriter, r *http.Request) {

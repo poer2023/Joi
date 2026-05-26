@@ -5,6 +5,7 @@ export type ChatRequest = {
   message: string;
   preferred_node?: string;
   allow_worker?: boolean;
+  model_name?: string;
   input_mode?: InputMode;
   product_task_id?: string;
 };
@@ -16,12 +17,20 @@ export type ChatResponse = {
   run_id: string;
   selected_agent_id: string;
   response: string;
+  ui?: ChatUIHints;
   model_calls?: ModelCall[];
   used_memories?: MemorySearchResult[];
   product_task?: ProductTask;
   artifacts?: ArtifactSummary[];
   proactive_candidates?: ProactiveMessage[];
   reflection?: ReflectionResult;
+};
+
+export type ChatUIHints = {
+  interaction_class: string;
+  requires_user_input: boolean;
+  missing_input?: string;
+  inline_execution: boolean;
 };
 
 export type InputMode = 'auto' | 'chat_assist' | 'serious_task' | 'background_task';
@@ -54,7 +63,20 @@ export type RunTrace = {
   model_calls?: ModelCall[];
   prompt_assemblies?: Array<{ id: string; prefix_hash: string; dynamic_tail_hash: string; prompt_cache_key: string }>;
   memory_context_packs?: Array<{ id: string; memory_profile_version: string; dynamic_retrieval?: MemorySearchResult[] }>;
-  steps?: Array<{ id: string; step_type: string; title: string; status: string; input?: Record<string, unknown>; output?: Record<string, unknown>; error?: Record<string, unknown> }>;
+  steps?: Array<{
+    id: string;
+    run_id?: string;
+    step_type: string;
+    title: string;
+    status: string;
+    input?: Record<string, unknown>;
+    output?: Record<string, unknown>;
+    error?: Record<string, unknown>;
+    started_at?: string;
+    finished_at?: string;
+    duration_ms?: number;
+    created_at?: string;
+  }>;
 };
 
 export type ConversationSummary = {
@@ -64,6 +86,9 @@ export type ConversationSummary = {
   title: string;
   active_agent_id?: string;
   topic?: string;
+  group_id?: string;
+  lifecycle_status?: 'active' | 'archived' | 'trashed' | 'purged' | string;
+  pinned?: boolean;
   last_message?: string;
   last_role?: string;
   latest_run_id?: string;
@@ -71,6 +96,44 @@ export type ConversationSummary = {
   metadata?: Record<string, unknown>;
   created_at?: string;
   updated_at?: string;
+  archived_at?: string;
+  trashed_at?: string;
+  purge_after?: string;
+  restored_at?: string;
+};
+
+export type ConversationFilter = {
+  view?: 'active' | 'archived' | 'trash' | 'all' | 'purged' | string;
+  group_id?: string;
+  limit?: number;
+};
+
+export type ConversationActionRequest = {
+  id: string;
+  reason?: string;
+  group_id?: string;
+};
+
+export type ConversationActionResponse = {
+  conversation: ConversationSummary;
+};
+
+export type ConversationGroup = {
+  id: string;
+  name: string;
+  sort_order: number;
+  collapsed: boolean;
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ConversationGroupRequest = {
+  id?: string;
+  name: string;
+  sort_order?: number;
+  collapsed?: boolean;
+  metadata?: Record<string, unknown>;
 };
 
 export type ConversationMessage = {
@@ -375,6 +438,7 @@ export type SettingsRecord = {
   log_dir?: string;
   model_provider: string;
   model_name: string;
+  model_reasoning_name?: string;
   model_base_url: string;
   telegram_enabled: boolean;
   telegram_allowed_user_ids?: string;
@@ -397,6 +461,8 @@ export type ConnectionTest = {
 };
 
 export type AvailableModel = {
+  provider?: string;
+  base_url?: string;
   id: string;
   display_name?: string;
   owner?: string;
@@ -448,6 +514,7 @@ export type ModelConfigRequest = {
   provider: string;
   base_url: string;
   name: string;
+  reasoning_name?: string;
   timeout_seconds?: number;
   max_retries?: number;
 };
@@ -456,11 +523,24 @@ export type ModelConnectionTestRequest = ModelConfigRequest & {
   api_key?: string;
 };
 
+export type ModelListRequest = {
+  provider?: string;
+  base_url?: string;
+};
+
 type DesktopBindings = {
   SendChat(req: ChatRequest): Promise<ChatResponse>;
   GetRunTrace(runID: string): Promise<RunTrace>;
-  ListConversations(): Promise<{ conversations: ConversationSummary[] }>;
+  ListConversations(filter: ConversationFilter): Promise<{ conversations: ConversationSummary[] }>;
   GetConversation(conversationID: string): Promise<ConversationDetail>;
+  ListConversationGroups(): Promise<{ groups: ConversationGroup[] }>;
+  SaveConversationGroup(req: ConversationGroupRequest): Promise<ConversationGroup>;
+  DeleteConversationGroup(id: string): Promise<void>;
+  MoveConversationToGroup(req: ConversationActionRequest): Promise<ConversationActionResponse>;
+  ArchiveConversation(req: ConversationActionRequest): Promise<ConversationActionResponse>;
+  TrashConversation(req: ConversationActionRequest): Promise<ConversationActionResponse>;
+  RestoreConversation(req: ConversationActionRequest): Promise<ConversationActionResponse>;
+  PurgeConversation(req: ConversationActionRequest): Promise<ConversationActionResponse>;
   ListCapabilities(): Promise<{ capabilities: CapabilityRecord[] }>;
   ListToolWorkflows(): Promise<{ workflows: ToolWorkflowRecord[] }>;
   ListToolRuns(): Promise<{ tool_runs: ToolRunRecord[] }>;
@@ -489,6 +569,8 @@ type DesktopBindings = {
   GetSettings(): Promise<SettingsRecord>;
   GetWorkspaceSettings(): Promise<WorkspaceSettings>;
   SaveWorkspaceSettings(req: WorkspaceSettings): Promise<void>;
+  ListSavedModels(req: ModelListRequest): Promise<{ models: AvailableModel[] }>;
+  FetchAvailableModels(req?: ModelConnectionTestRequest): Promise<ConnectionTest>;
   SaveModelConfig(req: ModelConfigRequest): Promise<void>;
   SaveModelSettings(req: ModelSettingsRequest): Promise<void>;
   SaveOperationalSettings(req: { telegram_enabled: boolean; telegram_allowed_user_ids?: string; worker_gateway_enabled: boolean; backup_dir?: string; auto_backup_enabled: boolean }): Promise<void>;
@@ -541,7 +623,10 @@ function bindings(): DesktopBindings {
           ],
         };
       },
-      async ListConversations() {
+      async ListConversations(filter: ConversationFilter = { view: 'active', limit: 100 }) {
+        if (filter.view && filter.view !== 'active') {
+          return { conversations: [] };
+        }
         return {
           conversations: [
             {
@@ -554,9 +639,32 @@ function bindings(): DesktopBindings {
               last_role: 'assistant',
               latest_run_id: '',
               message_count: 2,
+              lifecycle_status: 'active',
             },
           ],
         };
+      },
+      async ListConversationGroups() {
+        return { groups: [{ id: 'cgrp_preview', name: '默认分组', sort_order: 1, collapsed: false }] };
+      },
+      async SaveConversationGroup(req) {
+        return { id: req.id || `cgrp_preview_${Date.now()}`, name: req.name, sort_order: req.sort_order ?? 0, collapsed: Boolean(req.collapsed), metadata: req.metadata ?? {} };
+      },
+      async DeleteConversationGroup() {},
+      async MoveConversationToGroup() {
+        return { conversation: { id: 'conv_preview', channel: 'preview', user_id: 'desktop_user', title: 'Preview conversation', message_count: 2, lifecycle_status: 'active' } };
+      },
+      async ArchiveConversation() {
+        return { conversation: { id: 'conv_preview', channel: 'preview', user_id: 'desktop_user', title: 'Preview conversation', message_count: 2, lifecycle_status: 'archived' } };
+      },
+      async TrashConversation() {
+        return { conversation: { id: 'conv_preview', channel: 'preview', user_id: 'desktop_user', title: 'Preview conversation', message_count: 2, lifecycle_status: 'trashed', purge_after: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString() } };
+      },
+      async RestoreConversation() {
+        return { conversation: { id: 'conv_preview', channel: 'preview', user_id: 'desktop_user', title: 'Preview conversation', message_count: 2, lifecycle_status: 'active' } };
+      },
+      async PurgeConversation() {
+        return { conversation: { id: 'conv_preview', channel: 'preview', user_id: 'desktop_user', title: '[已永久清理]', message_count: 2, lifecycle_status: 'purged' } };
       },
       async GetConversation() {
         return {
@@ -704,7 +812,8 @@ function bindings(): DesktopBindings {
           sqlite_path: 'preview',
           log_dir: 'preview/logs',
           model_provider: 'mock_provider',
-          model_name: 'mock-model',
+          model_name: 'deepseek-v4-flash',
+          model_reasoning_name: 'deepseek-v4-pro',
           model_base_url: '',
           telegram_enabled: false,
           telegram_allowed_user_ids: '',
@@ -726,6 +835,40 @@ function bindings(): DesktopBindings {
         };
       },
       async SaveWorkspaceSettings() {},
+      async ListSavedModels() {
+        return {
+          models: [
+            {
+              provider: 'openai_compatible',
+              base_url: 'https://api.deepseek.com/v1',
+              id: 'deepseek-v4-flash',
+              display_name: 'DeepSeek V4 Flash',
+              owner: 'deepseek',
+              context_window: 64000,
+              max_output_tokens: 8192,
+              supports_json_mode: true,
+              supports_tool_calling: true,
+              supports_reasoning: false,
+              supported_parameters: ['temperature', 'max_tokens', 'response_format', 'tools'],
+              config: { role: 'default', enabled: true, temperature: 0.7, max_output_tokens: 8192, timeout_seconds: 60, max_retries: 1, supports_json_mode: true, supports_tool_calling: true, supports_reasoning: false },
+            },
+            {
+              provider: 'openai_compatible',
+              base_url: 'https://api.deepseek.com/v1',
+              id: 'deepseek-v4-pro',
+              display_name: 'DeepSeek V4 Pro',
+              owner: 'deepseek',
+              context_window: 128000,
+              max_output_tokens: 16384,
+              supports_json_mode: true,
+              supports_tool_calling: true,
+              supports_reasoning: true,
+              supported_parameters: ['temperature', 'max_tokens', 'response_format', 'tools', 'reasoning'],
+              config: { role: 'reasoning', enabled: true, temperature: 0.3, max_output_tokens: 16384, timeout_seconds: 90, max_retries: 1, supports_json_mode: true, supports_tool_calling: true, supports_reasoning: true },
+            },
+          ],
+        };
+      },
       async SaveModelConfig() {},
       async SaveModelSettings() {},
       async SaveOperationalSettings() {},
@@ -742,11 +885,16 @@ function bindings(): DesktopBindings {
       },
       async SaveSecret() {},
       async TestModelConnection() {
+        return { ok: true, status: 'preview' };
+      },
+      async FetchAvailableModels() {
         return {
           ok: true,
           status: 'preview',
           available_models: [
             {
+              provider: 'openai_compatible',
+              base_url: 'https://api.deepseek.com/v1',
               id: 'deepseek-v4-flash',
               display_name: 'DeepSeek V4 Flash',
               owner: 'deepseek',
@@ -759,6 +907,8 @@ function bindings(): DesktopBindings {
               config: { role: 'general', enabled: true, temperature: 0.7, max_output_tokens: 8192, timeout_seconds: 60, max_retries: 1, supports_json_mode: true, supports_tool_calling: true, supports_reasoning: false },
             },
             {
+              provider: 'openai_compatible',
+              base_url: 'https://api.deepseek.com/v1',
               id: 'deepseek-v4-pro',
               display_name: 'DeepSeek V4 Pro',
               owner: 'deepseek',
@@ -787,8 +937,16 @@ function bindings(): DesktopBindings {
 export const desktopApi = {
   sendChat: (req: ChatRequest) => bindings().SendChat(req),
   getRunTrace: (runID: string) => bindings().GetRunTrace(runID),
-  listConversations: () => bindings().ListConversations(),
+  listConversations: (filter: ConversationFilter = { view: 'active', limit: 100 }) => bindings().ListConversations(filter),
   getConversation: (conversationID: string) => bindings().GetConversation(conversationID),
+  listConversationGroups: () => bindings().ListConversationGroups(),
+  saveConversationGroup: (req: ConversationGroupRequest) => bindings().SaveConversationGroup(req),
+  deleteConversationGroup: (id: string) => bindings().DeleteConversationGroup(id),
+  moveConversationToGroup: (req: ConversationActionRequest) => bindings().MoveConversationToGroup(req),
+  archiveConversation: (req: ConversationActionRequest) => bindings().ArchiveConversation(req),
+  trashConversation: (req: ConversationActionRequest) => bindings().TrashConversation(req),
+  restoreConversation: (req: ConversationActionRequest) => bindings().RestoreConversation(req),
+  purgeConversation: (req: ConversationActionRequest) => bindings().PurgeConversation(req),
   listCapabilities: () => bindings().ListCapabilities(),
   listToolWorkflows: () => bindings().ListToolWorkflows(),
   listToolRuns: () => bindings().ListToolRuns(),
@@ -817,6 +975,8 @@ export const desktopApi = {
   getSettings: () => bindings().GetSettings(),
   getWorkspaceSettings: () => bindings().GetWorkspaceSettings(),
   saveWorkspaceSettings: (req: WorkspaceSettings) => bindings().SaveWorkspaceSettings(req),
+  listSavedModels: (req: ModelListRequest = {}) => bindings().ListSavedModels(req),
+  fetchAvailableModels: (req?: ModelConnectionTestRequest) => bindings().FetchAvailableModels(req),
   saveModelConfig: (req: ModelConfigRequest) => bindings().SaveModelConfig(req),
   saveModelSettings: (req: ModelSettingsRequest) => bindings().SaveModelSettings(req),
   saveOperationalSettings: (req: { telegram_enabled: boolean; telegram_allowed_user_ids?: string; worker_gateway_enabled: boolean; backup_dir?: string; auto_backup_enabled: boolean }) => bindings().SaveOperationalSettings(req),

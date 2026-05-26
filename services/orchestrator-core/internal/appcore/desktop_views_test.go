@@ -22,7 +22,7 @@ func TestSQLiteChatWorkbenchLoadsRealConversations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	list, err := core.ListConversations(ctx, 10)
+	list, err := core.ListConversations(ctx, ConversationFilter{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,6 +45,173 @@ func TestSQLiteChatWorkbenchLoadsRealConversations(t *testing.T) {
 	}
 	if detail.Messages[0].RunID != chat.RunID || detail.Messages[1].RunID != chat.RunID {
 		t.Fatalf("messages should link to run %s: %+v", chat.RunID, detail.Messages)
+	}
+}
+
+func TestSQLiteConversationTrashRestoreHidesPackageAndRestoresMemory(t *testing.T) {
+	ctx := context.Background()
+	core := newTestAppCore(t, ctx)
+	defer core.Shutdown(ctx)
+
+	chat, err := core.SendChat(ctx, ChatRequest{
+		Channel:   "test",
+		UserID:    "tester",
+		InputMode: "serious_task",
+		Message:   "请整理一份 Joi 会话管理方案。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chat.ProductTask == nil || len(chat.Artifacts) == 0 {
+		t.Fatalf("expected task and artifact before trash: task=%+v artifacts=%d", chat.ProductTask, len(chat.Artifacts))
+	}
+	pendingID, err := store.NewID("mem_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.DB().SQL().ExecContext(ctx, `
+		INSERT INTO memories (id, type, content, summary, status, source_event_ids, entities, metadata)
+		VALUES (?, 'user_preference', '用户临时说明：这条只属于会话回收测试。', '会话回收测试临时说明', 'pending', ?, '[]', '{}')
+	`, pendingID, mustJSON([]string{chat.ConversationID})); err != nil {
+		t.Fatal(err)
+	}
+	confirmed, err := core.ProposeMemory(ctx, MemoryProposalRequest{
+		Type:           "project_fact",
+		Content:        "Joi 会话回收测试确认记忆应保留。",
+		Summary:        "会话回收确认记忆",
+		SourceEventIDs: []string{chat.ConversationID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.UpdateMemory(ctx, MemoryActionRequest{ID: confirmed.ID, Action: "confirm"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := core.TrashConversation(ctx, ConversationActionRequest{ID: chat.ConversationID, Reason: "test_trash"}); err != nil {
+		t.Fatal(err)
+	}
+	activeList, err := core.ListConversations(ctx, ConversationFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activeList.Conversations) != 0 {
+		t.Fatalf("trashed conversation remained active: %+v", activeList.Conversations)
+	}
+	trashList, err := core.ListConversations(ctx, ConversationFilter{View: "trash", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trashList.Conversations) != 1 || trashList.Conversations[0].LifecycleStatus != "trashed" || trashList.Conversations[0].PurgeAfter == nil {
+		t.Fatalf("trash list mismatch: %+v", trashList.Conversations)
+	}
+	taskList, err := core.ListProductTasks(ctx, ProductTaskFilter{Status: "active", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(taskList.Tasks) != 0 {
+		t.Fatalf("trashed conversation task remained visible: %+v", taskList.Tasks)
+	}
+	artifactList, err := core.ListArtifacts(ctx, ArtifactFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifactList.Artifacts) != 0 {
+		t.Fatalf("trashed conversation artifact remained visible: %+v", artifactList.Artifacts)
+	}
+	memories, err := core.ListMemories(ctx, MemoryFilter{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMemory(memories.Memories, confirmed.ID) || hasMemory(memories.Memories, pendingID) {
+		t.Fatalf("trash memory policy mismatch: confirmed=%s pending=%s list=%+v", confirmed.ID, pendingID, memories.Memories)
+	}
+
+	if _, err := core.RestoreConversation(ctx, ConversationActionRequest{ID: chat.ConversationID, Reason: "test_restore"}); err != nil {
+		t.Fatal(err)
+	}
+	activeList, err = core.ListConversations(ctx, ConversationFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activeList.Conversations) != 1 || activeList.Conversations[0].LifecycleStatus != "active" {
+		t.Fatalf("restore active list mismatch: %+v", activeList.Conversations)
+	}
+	memories, err = core.ListMemories(ctx, MemoryFilter{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMemory(memories.Memories, confirmed.ID) || !hasMemory(memories.Memories, pendingID) {
+		t.Fatalf("restore memory policy mismatch: confirmed=%s pending=%s list=%+v", confirmed.ID, pendingID, memories.Memories)
+	}
+}
+
+func TestSQLiteConversationArchiveRejectsNewMessages(t *testing.T) {
+	ctx := context.Background()
+	core := newTestAppCore(t, ctx)
+	defer core.Shutdown(ctx)
+
+	chat, err := core.SendChat(ctx, ChatRequest{Channel: "test", UserID: "tester", Message: "你好。"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.ArchiveConversation(ctx, ConversationActionRequest{ID: chat.ConversationID, Reason: "test_archive"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.SendChat(ctx, ChatRequest{ConversationID: chat.ConversationID, Channel: "test", UserID: "tester", Message: "继续。"}); err == nil || !strings.Contains(err.Error(), "archived") {
+		t.Fatalf("expected archived conversation send rejection, got %v", err)
+	}
+}
+
+func TestSQLiteConversationPurgeRedactsButKeepsTraceReadable(t *testing.T) {
+	ctx := context.Background()
+	core := newTestAppCore(t, ctx)
+	defer core.Shutdown(ctx)
+
+	chat, err := core.SendChat(ctx, ChatRequest{
+		Channel:   "test",
+		UserID:    "tester",
+		InputMode: "serious_task",
+		Message:   "请整理一份可永久清理的测试报告。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.Artifacts) == 0 {
+		t.Fatalf("expected artifact before purge")
+	}
+	artifactID := chat.Artifacts[0].ID
+	if _, err := core.TrashConversation(ctx, ConversationActionRequest{ID: chat.ConversationID, Reason: "test_trash"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.PurgeConversation(ctx, ConversationActionRequest{ID: chat.ConversationID, Reason: "test_purge"}); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := core.GetConversation(ctx, chat.ConversationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Conversation.LifecycleStatus != "purged" {
+		t.Fatalf("expected purged conversation: %+v", detail.Conversation)
+	}
+	for _, message := range detail.Messages {
+		if message.Content != "[已永久清理]" {
+			t.Fatalf("message was not redacted: %+v", message)
+		}
+	}
+	trace, err := core.GetRunTrace(ctx, chat.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Steps) == 0 {
+		t.Fatalf("purged trace should remain readable")
+	}
+	artifact, err := core.GetArtifact(ctx, artifactID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.Content != "[已永久清理]" || artifact.Status != "deleted" {
+		t.Fatalf("artifact not redacted after purge: %+v", artifact)
 	}
 }
 
@@ -162,6 +329,15 @@ func hasCapabilityRecord(records []store.CapabilityRecord, id string) bool {
 func hasWorkflowRecord(records []ToolWorkflowRecord, name string) bool {
 	for _, record := range records {
 		if record.Name == name && len(record.Steps) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMemory(records []store.MemoryRecord, id string) bool {
+	for _, record := range records {
+		if record.ID == id {
 			return true
 		}
 	}

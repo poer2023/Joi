@@ -40,12 +40,16 @@ type ReflectionTaskCandidate struct {
 }
 
 type conversationClassification struct {
-	InputMode        string
-	Mode             string
-	ConversationType string
-	Importance       string
-	ShouldCreateTask bool
-	ShouldReflect    bool
+	InputMode          string
+	Mode               string
+	InteractionClass   string
+	ConversationType   string
+	Importance         string
+	ShouldCreateTask   bool
+	ShouldReflect      bool
+	RequiresUserInput  bool
+	MissingInput       string
+	ClassificationNote string
 }
 
 func (a *AppCore) RunConversationReflection(ctx context.Context, req ReflectionRequest) (*ReflectionResult, error) {
@@ -280,7 +284,7 @@ func maybeCreateProactiveDraftTx(ctx context.Context, tx *sql.Tx, req Reflection
 	if openLoop == nil && req.ProductTaskID == "" {
 		return nil, nil
 	}
-	if classification.Mode == "serious_task" && !isProactiveInstruction(req.Message, req.InputMode) {
+	if classification.Mode == "serious_task" && req.ProductTaskID == "" && !isProactiveInstruction(req.Message, req.InputMode) {
 		return nil, nil
 	}
 	score := proactiveScore(classification, openLoop != nil, len(memories) > 0)
@@ -385,11 +389,21 @@ func classifyConversation(message string, requestedMode string) conversationClas
 	if mode == "" || mode == "auto" {
 		mode = inferredInputMode(message)
 	}
+	interactionClass := mode
 	conversationType := "ordinary_chat"
 	importance := "low"
 	shouldReflect := false
 	shouldCreateTask := false
-	if mode == "serious_task" {
+	requiresUserInput := false
+	missingInput := ""
+	note := ""
+	if mode == "clarify" {
+		interactionClass = "clarify"
+		conversationType = "clarification_request"
+		requiresUserInput = true
+		missingInput = "url"
+		note = "web_research_missing_url"
+	} else if mode == "serious_task" {
 		conversationType = "serious_task_request"
 		importance = "high"
 		shouldReflect = true
@@ -417,12 +431,12 @@ func classifyConversation(message string, requestedMode string) conversationClas
 			shouldReflect = true
 		}
 	}
-	return conversationClassification{InputMode: inputMode, Mode: mode, ConversationType: conversationType, Importance: importance, ShouldCreateTask: shouldCreateTask, ShouldReflect: shouldReflect}
+	return conversationClassification{InputMode: inputMode, Mode: mode, InteractionClass: interactionClass, ConversationType: conversationType, Importance: importance, ShouldCreateTask: shouldCreateTask, ShouldReflect: shouldReflect, RequiresUserInput: requiresUserInput, MissingInput: missingInput, ClassificationNote: note}
 }
 
 func normalizeInputMode(mode string) string {
 	switch strings.TrimSpace(mode) {
-	case "auto", "chat_assist", "serious_task", "background_task":
+	case "auto", "chat_assist", "serious_task", "background_task", "clarify":
 		return strings.TrimSpace(mode)
 	case "聊聊":
 		return "chat_assist"
@@ -449,10 +463,63 @@ func inferredInputMode(message string) string {
 	if containsAnyText(message, []string{"之后提醒", "下次提醒", "提醒我", "后台", "持续关注", "下次继续"}) {
 		return "background_task"
 	}
-	if containsAnyText(lower, []string{"analyze", "report", "implement", "fix", "deploy", "research", "summarize"}) || containsAnyText(message, []string{"帮我分析", "给我", "查一下", "整理", "报告", "实现", "改代码", "部署", "诊断", "总结", "生成方案"}) {
+	if webResearchRequestMissingURL(message) {
+		return "clarify"
+	}
+	if isExplicitSeriousTaskRequest(message) || containsAnyText(lower, []string{"implementation plan", "development plan", "deliverable"}) {
 		return "serious_task"
 	}
 	return "chat_assist"
+}
+
+func isExplicitSeriousTaskRequest(message string) bool {
+	lower := strings.ToLower(message)
+	if containsAnyText(message, []string{"帮我分析"}) && containsAnyText(message, []string{"差距", "下一步", "开发计划", "计划", "方案", "问题"}) {
+		return true
+	}
+	if containsAnyText(message, []string{
+		"认真执行",
+		"严肃执行",
+		"生成报告",
+		"写一份报告",
+		"整理一份报告",
+		"输出报告",
+		"生成方案",
+		"制定方案",
+		"落地方案",
+		"生成开发计划",
+		"开发计划",
+		"下一步开发计划",
+		"实施计划",
+		"执行计划",
+		"交付物",
+		"开发 spec",
+		"开发spec",
+		"生成 spec",
+		"实现",
+		"改代码",
+		"写代码",
+		"修复",
+		"部署",
+		"完整测试",
+		"测试复测",
+		"复测",
+	}) {
+		return true
+	}
+	return containsAnyText(lower, []string{
+		"serious task",
+		"execute seriously",
+		"generate a report",
+		"write a report",
+		"implementation plan",
+		"development plan",
+		"deliverable",
+		"spec",
+		"implement",
+		"fix",
+		"deploy",
+	})
 }
 
 func shouldCreateMemoryCandidate(message string, classification conversationClassification) bool {
@@ -548,7 +615,7 @@ func suggestedFollowup(message string, classification conversationClassification
 		return explicitReminderBody(message)
 	}
 	if classification.Mode == "serious_task" {
-		return "下次可继续查看任务步骤、交付物和 Run Trace。"
+		return "继续推进：" + truncate(strings.TrimSpace(message), 72)
 	}
 	if isProductDirection(message) {
 		return "下一步优先确认 Memory、Task、Artifact 和主动触达的共同闭环。"
@@ -578,7 +645,15 @@ func proactiveScore(classification conversationClassification, hasOpenLoop bool,
 
 func proactiveCopy(message string, classification conversationClassification, openLoop *OpenLoopRecord) (string, string, string) {
 	if classification.Mode == "serious_task" {
-		return "任务后续可继续推进", "这个任务已经形成可追踪记录和交付物，下一步可以从任务卡继续。", "严肃任务存在自然后续，需要保留为审核候选。"
+		title := "任务后续可继续推进"
+		body := "这个任务已经形成可追踪记录和交付物，下一步可以从任务卡继续。"
+		if openLoop != nil && strings.TrimSpace(openLoop.SuggestedFollowup) != "" {
+			body = openLoop.SuggestedFollowup
+		}
+		if openLoop != nil && strings.TrimSpace(openLoop.Topic) != "" {
+			title = truncate(openLoop.Topic, 80)
+		}
+		return title, body, "严肃任务存在自然后续，需要保留为审核候选。"
 	}
 	if classification.Mode == "background_task" {
 		body := explicitReminderBody(message)

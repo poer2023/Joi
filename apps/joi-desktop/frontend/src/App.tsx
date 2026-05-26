@@ -1,5 +1,6 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
-import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
+import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
+import { WindowSetMinSize } from '../wailsjs/runtime/runtime';
 import {
   desktopApi,
   type ArtifactDetail,
@@ -11,7 +12,6 @@ import {
   type ConversationMessage,
   type ConversationSummary,
   type ConfirmationRecord,
-  type InputMode,
   type MemoryRecord,
   type MemorySearchResult,
   type ModelCall,
@@ -32,10 +32,12 @@ import {
 } from './api/desktop';
 import joiAvatar from './assets/joi-avatar-circle.png';
 import { ScrollArea } from './components/ScrollArea';
+import { projectRunTraceToActions, type ExecutionAction, type ExecutionActionDetail } from './executionActions';
 
 type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
 type SettingsTab = Exclude<Tab, 'chat'>;
 type SettingsCategory = 'models' | 'chatEntrances' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
+type ExecutionTarget = 'main-node' | 'auto' | 'local-worker-1' | 'vps-la-1';
 type ModelSettingsDraft = {
   provider: string;
   base_url: string;
@@ -80,20 +82,33 @@ const defaultSettingsObjectByCategory: Record<SettingsCategory, string> = {
   privacySecurity: 'secrets',
   advanced: 'diagnostics',
 };
-const DEFAULT_SIDEBAR_WIDTH = 376;
-const MIN_SIDEBAR_WIDTH = 300;
+const DEFAULT_SIDEBAR_WIDTH = 288;
+const MIN_SIDEBAR_WIDTH = 232;
 const MAX_SIDEBAR_WIDTH = 560;
+const CHAT_MAIN_MIN_WIDTH = 560;
+const RIGHT_PANEL_MIN_WIDTH = 260;
+const MIN_APP_WIDTH = CHAT_MAIN_MIN_WIDTH;
+const MIN_APP_HEIGHT = 720;
+const executionTargetOptions: Array<{ value: ExecutionTarget; label: string; preferredNode: string; allowWorker: boolean }> = [
+  { value: 'main-node', label: '本机', preferredNode: 'main-node', allowWorker: false },
+  { value: 'auto', label: '自动', preferredNode: 'auto', allowWorker: true },
+  { value: 'local-worker-1', label: '本机 Worker', preferredNode: 'local-worker-1', allowWorker: true },
+  { value: 'vps-la-1', label: '远端 Worker', preferredNode: 'vps-la-1', allowWorker: true },
+];
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('chat');
   const [message, setMessage] = useState('');
-  const [inputMode, setInputMode] = useState<InputMode>('auto');
   const [lastPrompt, setLastPrompt] = useState('');
-  const [preferredNode, setPreferredNode] = useState('main-node');
-  const [allowWorker, setAllowWorker] = useState(false);
+  const [pendingUserMessage, setPendingUserMessage] = useState<ConversationMessage | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [executionTarget, setExecutionTarget] = useState<ExecutionTarget>('main-node');
+  const [selectedModelName, setSelectedModelName] = useState('');
   const [chat, setChat] = useState<ChatResponse | null>(null);
   const [trace, setTrace] = useState<RunTrace | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [archivedConversations, setArchivedConversations] = useState<ConversationSummary[]>([]);
+  const [trashedConversations, setTrashedConversations] = useState<ConversationSummary[]>([]);
   const [currentConversationID, setCurrentConversationID] = useState('');
   const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([]);
   const [capabilities, setCapabilities] = useState<CapabilityRecord[]>([]);
@@ -113,6 +128,7 @@ export default function App() {
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
   const [gatewayAudit, setGatewayAudit] = useState<WorkerGatewayAuditRecord[]>([]);
   const [usage, setUsage] = useState<Record<string, unknown>[]>([]);
+  const [savedModels, setSavedModels] = useState<AvailableModel[]>([]);
   const [confirmations, setConfirmations] = useState<ConfirmationRecord[]>([]);
   const [backups, setBackups] = useState<BackupRecord[]>([]);
   const [settings, setSettings] = useState<SettingsRecord | null>(null);
@@ -120,29 +136,76 @@ export default function App() {
   const [onboarding, setOnboarding] = useState<OnboardingStatus | null>(null);
   const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>('models');
   const [settingsObjectByCategory, setSettingsObjectByCategory] = useState<Record<SettingsCategory, string>>(defaultSettingsObjectByCategory);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [manualSidebarCollapsed, setManualSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+  const [windowWidth, setWindowWidth] = useState(() => (typeof window === 'undefined' ? 1280 : window.innerWidth));
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [errorKey, setErrorKey] = useState(0);
   const [noticeKey, setNoticeKey] = useState(0);
+  const shellRef = useRef<HTMLElement | null>(null);
 
   const stepCount = useMemo(() => trace?.steps?.length ?? 0, [trace]);
   const firstModelCall = trace?.model_calls?.[0] ?? chat?.model_calls?.[0];
-  const inSettingsArea = activeTab !== 'chat';
+  const inSettingsArea = activeTab !== 'chat' && activeTab !== 'trace';
+  const autoSidebarCollapsed = !manualSidebarCollapsed && windowWidth < sidebarWidth + CHAT_MAIN_MIN_WIDTH;
+  const sidebarCollapsed = manualSidebarCollapsed || autoSidebarCollapsed;
   const activeSidebarWidth = sidebarCollapsed ? 0 : sidebarWidth;
-  const sidebarControlsLeft = sidebarCollapsed
-    ? '108px'
-    : inSettingsArea
-      ? `max(108px, ${sidebarWidth - 108}px)`
-      : `max(108px, ${sidebarWidth - 158}px)`;
+  const autoRightPanelCollapsed = windowWidth < activeSidebarWidth + CHAT_MAIN_MIN_WIDTH + RIGHT_PANEL_MIN_WIDTH;
   const shellStyle = {
     '--sidebar-width': `${activeSidebarWidth}px`,
-    '--sidebar-controls-left': sidebarControlsLeft,
+    '--chat-main-min-width': `${CHAT_MAIN_MIN_WIDTH}px`,
+    '--right-panel-min-width': `${RIGHT_PANEL_MIN_WIDTH}px`,
   } as CSSProperties;
 
   useEffect(() => {
+    if (!settings?.model_name) return;
+    const models = savedModelsForProvider(savedModels, settings.model_provider, settings.model_base_url);
+    const nextModel = models.length > 0 && !models.some((model) => model.id === settings.model_name)
+      ? preferredDefaultModel(models)
+      : settings.model_name;
+    setSelectedModelName(nextModel);
+  }, [savedModels, settings?.model_base_url, settings?.model_name, settings?.model_provider]);
+
+  useEffect(() => {
+    try {
+      WindowSetMinSize(MIN_APP_WIDTH, MIN_APP_HEIGHT);
+    } catch {
+      // Browser preview mode does not expose the Wails runtime.
+    }
+
     void refreshAll();
+  }, []);
+
+  useEffect(() => {
+    let animationFrame = 0;
+
+    function measureWidth() {
+      return Math.round(shellRef.current?.getBoundingClientRect().width || window.innerWidth);
+    }
+
+    function updateWindowWidth() {
+      if (animationFrame) return;
+      animationFrame = window.requestAnimationFrame(() => {
+        animationFrame = 0;
+        setWindowWidth(measureWidth());
+      });
+    }
+
+    updateWindowWidth();
+    window.addEventListener('resize', updateWindowWidth);
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updateWindowWidth);
+    if (shellRef.current) {
+      observer?.observe(shellRef.current);
+    }
+
+    return () => {
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame);
+      }
+      window.removeEventListener('resize', updateWindowWidth);
+      observer?.disconnect();
+    };
   }, []);
 
   useEffect(() => {
@@ -160,8 +223,6 @@ export default function App() {
       selectSettingsObject('dataMemory', 'memory-search');
     } else if (activeTab === 'nodes') {
       selectSettingsObject('nodesExecution', 'main-node');
-    } else if (activeTab === 'trace') {
-      selectSettingsObject('advanced', 'prompt-assembly');
     } else if (activeTab === 'system') {
       selectSettingsObject('advanced', 'diagnostics');
     } else if (activeTab === 'costs') {
@@ -198,6 +259,8 @@ export default function App() {
     try {
       const [
         conversationList,
+        archivedConversationList,
+        trashedConversationList,
         capabilityList,
         workflowList,
         toolRunList,
@@ -211,13 +274,16 @@ export default function App() {
         nodeList,
         gatewayAuditList,
         modelUsage,
+        savedModelList,
         confirmationList,
         backupList,
         desktopSettings,
         secrets,
         onboardingStatus,
       ] = await Promise.all([
-        desktopApi.listConversations(),
+        desktopApi.listConversations({ view: 'active', limit: 100 }),
+        desktopApi.listConversations({ view: 'archived', limit: 100 }),
+        desktopApi.listConversations({ view: 'trash', limit: 100 }),
         desktopApi.listCapabilities(),
         desktopApi.listToolWorkflows(),
         desktopApi.listToolRuns(),
@@ -231,6 +297,7 @@ export default function App() {
         desktopApi.listNodes(),
         desktopApi.listWorkerGatewayAuditLogs(),
         desktopApi.getModelUsage(),
+        desktopApi.listSavedModels({}),
         desktopApi.listConfirmations(),
         desktopApi.listBackups(),
         desktopApi.getSettings(),
@@ -238,6 +305,8 @@ export default function App() {
         desktopApi.getOnboardingStatus(),
       ]);
       setConversations(conversationList.conversations ?? []);
+      setArchivedConversations(archivedConversationList.conversations ?? []);
+      setTrashedConversations(trashedConversationList.conversations ?? []);
       setCapabilities(capabilityList.capabilities ?? []);
       setWorkflows(workflowList.workflows ?? []);
       setToolRuns(toolRunList.tool_runs ?? []);
@@ -251,6 +320,7 @@ export default function App() {
       setNodes(nodeList.nodes ?? []);
       setGatewayAudit(gatewayAuditList.items ?? []);
       setUsage(modelUsage.items ?? []);
+      setSavedModels(savedModelList.models ?? []);
       setConfirmations(confirmationList.items ?? []);
       setBackups(backupList.backups ?? []);
       setSettings(desktopSettings);
@@ -261,23 +331,37 @@ export default function App() {
     }
   }
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
+  async function submit(event?: FormEvent) {
+    event?.preventDefault();
     setError('');
     setNotice('');
     setTrace(null);
+    if (isSubmitting) return;
     const prompt = message.trim();
     if (!prompt) return;
+    const pendingConversationID = currentConversationID || 'pending-conversation';
     setLastPrompt(prompt);
+    setPendingUserMessage({
+      id: `pending-${Date.now()}`,
+      conversation_id: pendingConversationID,
+      role: 'user',
+      content: prompt,
+    });
+    setMessage('');
+    setIsSubmitting(true);
+    const routing = executionTargetOptions.find((item) => item.value === executionTarget) ?? executionTargetOptions[0];
+    const modelName = selectedModelName || settings?.model_name || 'deepseek-v4-flash';
     try {
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
       const result = await desktopApi.sendChat({
         conversation_id: currentConversationID || undefined,
         channel: 'desktop',
         user_id: 'desktop_user',
         message: prompt,
-        preferred_node: preferredNode,
-        allow_worker: allowWorker,
-        input_mode: inputMode,
+        preferred_node: routing.preferredNode,
+        allow_worker: routing.allowWorker,
+        model_name: modelName,
+        input_mode: 'auto',
         product_task_id: activeProductTaskID || undefined,
       });
       setChat(result);
@@ -294,10 +378,15 @@ export default function App() {
       setTrace(runTrace);
       const detail = await desktopApi.getConversation(result.conversation_id);
       setConversationMessages(detail.messages ?? []);
+      setPendingUserMessage(null);
       await refreshAll();
       setActiveTab('chat');
     } catch (err) {
+      setPendingUserMessage(null);
+      setMessage(prompt);
       showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsSubmitting(false);
     }
   }
 
@@ -318,6 +407,41 @@ export default function App() {
     } catch (err) {
       showError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  async function archiveConversation(conversationID: string) {
+    await desktopApi.archiveConversation({ id: conversationID, reason: 'desktop_ui' });
+    if (currentConversationID === conversationID) {
+      startNewChat();
+    }
+    showNotice('会话已归档');
+    await refreshAll();
+  }
+
+  async function trashConversation(conversationID: string) {
+    await desktopApi.trashConversation({ id: conversationID, reason: 'desktop_ui' });
+    if (currentConversationID === conversationID) {
+      startNewChat();
+    }
+    showNotice('会话已移到回收站');
+    await refreshAll();
+  }
+
+  async function restoreConversation(conversationID: string) {
+    await desktopApi.restoreConversation({ id: conversationID, reason: 'desktop_ui' });
+    showNotice('会话已恢复');
+    await refreshAll();
+  }
+
+  async function purgeConversation(conversationID: string) {
+    const confirmed = window.confirm('永久清理会红线化消息、提示词、模型/工具原始内容和交付物内容，且不可恢复。确定继续？');
+    if (!confirmed) return;
+    await desktopApi.purgeConversation({ id: conversationID, reason: 'desktop_ui' });
+    if (currentConversationID === conversationID) {
+      startNewChat();
+    }
+    showNotice('会话已永久清理');
+    await refreshAll();
   }
 
   async function setWorkflowEnabled(name: string, enabled: boolean) {
@@ -413,28 +537,49 @@ export default function App() {
   }
 
   function toggleSidebarCollapsed() {
-    setSidebarCollapsed((value) => !value);
+    setManualSidebarCollapsed(sidebarCollapsed ? false : true);
   }
 
   function startSidebarResize(event: ReactPointerEvent<HTMLDivElement>) {
     if (sidebarCollapsed) return;
 
     event.preventDefault();
+    const shell = shellRef.current;
     const startX = event.clientX;
     const startWidth = sidebarWidth;
+    let nextWidth = startWidth;
+    let animationFrame = 0;
     const previousCursor = document.body.style.cursor;
     const previousUserSelect = document.body.style.userSelect;
+    shell?.classList.add('sidebar-resizing');
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
 
+    function applyWidth() {
+      animationFrame = 0;
+      shell?.style.setProperty('--sidebar-width', `${nextWidth}px`);
+    }
+
+    function scheduleWidth(width: number) {
+      nextWidth = Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
+      if (animationFrame) return;
+      animationFrame = window.requestAnimationFrame(applyWidth);
+    }
+
     function resize(moveEvent: PointerEvent) {
-      const nextWidth = Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, startWidth + moveEvent.clientX - startX));
-      setSidebarWidth(nextWidth);
+      scheduleWidth(startWidth + moveEvent.clientX - startX);
     }
 
     function stopResize() {
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame);
+        animationFrame = 0;
+      }
+      shell?.style.setProperty('--sidebar-width', `${nextWidth}px`);
+      shell?.classList.remove('sidebar-resizing');
       document.body.style.cursor = previousCursor;
       document.body.style.userSelect = previousUserSelect;
+      setSidebarWidth(nextWidth);
       window.removeEventListener('pointermove', resize);
       window.removeEventListener('pointerup', stopResize);
       window.removeEventListener('pointercancel', stopResize);
@@ -446,7 +591,7 @@ export default function App() {
   }
 
   return (
-    <main className={`im-app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${inSettingsArea ? 'settings-mode' : ''}`} style={shellStyle}>
+    <main ref={shellRef} className={`im-app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${inSettingsArea ? 'settings-mode' : ''}`} style={shellStyle}>
       {inSettingsArea ? (
         <SettingsTopControls collapsed={sidebarCollapsed} goBack={() => setActiveTab('chat')} toggleCollapsed={toggleSidebarCollapsed} />
       ) : (
@@ -467,6 +612,7 @@ export default function App() {
       ) : (
         <ConversationSidebar
           activeTab={activeTab}
+          archiveConversation={archiveConversation}
           artifacts={artifacts}
           chat={chat}
           collapsed={sidebarCollapsed}
@@ -500,30 +646,30 @@ export default function App() {
         {!onboarding?.required && activeTab === 'chat' && (
           <ChatHome
             activeProductTask={activeProductTaskDetail}
-            allowWorker={allowWorker}
             artifacts={artifacts}
+            autoRightPanelCollapsed={autoRightPanelCollapsed}
             chat={chat}
             conversationMessages={conversationMessages}
             decideProactiveMessage={decideProactiveMessage}
-            firstModelCall={firstModelCall}
+            executionTarget={executionTarget}
             health={health}
-            inputMode={inputMode}
+            isSubmitting={isSubmitting}
             memories={memories}
             openArtifact={openArtifact}
             openLoops={openLoops}
             lastPrompt={lastPrompt}
             message={message}
-            preferredNode={preferredNode}
+            pendingUserMessage={pendingUserMessage}
             proactiveMessages={proactiveMessages}
             productTasks={productTasks}
+            savedModels={savedModels}
+            selectedModelName={selectedModelName || settings?.model_name || 'deepseek-v4-flash'}
             setActiveTab={setActiveTab}
-            setAllowWorker={setAllowWorker}
-            setInputMode={setInputMode}
+            setExecutionTarget={setExecutionTarget}
             setMessage={setMessage}
-            setPreferredNode={setPreferredNode}
+            setSelectedModelName={setSelectedModelName}
             settings={settings}
             updateMemory={updateMemory}
-            stepCount={stepCount}
             submit={submit}
             trace={trace}
           />
@@ -532,11 +678,21 @@ export default function App() {
           <ArtifactViewer artifact={artifactViewer} close={() => setArtifactViewer(null)} />
         )}
 
-        {!onboarding?.required && activeTab !== 'chat' && (
+        {!onboarding?.required && activeTab === 'trace' && (
+          <TraceStage
+            firstModelCall={firstModelCall}
+            goBack={() => setActiveTab('chat')}
+            stepCount={stepCount}
+            trace={trace}
+          />
+        )}
+
+        {!onboarding?.required && activeTab !== 'chat' && activeTab !== 'trace' && (
           <section className="settings-stage">
             <SettingsConsole
               activeCategory={settingsCategory}
               activeObjectID={settingsObjectByCategory[settingsCategory]}
+              archivedConversations={archivedConversations}
               audit={gatewayAudit}
               backups={backups}
               capabilities={capabilities}
@@ -551,7 +707,9 @@ export default function App() {
               nodes={nodes}
               refreshAll={refreshAll}
               restoreBackup={restoreBackup}
+              restoreConversation={restoreConversation}
               rotateWorkerToken={rotateWorkerToken}
+              savedModels={savedModels}
               secretStatus={secretStatus}
               selectSettingsObject={selectSettingsObject}
               setMemoryQuery={setMemoryQuery}
@@ -562,6 +720,9 @@ export default function App() {
               stepCount={stepCount}
               trace={trace}
               toolRuns={toolRuns}
+              trashedConversations={trashedConversations}
+              trashConversation={trashConversation}
+              purgeConversation={purgeConversation}
               updateMemory={updateMemory}
               usage={usage}
               workflows={workflows}
@@ -826,13 +987,6 @@ function SettingsSidebar({
 
   return (
     <aside className="im-sidebar settings-sidebar">
-      <div className="settings-sidebar-title">
-        <span className="settings-sidebar-gear"><SidebarIcon name="settings" /></span>
-        <div>
-          <strong>设置</strong>
-          <small>Joi 设置中心</small>
-        </div>
-      </div>
       <ScrollArea className="settings-menu" aria-label="设置菜单">
         {settingsCategories.map((section) => (
           <button
@@ -843,7 +997,6 @@ function SettingsSidebar({
           >
             <span>
               <strong>{section.label}</strong>
-              <small>{section.description}</small>
             </span>
           </button>
         ))}
@@ -860,6 +1013,7 @@ function SettingsSidebar({
 function SettingsConsole({
   activeCategory,
   activeObjectID,
+  archivedConversations,
   audit,
   backups,
   capabilities,
@@ -874,7 +1028,9 @@ function SettingsConsole({
   nodes,
   refreshAll,
   restoreBackup,
+  restoreConversation,
   rotateWorkerToken,
+  savedModels,
   secretStatus,
   selectSettingsObject,
   setMemoryQuery,
@@ -885,6 +1041,9 @@ function SettingsConsole({
   stepCount,
   trace,
   toolRuns,
+  trashedConversations,
+  trashConversation,
+  purgeConversation,
   updateMemory,
   usage,
   workflows,
@@ -892,6 +1051,7 @@ function SettingsConsole({
 }: {
   activeCategory: SettingsCategory;
   activeObjectID: string;
+  archivedConversations: ConversationSummary[];
   audit: WorkerGatewayAuditRecord[];
   backups: BackupRecord[];
   capabilities: CapabilityRecord[];
@@ -906,7 +1066,9 @@ function SettingsConsole({
   nodes: NodeRecord[];
   refreshAll: () => Promise<void>;
   restoreBackup: (path: string) => Promise<void>;
+  restoreConversation: (conversationID: string) => Promise<void>;
   rotateWorkerToken: () => Promise<void>;
+  savedModels: AvailableModel[];
   secretStatus: SecretStatus | null;
   selectSettingsObject: (category: SettingsCategory, objectID?: string) => void;
   setMemoryQuery: (value: string) => void;
@@ -917,6 +1079,9 @@ function SettingsConsole({
   stepCount: number;
   trace: RunTrace | null;
   toolRuns: ToolRunRecord[];
+  trashedConversations: ConversationSummary[];
+  trashConversation: (conversationID: string) => Promise<void>;
+  purgeConversation: (conversationID: string) => Promise<void>;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
   usage: Record<string, unknown>[];
   workflows: ToolWorkflowRecord[];
@@ -958,13 +1123,17 @@ function SettingsConsole({
 
   useEffect(() => {
     const preset = modelProviderPresets[activeObject.id] ?? modelProviderPresets.compatible;
+    const nextBaseURL = activeObject.id === 'deepseek' ? settings?.model_base_url || preset.baseURL : preset.baseURL;
+    const models = savedModelsForProvider(savedModels, preset.provider, nextBaseURL);
+    const configuredDefaultModel = activeObject.id === 'deepseek' ? settings?.model_name || preset.defaultModel : preset.defaultModel;
+    const configuredReasoningModel = activeObject.id === 'deepseek' ? settings?.model_reasoning_name || preset.reasoningModel : preset.reasoningModel;
     setProvider(preset.provider);
-    setModelBaseURL(activeObject.id === 'deepseek' ? settings?.model_base_url || preset.baseURL : preset.baseURL);
-    setModelName(activeObject.id === 'deepseek' ? settings?.model_name || preset.defaultModel : preset.defaultModel);
-    setReasoningModel(preset.reasoningModel);
-    setAvailableModels([]);
+    setModelBaseURL(nextBaseURL);
+    setModelName(models.length > 0 && !models.some((model) => model.id === configuredDefaultModel) ? preferredDefaultModel(models) : configuredDefaultModel);
+    setReasoningModel(models.length > 0 && !models.some((model) => model.id === configuredReasoningModel) ? preferredReasoningModel(models) : configuredReasoningModel);
+    setAvailableModels(models);
     setTestStatus('');
-  }, [activeObject.id, settings?.model_base_url, settings?.model_name]);
+  }, [activeObject.id, savedModels, settings?.model_base_url, settings?.model_name, settings?.model_reasoning_name]);
 
   useEffect(() => {
     setTelegramEnabled(settings?.telegram_enabled ?? false);
@@ -977,6 +1146,7 @@ function SettingsConsole({
       provider,
       base_url: modelBaseURL,
       name: modelName,
+      reasoning_name: reasoningModel,
       timeout_seconds: Number(modelTimeout) || 60,
       max_retries: Number(modelRetryCount) || 1,
     });
@@ -997,8 +1167,28 @@ function SettingsConsole({
       timeout_seconds: Number(modelTimeout) || 60,
       max_retries: Number(modelRetryCount) || 1,
     });
-    setAvailableModels(result.available_models ?? []);
     setTestStatus(`连接状态：${formatStatus(result.status)}${result.error_summary ? ` · ${result.error_summary}` : ''}`);
+  }
+
+  async function fetchModelList() {
+    const result = await desktopApi.fetchAvailableModels({
+      provider,
+      base_url: modelBaseURL,
+      name: modelName,
+      api_key: modelApiKey.trim() || undefined,
+      timeout_seconds: Number(modelTimeout) || 60,
+      max_retries: Number(modelRetryCount) || 1,
+    });
+    const models = result.available_models ?? [];
+    setAvailableModels(models);
+    if (models.length > 0 && !models.some((model) => model.id === modelName)) {
+      setModelName(preferredDefaultModel(models));
+    }
+    if (models.length > 0 && !models.some((model) => model.id === reasoningModel)) {
+      setReasoningModel(preferredReasoningModel(models));
+    }
+    setTestStatus(`模型列表：${formatStatus(result.status)}${result.error_summary ? ` · ${result.error_summary}` : ''}`);
+    await refreshAll();
   }
 
   function openModelSettings(model: AvailableModel) {
@@ -1145,6 +1335,7 @@ function SettingsConsole({
               <strong>{settings?.model_name ? '已配置' : '未配置'}</strong>
               <small>{testStatus || `${activeObject.label} API 配置状态`}</small>
               <button type="button" onClick={testModelDetail}>测试连接</button>
+              <button type="button" onClick={fetchModelList}>获取模型</button>
             </div>
           </div>
           {availableModels.length > 0 && (
@@ -1279,7 +1470,8 @@ function SettingsConsole({
         <MemoryObjectDetail
           emptyText="暂无待处理记忆。"
           memories={inbox}
-          title="Memory Inbox"
+          title="待确认记忆"
+          description="审核 Joi 准备写入长期记忆的候选内容"
           updateMemory={updateMemory}
           editAndConfirm={editAndConfirm}
           mode="inbox"
@@ -1292,6 +1484,7 @@ function SettingsConsole({
           emptyText="暂无已确认记忆。"
           memories={confirmedMemories}
           title="已确认记忆"
+          description="已经进入长期记忆库、可被后续对话召回的内容"
           updateMemory={updateMemory}
           mode="confirmed"
         />
@@ -1303,6 +1496,7 @@ function SettingsConsole({
           emptyText="暂无冲突记忆。"
           memories={conflictedMemories}
           title="冲突记忆"
+          description="需要合并、纠正或停用的记忆条目"
           updateMemory={updateMemory}
           mode="conflict"
         />
@@ -1320,11 +1514,35 @@ function SettingsConsole({
         </section>
       );
     }
+    if (activeObject.id === 'archived-conversations') {
+      return (
+        <ConversationLifecycleSettingsList
+          conversations={archivedConversations}
+          emptyText="暂无归档会话。"
+          mode="archived"
+          restoreConversation={restoreConversation}
+          title="归档会话"
+          trashConversation={trashConversation}
+        />
+      );
+    }
+    if (activeObject.id === 'trashed-conversations') {
+      return (
+        <ConversationLifecycleSettingsList
+          conversations={trashedConversations}
+          emptyText="回收站为空。"
+          mode="trash"
+          purgeConversation={purgeConversation}
+          restoreConversation={restoreConversation}
+          title="回收站"
+        />
+      );
+    }
     if (activeObject.id === 'local-data') {
       return (
         <section className="settings-detail-panel">
           <DetailHeader title="本地数据" description="查看本地 SQLite、日志与备份位置" />
-          <dl className="metrics">
+          <dl className="metrics local-data-metrics">
             <KV label="SQLite 路径" value={settings?.sqlite_path ?? '未设置'} />
             <KV label="日志目录" value={settings?.log_dir ?? '未设置'} />
             <KV label="备份目录" value={settings?.backup_dir ?? '未设置'} />
@@ -1733,11 +1951,6 @@ function SettingsConsole({
   return (
     <div className="settings-console">
       <ScrollArea as="aside" className="settings-object-column">
-        <div className="settings-breadcrumb">
-          <span>设置</span>
-          <span>·</span>
-          <strong>{activeCategoryMeta.label}</strong>
-        </div>
         <div className="settings-object-list" aria-label={`${activeCategoryMeta.label}对象`}>
           {objectItems.map((item) => (
             <button
@@ -1747,7 +1960,6 @@ function SettingsConsole({
               onClick={() => selectSettingsObject(activeCategory, item.id)}
             >
               <strong>{item.label}</strong>
-              <small>{item.description}</small>
             </button>
           ))}
         </div>
@@ -1755,7 +1967,6 @@ function SettingsConsole({
       <ScrollArea as="main" className="settings-detail">
         <header className="settings-detail-topbar">
           <span>{activeCategoryMeta.label}</span>
-          <button className="settings-refresh-button" type="button" onClick={refreshAll}>刷新</button>
         </header>
         {renderDetail()}
       </ScrollArea>
@@ -1773,10 +1984,10 @@ const modelProviderPresets: Record<string, { provider: string; baseURL: string; 
   },
   deepseek: {
     provider: 'openai_compatible',
-    baseURL: 'https://api.deepseek.com',
-    defaultModel: 'deepseek-chat',
-    reasoningModel: 'deepseek-reasoner',
-    models: ['deepseek-chat', 'deepseek-reasoner'],
+    baseURL: 'https://api.deepseek.com/v1',
+    defaultModel: 'deepseek-v4-flash',
+    reasoningModel: 'deepseek-v4-pro',
+    models: ['deepseek-v4-flash', 'deepseek-v4-pro'],
   },
   gemini: {
     provider: 'gemini',
@@ -1818,7 +2029,7 @@ const modelProviderPresets: Record<string, { provider: string; baseURL: string; 
     baseURL: '',
     defaultModel: '',
     reasoningModel: '',
-    models: ['deepseek-chat', 'gpt-4.1-mini', 'custom-model'],
+    models: ['deepseek-v4-flash', 'gpt-4.1-mini', 'custom-model'],
   },
 };
 
@@ -1846,10 +2057,12 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[]) {
   }
   if (category === 'dataMemory') {
     return [
-      { id: 'memory-inbox', label: 'Memory Inbox', description: '待确认记忆' },
+      { id: 'memory-inbox', label: '待确认记忆', description: '审核记忆候选' },
       { id: 'confirmed-memory', label: '已确认记忆', description: '长期记忆库' },
       { id: 'conflict-memory', label: '冲突记忆', description: '需要处理的记忆冲突' },
       { id: 'memory-search', label: '记忆搜索', description: '检索与筛选记忆' },
+      { id: 'archived-conversations', label: '归档会话', description: '查看和恢复已归档会话' },
+      { id: 'trashed-conversations', label: '回收站', description: '恢复或永久清理会话' },
       { id: 'local-data', label: '本地数据', description: 'SQLite、日志与备份目录' },
       { id: 'data-maintenance', label: '数据维护', description: '备份、恢复与维护' },
     ];
@@ -1924,6 +2137,7 @@ function RecordList<T>({ emptyText, items, renderItem }: { emptyText: string; it
 }
 
 function MemoryObjectDetail({
+  description,
   emptyText,
   editAndConfirm,
   memories,
@@ -1931,6 +2145,7 @@ function MemoryObjectDetail({
   title,
   updateMemory,
 }: {
+  description?: string;
   emptyText: string;
   editAndConfirm?: (memory: MemoryRecord) => Promise<void>;
   memories: MemoryRecord[];
@@ -1940,13 +2155,13 @@ function MemoryObjectDetail({
 }) {
   return (
     <section className="settings-detail-panel">
-      {title && <DetailHeader title={title} description="管理当前列表中的记忆条目" />}
+      {title && <DetailHeader title={title} description={description ?? "管理当前列表中的记忆条目"} />}
       <RecordList
         emptyText={emptyText}
         items={memories}
         renderItem={(memory) => (
-          <article key={memory.id} className="row-card">
-            <div>
+          <article key={memory.id} className="row-card memory-record-card">
+            <div className="memory-record-main">
               <strong>{memory.summary || memory.type}</strong>
               <p>{memory.content}</p>
               <small>{formatStatus(memory.status)} · 置信度 {memory.confidence.toFixed(2)} · 命中 {memory.usage_count}</small>
@@ -1954,14 +2169,67 @@ function MemoryObjectDetail({
               {memory.source_event_ids?.length ? <small>来源：{memory.source_event_ids.join(', ')}</small> : null}
               {memory.metadata ? <CollapsedData label="高级详情" value={memory.metadata} /> : null}
             </div>
-            <div className="row-actions">
+            <div className="row-actions memory-record-actions">
               {mode === 'inbox' && <button type="button" onClick={() => updateMemory(memory.id, 'confirm')}>确认</button>}
               {mode === 'inbox' && editAndConfirm && <button type="button" onClick={() => editAndConfirm(memory)}>编辑并确认</button>}
-              <button type="button" onClick={() => updateMemory(memory.id, memory.pinned ? 'unpin' : 'pin')}>{memory.pinned ? '取消置顶' : '置顶'}</button>
-              <button type="button" onClick={() => updateMemory(memory.id, memory.disabled ? 'enable' : 'disable')}>{memory.disabled ? '启用' : '停用'}</button>
-              <button type="button" onClick={() => updateMemory(memory.id, 'feedback_positive')}>有效</button>
-              <button type="button" onClick={() => updateMemory(memory.id, 'feedback_negative')}>无效</button>
-              <button type="button" onClick={() => updateMemory(memory.id, 'mark_conflict')}>标记冲突</button>
+              {mode === 'inbox' && <button type="button" className="secondary" onClick={() => updateMemory(memory.id, 'reject')}>别记</button>}
+              {mode !== 'inbox' && <button type="button" onClick={() => updateMemory(memory.id, memory.pinned ? 'unpin' : 'pin')}>{memory.pinned ? '取消置顶' : '置顶'}</button>}
+              {mode !== 'inbox' && <button type="button" onClick={() => updateMemory(memory.id, memory.disabled ? 'enable' : 'disable')}>{memory.disabled ? '启用' : '停用'}</button>}
+              {mode !== 'inbox' && <button type="button" onClick={() => updateMemory(memory.id, 'feedback_positive')}>有效</button>}
+              {mode !== 'inbox' && <button type="button" onClick={() => updateMemory(memory.id, 'feedback_negative')}>无效</button>}
+              {mode !== 'inbox' && <button type="button" onClick={() => updateMemory(memory.id, 'mark_conflict')}>标记冲突</button>}
+            </div>
+          </article>
+        )}
+      />
+    </section>
+  );
+}
+
+function ConversationLifecycleSettingsList({
+  conversations,
+  emptyText,
+  mode,
+  purgeConversation,
+  restoreConversation,
+  title,
+  trashConversation,
+}: {
+  conversations: ConversationSummary[];
+  emptyText: string;
+  mode: 'archived' | 'trash';
+  purgeConversation?: (conversationID: string) => Promise<void>;
+  restoreConversation: (conversationID: string) => Promise<void>;
+  title: string;
+  trashConversation?: (conversationID: string) => Promise<void>;
+}) {
+  return (
+    <section className="settings-detail-panel">
+      <DetailHeader
+        title={title}
+        description={mode === 'trash' ? '回收站会话默认保留 30 天，永久清理前会再次确认。' : '归档会话从左侧主列表隐藏，可随时恢复。'}
+      />
+      <RecordList
+        emptyText={emptyText}
+        items={conversations}
+        renderItem={(conversation) => (
+          <article key={conversation.id} className="row-card conversation-lifecycle-card">
+            <div>
+              <strong>{conversationTitle(conversation)}</strong>
+              <p>{conversation.last_message || '暂无最近消息'}</p>
+              <small>
+                {conversation.message_count ?? 0} 条消息 · 更新于 {formatShortTime(conversation.updated_at)}
+                {mode === 'trash' && conversation.purge_after ? ` · 可清理：${formatShortTime(conversation.purge_after)}` : ''}
+              </small>
+            </div>
+            <div className="row-actions">
+              <button type="button" onClick={() => void restoreConversation(conversation.id)}>恢复</button>
+              {mode === 'archived' && trashConversation && (
+                <button className="danger" type="button" onClick={() => void trashConversation(conversation.id)}>移到回收站</button>
+              )}
+              {mode === 'trash' && purgeConversation && (
+                <button className="danger" type="button" onClick={() => void purgeConversation(conversation.id)}>永久清理</button>
+              )}
             </div>
           </article>
         )}
@@ -1973,6 +2241,7 @@ function MemoryObjectDetail({
 function ConversationSidebar({
   activeTab,
   activeProductTaskID,
+  archiveConversation,
   artifacts,
   chat,
   collapsed,
@@ -1988,6 +2257,7 @@ function ConversationSidebar({
 }: {
   activeTab: Tab;
   activeProductTaskID: string;
+  archiveConversation: (conversationID: string) => Promise<void>;
   artifacts: ArtifactSummary[];
   chat: ChatResponse | null;
   collapsed: boolean;
@@ -2011,22 +2281,27 @@ function ConversationSidebar({
         <RailSectionTitle label="会话" />
         {conversations.length ? conversations.map((item) => {
           const active = currentConversationID === item.id || (!currentConversationID && chat?.conversation_id === item.id);
+          const isConversationContext = activeTab === 'chat' || activeTab === 'trace';
           return (
-            <button
-              key={item.id}
-              className={`conversation-item ${active && activeTab === 'chat' ? 'active' : ''}`}
-              type="button"
-              onClick={() => loadConversation(item.id)}
-            >
-              <img className={`conversation-avatar ${active ? '' : 'muted'}`} src={joiAvatar} alt="" />
-              <span>
-                <strong>{conversationTitle(item)}</strong>
-              </span>
-              <time>{formatShortTime(item.updated_at)}</time>
-            </button>
+            <div key={item.id} className={`conversation-row-wrap ${active && isConversationContext ? 'active' : ''}`}>
+              <button
+                className={`conversation-item ${active && isConversationContext ? 'active' : ''}`}
+                type="button"
+                onClick={() => loadConversation(item.id)}
+              >
+                <img className={`conversation-avatar ${active ? '' : 'muted'}`} src={joiAvatar} alt="" />
+                <span>
+                  <strong>{conversationTitle(item)}</strong>
+                </span>
+                <time>{formatShortTime(item.updated_at)}</time>
+              </button>
+              <div className="conversation-row-actions">
+                <button type="button" onClick={() => void archiveConversation(item.id)}>归档</button>
+              </div>
+            </div>
           );
         }) : (
-          <button className={`conversation-item ${activeTab === 'chat' ? 'active' : ''}`} type="button" onClick={() => setActiveTab('chat')}>
+          <button className={`conversation-item ${activeTab === 'chat' || activeTab === 'trace' ? 'active' : ''}`} type="button" onClick={() => setActiveTab('chat')}>
             <img className="conversation-avatar" src={joiAvatar} alt="" />
             <span>
               <strong>{chat ? '当前对话' : '新对话'}</strong>
@@ -2133,7 +2408,7 @@ function SettingsTopControls({
   );
 }
 
-function SidebarIcon({ name }: { name: 'plus' | 'search' | 'collapse' | 'expand' | 'settings' | 'back' }) {
+function SidebarIcon({ name }: { name: 'plus' | 'search' | 'collapse' | 'expand' | 'down' | 'settings' | 'back' }) {
   return (
     <svg aria-hidden="true" className="sidebar-action-icon" focusable="false" viewBox="0 0 24 24">
       {name === 'plus' && (
@@ -2156,6 +2431,7 @@ function SidebarIcon({ name }: { name: 'plus' | 'search' | 'collapse' | 'expand'
       )}
       {name === 'collapse' && <path d="m15 18-6-6 6-6" />}
       {name === 'expand' && <path d="m9 18 6-6-6-6" />}
+      {name === 'down' && <path d="m6 9 6 6 6-6" />}
       {name === 'settings' && (
         <>
           <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z" />
@@ -2168,63 +2444,62 @@ function SidebarIcon({ name }: { name: 'plus' | 'search' | 'collapse' | 'expand'
 
 function ChatHome({
   activeProductTask,
-  allowWorker,
   artifacts,
+  autoRightPanelCollapsed,
   chat,
   conversationMessages,
   decideProactiveMessage,
-  firstModelCall,
+  executionTarget,
   health,
-  inputMode,
+  isSubmitting,
   lastPrompt,
   message,
   memories,
   openArtifact,
   openLoops,
-  preferredNode,
+  pendingUserMessage,
   proactiveMessages,
   productTasks,
+  savedModels,
+  selectedModelName,
   setActiveTab,
-  setAllowWorker,
-  setInputMode,
+  setExecutionTarget,
   setMessage,
-  setPreferredNode,
+  setSelectedModelName,
   settings,
   updateMemory,
-  stepCount,
   submit,
   trace,
 }: {
   activeProductTask: ProductTaskDetail | null;
-  allowWorker: boolean;
   artifacts: ArtifactSummary[];
+  autoRightPanelCollapsed: boolean;
   chat: ChatResponse | null;
   conversationMessages: ConversationMessage[];
   decideProactiveMessage: (id: string, action: string, feedback?: string) => Promise<void>;
-  firstModelCall?: ModelCall;
+  executionTarget: ExecutionTarget;
   health: SystemHealth | null;
-  inputMode: InputMode;
+  isSubmitting: boolean;
   lastPrompt: string;
   message: string;
   memories: MemoryRecord[];
   openArtifact: (id: string) => Promise<void>;
   openLoops: OpenLoop[];
-  preferredNode: string;
+  pendingUserMessage: ConversationMessage | null;
   proactiveMessages: ProactiveMessage[];
   productTasks: ProductTask[];
+  savedModels: AvailableModel[];
+  selectedModelName: string;
   setActiveTab: (tab: Tab) => void;
-  setAllowWorker: (value: boolean) => void;
-  setInputMode: (value: InputMode) => void;
+  setExecutionTarget: (value: ExecutionTarget) => void;
   setMessage: (value: string) => void;
-  setPreferredNode: (value: string) => void;
+  setSelectedModelName: (value: string) => void;
   settings: SettingsRecord | null;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
-  stepCount: number;
-  submit: (event: FormEvent) => Promise<void>;
+  submit: (event?: FormEvent) => Promise<void>;
   trace: RunTrace | null;
 }) {
-  const modelName = firstModelCall?.model_name || settings?.model_name || 'deepseek-chat';
-  const displayMessages: ConversationMessage[] = conversationMessages.length
+  const settledMessages: ConversationMessage[] = conversationMessages.length
     ? conversationMessages
     : chat
       ? [
@@ -2232,123 +2507,267 @@ function ChatHome({
         { id: chat.assistant_message_id, conversation_id: chat.conversation_id, role: 'assistant', content: chat.response, run_id: chat.run_id },
       ]
       : [];
+  const displayMessages = pendingUserMessage ? [...settledMessages, pendingUserMessage] : settledMessages;
   const hasThread = displayMessages.length > 0;
-  const latestTask = activeProductTask ?? (chat?.product_task ? { task: chat.product_task, steps: [], deliverables: chat.artifacts ?? [] } : null);
+  const activeTaskBelongsToCurrentRun = Boolean(activeProductTask?.task.latest_run_id && activeProductTask.task.latest_run_id === (chat?.run_id || trace?.id));
+  const latestTask = chat?.product_task ? { task: chat.product_task, steps: [], deliverables: chat.artifacts ?? [] } : activeTaskBelongsToCurrentRun ? activeProductTask : null;
+  const executionActions = useMemo(() => projectRunTraceToActions(trace), [trace]);
+  const showInlineActionFlow = shouldShowExecutionActionFlow(executionActions);
+  const showRunDetails = shouldShowInlineRunDetails(chat, trace, latestTask, executionActions);
+  const [manualRightPanelCollapsed, setManualRightPanelCollapsed] = useState(true);
+  const [executionTargetOpen, setExecutionTargetOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const modelControlRef = useRef<HTMLDivElement | null>(null);
+  const modelOptions = composerModelOptions(settings, selectedModelName, savedModels);
+  const rightPanelCollapsed = manualRightPanelCollapsed || autoRightPanelCollapsed;
+  const rightPanelToggleLabel = autoRightPanelCollapsed
+    ? '窗口宽度不足，右侧内容已自动收起'
+    : rightPanelCollapsed
+      ? '展开右侧内容'
+      : '收起右侧内容';
+  const selectedExecutionTarget = executionTargetOptions.find((item) => item.value === executionTarget) ?? executionTargetOptions[0];
+  const executionStatusLabel = executionTargetLabelFromTrace(trace, selectedExecutionTarget.label);
+
+  useEffect(() => {
+    if (!modelMenuOpen) return;
+
+    function closeOnPointerDown(event: globalThis.PointerEvent) {
+      const target = event.target;
+      if (target instanceof Node && modelControlRef.current?.contains(target)) return;
+      setModelMenuOpen(false);
+    }
+
+    function closeOnEscape(event: globalThis.KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setModelMenuOpen(false);
+      }
+    }
+
+    window.addEventListener('pointerdown', closeOnPointerDown, true);
+    window.addEventListener('keydown', closeOnEscape, true);
+    return () => {
+      window.removeEventListener('pointerdown', closeOnPointerDown, true);
+      window.removeEventListener('keydown', closeOnEscape, true);
+    };
+  }, [modelMenuOpen]);
 
   function fillSuggestion(next: string) {
     setMessage(next);
   }
 
+  function fillSeriousTaskSuggestion() {
+    setMessage('认真执行：根据这个方向，给我整理一份开发 spec。');
+  }
+
+  function handleComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
+
+    event.preventDefault();
+    void submit();
+  }
+
   return (
-    <section className="chat-home companion-layout">
+    <section className={`chat-home companion-layout${rightPanelCollapsed ? ' companion-layout-right-collapsed' : ''}`}>
       <section className="chat-main-column">
         <header className="chat-statusbar">
-          <small>本地运行 · 可检查</small>
+          {!hasThread && <small>本地运行 · 可检查</small>}
+          {!hasThread ? (
+            <div
+              className="execution-target-control"
+              title="选择本轮任务的执行位置；Worker 选项会自动启用工作节点派发。"
+              onBlur={(event) => {
+                const nextFocus = event.relatedTarget;
+                if (!(nextFocus instanceof Node) || !event.currentTarget.contains(nextFocus)) {
+                  setExecutionTargetOpen(false);
+                }
+              }}
+            >
+              <button
+                aria-expanded={executionTargetOpen}
+                aria-haspopup="menu"
+                className="execution-target-trigger"
+                type="button"
+                onClick={() => setExecutionTargetOpen((current) => !current)}
+              >
+                <span>执行位置</span>
+                <strong>{selectedExecutionTarget.label}</strong>
+                <SidebarIcon name="down" />
+              </button>
+              {executionTargetOpen && (
+                <div className="execution-target-menu" role="menu">
+                  {executionTargetOptions.map((item) => (
+                    <button
+                      key={item.value}
+                      className={item.value === executionTarget ? 'active' : ''}
+                      role="menuitemradio"
+                      aria-checked={item.value === executionTarget}
+                      type="button"
+                      onClick={() => {
+                        setExecutionTarget(item.value);
+                        setExecutionTargetOpen(false);
+                      }}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <span className="execution-target-status" title="本轮会话的执行位置已固定">
+              执行位置 <strong>{executionStatusLabel}</strong>
+            </span>
+          )}
+          <button
+            aria-expanded={!rightPanelCollapsed}
+            className="round-icon-button collapse-sidebar-button right-panel-collapse-button"
+            title={rightPanelToggleLabel}
+            type="button"
+            disabled={autoRightPanelCollapsed}
+            onClick={() => setManualRightPanelCollapsed((current) => !current)}
+          >
+            <SidebarIcon name={rightPanelCollapsed ? 'expand' : 'collapse'} />
+          </button>
         </header>
 
         <ScrollArea className={hasThread ? 'chat-thread' : 'chat-empty-state'}>
           {hasThread ? (
             <>
-              {displayMessages.map((item) => (
-                <article key={item.id} className={`message-row ${item.role === 'assistant' ? 'assistant-message' : 'user-message'}`}>
-                  {item.role === 'assistant' ? <img className="message-avatar assistant" src={joiAvatar} alt="Joi" /> : <div className="message-avatar">你</div>}
+              {displayMessages.map((item) => {
+                const shouldInsertActionFlow = item.role === 'assistant' && item.run_id && trace?.id === item.run_id && showInlineActionFlow;
+                return (
+                  <Fragment key={item.id}>
+                    {shouldInsertActionFlow ? (
+                      <ExecutionActionFlow
+                        key={`${trace.id}-inline-actions`}
+                        actions={executionActions}
+                        mode="inline"
+                        openTrace={() => setActiveTab('trace')}
+                      />
+                    ) : null}
+                    <article className={`message-row ${item.role === 'assistant' ? 'assistant-message' : 'user-message'}`}>
+                      {item.role === 'assistant' ? <img className="message-avatar assistant" src={joiAvatar} alt="Joi" /> : <div className="message-avatar">你</div>}
+                      <div className="message-bubble">
+                        <p>{item.role === 'assistant' ? userFacingAssistantText(item.content) : item.content}</p>
+                      </div>
+                    </article>
+                  </Fragment>
+                );
+              })}
+              {isSubmitting && (
+                <article className="message-row assistant-message pending-message">
+                  <img className="message-avatar assistant" src={joiAvatar} alt="Joi" />
                   <div className="message-bubble">
-                    <div className="message-heading">
-                      <strong>{item.role === 'assistant' ? trace?.selected_agent_id || chat?.selected_agent_id || 'Joi' : '你'}</strong>
-                      {item.role === 'assistant' && item.run_id ? <button type="button" onClick={() => setActiveTab('trace')}>查看执行细节</button> : null}
-                    </div>
-                    <p>{item.content}</p>
-                    {item.run_id ? <small>{item.run_id}</small> : null}
+                    <p>正在处理...</p>
                   </div>
                 </article>
-              ))}
-              {latestTask && <TaskCard detail={latestTask} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />}
-              <ExecutionCards trace={trace} openTrace={() => setActiveTab('trace')} />
-              {trace && (
-                <button className="trace-chip" type="button" onClick={() => setActiveTab('trace')}>
-                  <span>{trace.status}</span>
-                  <span>{stepCount} steps</span>
-                  <span>{modelName}</span>
-                </button>
               )}
+              {latestTask && showRunDetails && !showInlineActionFlow && <TaskCard detail={latestTask} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />}
             </>
           ) : (
             <>
-              <img className="hero-avatar" src={joiAvatar} alt="Joi" />
+              <div className="hero-brand-lockup">
+                <img className="hero-avatar" src={joiAvatar} alt="Joi" />
+              </div>
               <h1>想聊点什么?</h1>
               <p>Joi 随时准备好帮你思考、写作、执行任务。</p>
               <div className="quick-actions">
                 <button type="button" onClick={() => fillSuggestion('帮我总结这个网页，并提炼核心观点。')}>◎ 总结网页</button>
                 <button type="button" onClick={() => fillSuggestion('记住：')}>□ 写入记忆</button>
                 <button type="button" onClick={() => setActiveTab('trace')}>◴ 查看最近任务</button>
-                <button type="button" onClick={() => fillSuggestion('根据这个方向，给我整理一份开发 spec。')}>▤ 认真执行</button>
+                <button type="button" onClick={fillSeriousTaskSuggestion}>▤ 认真执行</button>
               </div>
             </>
           )}
         </ScrollArea>
 
-        <form className="composer" onSubmit={submit}>
+        <form className="composer" aria-busy={isSubmitting} onSubmit={submit}>
           <textarea
             placeholder="输入任务，或直接和 Joi 说你想做什么..."
             value={message}
             onChange={(event) => setMessage(event.target.value)}
+            onKeyDown={handleComposerKeyDown}
           />
-          <button className="send-button" disabled={!message.trim()} type="submit" title="发送">↑</button>
-          <div className="composer-mode-row">
-            {inputModeOptions.map((item) => (
-              <button key={item.value} className={inputMode === item.value ? 'active' : ''} type="button" onClick={() => setInputMode(item.value)}>
-                {item.label}
+          <div
+            className="composer-tools"
+            onBlur={(event) => {
+              const nextFocus = event.relatedTarget;
+              if (!(nextFocus instanceof Node) || !event.currentTarget.contains(nextFocus)) {
+                setModelMenuOpen(false);
+              }
+            }}
+          >
+            <div ref={modelControlRef} className="composer-model-control">
+              <button
+                aria-expanded={modelMenuOpen}
+                className="composer-model-trigger"
+                title="选择本次发送使用的模型"
+                type="button"
+                onClick={() => setModelMenuOpen((current) => !current)}
+              >
+                <span>{selectedModelName}</span>
+                <SidebarIcon name="down" />
               </button>
-            ))}
+              {modelMenuOpen && (
+                <div className="composer-model-menu">
+                  {modelOptions.map((item) => (
+                    <button
+                      key={item}
+                      className={item === selectedModelName ? 'active' : ''}
+                      aria-pressed={item === selectedModelName}
+                      type="button"
+                      onClick={() => {
+                        setSelectedModelName(item);
+                        setModelMenuOpen(false);
+                      }}
+                    >
+                      {item}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
-          <div className="composer-bottom">
-            <span className="config-chip">♙ <b>Agent</b> Joi Assistant</span>
-            <span className="config-chip">◇ <b>模型</b> {modelName}</span>
-            <label className="config-chip node-chip">
-              ▣ <b>节点</b>
-              <select value={preferredNode} onChange={(event) => setPreferredNode(event.target.value)}>
-                <option value="main-node">本地节点 (127.0.0.1)</option>
-                <option value="local-worker-1">local-worker-1</option>
-                <option value="vps-la-1">vps-la-1</option>
-                <option value="auto">自动选择</option>
-              </select>
-            </label>
-            <label className="config-chip toggle-chip">
-              ⚙ <b>Worker</b>
-              <input checked={allowWorker} type="checkbox" onChange={(event) => setAllowWorker(event.target.checked)} />
-              <span>{allowWorker ? '开' : '关'}</span>
-            </label>
-            <button className="config-chip more-chip" type="button" onClick={() => setActiveTab('settings')}>更多⌄</button>
-          </div>
+          <button
+            className="send-button"
+            disabled={isSubmitting || !message.trim()}
+            type="button"
+            title={isSubmitting ? '发送中' : '发送'}
+            onClick={() => void submit()}
+          >
+            ↑
+          </button>
         </form>
       </section>
-      <aside className="companion-right-panel">
-        {latestTask ? (
-          <TaskExecutionPanel detail={latestTask} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />
-        ) : (
-	          <CompanionInsightPanel
-	            memories={memories}
-	            openLoops={openLoops}
-	            proactiveMessages={proactiveMessages}
-	            trace={trace}
-	            updateMemory={updateMemory}
-	            decideProactiveMessage={decideProactiveMessage}
-	          />
-        )}
-        <ProactiveQueuePanel messages={proactiveMessages} decide={decideProactiveMessage} />
-        <RecentArtifactsPanel artifacts={artifacts} openArtifact={openArtifact} />
-        <TaskMiniList tasks={productTasks} />
-      </aside>
+      {!rightPanelCollapsed && (
+        <ScrollArea
+          as="aside"
+          className="companion-right-panel"
+          contentClassName="companion-right-panel-content"
+          aria-label="Joi 右侧内容"
+        >
+          <>
+            {latestTask ? (
+              <TaskExecutionPanel detail={latestTask} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />
+            ) : (
+              <CompanionInsightPanel
+                memories={memories}
+                openLoops={openLoops}
+                proactiveMessages={proactiveMessages}
+                trace={trace}
+                updateMemory={updateMemory}
+                decideProactiveMessage={decideProactiveMessage}
+              />
+            )}
+            <ProactiveQueuePanel messages={proactiveMessages} decide={decideProactiveMessage} />
+            <RecentArtifactsPanel artifacts={artifacts} openArtifact={openArtifact} />
+            <TaskMiniList tasks={productTasks} />
+          </>
+        </ScrollArea>
+      )}
     </section>
   );
 }
-
-const inputModeOptions: Array<{ value: InputMode; label: string }> = [
-  { value: 'auto', label: '自动判断' },
-  { value: 'chat_assist', label: '聊聊' },
-  { value: 'serious_task', label: '认真执行' },
-  { value: 'background_task', label: '后台任务' },
-];
 
 function TaskCard({ detail, openArtifact, openTrace }: { detail: ProductTaskDetail; openArtifact: (id: string) => Promise<void>; openTrace: () => void }) {
   const task = detail.task;
@@ -2364,13 +2783,13 @@ function TaskCard({ detail, openArtifact, openTrace }: { detail: ProductTaskDeta
         <KV label="计划" value={`${detail.steps.length} 步`} />
         <KV label="当前步骤" value={currentStep?.title || '待开始'} />
         <KV label="风险" value={formatRiskLevel(task.risk_level)} />
-        <KV label="Trace" value={task.latest_run_id || '待生成'} />
+        <KV label="运行 ID" value={task.latest_run_id || '待生成'} />
       </div>
       <div className="task-progress-bar" aria-label={`任务进度 ${task.progress_percent}%`}>
         <span style={{ width: `${Math.max(0, Math.min(100, task.progress_percent))}%` }} />
       </div>
       <footer>
-        <button type="button" onClick={openTrace}>查看 Trace</button>
+        <button type="button" onClick={openTrace}>查看执行过程</button>
         {detail.deliverables.map((artifact) => (
           <button key={artifact.id} type="button" onClick={() => openArtifact(artifact.id)}>打开交付物</button>
         ))}
@@ -2489,7 +2908,7 @@ function TaskExecutionPanel({ detail, openArtifact, openTrace }: { detail: Produ
           </InsightItem>
         ))}
       </InsightList>
-      <button className="trace-link-button" type="button" onClick={openTrace}>查看 Run Trace</button>
+      <button className="trace-link-button" type="button" onClick={openTrace}>查看执行过程</button>
     </section>
   );
 }
@@ -2621,59 +3040,169 @@ function formatMemoryReason(reason?: string) {
   return reason;
 }
 
-type ExecutionCard = {
-  capability: string;
-  workflow: string;
-  node: string;
-  risk: string;
-  status: string;
-  toolRunID: string;
-  traceID: string;
-};
-
-function ExecutionCards({ trace, openTrace }: { trace: RunTrace | null; openTrace: () => void }) {
-  const cards = buildExecutionCards(trace);
-  if (cards.length === 0) return null;
-  return (
-    <div className="execution-card-list">
-      {cards.map((card) => (
-        <button key={`${card.traceID}-${card.capability}-${card.toolRunID || card.workflow}`} className="execution-card" type="button" onClick={openTrace}>
-          <span>
-            <strong>{card.capability}</strong>
-            <small>{card.workflow || '未编译 workflow'} · {formatRiskLevel(card.risk)}</small>
-          </span>
-          <span>
-            <strong>{formatStatus(card.status)}</strong>
-            <small>{card.node || '未派发'} · Trace</small>
-          </span>
-        </button>
-      ))}
+function ExecutionActionFlow({
+  actions,
+  mode = 'inline',
+  openTrace,
+}: {
+  actions: ExecutionAction[];
+  mode?: 'inline' | 'detail';
+  openTrace?: () => void;
+}) {
+  if (actions.length === 0) return null;
+  const content = (
+    <div className={`execution-action-flow execution-action-flow-${mode}`}>
+      <header className="execution-action-flow-header">
+        <div>
+          <strong>执行过程</strong>
+          <small>{actions.length} 个动作 · 默认折叠</small>
+        </div>
+        {mode === 'inline' && openTrace ? (
+          <button type="button" onClick={openTrace}>打开详情</button>
+        ) : null}
+      </header>
+      <div className="execution-action-list">
+        {actions.map((action) => (
+          <ExecutionActionCard key={action.id} action={action} />
+        ))}
+      </div>
     </div>
+  );
+  if (mode === 'detail') return content;
+  return (
+    <article className="message-row execution-flow-row">
+      {content}
+    </article>
   );
 }
 
-function buildExecutionCards(trace: RunTrace | null): ExecutionCard[] {
-  const steps = trace?.steps ?? [];
-  if (!trace || steps.length === 0) return [];
-  return steps.flatMap((step, index) => {
-    if (step.step_type !== 'capability_requested') return [];
-    const window = steps.slice(index + 1);
-    const compiled = window.find((item) => item.step_type === 'tool_compiled');
-    const selected = window.find((item) => item.step_type === 'node_selected');
-    const started = window.find((item) => item.step_type === 'tool_started');
-    const finished = window.find((item) => item.step_type === 'tool_finished');
-    const blocked = window.find((item) => item.step_type === 'capability_blocked' || item.step_type === 'policy_blocked');
-    const workflow = objectFromUnknown(compiled?.output?.workflow);
-    return [{
-      capability: String(step.output?.capability || step.output?.raw_capability || 'unknown'),
-      workflow: String(workflow.workflow_name || workflow.name || ''),
-      node: String(selected?.output?.node_id || finished?.output?.node_id || ''),
-      risk: String(step.output?.risk || workflow.risk_level || 'read_only'),
-      status: blocked ? 'blocked' : finished ? finished.status || 'succeeded' : started ? 'running' : 'pending',
-      toolRunID: String(started?.input?.tool_run_id || finished?.input?.tool_run_id || ''),
-      traceID: trace.id,
-    }];
+function ExecutionActionCard({ action }: { action: ExecutionAction }) {
+  return (
+    <details className={`execution-action-card action-${action.kind} status-${action.status}`}>
+      <summary>
+        <span className="execution-action-dot" />
+        <span className="execution-action-copy">
+          <strong>{action.title}</strong>
+          <small>{action.description}</small>
+        </span>
+        <span className="execution-action-meta">
+          <strong>{formatStatus(action.status)}</strong>
+          {action.duration_ms ? <small>{formatDuration(action.duration_ms)}</small> : null}
+        </span>
+      </summary>
+      <div className="execution-action-body">
+        {action.details.length > 0 ? action.details.map((detail) => (
+          <ExecutionActionDetailBlock key={`${action.id}-${detail.label}`} detail={detail} />
+        )) : (
+          <p className="empty">没有额外输出。</p>
+        )}
+        <CollapsedData label="原始步骤" value={action.raw_steps} />
+      </div>
+    </details>
+  );
+}
+
+function ExecutionActionDetailBlock({ detail }: { detail: ExecutionActionDetail }) {
+  return (
+    <section className="execution-action-detail">
+      <h4>{detail.label}</h4>
+      {typeof detail.value === 'string' || typeof detail.value === 'number' || typeof detail.value === 'boolean' ? (
+        <pre>{String(detail.value)}</pre>
+      ) : (
+        <pre>{formatRawData(detail.value)}</pre>
+      )}
+    </section>
+  );
+}
+
+function formatDuration(value: number) {
+  if (value < 1000) return `${Math.round(value)} ms`;
+  return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)} s`;
+}
+
+function userFacingAssistantText(content: string) {
+  if (content.includes('task_attempts') || content.includes('tool_runs') || content.includes('Run Trace')) {
+    if (content.includes('已将任务派发') || content.includes('已交给') || content.includes('worker')) {
+      return '已交给执行后台处理，结果会在这里更新。';
+    }
+  }
+  return content
+    .replace(/。?完整 Run Trace 已记录[^。]*。?/g, '')
+    .replace(/Run Trace/g, '执行详情')
+    .trim();
+}
+
+function shouldShowExecutionActionFlow(actions: ExecutionAction[]) {
+  return actions.some((action) => action.kind === 'tool' || action.kind === 'artifact' || action.kind === 'memory' || action.title === '创建任务');
+}
+
+function shouldShowInlineRunDetails(chat: ChatResponse | null, trace: RunTrace | null, latestTask: ProductTaskDetail | null, executionActions: ExecutionAction[]): boolean {
+  if (latestTask || executionActions.length > 0) return true;
+  const uiInline = chat?.ui?.inline_execution ?? booleanFromUnknown(trace?.metadata?.ui_inline_execution);
+  if (uiInline) return true;
+  const interactionClass = String(chat?.ui?.interaction_class || trace?.metadata?.interaction_class || '');
+  return !['', 'chat_assist', 'clarify'].includes(interactionClass);
+}
+
+function composerModelOptions(settings: SettingsRecord | null, selectedModelName: string, savedModels: AvailableModel[]) {
+  const configured = settings?.model_name || 'deepseek-v4-flash';
+  const options = new Set<string>();
+  const providerModels = savedModelsForProvider(savedModels, settings?.model_provider, settings?.model_base_url);
+  const configuredIsSaved = providerModels.some((model) => model.id === configured);
+  if (selectedModelName) options.add(selectedModelName);
+  if (providerModels.length === 0 || configuredIsSaved) options.add(configured);
+  for (const model of providerModels) {
+    if (model.config?.enabled === false) continue;
+    if (model.id) options.add(model.id);
+  }
+  const preset = Object.values(modelProviderPresets).find((item) => (
+    item.provider === settings?.model_provider && item.baseURL === settings?.model_base_url
+  )) ?? (settings?.model_base_url?.includes('deepseek.com') ? modelProviderPresets.deepseek : undefined);
+
+  for (const item of preset?.models ?? []) {
+    if (item) options.add(item);
+  }
+  if (preset?.reasoningModel) {
+    options.add(preset.reasoningModel);
+  }
+  return Array.from(options).filter(Boolean);
+}
+
+function savedModelsForProvider(models: AvailableModel[], provider?: string, baseURL?: string) {
+  const normalizedProvider = provider || '';
+  const normalizedBaseURL = normalizeBaseURL(baseURL || '');
+  return models.filter((model) => {
+    if (normalizedProvider && model.provider !== normalizedProvider) return false;
+    if (normalizedBaseURL && normalizeBaseURL(model.base_url || '') !== normalizedBaseURL) return false;
+    return Boolean(model.id);
   });
+}
+
+function normalizeBaseURL(value: string) {
+  return value.trim().replace(/\/+$/, '').replace(/\/v1$/, '');
+}
+
+function preferredDefaultModel(models: AvailableModel[]) {
+  return models.find((model) => model.config?.role === 'default')?.id
+    || models.find((model) => model.id.toLowerCase().includes('flash'))?.id
+    || models[0]?.id
+    || 'deepseek-v4-flash';
+}
+
+function preferredReasoningModel(models: AvailableModel[]) {
+  return models.find((model) => model.config?.role === 'reasoning')?.id
+    || models.find((model) => model.supports_reasoning)?.id
+    || models.find((model) => model.id.toLowerCase().includes('pro'))?.id
+    || models[0]?.id
+    || '';
+}
+
+function executionTargetLabelFromTrace(trace: RunTrace | null, fallback: string) {
+  const preferredNode = String(trace?.metadata?.preferred_node || trace?.route_result?.preferred_node || '');
+  const allowWorker = Boolean(trace?.metadata?.allow_worker ?? trace?.route_result?.allow_worker);
+  const match = executionTargetOptions.find((item) => item.preferredNode === preferredNode && item.allowWorker === allowWorker)
+    ?? executionTargetOptions.find((item) => item.preferredNode === preferredNode);
+  return match?.label || fallback;
 }
 
 function OnboardingPanel({
@@ -2690,8 +3219,8 @@ function OnboardingPanel({
   setNotice: (value: string) => void;
 }) {
   const [provider, setProvider] = useState('openai_compatible');
-  const [baseURL, setBaseURL] = useState('https://api.deepseek.com');
-  const [modelName, setModelName] = useState('deepseek-chat');
+  const [baseURL, setBaseURL] = useState('https://api.deepseek.com/v1');
+  const [modelName, setModelName] = useState('deepseek-v4-flash');
   const [apiKey, setApiKey] = useState('');
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
@@ -2718,7 +3247,6 @@ function OnboardingPanel({
         setApiKey('');
       }
       const result = await desktopApi.testModelConnection({ provider, base_url: baseURL, name: modelName, timeout_seconds: 60, max_retries: 1 });
-      setAvailableModels(result.available_models ?? []);
       if (!result.ok) {
         throw new Error(result.error_summary || result.status);
       }
@@ -2776,7 +3304,7 @@ function OnboardingPanel({
         </article>
         <article>
           <strong>认真执行</strong>
-          <span>需要报告、计划或复盘时会生成任务步骤，结果留在 Run Trace 里。</span>
+          <span>需要报告、计划或复盘时会生成任务步骤，结果会保留在执行详情里。</span>
         </article>
         <article>
           <strong>交付物</strong>
@@ -2833,7 +3361,32 @@ function OnboardingPanel({
   );
 }
 
+function TraceStage({
+  firstModelCall,
+  goBack,
+  stepCount,
+  trace,
+}: {
+  firstModelCall?: ModelCall;
+  goBack: () => void;
+  stepCount: number;
+  trace: RunTrace | null;
+}) {
+  return (
+    <section className="trace-stage">
+      <header className="trace-stage-topbar">
+        <button className="trace-stage-back-button" type="button" onClick={goBack}>返回对话</button>
+        <span>执行过程</span>
+      </header>
+      <ScrollArea className="trace-stage-scroll">
+        <TraceDetail firstModelCall={firstModelCall} stepCount={stepCount} trace={trace} />
+      </ScrollArea>
+    </section>
+  );
+}
+
 function TracePanel({ trace, stepCount, firstModelCall }: { trace: RunTrace | null; stepCount: number; firstModelCall?: ModelCall }) {
+  const actions = projectRunTraceToActions(trace);
   return (
     <section className="panel trace-panel">
       <h2>运行记录</h2>
@@ -2847,7 +3400,7 @@ function TracePanel({ trace, stepCount, firstModelCall }: { trace: RunTrace | nu
             <KV label="服务商" value={firstModelCall?.provider ?? '无'} />
             <KV label="令牌" value={firstModelCall ? `${firstModelCall.input_tokens}/${firstModelCall.output_tokens}` : '0/0'} />
           </dl>
-          <StepList trace={trace} />
+          <ExecutionActionFlow actions={actions} mode="detail" />
         </>
       ) : (
         <p className="empty">发送一条消息后会生成运行记录。</p>
@@ -2858,23 +3411,35 @@ function TracePanel({ trace, stepCount, firstModelCall }: { trace: RunTrace | nu
 
 function TraceDetail({ trace, stepCount, firstModelCall }: { trace: RunTrace | null; stepCount: number; firstModelCall?: ModelCall }) {
   if (!trace) return <section className="panel wide"><p className="empty">暂无运行记录。</p></section>;
+  const actions = projectRunTraceToActions(trace);
   return (
     <section className="panel wide">
-      <h2>运行记录</h2>
+      <h2>执行过程</h2>
       <dl className="metrics">
-        <KV label="任务 ID" value={trace.id} />
         <KV label="状态" value={formatStatus(trace.status)} />
-        <KV label="代理" value={trace.selected_agent_id} />
-        <KV label="步骤数" value={`${stepCount} 步`} />
-        <KV label="提示词组装" value={`${trace.prompt_assemblies?.length ?? 0} 次`} />
-        <KV label="记忆包" value={`${trace.memory_context_packs?.length ?? 0} 个`} />
-        <KV label="模型调用" value={`${trace.model_calls?.length ?? 0} 次`} />
-        <KV label="延迟" value={`${firstModelCall?.latency_ms ?? 0} ms`} />
+        <KV label="动作数" value={`${actions.length} 个`} />
+        <KV label="耗时" value={`${firstModelCall?.latency_ms ?? 0} ms`} />
       </dl>
-      <div className="split">
-        <StepList trace={trace} />
-        <TraceRuntimeSummary trace={trace} />
-      </div>
+      {actions.length > 0 ? (
+        <ExecutionActionFlow actions={actions} mode="detail" />
+      ) : (
+        <p className="empty">这次运行没有可投影的执行动作。</p>
+      )}
+      <details className="developer-diagnostics">
+        <summary>开发者诊断</summary>
+        <dl className="metrics compact">
+          <KV label="运行 ID" value={trace.id} />
+          <KV label="代理" value={trace.selected_agent_id} />
+          <KV label="提示词组装" value={`${trace.prompt_assemblies?.length ?? 0} 次`} />
+          <KV label="记忆包" value={`${trace.memory_context_packs?.length ?? 0} 个`} />
+          <KV label="模型调用" value={`${trace.model_calls?.length ?? 0} 次`} />
+          <KV label="步骤数" value={`${stepCount} 步`} />
+        </dl>
+        <div className="split diagnostics-split">
+          <StepList trace={trace} />
+          <TraceRuntimeSummary trace={trace} />
+        </div>
+      </details>
     </section>
   );
 }
@@ -3122,8 +3687,8 @@ function SettingsPanel({
   const [testStatus, setTestStatus] = useState('');
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [provider, setProvider] = useState(settings?.model_provider ?? 'openai_compatible');
-  const [baseURL, setBaseURL] = useState(settings?.model_base_url ?? 'https://api.deepseek.com');
-  const [modelName, setModelName] = useState(settings?.model_name ?? 'deepseek-chat');
+  const [baseURL, setBaseURL] = useState(settings?.model_base_url ?? 'https://api.deepseek.com/v1');
+  const [modelName, setModelName] = useState(settings?.model_name ?? 'deepseek-v4-flash');
   const [telegramToken, setTelegramToken] = useState('');
   const [telegramTokenVisible, setTelegramTokenVisible] = useState(false);
   const [telegramAllowed, setTelegramAllowed] = useState(settings?.telegram_allowed_user_ids ?? '');
@@ -3135,8 +3700,8 @@ function SettingsPanel({
 
   useEffect(() => {
     setProvider(settings?.model_provider ?? 'openai_compatible');
-    setBaseURL(settings?.model_base_url ?? 'https://api.deepseek.com');
-    setModelName(settings?.model_name ?? 'deepseek-chat');
+    setBaseURL(settings?.model_base_url ?? 'https://api.deepseek.com/v1');
+    setModelName(settings?.model_name ?? 'deepseek-v4-flash');
     setTelegramAllowed(settings?.telegram_allowed_user_ids ?? '');
     setTelegramEnabled(settings?.telegram_enabled ?? false);
     setWorkerGatewayEnabled(settings?.worker_gateway_enabled ?? true);
@@ -3153,7 +3718,6 @@ function SettingsPanel({
 
   async function testModel() {
     const result = await desktopApi.testModelConnection({ provider, base_url: baseURL, name: modelName, timeout_seconds: 60, max_retries: 1 });
-    setAvailableModels(result.available_models ?? []);
     setTestStatus(`模型：${formatStatus(result.status)}${result.error_summary ? ` · ${result.error_summary}` : ''}`);
   }
 
@@ -3452,6 +4016,10 @@ function objectFromUnknown(value: unknown): Record<string, unknown> {
   return {};
 }
 
+function booleanFromUnknown(value: unknown): boolean {
+  return value === true || value === 'true';
+}
+
 function conversationTitle(item: ConversationSummary) {
   return item.title || item.last_message || '未命名对话';
 }
@@ -3497,6 +4065,7 @@ function formatStatus(status: string) {
     preview: '预览',
     pending: '待处理',
     running: '运行中',
+    queued: '已派发',
     failed: '失败',
     error: '错误',
     blocked: '已阻止',

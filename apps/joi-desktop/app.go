@@ -37,6 +37,7 @@ type DesktopChatRequest struct {
 	Message        string `json:"message"`
 	PreferredNode  string `json:"preferred_node"`
 	AllowWorker    bool   `json:"allow_worker"`
+	ModelName      string `json:"model_name"`
 	InputMode      string `json:"input_mode"`
 	ProductTaskID  string `json:"product_task_id"`
 }
@@ -49,10 +50,18 @@ type DesktopChatResponse struct {
 	SelectedAgentID     string                    `json:"selected_agent_id"`
 	Response            string                    `json:"response"`
 	Steps               []DesktopRunStep          `json:"steps"`
+	UI                  *DesktopChatUIHints       `json:"ui,omitempty"`
 	ModelCalls          []DesktopModelCall        `json:"model_calls"`
 	ProductTask         *DesktopProductTask       `json:"product_task,omitempty"`
 	Artifacts           []DesktopArtifactSummary  `json:"artifacts,omitempty"`
 	ProactiveCandidates []DesktopProactiveMessage `json:"proactive_candidates,omitempty"`
+}
+
+type DesktopChatUIHints struct {
+	InteractionClass  string `json:"interaction_class"`
+	RequiresUserInput bool   `json:"requires_user_input"`
+	MissingInput      string `json:"missing_input,omitempty"`
+	InlineExecution   bool   `json:"inline_execution"`
 }
 
 type DesktopRunTrace struct {
@@ -71,6 +80,44 @@ type DesktopRunTrace struct {
 
 type DesktopConversationListResponse struct {
 	Conversations []DesktopConversationSummary `json:"conversations"`
+}
+
+type DesktopConversationFilter struct {
+	View    string `json:"view"`
+	GroupID string `json:"group_id"`
+	Limit   int    `json:"limit"`
+}
+
+type DesktopConversationActionRequest struct {
+	ID      string `json:"id"`
+	Reason  string `json:"reason"`
+	GroupID string `json:"group_id"`
+}
+
+type DesktopConversationGroup struct {
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
+	SortOrder int            `json:"sort_order"`
+	Collapsed bool           `json:"collapsed"`
+	Metadata  map[string]any `json:"metadata"`
+	CreatedAt string         `json:"created_at,omitempty"`
+	UpdatedAt string         `json:"updated_at,omitempty"`
+}
+
+type DesktopConversationGroupListResponse struct {
+	Groups []DesktopConversationGroup `json:"groups"`
+}
+
+type DesktopConversationGroupRequest struct {
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
+	SortOrder int            `json:"sort_order"`
+	Collapsed bool           `json:"collapsed"`
+	Metadata  map[string]any `json:"metadata"`
+}
+
+type DesktopConversationActionResponse struct {
+	Conversation DesktopConversationSummary `json:"conversation"`
 }
 
 type DesktopConversationDetailResponse struct {
@@ -96,13 +143,18 @@ type DesktopToolWorkflowEnabledRequest struct {
 }
 
 type DesktopRunStep struct {
-	ID       string         `json:"id"`
-	StepType string         `json:"step_type"`
-	Title    string         `json:"title"`
-	Status   string         `json:"status"`
-	Input    map[string]any `json:"input,omitempty"`
-	Output   map[string]any `json:"output,omitempty"`
-	Error    map[string]any `json:"error,omitempty"`
+	ID         string         `json:"id"`
+	RunID      string         `json:"run_id,omitempty"`
+	StepType   string         `json:"step_type"`
+	Title      string         `json:"title"`
+	Status     string         `json:"status"`
+	Input      map[string]any `json:"input,omitempty"`
+	Output     map[string]any `json:"output,omitempty"`
+	Error      map[string]any `json:"error,omitempty"`
+	StartedAt  string         `json:"started_at,omitempty"`
+	FinishedAt string         `json:"finished_at,omitempty"`
+	DurationMs *int           `json:"duration_ms,omitempty"`
+	CreatedAt  string         `json:"created_at,omitempty"`
 }
 
 type DesktopPromptAssembly struct {
@@ -181,19 +233,26 @@ type DesktopProactiveDecisionRequest struct {
 }
 
 type DesktopConversationSummary struct {
-	ID            string         `json:"id"`
-	Channel       string         `json:"channel"`
-	UserID        string         `json:"user_id"`
-	Title         string         `json:"title"`
-	ActiveAgentID string         `json:"active_agent_id"`
-	Topic         string         `json:"topic"`
-	LastMessage   string         `json:"last_message"`
-	LastRole      string         `json:"last_role"`
-	LatestRunID   string         `json:"latest_run_id"`
-	MessageCount  int            `json:"message_count"`
-	Metadata      map[string]any `json:"metadata"`
-	CreatedAt     string         `json:"created_at,omitempty"`
-	UpdatedAt     string         `json:"updated_at,omitempty"`
+	ID              string         `json:"id"`
+	Channel         string         `json:"channel"`
+	UserID          string         `json:"user_id"`
+	Title           string         `json:"title"`
+	ActiveAgentID   string         `json:"active_agent_id"`
+	Topic           string         `json:"topic"`
+	GroupID         string         `json:"group_id"`
+	LifecycleStatus string         `json:"lifecycle_status"`
+	Pinned          bool           `json:"pinned"`
+	LastMessage     string         `json:"last_message"`
+	LastRole        string         `json:"last_role"`
+	LatestRunID     string         `json:"latest_run_id"`
+	MessageCount    int            `json:"message_count"`
+	Metadata        map[string]any `json:"metadata"`
+	CreatedAt       string         `json:"created_at,omitempty"`
+	UpdatedAt       string         `json:"updated_at,omitempty"`
+	ArchivedAt      string         `json:"archived_at,omitempty"`
+	TrashedAt       string         `json:"trashed_at,omitempty"`
+	PurgeAfter      string         `json:"purge_after,omitempty"`
+	RestoredAt      string         `json:"restored_at,omitempty"`
 }
 
 type DesktopConversationMessage struct {
@@ -508,6 +567,7 @@ type DesktopSettingsResponse struct {
 	LogDir                 string `json:"log_dir"`
 	ModelProvider          string `json:"model_provider"`
 	ModelName              string `json:"model_name"`
+	ModelReasoningName     string `json:"model_reasoning_name"`
 	ModelBaseURL           string `json:"model_base_url"`
 	TelegramEnabled        bool   `json:"telegram_enabled"`
 	TelegramAllowedUserIDs string `json:"telegram_allowed_user_ids"`
@@ -535,6 +595,8 @@ type DesktopConnectionTestResponse struct {
 }
 
 type DesktopAvailableModel struct {
+	Provider          string                    `json:"provider"`
+	BaseURL           string                    `json:"base_url"`
 	ID                string                    `json:"id"`
 	DisplayName       string                    `json:"display_name"`
 	Owner             string                    `json:"owner"`
@@ -550,6 +612,15 @@ type DesktopAvailableModel struct {
 	SupportedParams   []string                  `json:"supported_parameters"`
 	Config            DesktopModelRuntimeConfig `json:"config"`
 	Metadata          map[string]any            `json:"metadata"`
+}
+
+type DesktopModelListRequest struct {
+	Provider string `json:"provider"`
+	BaseURL  string `json:"base_url"`
+}
+
+type DesktopModelListResponse struct {
+	Models []DesktopAvailableModel `json:"models"`
 }
 
 type DesktopModelRuntimeConfig struct {
@@ -596,6 +667,7 @@ type DesktopModelConfigRequest struct {
 	Provider       string `json:"provider"`
 	BaseURL        string `json:"base_url"`
 	Name           string `json:"name"`
+	ReasoningName  string `json:"reasoning_name"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	MaxRetries     int    `json:"max_retries"`
 }
@@ -682,6 +754,7 @@ func (a *DesktopApp) SendChat(req DesktopChatRequest) (*DesktopChatResponse, err
 		Message:        req.Message,
 		PreferredNode:  req.PreferredNode,
 		AllowWorker:    req.AllowWorker,
+		ModelName:      req.ModelName,
 		InputMode:      req.InputMode,
 		ProductTaskID:  req.ProductTaskID,
 	})
@@ -697,6 +770,7 @@ func (a *DesktopApp) SendChat(req DesktopChatRequest) (*DesktopChatResponse, err
 		SelectedAgentID:     result.SelectedAgentID,
 		Response:            result.Response,
 		Steps:               make([]DesktopRunStep, 0, len(result.Steps)),
+		UI:                  convertChatUIHints(result.UI),
 		ProductTask:         convertProductTaskPtr(result.ProductTask),
 		Artifacts:           convertArtifactSummaries(result.Artifacts),
 		ProactiveCandidates: convertProactiveMessages(result.ProactiveCandidates),
@@ -721,15 +795,76 @@ func (a *DesktopApp) GetRunTrace(runID string) (*DesktopRunTrace, error) {
 	return convertRunTrace(trace), nil
 }
 
-func (a *DesktopApp) ListConversations() (*DesktopConversationListResponse, error) {
+func (a *DesktopApp) ListConversations(filter DesktopConversationFilter) (*DesktopConversationListResponse, error) {
 	if err := a.ensureReady(); err != nil {
 		return nil, err
 	}
-	result, err := a.core.ListConversations(context.Background(), 50)
+	result, err := a.core.ListConversations(context.Background(), appcore.ConversationFilter{View: filter.View, GroupID: filter.GroupID, Limit: filter.Limit})
 	if err != nil {
 		return nil, err
 	}
 	return &DesktopConversationListResponse{Conversations: convertConversationSummaries(result.Conversations)}, nil
+}
+
+func (a *DesktopApp) ListConversationGroups() (*DesktopConversationGroupListResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.ListConversationGroups(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopConversationGroupListResponse{Groups: convertConversationGroups(result.Groups)}, nil
+}
+
+func (a *DesktopApp) SaveConversationGroup(req DesktopConversationGroupRequest) (*DesktopConversationGroup, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	group, err := a.core.SaveConversationGroup(context.Background(), appcore.ConversationGroupRequest{ID: req.ID, Name: req.Name, SortOrder: req.SortOrder, Collapsed: req.Collapsed, Metadata: req.Metadata})
+	if err != nil {
+		return nil, err
+	}
+	converted := convertConversationGroup(*group)
+	return &converted, nil
+}
+
+func (a *DesktopApp) DeleteConversationGroup(id string) error {
+	if err := a.ensureReady(); err != nil {
+		return err
+	}
+	return a.core.DeleteConversationGroup(context.Background(), id)
+}
+
+func (a *DesktopApp) MoveConversationToGroup(req DesktopConversationActionRequest) (*DesktopConversationActionResponse, error) {
+	return a.runConversationAction(req, a.core.MoveConversationToGroup)
+}
+
+func (a *DesktopApp) ArchiveConversation(req DesktopConversationActionRequest) (*DesktopConversationActionResponse, error) {
+	return a.runConversationAction(req, a.core.ArchiveConversation)
+}
+
+func (a *DesktopApp) TrashConversation(req DesktopConversationActionRequest) (*DesktopConversationActionResponse, error) {
+	return a.runConversationAction(req, a.core.TrashConversation)
+}
+
+func (a *DesktopApp) RestoreConversation(req DesktopConversationActionRequest) (*DesktopConversationActionResponse, error) {
+	return a.runConversationAction(req, a.core.RestoreConversation)
+}
+
+func (a *DesktopApp) PurgeConversation(req DesktopConversationActionRequest) (*DesktopConversationActionResponse, error) {
+	return a.runConversationAction(req, a.core.PurgeConversation)
+}
+
+func (a *DesktopApp) runConversationAction(req DesktopConversationActionRequest, action func(context.Context, appcore.ConversationActionRequest) (*appcore.ConversationActionResponse, error)) (*DesktopConversationActionResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := action(context.Background(), appcore.ConversationActionRequest{ID: req.ID, Reason: req.Reason, GroupID: req.GroupID})
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopConversationActionResponse{Conversation: convertConversationSummary(result.Conversation)}, nil
 }
 
 func (a *DesktopApp) GetConversation(conversationID string) (*DesktopConversationDetailResponse, error) {
@@ -1018,7 +1153,7 @@ func (a *DesktopApp) GetSettings() (*DesktopSettingsResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DesktopSettingsResponse{Version: settings.Version, AppMode: settings.AppMode, DataStore: settings.DataStore, TaskQueue: settings.TaskQueue, SQLitePath: settings.SQLitePath, LogDir: settings.LogDir, ModelProvider: settings.ModelProvider, ModelName: settings.ModelName, ModelBaseURL: settings.ModelBaseURL, TelegramEnabled: settings.TelegramEnabled, TelegramAllowedUserIDs: settings.TelegramAllowedUserIDs, WorkerGateway: settings.WorkerGateway, WorkerGatewayEnabled: settings.WorkerGatewayEnabled, BackupDir: settings.BackupDir, AutoBackupEnabled: settings.AutoBackupEnabled, DockerRequired: settings.DockerRequired}, nil
+	return &DesktopSettingsResponse{Version: settings.Version, AppMode: settings.AppMode, DataStore: settings.DataStore, TaskQueue: settings.TaskQueue, SQLitePath: settings.SQLitePath, LogDir: settings.LogDir, ModelProvider: settings.ModelProvider, ModelName: settings.ModelName, ModelReasoningName: settings.ModelReasoningName, ModelBaseURL: settings.ModelBaseURL, TelegramEnabled: settings.TelegramEnabled, TelegramAllowedUserIDs: settings.TelegramAllowedUserIDs, WorkerGateway: settings.WorkerGateway, WorkerGatewayEnabled: settings.WorkerGatewayEnabled, BackupDir: settings.BackupDir, AutoBackupEnabled: settings.AutoBackupEnabled, DockerRequired: settings.DockerRequired}, nil
 }
 
 func (a *DesktopApp) SaveModelConfig(req DesktopModelConfigRequest) error {
@@ -1029,9 +1164,21 @@ func (a *DesktopApp) SaveModelConfig(req DesktopModelConfigRequest) error {
 		Provider:       req.Provider,
 		BaseURL:        req.BaseURL,
 		Name:           req.Name,
+		ReasoningName:  req.ReasoningName,
 		TimeoutSeconds: req.TimeoutSeconds,
 		MaxRetries:     req.MaxRetries,
 	})
+}
+
+func (a *DesktopApp) ListSavedModels(req DesktopModelListRequest) (*DesktopModelListResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	models, err := a.listSavedModels(context.Background(), req.Provider, req.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopModelListResponse{Models: models}, nil
 }
 
 func (a *DesktopApp) SaveOperationalSettings(req DesktopOperationalSettingsRequest) error {
@@ -1161,19 +1308,7 @@ func (a *DesktopApp) TestModelConnection(req DesktopModelConnectionTestRequest) 
 		if strings.TrimSpace(modelName) == "" {
 			return &DesktopConnectionTestResponse{OK: false, Status: "missing_model_config", ErrorSummary: "mock model name is required"}, nil
 		}
-		return &DesktopConnectionTestResponse{
-			OK:     true,
-			Status: "succeeded",
-			AvailableModels: []DesktopAvailableModel{{
-				ID:                modelName,
-				DisplayName:       modelName,
-				Owner:             "mock_provider",
-				Object:            "model",
-				SupportsJSONMode:  true,
-				SupportsToolCalls: false,
-				Metadata:          map[string]any{"mock_provider": true},
-			}},
-		}, nil
+		return &DesktopConnectionTestResponse{OK: true, Status: "succeeded"}, nil
 	}
 	apiKey := strings.TrimSpace(req.APIKey)
 	if apiKey == "" {
@@ -1192,6 +1327,71 @@ func (a *DesktopApp) TestModelConnection(req DesktopModelConnectionTestRequest) 
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 30
 	}
+	if err := testOpenAICompatibleChat(context.Background(), baseURL, apiKey, modelName, timeoutSeconds); err != nil {
+		return &DesktopConnectionTestResponse{OK: false, Status: "failed", ErrorSummary: err.Error()}, nil
+	}
+	return &DesktopConnectionTestResponse{OK: true, Status: "succeeded"}, nil
+}
+
+func (a *DesktopApp) FetchAvailableModels(req DesktopModelConnectionTestRequest) (*DesktopConnectionTestResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	settings, err := a.core.GetDesktopSettings(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	provider := valueOrDefault(strings.TrimSpace(req.Provider), settings.ModelProvider)
+	baseURL := valueOrDefault(strings.TrimSpace(req.BaseURL), settings.ModelBaseURL)
+	if provider == "mock_provider" {
+		if !desktopMockProviderAllowed() {
+			return &DesktopConnectionTestResponse{OK: false, Status: "mock_disabled", ErrorSummary: "mock_provider is disabled by ALLOW_MOCK_PROVIDER"}, nil
+		}
+		modelName := valueOrDefault(strings.TrimSpace(req.Name), settings.ModelName)
+		if strings.TrimSpace(modelName) == "" {
+			return &DesktopConnectionTestResponse{OK: false, Status: "missing_model_config", ErrorSummary: "mock model name is required"}, nil
+		}
+		models := []DesktopAvailableModel{{
+			Provider:          provider,
+			BaseURL:           baseURL,
+			ID:                modelName,
+			DisplayName:       modelName,
+			Owner:             "mock_provider",
+			Object:            "model",
+			SupportsJSONMode:  true,
+			SupportsToolCalls: false,
+			Config: DesktopModelRuntimeConfig{
+				Enabled:           true,
+				Temperature:       0.7,
+				TimeoutSeconds:    60,
+				MaxRetries:        1,
+				SupportsJSONMode:  true,
+				SupportsToolCalls: false,
+			},
+			Metadata: map[string]any{"mock_provider": true},
+		}}
+		if err := a.replaceFetchedModels(context.Background(), provider, baseURL, models); err != nil {
+			return nil, err
+		}
+		return &DesktopConnectionTestResponse{OK: true, Status: "succeeded", AvailableModels: models}, nil
+	}
+	apiKey := strings.TrimSpace(req.APIKey)
+	if apiKey == "" {
+		apiKey = os.Getenv("MODEL_API_KEY")
+	}
+	if apiKey == "" {
+		apiKey, _ = keychainGet("MODEL_API_KEY")
+	}
+	if apiKey == "" {
+		return &DesktopConnectionTestResponse{OK: false, Status: "missing_api_key", ErrorSummary: "MODEL_API_KEY is not configured"}, nil
+	}
+	if baseURL == "" {
+		return &DesktopConnectionTestResponse{OK: false, Status: "missing_model_config", ErrorSummary: "model base URL is required"}, nil
+	}
+	timeoutSeconds := req.TimeoutSeconds
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 30
+	}
 	models, err := fetchOpenAICompatibleModels(context.Background(), baseURL, apiKey, timeoutSeconds)
 	if err != nil {
 		return &DesktopConnectionTestResponse{OK: false, Status: "failed", ErrorSummary: err.Error()}, nil
@@ -1199,11 +1399,14 @@ func (a *DesktopApp) TestModelConnection(req DesktopModelConnectionTestRequest) 
 	if len(models) == 0 {
 		return &DesktopConnectionTestResponse{OK: false, Status: "empty_model_list", ErrorSummary: "provider returned no available models"}, nil
 	}
-	_ = a.upsertFetchedModels(context.Background(), provider, baseURL, models)
-	models = a.applySavedModelSettings(context.Background(), provider, baseURL, models)
-	if !modelListContains(models, modelName) {
-		return &DesktopConnectionTestResponse{OK: true, Status: "succeeded", AvailableModels: models, ErrorSummary: fmt.Sprintf("%s key is valid, but %q was not found in the available model list", provider, modelName)}, nil
+	for index := range models {
+		models[index].Provider = provider
+		models[index].BaseURL = baseURL
 	}
+	if err := a.replaceFetchedModels(context.Background(), provider, baseURL, models); err != nil {
+		return nil, err
+	}
+	models = a.applySavedModelSettings(context.Background(), provider, baseURL, models)
 	return &DesktopConnectionTestResponse{OK: true, Status: "succeeded", AvailableModels: models}, nil
 }
 
@@ -1223,7 +1426,18 @@ func (a *DesktopApp) SaveModelSettings(req DesktopModelSettingsRequest) error {
 	if req.MaxRetries < 0 {
 		req.MaxRetries = 0
 	}
-	metadata := map[string]any{
+	recordID := desktopModelRecordID(provider, baseURL, modelID)
+	metadata := a.modelMetadata(context.Background(), recordID)
+	metadata["source"] = "desktop_model_settings"
+	metadata["role"] = strings.TrimSpace(req.Role)
+	metadata["temperature"] = req.Temperature
+	metadata["max_output_tokens"] = req.MaxOutputTokens
+	metadata["timeout_seconds"] = req.TimeoutSeconds
+	metadata["max_retries"] = req.MaxRetries
+	metadata["supports_json_mode"] = req.SupportsJSONMode
+	metadata["supports_tool_calling"] = req.SupportsToolCalls
+	metadata["supports_reasoning"] = req.SupportsReasoning
+	metadata["config"] = map[string]any{
 		"source":                "desktop_model_settings",
 		"role":                  strings.TrimSpace(req.Role),
 		"temperature":           req.Temperature,
@@ -1234,7 +1448,6 @@ func (a *DesktopApp) SaveModelSettings(req DesktopModelSettingsRequest) error {
 		"supports_tool_calling": req.SupportsToolCalls,
 		"supports_reasoning":    req.SupportsReasoning,
 	}
-	recordID := desktopModelRecordID(provider, baseURL, modelID)
 	_, err := a.core.DB().SQL().ExecContext(context.Background(), `
 		INSERT INTO models (id, provider, model_name, display_name, base_url, supports_json_mode, supports_tool_calling, enabled, metadata, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
@@ -1258,6 +1471,7 @@ func (a *DesktopApp) SaveModelSettings(req DesktopModelSettingsRequest) error {
 			Provider:       provider,
 			BaseURL:        baseURL,
 			Name:           modelID,
+			ReasoningName:  settings.ModelReasoningName,
 			TimeoutSeconds: req.TimeoutSeconds,
 			MaxRetries:     req.MaxRetries,
 		})
@@ -1294,6 +1508,42 @@ func fetchOpenAICompatibleModels(ctx context.Context, baseURL string, apiKey str
 	return parseOpenAICompatibleModels(raw)
 }
 
+func testOpenAICompatibleChat(ctx context.Context, baseURL string, apiKey string, modelName string, timeoutSeconds int) error {
+	endpoint := openAICompatibleChatCompletionsEndpoint(baseURL)
+	payload := map[string]any{
+		"model": modelName,
+		"messages": []map[string]string{{
+			"role":    "user",
+			"content": "ping",
+		}},
+		"max_tokens": 1,
+		"stream":     false,
+	}
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(rawPayload)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: time.Duration(timeoutSeconds) * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("chat completion returned %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+	}
+	return nil
+}
+
 func openAICompatibleModelsEndpoint(baseURL string) string {
 	endpoint := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if strings.HasSuffix(endpoint, "/chat/completions") {
@@ -1306,6 +1556,20 @@ func openAICompatibleModelsEndpoint(baseURL string) string {
 		return endpoint + "/models"
 	}
 	return endpoint + "/v1/models"
+}
+
+func openAICompatibleChatCompletionsEndpoint(baseURL string) string {
+	endpoint := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.HasSuffix(endpoint, "/chat/completions") {
+		return endpoint
+	}
+	if strings.HasSuffix(endpoint, "/models") {
+		return strings.TrimSuffix(endpoint, "/models") + "/chat/completions"
+	}
+	if strings.HasSuffix(endpoint, "/v1") {
+		return endpoint + "/chat/completions"
+	}
+	return endpoint + "/v1/chat/completions"
 }
 
 func parseOpenAICompatibleModels(raw []byte) ([]DesktopAvailableModel, error) {
@@ -1375,6 +1639,14 @@ func parseOpenAICompatibleModels(raw []byte) ([]DesktopAvailableModel, error) {
 func (a *DesktopApp) upsertFetchedModels(ctx context.Context, provider string, baseURL string, models []DesktopAvailableModel) error {
 	for _, model := range models {
 		recordID := desktopModelRecordID(provider, baseURL, model.ID)
+		metadata := a.modelMetadata(ctx, recordID)
+		metadata["source"] = "provider_model_list"
+		metadata["raw"] = model.Metadata
+		metadata["supported_parameters"] = model.SupportedParams
+		metadata["supports_reasoning"] = model.SupportsReasoning
+		metadata["supports_json_mode"] = model.SupportsJSONMode
+		metadata["supports_tool_calling"] = model.SupportsToolCalls
+		metadata["max_output_tokens"] = model.MaxOutputTokens
 		if _, err := a.core.DB().SQL().ExecContext(ctx, `
 			INSERT INTO models (id, provider, model_name, display_name, base_url, supports_json_mode, supports_tool_calling, context_window, input_price_per_1m, output_price_per_1m, enabled, metadata, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, 0), NULLIF(?, 0), NULLIF(?, 0), 1, ?, datetime('now'))
@@ -1383,15 +1655,164 @@ func (a *DesktopApp) upsertFetchedModels(ctx context.Context, provider string, b
 				model_name=excluded.model_name,
 				display_name=excluded.display_name,
 				base_url=excluded.base_url,
+				supports_json_mode=excluded.supports_json_mode,
+				supports_tool_calling=excluded.supports_tool_calling,
 				context_window=excluded.context_window,
 				input_price_per_1m=excluded.input_price_per_1m,
 				output_price_per_1m=excluded.output_price_per_1m,
+				metadata=excluded.metadata,
 				updated_at=datetime('now')
-		`, recordID, provider, model.ID, valueOrDefault(model.DisplayName, model.ID), baseURL, boolInt(model.SupportsJSONMode), boolInt(model.SupportsToolCalls), model.ContextWindow, model.InputPricePer1M, model.OutputPricePer1M, mustMarshalJSON(map[string]any{"source": "provider_model_list", "raw": model.Metadata})); err != nil {
+		`, recordID, provider, model.ID, valueOrDefault(model.DisplayName, model.ID), baseURL, boolInt(model.SupportsJSONMode), boolInt(model.SupportsToolCalls), model.ContextWindow, model.InputPricePer1M, model.OutputPricePer1M, mustMarshalJSON(metadata)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (a *DesktopApp) replaceFetchedModels(ctx context.Context, provider string, baseURL string, models []DesktopAvailableModel) error {
+	keep := make(map[string]bool, len(models))
+	for _, model := range models {
+		keep[desktopModelRecordID(provider, baseURL, model.ID)] = true
+	}
+	rows, err := a.core.DB().SQL().QueryContext(ctx, `
+		SELECT id, metadata
+		FROM models
+		WHERE provider = ? AND COALESCE(base_url, '') = ?
+	`, provider, baseURL)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	deleteIDs := []string{}
+	for rows.Next() {
+		var id string
+		var rawMetadata string
+		if err := rows.Scan(&id, &rawMetadata); err != nil {
+			return err
+		}
+		metadata := metadataFromJSON(rawMetadata)
+		if keep[id] || firstString(metadata, "source") != "provider_model_list" {
+			continue
+		}
+		deleteIDs = append(deleteIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range deleteIDs {
+		if _, err := a.core.DB().SQL().ExecContext(ctx, `DELETE FROM models WHERE id = ?`, id); err != nil {
+			return err
+		}
+	}
+	return a.upsertFetchedModels(ctx, provider, baseURL, models)
+}
+
+func (a *DesktopApp) listSavedModels(ctx context.Context, provider string, baseURL string) ([]DesktopAvailableModel, error) {
+	provider = strings.TrimSpace(provider)
+	baseURL = strings.TrimSpace(baseURL)
+	rows, err := a.core.DB().SQL().QueryContext(ctx, `
+		SELECT provider, model_name, display_name, COALESCE(base_url, ''), supports_json_mode,
+		       supports_tool_calling, context_window, input_price_per_1m, output_price_per_1m,
+		       enabled, metadata
+		FROM models
+		WHERE (? = '' OR provider = ?)
+		  AND (? = '' OR COALESCE(base_url, '') = ?)
+		ORDER BY updated_at DESC, display_name ASC
+	`, provider, provider, baseURL, baseURL)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	models := []DesktopAvailableModel{}
+	for rows.Next() {
+		model, err := scanSavedModel(rows)
+		if err != nil {
+			return nil, err
+		}
+		if firstString(model.Metadata, "source") == "desktop_runtime_config" {
+			continue
+		}
+		models = append(models, model)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return models, nil
+}
+
+type savedModelScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanSavedModel(row savedModelScanner) (DesktopAvailableModel, error) {
+	var model DesktopAvailableModel
+	var supportsJSON int
+	var supportsTool int
+	var contextWindow sql.NullInt64
+	var inputPrice sql.NullFloat64
+	var outputPrice sql.NullFloat64
+	var enabled int
+	var rawMetadata string
+	if err := row.Scan(&model.Provider, &model.ID, &model.DisplayName, &model.BaseURL, &supportsJSON, &supportsTool, &contextWindow, &inputPrice, &outputPrice, &enabled, &rawMetadata); err != nil {
+		return model, err
+	}
+	metadata := metadataFromJSON(rawMetadata)
+	raw := objectFromAny(metadata["raw"])
+	model.Metadata = metadata
+	model.Owner = firstString(raw, "owned_by", "owner", "organization")
+	model.Object = firstString(raw, "object", "type")
+	model.Created = stringFromNumberish(raw["created"])
+	if contextWindow.Valid {
+		model.ContextWindow = int(contextWindow.Int64)
+	}
+	if inputPrice.Valid {
+		model.InputPricePer1M = inputPrice.Float64
+	}
+	if outputPrice.Valid {
+		model.OutputPricePer1M = outputPrice.Float64
+	}
+	model.MaxOutputTokens = firstInt(metadata, "max_output_tokens")
+	if model.MaxOutputTokens == 0 {
+		model.MaxOutputTokens = firstInt(raw, "max_output_tokens", "output_token_limit")
+	}
+	model.SupportedParams = stringSliceFromAny(metadata["supported_parameters"])
+	if len(model.SupportedParams) == 0 {
+		model.SupportedParams = stringSliceFromAny(raw["supported_parameters"])
+	}
+	model.SupportsJSONMode = supportsJSON != 0 || boolFromAny(raw["supports_json_mode"]) || containsAnyString(model.SupportedParams, "response_format", "json_schema", "structured_outputs")
+	model.SupportsToolCalls = supportsTool != 0 || boolFromAny(raw["supports_tool_calling"]) || containsAnyString(model.SupportedParams, "tools", "tool_choice", "function_calling")
+	model.SupportsReasoning = boolFromAny(metadata["supports_reasoning"]) || boolFromAny(raw["supports_reasoning"]) || containsAnyString(model.SupportedParams, "reasoning", "reasoning_effort") || strings.Contains(strings.ToLower(model.ID), "reasoner")
+	model.Config = DesktopModelRuntimeConfig{
+		Enabled:           enabled != 0,
+		Temperature:       0.7,
+		MaxOutputTokens:   model.MaxOutputTokens,
+		TimeoutSeconds:    60,
+		MaxRetries:        1,
+		SupportsJSONMode:  model.SupportsJSONMode,
+		SupportsToolCalls: model.SupportsToolCalls,
+		SupportsReasoning: model.SupportsReasoning,
+	}
+	applyModelMetadataConfig(&model, rawMetadata)
+	if model.DisplayName == "" {
+		model.DisplayName = model.ID
+	}
+	return model, nil
+}
+
+func (a *DesktopApp) modelMetadata(ctx context.Context, recordID string) map[string]any {
+	var rawMetadata string
+	if err := a.core.DB().SQL().QueryRowContext(ctx, `SELECT metadata FROM models WHERE id = ?`, recordID).Scan(&rawMetadata); err != nil {
+		return map[string]any{}
+	}
+	return metadataFromJSON(rawMetadata)
+}
+
+func metadataFromJSON(rawMetadata string) map[string]any {
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(rawMetadata), &metadata); err != nil || metadata == nil {
+		return map[string]any{}
+	}
+	return metadata
 }
 
 func (a *DesktopApp) applySavedModelSettings(ctx context.Context, provider string, baseURL string, models []DesktopAvailableModel) []DesktopAvailableModel {
@@ -1740,19 +2161,46 @@ func convertConversationSummaries(items []appcore.ConversationSummary) []Desktop
 
 func convertConversationSummary(item appcore.ConversationSummary) DesktopConversationSummary {
 	return DesktopConversationSummary{
-		ID:            item.ID,
-		Channel:       item.Channel,
-		UserID:        item.UserID,
-		Title:         item.Title,
-		ActiveAgentID: item.ActiveAgentID,
-		Topic:         item.Topic,
-		LastMessage:   item.LastMessage,
-		LastRole:      item.LastRole,
-		LatestRunID:   item.LatestRunID,
-		MessageCount:  item.MessageCount,
-		Metadata:      item.Metadata,
-		CreatedAt:     desktopTime(item.CreatedAt),
-		UpdatedAt:     desktopTime(item.UpdatedAt),
+		ID:              item.ID,
+		Channel:         item.Channel,
+		UserID:          item.UserID,
+		Title:           item.Title,
+		ActiveAgentID:   item.ActiveAgentID,
+		Topic:           item.Topic,
+		GroupID:         item.GroupID,
+		LifecycleStatus: item.LifecycleStatus,
+		Pinned:          item.Pinned,
+		LastMessage:     item.LastMessage,
+		LastRole:        item.LastRole,
+		LatestRunID:     item.LatestRunID,
+		MessageCount:    item.MessageCount,
+		Metadata:        item.Metadata,
+		CreatedAt:       desktopTime(item.CreatedAt),
+		UpdatedAt:       desktopTime(item.UpdatedAt),
+		ArchivedAt:      desktopTimePtr(item.ArchivedAt),
+		TrashedAt:       desktopTimePtr(item.TrashedAt),
+		PurgeAfter:      desktopTimePtr(item.PurgeAfter),
+		RestoredAt:      desktopTimePtr(item.RestoredAt),
+	}
+}
+
+func convertConversationGroups(items []appcore.ConversationGroup) []DesktopConversationGroup {
+	result := make([]DesktopConversationGroup, 0, len(items))
+	for _, item := range items {
+		result = append(result, convertConversationGroup(item))
+	}
+	return result
+}
+
+func convertConversationGroup(item appcore.ConversationGroup) DesktopConversationGroup {
+	return DesktopConversationGroup{
+		ID:        item.ID,
+		Name:      item.Name,
+		SortOrder: item.SortOrder,
+		Collapsed: item.Collapsed,
+		Metadata:  item.Metadata,
+		CreatedAt: desktopTime(item.CreatedAt),
+		UpdatedAt: desktopTime(item.UpdatedAt),
 	}
 }
 
@@ -1837,6 +2285,18 @@ func convertProductTaskPtr(item *appcore.ProductTask) *DesktopProductTask {
 	}
 	converted := convertProductTask(*item)
 	return &converted
+}
+
+func convertChatUIHints(item *appcore.ChatUIHints) *DesktopChatUIHints {
+	if item == nil {
+		return nil
+	}
+	return &DesktopChatUIHints{
+		InteractionClass:  item.InteractionClass,
+		RequiresUserInput: item.RequiresUserInput,
+		MissingInput:      item.MissingInput,
+		InlineExecution:   item.InlineExecution,
+	}
 }
 
 func convertProductTasks(items []appcore.ProductTask) []DesktopProductTask {
@@ -2032,7 +2492,20 @@ func convertRunTrace(trace *appcore.RunTrace) *DesktopRunTrace {
 		result.MemoryContextPacks = append(result.MemoryContextPacks, DesktopMemoryContextPack{ID: pack.ID, AgentID: pack.AgentID, MemoryProfileVersion: pack.MemoryProfileVersion, Profile: pack.Profile, ProjectFacts: pack.ProjectFacts, RelevantEpisodes: pack.RelevantEpisodes, Heuristics: pack.Heuristics, AntiPatterns: pack.AntiPatterns, OpenIssues: pack.OpenIssues, DynamicRetrieval: pack.DynamicRetrieval, Metadata: pack.Metadata})
 	}
 	for _, step := range trace.Steps {
-		result.Steps = append(result.Steps, DesktopRunStep{ID: step.ID, StepType: step.StepType, Title: step.Title, Status: step.Status, Input: step.Input, Output: step.Output, Error: step.Error})
+		result.Steps = append(result.Steps, DesktopRunStep{
+			ID:         step.ID,
+			RunID:      step.RunID,
+			StepType:   step.StepType,
+			Title:      step.Title,
+			Status:     step.Status,
+			Input:      step.Input,
+			Output:     step.Output,
+			Error:      step.Error,
+			StartedAt:  desktopTime(step.StartedAt),
+			FinishedAt: desktopTimePtr(step.FinishedAt),
+			DurationMs: step.DurationMs,
+			CreatedAt:  desktopTime(step.CreatedAt),
+		})
 	}
 	return result
 }

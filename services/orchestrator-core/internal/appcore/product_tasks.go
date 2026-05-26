@@ -133,13 +133,14 @@ func (a *AppCore) ListProductTasks(ctx context.Context, filter ProductTaskFilter
 	}
 	status := strings.TrimSpace(filter.Status)
 	args := []any{}
-	where := ""
+	whereParts := []string{conversationVisibleInPrimaryListsPredicate("product_tasks.created_from_conversation_id")}
 	if status == "active" {
-		where = "WHERE status IN ('planning','running','waiting_confirmation','blocked')"
+		whereParts = append(whereParts, "status IN ('planning','running','waiting_confirmation','blocked')")
 	} else if status != "" {
-		where = "WHERE status=?"
+		whereParts = append(whereParts, "status=?")
 		args = append(args, status)
 	}
+	where := "WHERE " + strings.Join(whereParts, " AND ")
 	query := fmt.Sprintf(`
 		SELECT id, title, description, status, mode, priority, COALESCE(created_from_conversation_id, ''),
 		       COALESCE(created_from_message_id, ''), COALESCE(latest_run_id, ''), owner_user_id,

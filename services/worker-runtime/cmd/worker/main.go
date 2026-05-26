@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -28,8 +29,23 @@ import (
 var workerHTMLScriptPattern = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
 var workerHTMLStylePattern = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
 var workerHTMLNoScriptPattern = regexp.MustCompile(`(?is)<noscript[^>]*>.*?</noscript>`)
+var workerHTMLCommentPattern = regexp.MustCompile(`(?is)<!--.*?-->`)
+var workerHTMLTitlePattern = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+var workerHTMLMetaTitlePattern = regexp.MustCompile(`(?is)<meta[^>]+(?:property|name)=["'](?:og:title|twitter:title)["'][^>]+content=["']([^"']+)["']`)
+var workerHTMLBlockPattern = regexp.MustCompile(`(?is)<(?:h1|h2|h3|h4|p|li|blockquote|figcaption)[^>]*>(.*?)</(?:h1|h2|h3|h4|p|li|blockquote|figcaption)>`)
+var workerHTMLBlockBreakPattern = regexp.MustCompile(`(?i)<\s*/?\s*(?:br|p|div|section|article|main|header|footer|li|ul|ol|h1|h2|h3|h4|blockquote|figcaption)\b[^>]*>`)
 var workerHTMLTagPattern = regexp.MustCompile(`<[^>]+>`)
 var workerLinkPattern = regexp.MustCompile(`href=["']([^"']+)["']`)
+
+const workerMaxReadableTextRunes = 12000
+const workerMaxReadableSummaryRunes = 900
+const workerMinReadableTextRunes = 80
+
+type workerReadableHTMLExtraction struct {
+	Title  string
+	Text   string
+	Source string
+}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -416,28 +432,254 @@ func workerFetchURL(ctx context.Context, url string) map[string]any {
 		truncated = true
 	}
 	body := string(raw)
-	text := workerReadableHTMLText(body)
-	if len(text) > 1200 {
-		text = text[:1200]
-	}
+	extraction := workerExtractReadableHTML(body)
+	text, readableTextTruncated := workerTruncateTextRunes(extraction.Text, workerMaxReadableTextRunes)
 	links := []string{}
 	for _, match := range workerLinkPattern.FindAllStringSubmatch(body, 20) {
 		if len(match) > 1 {
 			links = append(links, match[1])
 		}
 	}
-	summary := text
-	if len(summary) > 280 {
-		summary = summary[:280]
+	return map[string]any{
+		"url":           url,
+		"fetch_status":  "succeeded",
+		"status_code":   resp.StatusCode,
+		"content_type":  resp.Header.Get("Content-Type"),
+		"title":         extraction.Title,
+		"readable_text": text,
+		"text_length":   workerRuneCount(text),
+		"links":         links,
+		"summary":       workerSummarizeText(text),
+		"extraction": map[string]any{
+			"source":                  extraction.Source,
+			"readable_text_truncated": readableTextTruncated,
+		},
+		"truncated": truncated,
+		"mode":      "web_research_v2_readonly_fetch",
 	}
-	return map[string]any{"url": url, "fetch_status": "succeeded", "status_code": resp.StatusCode, "content_type": resp.Header.Get("Content-Type"), "readable_text": text, "links": links, "summary": summary, "truncated": truncated, "mode": "web_research_v2_readonly_fetch"}
 }
 
 func workerReadableHTMLText(body string) string {
+	return workerExtractReadableHTML(body).Text
+}
+
+func workerSummarizeText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	lines := []string{}
+	totalRunes := 0
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lineRunes := workerRuneCount(line)
+		if totalRunes > 0 && totalRunes+lineRunes+1 > workerMaxReadableSummaryRunes {
+			break
+		}
+		lines = append(lines, line)
+		totalRunes += lineRunes + 1
+	}
+	if len(lines) == 0 {
+		return workerTruncateRunes(text, workerMaxReadableSummaryRunes)
+	}
+	return workerTruncateRunes(strings.Join(lines, " "), workerMaxReadableSummaryRunes)
+}
+
+func workerExtractReadableHTML(body string) workerReadableHTMLExtraction {
+	title := workerExtractHTMLTitle(body)
+	if !strings.Contains(body, "<") {
+		text := workerNormalizeReadableText(body)
+		source := "plain_text"
+		if workerRuneCount(text) < workerMinReadableTextRunes {
+			source = "insufficient"
+		}
+		return workerReadableHTMLExtraction{Title: title, Text: text, Source: source}
+	}
+	cleaned := workerStripNonContentHTML(body)
+	fragment, source := workerArticleHTMLFragment(cleaned)
+	text := workerExtractStructuredText(fragment)
+	if workerRuneCount(text) < workerMinReadableTextRunes && fragment != cleaned {
+		if fallback := workerExtractStructuredText(cleaned); workerRuneCount(fallback) > workerRuneCount(text) {
+			text = fallback
+			source = "document"
+		}
+	}
+	if text == "" {
+		text = workerHTMLFragmentToText(fragment)
+	}
+	if workerRuneCount(text) < workerMinReadableTextRunes {
+		source = "insufficient"
+	}
+	return workerReadableHTMLExtraction{Title: title, Text: text, Source: source}
+}
+
+func workerStripNonContentHTML(body string) string {
+	body = workerHTMLCommentPattern.ReplaceAllString(body, " ")
 	body = workerHTMLScriptPattern.ReplaceAllString(body, " ")
 	body = workerHTMLStylePattern.ReplaceAllString(body, " ")
 	body = workerHTMLNoScriptPattern.ReplaceAllString(body, " ")
-	return strings.Join(strings.Fields(workerHTMLTagPattern.ReplaceAllString(body, " ")), " ")
+	return body
+}
+
+func workerExtractHTMLTitle(body string) string {
+	if match := workerHTMLMetaTitlePattern.FindStringSubmatch(body); len(match) > 1 {
+		return workerSingleLineText(match[1])
+	}
+	if match := workerHTMLTitlePattern.FindStringSubmatch(body); len(match) > 1 {
+		return workerSingleLineText(match[1])
+	}
+	return ""
+}
+
+func workerArticleHTMLFragment(body string) (string, string) {
+	lower := strings.ToLower(body)
+	startMarkers := []struct {
+		marker string
+		source string
+	}{
+		{`class="article-body`, "article_body"},
+		{`class='article-body`, "article_body"},
+		{`class="article__main__wrapper`, "article_body"},
+		{`class='article__main__wrapper`, "article_body"},
+		{`class="post-content`, "article_body"},
+		{`class='post-content`, "article_body"},
+		{`class="article-content`, "article_body"},
+		{`class='article-content`, "article_body"},
+		{`class="entry-content`, "article_body"},
+		{`class='entry-content`, "article_body"},
+		{`class="markdown-body`, "article_body"},
+		{`class='markdown-body`, "article_body"},
+		{`<article`, "article"},
+		{`<main`, "main"},
+	}
+	start := -1
+	source := "document"
+	for _, marker := range startMarkers {
+		if idx := strings.Index(lower, marker.marker); idx >= 0 {
+			start = workerTagStartBefore(body, idx)
+			source = marker.source
+			break
+		}
+	}
+	if start < 0 {
+		return body, source
+	}
+	end := len(body)
+	endMarkers := []string{
+		`class="article-side`,
+		`class='article-side`,
+		`class="comments`,
+		`class='comments`,
+		`id="comments`,
+		`id='comments`,
+		`<footer`,
+		`</article`,
+		`</main`,
+	}
+	for _, marker := range endMarkers {
+		if idx := strings.Index(lower[start:], marker); idx > 0 {
+			candidate := start + idx
+			if strings.HasPrefix(marker, "class=") || strings.HasPrefix(marker, "id=") {
+				candidate = workerTagStartBefore(body, candidate)
+			}
+			if candidate > start && candidate < end {
+				end = candidate
+			}
+		}
+	}
+	return body[start:end], source
+}
+
+func workerTagStartBefore(body string, idx int) int {
+	if idx <= 0 || idx > len(body) {
+		return idx
+	}
+	if start := strings.LastIndex(body[:idx], "<"); start >= 0 {
+		return start
+	}
+	return idx
+}
+
+func workerExtractStructuredText(fragment string) string {
+	lines := []string{}
+	seen := map[string]bool{}
+	for _, match := range workerHTMLBlockPattern.FindAllStringSubmatch(fragment, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		for _, line := range workerSplitReadableLines(workerHTMLFragmentToText(match[1])) {
+			if seen[line] {
+				continue
+			}
+			seen[line] = true
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return workerHTMLFragmentToText(fragment)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func workerHTMLFragmentToText(fragment string) string {
+	fragment = workerHTMLBlockBreakPattern.ReplaceAllString(fragment, "\n")
+	fragment = workerHTMLTagPattern.ReplaceAllString(fragment, " ")
+	return workerNormalizeReadableText(fragment)
+}
+
+func workerNormalizeReadableText(text string) string {
+	text = html.UnescapeString(text)
+	text = strings.ReplaceAll(text, "\u00a0", " ")
+	return strings.Join(workerSplitReadableLines(text), "\n")
+}
+
+func workerSplitReadableLines(text string) []string {
+	lines := []string{}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.Join(strings.Fields(line), " ")
+		line = strings.TrimSpace(line)
+		if line == "" || workerIsBoilerplateReadableLine(line) {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func workerSingleLineText(text string) string {
+	return strings.Join(strings.Fields(html.UnescapeString(workerHTMLTagPattern.ReplaceAllString(text, " "))), " ")
+}
+
+func workerIsBoilerplateReadableLine(line string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(line))
+	switch normalized {
+	case "登录", "注册", "首页", "发现", "搜索", "评论", "赞", "分享", "展开阅读全文", "read more", "sign in", "log in":
+		return true
+	}
+	return false
+}
+
+func workerTruncateTextRunes(text string, limit int) (string, bool) {
+	if limit <= 0 {
+		return "", text != ""
+	}
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text, false
+	}
+	return string(runes[:limit]), true
+}
+
+func workerTruncateRunes(text string, limit int) string {
+	truncated, _ := workerTruncateTextRunes(text, limit)
+	return truncated
+}
+
+func workerRuneCount(text string) int {
+	return len([]rune(text))
 }
 
 func blockedWorkerURL(rawURL string) (bool, string) {

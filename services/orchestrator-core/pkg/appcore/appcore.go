@@ -12,8 +12,15 @@ import (
 type AppCore = internal.AppCore
 type ChatRequest = internal.ChatRequest
 type ChatResponse = internal.ChatResponse
+type ChatUIHints = internal.ChatUIHints
 type RunTrace = internal.RunTrace
 type ConversationListResponse = internal.ConversationListResponse
+type ConversationFilter = internal.ConversationFilter
+type ConversationGroup = internal.ConversationGroup
+type ConversationGroupListResponse = internal.ConversationGroupListResponse
+type ConversationGroupRequest = internal.ConversationGroupRequest
+type ConversationActionRequest = internal.ConversationActionRequest
+type ConversationActionResponse = internal.ConversationActionResponse
 type ConversationSummary = internal.ConversationSummary
 type ConversationDetail = internal.ConversationDetail
 type ConversationMessage = internal.ConversationMessage

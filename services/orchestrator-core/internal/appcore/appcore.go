@@ -50,6 +50,7 @@ type ChatRequest struct {
 	Message        string `json:"message"`
 	PreferredNode  string `json:"preferred_node"`
 	AllowWorker    bool   `json:"allow_worker"`
+	ModelName      string `json:"model_name"`
 	InputMode      string `json:"input_mode"`
 	ProductTaskID  string `json:"product_task_id"`
 }
@@ -62,11 +63,19 @@ type ChatResponse struct {
 	SelectedAgentID     string                     `json:"selected_agent_id"`
 	Response            string                     `json:"response"`
 	Steps               []store.RunStepBrief       `json:"steps"`
+	UI                  *ChatUIHints               `json:"ui,omitempty"`
 	UsedMemories        []store.MemorySearchResult `json:"used_memories,omitempty"`
 	ProductTask         *ProductTask               `json:"product_task,omitempty"`
 	Artifacts           []ArtifactSummary          `json:"artifacts,omitempty"`
 	ProactiveCandidates []ProactiveMessageRecord   `json:"proactive_candidates,omitempty"`
 	Reflection          *ReflectionResult          `json:"reflection,omitempty"`
+}
+
+type ChatUIHints struct {
+	InteractionClass  string `json:"interaction_class"`
+	RequiresUserInput bool   `json:"requires_user_input"`
+	MissingInput      string `json:"missing_input,omitempty"`
+	InlineExecution   bool   `json:"inline_execution"`
 }
 type RunTrace = store.RunRecord
 type MemorySearchRequest = store.SearchMemoriesParams
@@ -144,6 +153,7 @@ type DesktopSettingsResponse struct {
 	LogDir                 string `json:"log_dir"`
 	ModelProvider          string `json:"model_provider"`
 	ModelName              string `json:"model_name"`
+	ModelReasoningName     string `json:"model_reasoning_name"`
 	ModelBaseURL           string `json:"model_base_url"`
 	TelegramEnabled        bool   `json:"telegram_enabled"`
 	TelegramAllowedUserIDs string `json:"telegram_allowed_user_ids"`
@@ -157,6 +167,7 @@ type DesktopModelConfigRequest struct {
 	Provider       string `json:"provider"`
 	BaseURL        string `json:"base_url"`
 	Name           string `json:"name"`
+	ReasoningName  string `json:"reasoning_name"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	MaxRetries     int    `json:"max_retries"`
 }
@@ -888,6 +899,7 @@ func (a *AppCore) GetDesktopSettings(ctx context.Context) (*DesktopSettingsRespo
 	telegramEnabled := a.desktopBoolSetting(ctx, "telegram.enabled", os.Getenv("TELEGRAM_BOT_TOKEN") != "" || strings.TrimSpace(telegramAllowed) != "")
 	workerGatewayEnabled := a.desktopBoolSetting(ctx, "worker_gateway.enabled", true)
 	autoBackupEnabled := a.desktopBoolSetting(ctx, "backup.auto_enabled", false)
+	reasoningModelName := a.desktopSettingOrDefault(ctx, "model.reasoning_name", "")
 	return &DesktopSettingsResponse{
 		Version:                valueOrDefault(os.Getenv("APP_VERSION"), "0.1.0-rc0"),
 		AppMode:                a.Config.App.Mode,
@@ -897,6 +909,7 @@ func (a *AppCore) GetDesktopSettings(ctx context.Context) (*DesktopSettingsRespo
 		LogDir:                 filepath.Join(filepath.Dir(a.Config.App.SQLitePath), "logs"),
 		ModelProvider:          a.Config.Model.Provider,
 		ModelName:              a.Config.Model.Name,
+		ModelReasoningName:     reasoningModelName,
 		ModelBaseURL:           a.Config.Model.BaseURL,
 		TelegramEnabled:        telegramEnabled,
 		TelegramAllowedUserIDs: telegramAllowed,
@@ -913,8 +926,9 @@ func (a *AppCore) SaveDesktopModelConfig(ctx context.Context, req DesktopModelCo
 		return errors.New("desktop model config is only available in SQLite mode")
 	}
 	provider := valueOrDefault(req.Provider, "openai_compatible")
-	baseURL := valueOrDefault(req.BaseURL, "https://api.deepseek.com")
-	modelName := valueOrDefault(req.Name, "deepseek-chat")
+	baseURL := valueOrDefault(req.BaseURL, "https://api.deepseek.com/v1")
+	modelName := valueOrDefault(req.Name, "deepseek-v4-flash")
+	reasoningName := strings.TrimSpace(req.ReasoningName)
 	timeoutSeconds := req.TimeoutSeconds
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 60
@@ -929,6 +943,9 @@ func (a *AppCore) SaveDesktopModelConfig(ctx context.Context, req DesktopModelCo
 		"model.name":            modelName,
 		"model.timeout_seconds": strconv.Itoa(timeoutSeconds),
 		"model.max_retries":     strconv.Itoa(maxRetries),
+	}
+	if reasoningName != "" {
+		settings["model.reasoning_name"] = reasoningName
 	}
 	for key, value := range settings {
 		if err := a.setDesktopSetting(ctx, key, value); err != nil {
@@ -1265,6 +1282,9 @@ func sqliteSchemaPath() (string, error) {
 }
 
 func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	if err := a.db.EnsureSQLiteConversationLifecycle(ctx); err != nil {
+		return nil, err
+	}
 	channel := valueOrDefault(req.Channel, "desktop")
 	userID := valueOrDefault(req.UserID, "desktop_user")
 	conversationID := req.ConversationID
@@ -1278,15 +1298,20 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 	var runtimeResult *sqliteRuntimeResult
 	memoryIntent := intent.MemoryControl
 	artifactRewrite := intent.ArtifactRewrite
+	selectedModelName := valueOrDefault(strings.TrimSpace(req.ModelName), a.Config.Model.Name)
+	if productTaskID != "" && !intent.TaskFollowup && !intent.ArtifactFollowup {
+		productTaskID = ""
+	}
 	if memoryIntent.Kind != memoryControlNone || intent.ArtifactFollowup {
 		classification.ShouldCreateTask = false
 	}
 	if intent.Proactive || intent.TaskFollowup {
 		classification.ShouldCreateTask = false
 	}
-	if intent.SeriousTask {
+	if intent.SeriousTask && !intent.Clarify {
 		classification.ShouldCreateTask = true
 	}
+	uiHints := chatUIHintsFor(classification, intent, classification.ShouldCreateTask)
 	selectedAgentID := routeSQLiteAgent(req.Message)
 	if memoryIntent.Kind != memoryControlNone {
 		selectedAgentID = "memory_agent"
@@ -1309,6 +1334,13 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 			return nil, err
 		}
 	} else {
+		lifecycleStatus, err := conversationLifecycleStatusTx(ctx, tx, conversationID)
+		if err != nil {
+			return nil, err
+		}
+		if lifecycleStatus != conversationLifecycleActive {
+			return nil, fmt.Errorf("conversation is %s and cannot receive new messages", lifecycleStatus)
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE conversations SET active_agent_id=?, updated_at=datetime('now') WHERE id=?`, selectedAgentID, conversationID); err != nil {
 			return nil, err
 		}
@@ -1332,13 +1364,13 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 			return nil, err
 		}
 	}
-	routeResult := map[string]any{"intent": intent.Name, "route_mode": "single", "lead_agent": selectedAgentID, "route_source": "desktop_appcore", "confidence": 0.8, "priority": []string{"memory", "proactive", "task_followup", "artifact_followup", "serious_task", "chat"}}
+	routeResult := map[string]any{"intent": intent.Name, "route_mode": "single", "lead_agent": selectedAgentID, "route_source": "desktop_appcore", "confidence": 0.8, "preferred_node": req.PreferredNode, "allow_worker": req.AllowWorker, "selected_model_name": selectedModelName, "priority": []string{"memory", "proactive", "task_followup", "artifact_followup", "clarify", "serious_task", "chat"}}
 	routeRaw := mustJSON(routeResult)
-	metadataRaw := mustJSON(map[string]any{"app_mode": "desktop", "data_store": "sqlite", "task_queue": "sqlite", "input_mode": classification.InputMode, "conversation_mode": classification.Mode, "conversation_type": classification.ConversationType})
+	metadataRaw := mustJSON(map[string]any{"app_mode": "desktop", "data_store": "sqlite", "task_queue": "sqlite", "input_mode": classification.InputMode, "conversation_mode": classification.Mode, "conversation_type": classification.ConversationType, "interaction_class": uiHints.InteractionClass, "requires_user_input": uiHints.RequiresUserInput, "missing_input": uiHints.MissingInput, "ui_inline_execution": uiHints.InlineExecution, "classification_note": classification.ClassificationNote, "preferred_node": req.PreferredNode, "allow_worker": req.AllowWorker, "selected_model_name": selectedModelName})
 	if _, err := tx.ExecContext(ctx, `INSERT INTO runs (id, conversation_id, user_message_id, status, selected_agent_id, route_result, finished_at, duration_ms, metadata) VALUES (?, ?, ?, 'succeeded', ?, ?, datetime('now'), 0, ?)`, runID, conversationID, userMessageID, selectedAgentID, routeRaw, metadataRaw); err != nil {
 		return nil, err
 	}
-	if _, err := insertSQLiteRunStep(ctx, tx, runID, "task_classified", "Task mode classified", map[string]any{"message": req.Message, "requested_input_mode": req.InputMode}, map[string]any{"input_mode": classification.InputMode, "mode": classification.Mode, "conversation_type": classification.ConversationType, "should_create_task": classification.ShouldCreateTask}); err != nil {
+	if _, err := insertSQLiteRunStep(ctx, tx, runID, "task_classified", "Task mode classified", map[string]any{"message": req.Message, "requested_input_mode": req.InputMode}, map[string]any{"input_mode": classification.InputMode, "mode": classification.Mode, "interaction_class": uiHints.InteractionClass, "conversation_type": classification.ConversationType, "should_create_task": classification.ShouldCreateTask, "requires_user_input": uiHints.RequiresUserInput, "missing_input": uiHints.MissingInput}); err != nil {
 		return nil, err
 	}
 	if productTaskID != "" && memoryIntent.Kind == memoryControlNone && !artifactRewrite {
@@ -1388,7 +1420,22 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 		}
 	}
 
-	if memoryIntent.Kind != memoryControlNone {
+	if intent.Clarify && classification.RequiresUserInput {
+		runtimeResult, err = a.finishSQLiteMissingInputClarification(ctx, tx, sqliteRuntimeInput{
+			RunID:          runID,
+			ConversationID: conversationID,
+			UserMessageID:  userMessageID,
+			AgentID:        selectedAgentID,
+			Message:        req.Message,
+			Channel:        channel,
+			ModelName:      selectedModelName,
+			InputMode:      classification.Mode,
+			RouteResult:    routeResult,
+		}, classification)
+		if err != nil {
+			return nil, err
+		}
+	} else if memoryIntent.Kind != memoryControlNone {
 		runtimeResult, err = a.handleSQLiteMemoryControl(ctx, tx, memoryControlInput{
 			RunID:          runID,
 			ConversationID: conversationID,
@@ -1420,6 +1467,7 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 			AgentID:        selectedAgentID,
 			Message:        req.Message,
 			Channel:        channel,
+			ModelName:      selectedModelName,
 			PreferredNode:  req.PreferredNode,
 			AllowWorker:    req.AllowWorker,
 			InputMode:      classification.Mode,
@@ -1465,6 +1513,14 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 			productTask = &task
 		}
 	}
+	if hasExecution, err := runHasVisibleExecutionTx(ctx, tx, runID); err != nil {
+		return nil, err
+	} else if hasExecution && !uiHints.InlineExecution {
+		uiHints.InlineExecution = true
+		if err := updateRunMetadataTx(ctx, tx, runID, map[string]any{"ui_inline_execution": true}); err != nil {
+			return nil, err
+		}
+	}
 	if memoryIntent.Kind == memoryControlNone && !artifactRewrite {
 		reflectionResult, err = a.runConversationReflectionTx(ctx, tx, ReflectionRequest{
 			ConversationID: conversationID,
@@ -1488,7 +1544,7 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 	if err != nil {
 		return nil, err
 	}
-	messageMetadata := map[string]any{"run_id": runID, "agent_id": selectedAgentID}
+	messageMetadata := map[string]any{"run_id": runID, "agent_id": selectedAgentID, "selected_model_name": selectedModelName}
 	if productTaskID != "" {
 		messageMetadata["product_task_id"] = productTaskID
 	}
@@ -1512,7 +1568,7 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 	if reflectionResult != nil {
 		proactiveCandidates = reflectionResult.ProactiveOpportunities
 	}
-	return &ChatResponse{ConversationID: conversationID, UserMessageID: userMessageID, AssistantMessageID: assistantMessageID, RunID: runID, SelectedAgentID: selectedAgentID, Response: response, Steps: steps, UsedMemories: runtimeResult.UsedMemories, ProductTask: productTask, Artifacts: createdArtifacts, ProactiveCandidates: proactiveCandidates, Reflection: reflectionResult}, nil
+	return &ChatResponse{ConversationID: conversationID, UserMessageID: userMessageID, AssistantMessageID: assistantMessageID, RunID: runID, SelectedAgentID: selectedAgentID, Response: response, Steps: steps, UI: uiHints, UsedMemories: runtimeResult.UsedMemories, ProductTask: productTask, Artifacts: createdArtifacts, ProactiveCandidates: proactiveCandidates, Reflection: reflectionResult}, nil
 }
 
 const (
@@ -1534,6 +1590,7 @@ type sqliteRuntimeInput struct {
 	Channel        string
 	PreferredNode  string
 	AllowWorker    bool
+	ModelName      string
 	InputMode      string
 	ProductTaskID  string
 	RouteResult    map[string]any
@@ -1546,9 +1603,44 @@ type sqliteRuntimeResult struct {
 	Queued       bool
 }
 
+func chatUIHintsFor(classification conversationClassification, intent desktopIntent, inlineExecution bool) *ChatUIHints {
+	interactionClass := classification.InteractionClass
+	if interactionClass == "" {
+		interactionClass = classification.Mode
+	}
+	if intent.MemoryControl.Kind != memoryControlNone {
+		interactionClass = "memory_control"
+	} else if intent.TaskFollowup {
+		interactionClass = "task_followup"
+	} else if intent.ArtifactFollowup {
+		interactionClass = "artifact_followup"
+	} else if intent.Proactive {
+		interactionClass = "background_task"
+	} else if intent.SeriousTask {
+		interactionClass = "serious_task"
+	} else if intent.Clarify {
+		interactionClass = "clarify"
+	}
+	return &ChatUIHints{
+		InteractionClass:  interactionClass,
+		RequiresUserInput: classification.RequiresUserInput,
+		MissingInput:      classification.MissingInput,
+		InlineExecution:   inlineExecution || intent.SeriousTask || intent.TaskFollowup || intent.ArtifactFollowup,
+	}
+}
+
+func runHasVisibleExecutionTx(ctx context.Context, tx *sql.Tx, runID string) (bool, error) {
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_steps WHERE run_id=? AND step_type IN ('tool_started', 'tool_finished', 'task_dispatched')`, runID).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 type sqlitePromptAssembly struct {
 	ID              string
 	ModelID         string
+	ModelName       string
 	CacheablePrefix string
 	DynamicTail     string
 	PrefixHash      string
@@ -1568,6 +1660,117 @@ type desktopAgentOutput struct {
 	Risk       string         `json:"risk"`
 	Confidence float64        `json:"confidence"`
 	Memory     map[string]any `json:"memory"`
+}
+
+func (a *AppCore) finishSQLiteMissingInputClarification(ctx context.Context, tx *sql.Tx, input sqliteRuntimeInput, classification conversationClassification) (*sqliteRuntimeResult, error) {
+	result := &sqliteRuntimeResult{Steps: []store.RunStepBrief{}}
+	for _, step := range []sqliteStepDefinition{
+		{stepType: "input_received", title: "Input received", input: map[string]any{"message": input.Message, "channel": input.Channel}, output: map[string]any{"conversation_id": input.ConversationID, "message_id": input.UserMessageID}},
+		{stepType: "router_selected", title: "Router selected agent", input: map[string]any{"message": input.Message}, output: input.RouteResult},
+		{stepType: "missing_input_clarified", title: "Missing input clarified", input: map[string]any{"message": input.Message}, output: map[string]any{"missing_input": classification.MissingInput, "requires_user_input": true, "policy": "clarify_before_tool_run"}},
+	} {
+		brief, err := insertSQLiteRunStep(ctx, tx, input.RunID, step.stepType, step.title, step.input, step.output)
+		if err != nil {
+			return nil, err
+		}
+		result.Steps = append(result.Steps, brief)
+	}
+	response := "可以帮你总结网页内容。请把网页链接发给我，我会读取页面并提炼重点。"
+	if err := a.finishSQLiteAgentResponse(ctx, tx, input.RunID, input.AgentID, "", response, result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (a *AppCore) runSQLiteDeterministicWebResearch(ctx context.Context, tx *sql.Tx, input sqliteRuntimeInput, result *sqliteRuntimeResult, targetURL string) error {
+	inputs := map[string]any{"url": targetURL}
+	brief, err := insertSQLiteRunStep(ctx, tx, input.RunID, "capability_requested", "Agent requested capability", map[string]any{"agent_id": input.AgentID, "deterministic": true}, map[string]any{"capability": "web_research", "goal": "读取并提炼用户提供的 URL", "inputs": inputs, "risk": "read_only", "confidence": 1.0})
+	if err != nil {
+		return err
+	}
+	result.Steps = append(result.Steps, brief)
+	settings, err := a.getWorkspaceSettingsFrom(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if blocked, reason := store.BlockedResearchURLWithPolicy(targetURL, store.WebResearchPolicy{AllowPrivateHosts: settings.WebResearchAllowPrivateHosts, AllowedHosts: settings.BrowserAllowedHosts}); blocked {
+		response := store.FinalAnswerForCapabilityResult("web_research", map[string]any{"url": targetURL, "fetch_status": "policy_blocked", "reason": reason})
+		brief, stepErr := insertSQLiteRunStep(ctx, tx, input.RunID, "capability_blocked", "Capability request blocked before execution", map[string]any{"agent_id": input.AgentID, "capability": "web_research", "inputs": inputs}, map[string]any{"reason": reason, "policy": "web_research_url_policy"})
+		if stepErr != nil {
+			return stepErr
+		}
+		result.Steps = append(result.Steps, brief)
+		return a.finishSQLiteAgentResponse(ctx, tx, input.RunID, input.AgentID, "", response, result)
+	}
+	capabilityResult, err := a.executeAndRecordSQLiteCapability(ctx, tx, store.CapabilityRequest{
+		Type:          "capability_request",
+		Capability:    "web_research",
+		Goal:          "读取并提炼用户提供的 URL",
+		Inputs:        inputs,
+		Risk:          "read_only",
+		RunID:         input.RunID,
+		PreferredNode: input.PreferredNode,
+		AllowWorker:   input.AllowWorker,
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrPolicyDenied) {
+			response := "policy_blocked：该网页读取请求被策略阻止。"
+			brief, stepErr := insertSQLiteRunStep(ctx, tx, input.RunID, "capability_blocked", "Capability request blocked by Tool Compiler", map[string]any{"agent_id": input.AgentID, "capability": "web_research"}, map[string]any{"reason": "tool_compiler_policy_denied"})
+			if stepErr != nil {
+				return stepErr
+			}
+			result.Steps = append(result.Steps, brief)
+			if err := a.finishSQLiteAgentResponse(ctx, tx, input.RunID, input.AgentID, "", response, result); err != nil {
+				return err
+			}
+			return nil
+		}
+		return err
+	}
+	if status := stringFromAny(capabilityResult.NormalizedResult["status"]); status == "queued" {
+		result.Queued = true
+		response := "已交给执行后台处理，结果会在这里更新。"
+		return a.finishSQLiteAgentResponse(ctx, tx, input.RunID, input.AgentID, "", response, result)
+	}
+	brief, err = insertSQLiteRunStep(ctx, tx, input.RunID, "tool_finished", "Tool runtime finished", map[string]any{"workflow_name": capabilityResult.Workflow.WorkflowName, "tool_run_id": capabilityResult.ToolRunID}, capabilityResult.NormalizedResult)
+	if err != nil {
+		return err
+	}
+	result.Steps = append(result.Steps, brief)
+	response := store.FinalAnswerForCapabilityResult("web_research", capabilityResult.NormalizedResult)
+	if response == "" {
+		response = "已读取网页，但没有生成可展示内容。"
+	}
+	return a.finishSQLiteAgentResponse(ctx, tx, input.RunID, input.AgentID, "", response, result)
+}
+
+func (a *AppCore) recordSQLiteMockModelTraceForDeterministicPath(ctx context.Context, tx *sql.Tx, input sqliteRuntimeInput, result *sqliteRuntimeResult, dynamicContext string, memoryResults []store.MemorySearchResult) (string, error) {
+	if !strings.EqualFold(valueOrDefault(a.Config.Model.Provider, os.Getenv("MODEL_PROVIDER")), "mock_provider") {
+		return "", nil
+	}
+	assembly, err := a.insertSQLitePromptAssembly(ctx, tx, input.RunID, input.AgentID, input.Message, input.RouteResult, dynamicContext, memoryResults, input.ModelName)
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE runs SET selected_model_id=? WHERE id=?`, assembly.ModelID, input.RunID); err != nil {
+		return "", err
+	}
+	brief, err := insertSQLiteRunStep(ctx, tx, input.RunID, "prompt_assembled", "Prompt assembly finished", map[string]any{"run_id": input.RunID, "agent_id": input.AgentID, "turn": 1, "deterministic_path": true}, map[string]any{"prompt_assembly_id": assembly.ID, "prefix_hash": assembly.PrefixHash, "dynamic_tail_hash": assembly.DynamicHash, "prompt_cache_key": assembly.PromptCacheKey, "memory_profile_version": desktopMemoryProfileVersion, "tool_schema_version": desktopToolSchemaVersion})
+	if err != nil {
+		return "", err
+	}
+	result.Steps = append(result.Steps, brief)
+	modelResponse, modelCallID, err := a.invokeAndRecordSQLiteModel(ctx, tx, input.RunID, input.AgentID, assembly)
+	if err != nil {
+		return "", err
+	}
+	realModel := modelResponse.Provider != "" && modelResponse.Provider != "mock_provider" && !modelResponse.FallbackToMock
+	brief, err = insertSQLiteRunStep(ctx, tx, input.RunID, "model_call_finished", "Model call finished", map[string]any{"agent_id": input.AgentID, "model_id": assembly.ModelID, "prompt_assembly_id": assembly.ID, "deterministic_path": true}, map[string]any{"model_call_id": modelCallID, "provider": modelResponse.Provider, "model": modelResponse.ModelName, "real_model": realModel, "fallback_to_mock": modelResponse.FallbackToMock, "fallback_reason": modelResponse.FallbackReason, "input_tokens": modelResponse.InputTokens, "output_tokens": modelResponse.OutputTokens, "cached_input_tokens": modelResponse.CachedInputTokens, "latency_ms": modelResponse.LatencyMs})
+	if err != nil {
+		return "", err
+	}
+	result.Steps = append(result.Steps, brief)
+	return modelCallID, nil
 }
 
 func (a *AppCore) runSQLiteAgentRuntime(ctx context.Context, tx *sql.Tx, input sqliteRuntimeInput) (*sqliteRuntimeResult, error) {
@@ -1664,6 +1867,10 @@ func (a *AppCore) runSQLiteAgentRuntime(ctx context.Context, tx *sql.Tx, input s
 		return result, nil
 	}
 	if isMemoryInstruction(input.Message) && !isProductDirection(input.Message) {
+		modelCallID, err := a.recordSQLiteMockModelTraceForDeterministicPath(ctx, tx, input, result, dynamicContext, memoryResults)
+		if err != nil {
+			return nil, err
+		}
 		classification := classifyConversation(input.Message, input.InputMode)
 		content, summary, memoryType := reflectionMemoryContent(input.Message, classification)
 		memoryID, err := insertSQLiteMemoryProposal(ctx, tx, input.RunID, input.UserMessageID, input.AgentID, map[string]any{
@@ -1682,10 +1889,18 @@ func (a *AppCore) runSQLiteAgentRuntime(ctx context.Context, tx *sql.Tx, input s
 		}
 		result.Steps = append(result.Steps, brief)
 		response := "已生成记忆候选，等待你在右侧确认；确认前不会写成长期记忆。"
-		if err := a.finishSQLiteAgentResponse(ctx, tx, input.RunID, input.AgentID, "", response, result); err != nil {
+		if err := a.finishSQLiteAgentResponse(ctx, tx, input.RunID, input.AgentID, modelCallID, response, result); err != nil {
 			return nil, err
 		}
 		return result, nil
+	}
+	if input.ProductTaskID == "" {
+		if url := firstURLFromText(input.Message); url != "" {
+			if err := a.runSQLiteDeterministicWebResearch(ctx, tx, input, result, url); err != nil {
+				return nil, err
+			}
+			return result, nil
+		}
 	}
 	modelCalls := 0
 	capabilityRequests := 0
@@ -1699,7 +1914,7 @@ func (a *AppCore) runSQLiteAgentRuntime(ctx context.Context, tx *sql.Tx, input s
 			result.Response = response
 			return result, nil
 		}
-		assembly, err := a.insertSQLitePromptAssembly(ctx, tx, input.RunID, input.AgentID, input.Message, input.RouteResult, dynamicContext, memoryResults)
+		assembly, err := a.insertSQLitePromptAssembly(ctx, tx, input.RunID, input.AgentID, input.Message, input.RouteResult, dynamicContext, memoryResults, input.ModelName)
 		if err != nil {
 			return nil, err
 		}
@@ -1818,6 +2033,18 @@ func (a *AppCore) runSQLiteAgentRuntime(ctx context.Context, tx *sql.Tx, input s
 				result.Response = response
 				return result, nil
 			}
+			if capability == "web_research" && strings.TrimSpace(stringFromAny(parsed.Inputs["url"])) == "" {
+				response := "可以帮你总结网页内容。请把网页链接发给我，我会读取页面并提炼重点。"
+				brief, err := insertSQLiteRunStep(ctx, tx, input.RunID, "capability_blocked", "Capability request needs URL", map[string]any{"agent_id": input.AgentID, "capability": capability, "inputs": parsed.Inputs}, map[string]any{"reason": "missing_url", "policy": "clarify_before_tool_run"})
+				if err != nil {
+					return nil, err
+				}
+				result.Steps = append(result.Steps, brief)
+				if err := a.finishSQLiteAgentResponse(ctx, tx, input.RunID, input.AgentID, modelCallID, response, result); err != nil {
+					return nil, err
+				}
+				return result, nil
+			}
 			if capability == "memory_search" {
 				query := stringFromAny(parsed.Inputs["query"])
 				if query == "" {
@@ -1904,7 +2131,7 @@ func (a *AppCore) runSQLiteAgentRuntime(ctx context.Context, tx *sql.Tx, input s
 							return nil, err
 						}
 					}
-					response := "已将任务派发到所选节点；worker 执行结果会写入 task_attempts、tool_runs 和 Run Trace。"
+					response := "已交给执行后台处理，结果会在这里更新。"
 					if err := a.finishSQLiteAgentResponse(ctx, tx, input.RunID, input.AgentID, modelCallID, response, result); err != nil {
 						return nil, err
 					}
@@ -2174,8 +2401,11 @@ func finalizeSQLiteRun(ctx context.Context, tx *sql.Tx, runID string, status str
 	return err
 }
 
-func (a *AppCore) insertSQLitePromptAssembly(ctx context.Context, tx *sql.Tx, runID string, agentID string, userMessage string, routeResult map[string]any, dynamicContext string, memories []store.MemorySearchResult) (sqlitePromptAssembly, error) {
-	modelID := desktopDefaultModelID
+func (a *AppCore) insertSQLitePromptAssembly(ctx context.Context, tx *sql.Tx, runID string, agentID string, userMessage string, routeResult map[string]any, dynamicContext string, memories []store.MemorySearchResult, selectedModelName string) (sqlitePromptAssembly, error) {
+	modelID, modelName, err := a.ensureSQLiteRunModelTx(ctx, tx, selectedModelName)
+	if err != nil {
+		return sqlitePromptAssembly{}, err
+	}
 	prefix := desktopCacheablePrefix(agentID)
 	dynamic := desktopDynamicTail(runID, agentID, userMessage, dynamicContext, memories)
 	prefixHash := hashText(prefix)
@@ -2189,10 +2419,37 @@ func (a *AppCore) insertSQLitePromptAssembly(ctx context.Context, tx *sql.Tx, ru
 	if err != nil {
 		return sqlitePromptAssembly{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO prompt_assemblies (id, run_id, agent_id, model_id, memory_context_pack_id, cacheable_prefix, dynamic_tail, prefix_hash, dynamic_tail_hash, prompt_cache_key, memory_profile_version, tool_schema_version, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, assemblyID, runID, agentID, modelID, contextPackID, prefix, dynamic, prefixHash, dynamicHash, promptCacheKey, desktopMemoryProfileVersion, desktopToolSchemaVersion, mustJSON(map[string]any{"desktop_poc": false, "assembly_version": "desktop_runtime_v1"})); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO prompt_assemblies (id, run_id, agent_id, model_id, memory_context_pack_id, cacheable_prefix, dynamic_tail, prefix_hash, dynamic_tail_hash, prompt_cache_key, memory_profile_version, tool_schema_version, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, assemblyID, runID, agentID, modelID, contextPackID, prefix, dynamic, prefixHash, dynamicHash, promptCacheKey, desktopMemoryProfileVersion, desktopToolSchemaVersion, mustJSON(map[string]any{"desktop_poc": false, "assembly_version": "desktop_runtime_v1", "selected_model_name": modelName})); err != nil {
 		return sqlitePromptAssembly{}, err
 	}
-	return sqlitePromptAssembly{ID: assemblyID, ModelID: modelID, CacheablePrefix: prefix, DynamicTail: dynamic, PrefixHash: prefixHash, DynamicHash: dynamicHash, PromptCacheKey: promptCacheKey}, nil
+	return sqlitePromptAssembly{ID: assemblyID, ModelID: modelID, ModelName: modelName, CacheablePrefix: prefix, DynamicTail: dynamic, PrefixHash: prefixHash, DynamicHash: dynamicHash, PromptCacheKey: promptCacheKey}, nil
+}
+
+func (a *AppCore) ensureSQLiteRunModelTx(ctx context.Context, tx *sql.Tx, selectedModelName string) (string, string, error) {
+	provider := valueOrDefault(a.Config.Model.Provider, "openai_compatible")
+	baseURL := a.Config.Model.BaseURL
+	defaultModelName := valueOrDefault(a.Config.Model.Name, "model_default")
+	modelName := valueOrDefault(strings.TrimSpace(selectedModelName), defaultModelName)
+	modelID := desktopDefaultModelID
+	if modelName != defaultModelName {
+		modelID = "desktop_model_" + hashText(provider + "\n" + baseURL + "\n" + modelName)[:16]
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO models (id, provider, model_name, display_name, base_url, base_url_env, api_key_env, supports_json_mode, supports_tool_calling, enabled, metadata, updated_at)
+		VALUES (?, ?, ?, ?, ?, 'MODEL_DEFAULT_BASE_URL', 'MODEL_DEFAULT_API_KEY', 1, 0, 1, ?, datetime('now'))
+		ON CONFLICT(id) DO UPDATE SET
+			provider=excluded.provider,
+			model_name=excluded.model_name,
+			display_name=excluded.display_name,
+			base_url=excluded.base_url,
+			base_url_env=excluded.base_url_env,
+			api_key_env=excluded.api_key_env,
+			supports_json_mode=excluded.supports_json_mode,
+			enabled=excluded.enabled,
+			metadata=excluded.metadata,
+			updated_at=datetime('now')
+	`, modelID, provider, modelName, modelName, baseURL, mustJSON(map[string]any{"source": "desktop_run_model", "per_run_selectable": true}))
+	return modelID, modelName, err
 }
 
 func insertSQLiteMemoryContextPackTx(ctx context.Context, tx *sql.Tx, runID string, agentID string, memories []store.MemorySearchResult, metadata map[string]any) (string, error) {
@@ -2212,7 +2469,7 @@ func insertSQLiteMemoryContextPackTx(ctx context.Context, tx *sql.Tx, runID stri
 
 func (a *AppCore) invokeAndRecordSQLiteModel(ctx context.Context, tx *sql.Tx, runID string, agentID string, assembly sqlitePromptAssembly) (*store.ModelResponse, string, error) {
 	provider := valueOrDefault(a.Config.Model.Provider, "openai_compatible")
-	modelName := valueOrDefault(a.Config.Model.Name, "model_default")
+	modelName := valueOrDefault(assembly.ModelName, valueOrDefault(a.Config.Model.Name, "model_default"))
 	request := store.ModelRequest{
 		Provider:        provider,
 		ModelID:         assembly.ModelID,
@@ -2995,6 +3252,9 @@ func scanSQLiteMemory(rows *sql.Rows) (store.MemoryRecord, float64, error) {
 
 func routeSQLiteAgent(message string) string {
 	lower := strings.ToLower(message)
+	if webResearchRequestMissingURL(message) {
+		return "general_agent"
+	}
 	if strings.Contains(lower, "http://") || strings.Contains(lower, "https://") {
 		return "research_agent"
 	}
@@ -3037,6 +3297,7 @@ func desktopCacheablePrefix(agentID string) string {
 - capability_request schema: {"output_type":"capability_request","capability":"memory_search|server_diagnose|system_health_check|web_research|workspace_search|file_analyze","goal":"...","inputs":{},"risk":"read_only","confidence":0.0}.
 - memory_write_proposal schema: {"output_type":"memory_write_proposal","memory":{"type":"...","content":"...","confidence":0.0}}.
 - The model must not output raw shell, SQL, file_write, service_restart, restart, stop, rm, delete, chmod, or chown for execution.
+- If a capability lacks required inputs, such as web_research without a URL, return final_answer asking for the missing input instead of requesting the capability.
 - Artifact-style answers must not invent numbers, rates, timings, file evidence, or user behavior claims. If evidence is missing, say it is a待验证判断 and name the limitation.
 - When using memory, separate "confirmed memory says" from "my current inference". Never describe an inference as something the user previously preferred or said.
 - Desktop Mode uses local SQLite and AppCore directly. It does not call localhost HTTP.
@@ -3320,6 +3581,18 @@ func ftsQuery(query string) string {
 func firstURLFromText(value string) string {
 	match := desktopURLPattern.FindString(value)
 	return strings.TrimRight(match, ".,;:!?")
+}
+
+func webResearchRequestMissingURL(message string) bool {
+	if firstURLFromText(message) != "" {
+		return false
+	}
+	lower := strings.ToLower(message)
+	targetsWebPage := containsAnyText(message, []string{"网页", "页面", "这个网页", "当前网页", "这个页面", "当前页面", "网页内容", "页面内容", "网页链接", "网页地址", "网址", "链接"}) ||
+		containsAnyText(lower, []string{"web page", "webpage", "website", "url", "link", "page", "site"})
+	wantsSummary := containsAnyText(message, []string{"总结", "读取", "看一下", "提炼", "分析"}) ||
+		containsAnyText(lower, []string{"summarize", "summary", "read", "fetch", "extract", "analyze"})
+	return targetsWebPage && wantsSummary
 }
 
 func truncate(value string, limit int) string {

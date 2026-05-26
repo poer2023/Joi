@@ -30,6 +30,33 @@ func TestWorkerReadableHTMLTextDropsStyleScriptAndNoscript(t *testing.T) {
 	}
 }
 
+func TestWorkerReadableHTMLTextPrefersArticleBody(t *testing.T) {
+	body := `<html>
+		<body>
+			<nav>少数派 共创 PRIME Matrix 栏目 Pi Store 无需申请，自由写作</nav>
+			<article class="normal-article">
+				<div class="article-body">
+					<h2>VWFNDR™ + MBL：Android 独占特色交互相机应用</h2>
+					<p>VWFNDR 是一款把取景和胶片模拟放在核心位置的相机应用。</p>
+					<h2>Raycast for iOS：手机端快速启动器</h2>
+					<p>它把常用搜索、快捷动作和跨端同步放进了移动端。</p>
+				</div>
+			</article>
+			<aside class="article-side">分享 收藏 下载 App</aside>
+		</body>
+	</html>`
+
+	text := workerReadableHTMLText(body)
+	if !strings.Contains(text, "VWFNDR") || !strings.Contains(text, "Raycast for iOS") {
+		t.Fatalf("readable text missed article content: %s", text)
+	}
+	for _, blocked := range []string{"无需申请，自由写作", "分享 收藏 下载 App"} {
+		if strings.Contains(text, blocked) {
+			t.Fatalf("readable text leaked chrome text %q: %s", blocked, text)
+		}
+	}
+}
+
 func TestExecuteWorkerCapabilityAcceptsWebResearchAliases(t *testing.T) {
 	for _, capability := range []string{"web_research", "web_research_v1", "web_research_v2", "fetch_url"} {
 		t.Run(capability, func(t *testing.T) {

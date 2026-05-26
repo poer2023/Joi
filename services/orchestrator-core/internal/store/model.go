@@ -156,6 +156,9 @@ func InvokeModelDirect(ctx context.Context, request ModelRequest) (*ModelRespons
 		APIKeyEnv:    "MODEL_DEFAULT_API_KEY",
 		SupportsJSON: true,
 	})
+	if strings.TrimSpace(request.ModelName) != "" {
+		config.ModelName = request.ModelName
+	}
 	started := time.Now()
 	response, err := dispatchModel(ctx, config, request)
 	if response != nil {
@@ -218,21 +221,21 @@ func mockAgentRuntimeContent(dynamicTail string) string {
 		return `{"output_type":"final_answer","content":"根据已召回的记忆：轻量部署问题应优先考虑 Docker Compose，并避免默认推荐 Kubernetes。"}`
 	}
 	if strings.Contains(dynamicTail, "SERVER_DIAGNOSE_QUEUED") {
-		return `{"output_type":"final_answer","content":"已将只读服务诊断任务派发到所选 worker；worker 执行结果会写入 tool_runs、task_attempts 和 Run Trace。"}`
+		return `{"output_type":"final_answer","content":"已交给执行后台处理，结果会在这里更新。"}`
 	}
 	if strings.Contains(dynamicTail, "WEB_RESEARCH_RESULT") {
-		return `{"output_type":"final_answer","content":"已完成只读网页研究。Run Trace 中包含 source URL、fetch 状态、节点和摘要。"}`
+		return `{"output_type":"final_answer","content":"已完成网页读取，并整理了页面来源、读取状态和摘要。"}`
 	}
 	if strings.Contains(dynamicTail, "SERVER_DIAGNOSE_RESULT") {
-		return `{"output_type":"final_answer","content":"已完成只读服务诊断。诊断结果已写入 tool_runs 和 Run Trace；请在 Trace 中查看 docker、端口、HTTP、磁盘和内存检查详情。"}`
+		return `{"output_type":"final_answer","content":"已完成只读服务诊断。可以在执行详情里查看 docker、端口、HTTP、磁盘和内存检查。"}`
 	}
 	if strings.Contains(dynamicTail, "SYSTEM_HEALTH_RESULT") {
-		return `{"output_type":"final_answer","content":"Joi 自检已完成。结果包含 postgres、nats、orchestrator、console、worker-runtime、磁盘和最近错误，详情已写入 Run Trace。"}`
+		return `{"output_type":"final_answer","content":"Joi 自检已完成。结果包含 postgres、nats、orchestrator、console、worker-runtime、磁盘和最近错误。"}`
 	}
 	if strings.Contains(lower, "当前项目") && (strings.Contains(lower, "run trace") || strings.Contains(dynamicTail, "Run Trace")) && (strings.Contains(dynamicTail, "找") || strings.Contains(lower, "search")) {
 		return `{"output_type":"capability_request","capability":"workspace_search","goal":"在授权 workspace 中搜索 Run Trace 设计文档","inputs":{"query":"Run Trace","root":"/Users/hao/Documents/Joi","glob":"*.md","max_results":20},"risk":"read_only","confidence":0.9}`
 	}
-	if strings.Contains(dynamicTail, "AGENTS.md") && (strings.Contains(dynamicTail, "读一下") || strings.Contains(lower, "read")) {
+	if strings.Contains(userMessage, "AGENTS.md") && (strings.Contains(userMessage, "读一下") || strings.Contains(lower, "read")) {
 		return `{"output_type":"capability_request","capability":"file_analyze","goal":"读取 AGENTS.md 并总结 capability 实现红线","inputs":{"path":"AGENTS.md","question":"总结 capability 实现不能违反哪些红线"},"risk":"read_only","confidence":0.9}`
 	}
 	if strings.Contains(lower, "joi 自检") || strings.Contains(lower, "系统自检") || strings.Contains(lower, "system health") || strings.Contains(lower, "健康检查") {
@@ -246,6 +249,9 @@ func mockAgentRuntimeContent(dynamicTail string) string {
 	}
 	if url := firstURL(userMessage); url != "" {
 		return `{"output_type":"capability_request","capability":"web_research","goal":"读取并总结用户提供的 URL","inputs":{"url":"` + url + `"},"risk":"read_only","confidence":0.86}`
+	}
+	if mockWebResearchMissingURLRequest(userMessage) {
+		return `{"output_type":"capability_request","capability":"web_research","goal":"读取并总结网页内容","inputs":{},"risk":"read_only","confidence":0.74}`
 	}
 	if strings.Contains(userMessage, "伙伴式前台") && strings.Contains(userMessage, "严肃执行后台") && strings.Contains(userMessage, "记住") {
 		return `{"output_type":"memory_write_proposal","memory":{"type":"project_fact","summary":"Joi 的产品方向","content":"用户希望把 Joi 做成伙伴式前台 + 严肃执行后台：平时陪用户想，严肃任务时能可追踪、可交付、可审计地干活。","confidence":0.92,"entities":["Joi","产品方向","伙伴式前台","严肃执行后台"]}}`
@@ -266,6 +272,40 @@ func firstURL(value string) string {
 		}
 	}
 	return ""
+}
+
+func mockWebResearchMissingURLRequest(message string) bool {
+	lower := strings.ToLower(message)
+	targetsWebPage := strings.Contains(message, "这个网页") ||
+		strings.Contains(message, "网页") ||
+		strings.Contains(message, "页面") ||
+		strings.Contains(message, "当前网页") ||
+		strings.Contains(message, "当前页面") ||
+		strings.Contains(message, "网页内容") ||
+		strings.Contains(message, "页面内容") ||
+		strings.Contains(message, "网页链接") ||
+		strings.Contains(message, "网页地址") ||
+		strings.Contains(message, "网址") ||
+		strings.Contains(message, "链接") ||
+		strings.Contains(lower, "web page") ||
+		strings.Contains(lower, "webpage") ||
+		strings.Contains(lower, "website") ||
+		strings.Contains(lower, "url") ||
+		strings.Contains(lower, "link") ||
+		strings.Contains(lower, "page") ||
+		strings.Contains(lower, "site")
+	wantsSummary := strings.Contains(message, "总结") ||
+		strings.Contains(message, "读取") ||
+		strings.Contains(message, "看一下") ||
+		strings.Contains(message, "提炼") ||
+		strings.Contains(message, "分析") ||
+		strings.Contains(lower, "summarize") ||
+		strings.Contains(lower, "summary") ||
+		strings.Contains(lower, "read") ||
+		strings.Contains(lower, "fetch") ||
+		strings.Contains(lower, "extract") ||
+		strings.Contains(lower, "analyze")
+	return targetsWebPage && wantsSummary
 }
 
 func extractUserMessage(dynamicTail string) string {

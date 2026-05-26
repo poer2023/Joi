@@ -19,6 +19,8 @@ func main() {
 		Title:            "Joi",
 		Width:            1280,
 		Height:           860,
+		MinWidth:         560,
+		MinHeight:        720,
 		BackgroundColour: options.NewRGB(251, 251, 249),
 		AssetServer: &assetserver.Options{
 			Assets: assets,

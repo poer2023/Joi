@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -21,8 +22,23 @@ import (
 var htmlScriptPattern = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
 var htmlStylePattern = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
 var htmlNoScriptPattern = regexp.MustCompile(`(?is)<noscript[^>]*>.*?</noscript>`)
+var htmlCommentPattern = regexp.MustCompile(`(?is)<!--.*?-->`)
+var htmlTitlePattern = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+var htmlMetaTitlePattern = regexp.MustCompile(`(?is)<meta[^>]+(?:property|name)=["'](?:og:title|twitter:title)["'][^>]+content=["']([^"']+)["']`)
+var htmlBlockPattern = regexp.MustCompile(`(?is)<(?:h1|h2|h3|h4|p|li|blockquote|figcaption)[^>]*>(.*?)</(?:h1|h2|h3|h4|p|li|blockquote|figcaption)>`)
+var htmlBlockBreakPattern = regexp.MustCompile(`(?i)<\s*/?\s*(?:br|p|div|section|article|main|header|footer|li|ul|ol|h1|h2|h3|h4|blockquote|figcaption)\b[^>]*>`)
 var htmlTagPattern = regexp.MustCompile(`<[^>]+>`)
 var linkPattern = regexp.MustCompile(`href=["']([^"']+)["']`)
+
+const maxReadableTextRunes = 12000
+const maxReadableSummaryRunes = 900
+const minReadableTextRunes = 80
+
+type readableHTMLExtraction struct {
+	Title  string
+	Text   string
+	Source string
+}
 
 var ErrPolicyDenied = errors.New("policy denied")
 
@@ -62,6 +78,10 @@ type CapabilityExecutionResult struct {
 type WebResearchPolicy struct {
 	AllowPrivateHosts bool     `json:"allow_private_hosts"`
 	AllowedHosts      []string `json:"allowed_hosts"`
+}
+
+func BlockedResearchURLWithPolicy(rawURL string, policy WebResearchPolicy) (bool, string) {
+	return blockedResearchURLWithPolicy(rawURL, policy)
 }
 
 func (db *DB) CompileAndRecordCapability(ctx context.Context, request CapabilityRequest) (*CapabilityExecutionResult, error) {
@@ -303,10 +323,8 @@ func FetchReadableURLWithPolicy(ctx context.Context, url string, policy WebResea
 		truncated = true
 	}
 	body := string(raw)
-	text := readableHTMLText(body)
-	if len(text) > 1200 {
-		text = text[:1200]
-	}
+	extraction := extractReadableHTML(body)
+	text, readableTextTruncated := truncateTextRunes(extraction.Text, maxReadableTextRunes)
 	links := []string{}
 	for _, match := range linkPattern.FindAllStringSubmatch(body, 20) {
 		if len(match) > 1 {
@@ -318,29 +336,237 @@ func FetchReadableURLWithPolicy(ctx context.Context, url string, policy WebResea
 		"fetch_status":  "succeeded",
 		"status_code":   resp.StatusCode,
 		"content_type":  resp.Header.Get("Content-Type"),
+		"title":         extraction.Title,
 		"readable_text": text,
+		"text_length":   runeCount(text),
 		"links":         links,
 		"summary":       summarizeText(text),
-		"truncated":     truncated,
-		"mode":          "web_research_v2_readonly_fetch",
+		"extraction": map[string]any{
+			"source":                  extraction.Source,
+			"readable_text_truncated": readableTextTruncated,
+		},
+		"truncated": truncated,
+		"mode":      "web_research_v2_readonly_fetch",
 	}
 }
 
 func readableHTMLText(body string) string {
-	body = htmlScriptPattern.ReplaceAllString(body, " ")
-	body = htmlStylePattern.ReplaceAllString(body, " ")
-	body = htmlNoScriptPattern.ReplaceAllString(body, " ")
-	return strings.Join(strings.Fields(htmlTagPattern.ReplaceAllString(body, " ")), " ")
+	return extractReadableHTML(body).Text
 }
 
 func summarizeText(text string) string {
+	text = strings.TrimSpace(text)
 	if text == "" {
 		return ""
 	}
-	if len(text) > 280 {
-		return text[:280]
+	lines := []string{}
+	totalRunes := 0
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lineRunes := runeCount(line)
+		if totalRunes > 0 && totalRunes+lineRunes+1 > maxReadableSummaryRunes {
+			break
+		}
+		lines = append(lines, line)
+		totalRunes += lineRunes + 1
 	}
-	return text
+	if len(lines) == 0 {
+		return truncateRunes(text, maxReadableSummaryRunes)
+	}
+	summary := strings.Join(lines, " ")
+	return truncateRunes(summary, maxReadableSummaryRunes)
+}
+
+func extractReadableHTML(body string) readableHTMLExtraction {
+	title := extractHTMLTitle(body)
+	if !strings.Contains(body, "<") {
+		text := normalizeReadableText(body)
+		source := "plain_text"
+		if runeCount(text) < minReadableTextRunes {
+			source = "insufficient"
+		}
+		return readableHTMLExtraction{Title: title, Text: text, Source: source}
+	}
+	cleaned := stripNonContentHTML(body)
+	fragment, source := articleHTMLFragment(cleaned)
+	text := extractStructuredText(fragment)
+	if runeCount(text) < minReadableTextRunes && fragment != cleaned {
+		if fallback := extractStructuredText(cleaned); runeCount(fallback) > runeCount(text) {
+			text = fallback
+			source = "document"
+		}
+	}
+	if text == "" {
+		text = htmlFragmentToText(fragment)
+	}
+	if runeCount(text) < minReadableTextRunes {
+		source = "insufficient"
+	}
+	return readableHTMLExtraction{Title: title, Text: text, Source: source}
+}
+
+func stripNonContentHTML(body string) string {
+	body = htmlCommentPattern.ReplaceAllString(body, " ")
+	body = htmlScriptPattern.ReplaceAllString(body, " ")
+	body = htmlStylePattern.ReplaceAllString(body, " ")
+	body = htmlNoScriptPattern.ReplaceAllString(body, " ")
+	return body
+}
+
+func extractHTMLTitle(body string) string {
+	if match := htmlMetaTitlePattern.FindStringSubmatch(body); len(match) > 1 {
+		return singleLineText(match[1])
+	}
+	if match := htmlTitlePattern.FindStringSubmatch(body); len(match) > 1 {
+		return singleLineText(match[1])
+	}
+	return ""
+}
+
+func articleHTMLFragment(body string) (string, string) {
+	lower := strings.ToLower(body)
+	startMarkers := []struct {
+		marker string
+		source string
+	}{
+		{`class="article-body`, "article_body"},
+		{`class='article-body`, "article_body"},
+		{`class="article__main__wrapper`, "article_body"},
+		{`class='article__main__wrapper`, "article_body"},
+		{`class="post-content`, "article_body"},
+		{`class='post-content`, "article_body"},
+		{`class="article-content`, "article_body"},
+		{`class='article-content`, "article_body"},
+		{`class="entry-content`, "article_body"},
+		{`class='entry-content`, "article_body"},
+		{`class="markdown-body`, "article_body"},
+		{`class='markdown-body`, "article_body"},
+		{`<article`, "article"},
+		{`<main`, "main"},
+	}
+	start := -1
+	source := "document"
+	for _, marker := range startMarkers {
+		if idx := strings.Index(lower, marker.marker); idx >= 0 {
+			start = tagStartBefore(body, idx)
+			source = marker.source
+			break
+		}
+	}
+	if start < 0 {
+		return body, source
+	}
+	end := len(body)
+	endMarkers := []string{
+		`class="article-side`,
+		`class='article-side`,
+		`class="comments`,
+		`class='comments`,
+		`id="comments`,
+		`id='comments`,
+		`<footer`,
+		`</article`,
+		`</main`,
+	}
+	for _, marker := range endMarkers {
+		if idx := strings.Index(lower[start:], marker); idx > 0 {
+			candidate := start + idx
+			if strings.HasPrefix(marker, "class=") || strings.HasPrefix(marker, "id=") {
+				candidate = tagStartBefore(body, candidate)
+			}
+			if candidate > start && candidate < end {
+				end = candidate
+			}
+		}
+	}
+	return body[start:end], source
+}
+
+func tagStartBefore(body string, idx int) int {
+	if idx <= 0 || idx > len(body) {
+		return idx
+	}
+	if start := strings.LastIndex(body[:idx], "<"); start >= 0 {
+		return start
+	}
+	return idx
+}
+
+func extractStructuredText(fragment string) string {
+	lines := []string{}
+	seen := map[string]bool{}
+	for _, match := range htmlBlockPattern.FindAllStringSubmatch(fragment, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		for _, line := range splitReadableLines(htmlFragmentToText(match[1])) {
+			if seen[line] {
+				continue
+			}
+			seen[line] = true
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return htmlFragmentToText(fragment)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func htmlFragmentToText(fragment string) string {
+	fragment = htmlBlockBreakPattern.ReplaceAllString(fragment, "\n")
+	fragment = htmlTagPattern.ReplaceAllString(fragment, " ")
+	return normalizeReadableText(fragment)
+}
+
+func normalizeReadableText(text string) string {
+	text = html.UnescapeString(text)
+	text = strings.ReplaceAll(text, "\u00a0", " ")
+	return strings.Join(splitReadableLines(text), "\n")
+}
+
+func splitReadableLines(text string) []string {
+	lines := []string{}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.Join(strings.Fields(line), " ")
+		line = strings.TrimSpace(line)
+		if line == "" || isBoilerplateReadableLine(line) {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func singleLineText(text string) string {
+	return strings.Join(strings.Fields(html.UnescapeString(htmlTagPattern.ReplaceAllString(text, " "))), " ")
+}
+
+func isBoilerplateReadableLine(line string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(line))
+	switch normalized {
+	case "登录", "注册", "首页", "发现", "搜索", "评论", "赞", "分享", "展开阅读全文", "read more", "sign in", "log in":
+		return true
+	}
+	return false
+}
+
+func truncateTextRunes(text string, limit int) (string, bool) {
+	if limit <= 0 {
+		return "", text != ""
+	}
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text, false
+	}
+	return string(runes[:limit]), true
+}
+
+func runeCount(text string) int {
+	return len([]rune(text))
 }
 
 func executeSystemHealthCheck(ctx context.Context, tx execTx, request CapabilityRequest) (*CapabilityExecutionResult, error) {

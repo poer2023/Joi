@@ -10,6 +10,7 @@ type desktopIntent struct {
 	Proactive        bool
 	TaskFollowup     bool
 	SeriousTask      bool
+	Clarify          bool
 }
 
 func classifyDesktopIntent(message string, requestedMode string) desktopIntent {
@@ -29,6 +30,9 @@ func classifyDesktopIntent(message string, requestedMode string) desktopIntent {
 		return desktopIntent{Name: "artifact_followup", ArtifactFollowup: true}
 	}
 	classification := classifyConversation(message, requestedMode)
+	if classification.Mode == "clarify" {
+		return desktopIntent{Name: "clarify", Clarify: true}
+	}
 	if classification.Mode == "serious_task" {
 		return desktopIntent{Name: "serious_task", SeriousTask: true}
 	}

@@ -87,10 +87,39 @@ CREATE TABLE conversations (
   active_agent_id TEXT REFERENCES agents(id),
   active_project_id TEXT,
   topic TEXT,
+  lifecycle_status TEXT NOT NULL DEFAULT 'active',
+  group_id TEXT,
+  pinned BOOLEAN NOT NULL DEFAULT FALSE,
+  archived_at TIMESTAMPTZ,
+  trashed_at TIMESTAMPTZ,
+  purge_after TIMESTAMPTZ,
+  restored_at TIMESTAMPTZ,
   expires_at TIMESTAMPTZ,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE conversation_groups (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  collapsed BOOLEAN NOT NULL DEFAULT FALSE,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE conversation_lifecycle_events (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id),
+  action TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT 'desktop_ui',
+  reason TEXT NOT NULL DEFAULT '',
+  previous_status TEXT NOT NULL DEFAULT '',
+  next_status TEXT NOT NULL DEFAULT '',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE messages (
@@ -400,6 +429,10 @@ CREATE TABLE confirmations (
 CREATE INDEX idx_runs_created_at ON runs(created_at DESC);
 CREATE INDEX idx_runs_status ON runs(status);
 CREATE INDEX idx_run_steps_run_id ON run_steps(run_id);
+CREATE INDEX idx_conversations_lifecycle ON conversations(lifecycle_status, pinned DESC, updated_at DESC);
+CREATE INDEX idx_conversations_group ON conversations(group_id, lifecycle_status, updated_at DESC);
+CREATE INDEX idx_conversation_groups_sort ON conversation_groups(sort_order, updated_at DESC);
+CREATE INDEX idx_conversation_lifecycle_events_conversation ON conversation_lifecycle_events(conversation_id, created_at DESC);
 CREATE INDEX idx_messages_conversation_id ON messages(conversation_id);
 CREATE INDEX idx_memories_type ON memories(type);
 CREATE INDEX idx_memories_status ON memories(status);

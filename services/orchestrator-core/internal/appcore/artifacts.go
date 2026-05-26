@@ -216,6 +216,8 @@ func (a *AppCore) ListOpenLoops(ctx context.Context, filter OpenLoopFilter) (*Op
 		       updated_at, closed_at
 		FROM open_loops
 		WHERE status=?
+		  AND `+conversationVisibleInPrimaryListsPredicate("open_loops.source_conversation_id")+`
+		  AND `+productTaskConversationVisiblePredicate("open_loops.source_product_task_id")+`
 		ORDER BY updated_at DESC, created_at DESC
 		LIMIT ?
 	`, status, limit)
@@ -252,6 +254,14 @@ func (a *AppCore) ListProactiveMessages(ctx context.Context, filter ProactiveMes
 		       COALESCE(feedback, ''), metadata, created_at, updated_at, sent_at
 		FROM proactive_messages
 		WHERE status=?
+		  AND `+productTaskConversationVisiblePredicate("proactive_messages.source_product_task_id")+`
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM open_loops ol
+		    JOIN conversations c ON c.id=ol.source_conversation_id
+		    WHERE ol.id=proactive_messages.source_open_loop_id
+		      AND COALESCE(c.lifecycle_status, 'active') IN ('archived','trashed','purged')
+		  )
 		ORDER BY score DESC, updated_at DESC, created_at DESC
 		LIMIT ?
 	`, status, limit)
@@ -370,7 +380,11 @@ func listArtifactSummaries(ctx context.Context, runner queryContextRunner, filte
 		limit = 50
 	}
 	args := []any{}
-	where := []string{"status <> 'deleted'"}
+	where := []string{
+		"status <> 'deleted'",
+		conversationVisibleInPrimaryListsPredicate("artifacts.source_conversation_id"),
+		productTaskConversationVisiblePredicate("artifacts.source_product_task_id"),
+	}
 	if strings.TrimSpace(filter.ProductTaskID) != "" {
 		where = append(where, "source_product_task_id=?")
 		args = append(args, strings.TrimSpace(filter.ProductTaskID))

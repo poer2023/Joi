@@ -20,6 +20,15 @@ func NewRouter(core *appcore.AppCore, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /api/chat/send", handlers.SendChat)
 	mux.HandleFunc("GET /api/conversations", handlers.ListConversations)
 	mux.HandleFunc("GET /api/conversations/{id}", handlers.GetConversation)
+	mux.HandleFunc("POST /api/conversations/{id}/archive", handlers.ArchiveConversation)
+	mux.HandleFunc("POST /api/conversations/{id}/trash", handlers.TrashConversation)
+	mux.HandleFunc("POST /api/conversations/{id}/restore", handlers.RestoreConversation)
+	mux.HandleFunc("POST /api/conversations/{id}/purge", handlers.PurgeConversation)
+	mux.HandleFunc("POST /api/conversations/{id}/group", handlers.MoveConversationToGroup)
+	mux.HandleFunc("GET /api/conversation-groups", handlers.ListConversationGroups)
+	mux.HandleFunc("POST /api/conversation-groups", handlers.SaveConversationGroup)
+	mux.HandleFunc("PATCH /api/conversation-groups", handlers.SaveConversationGroup)
+	mux.HandleFunc("DELETE /api/conversation-groups/{id}", handlers.DeleteConversationGroup)
 	mux.HandleFunc("GET /api/runs/{id}", handlers.GetRun)
 	mux.HandleFunc("GET /api/runs/{id}/steps", handlers.GetRunSteps)
 	mux.HandleFunc("GET /api/agents", handlers.ListAgents)
@@ -70,6 +79,7 @@ func adminProtectedPath(path string) bool {
 	protectedPrefixes := []string{
 		"/api/runs/",
 		"/api/conversations",
+		"/api/conversation-groups",
 		"/api/memories",
 		"/api/nodes",
 		"/api/tool-workflows",

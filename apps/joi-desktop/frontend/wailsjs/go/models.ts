@@ -177,6 +177,8 @@ export namespace main {
 	    }
 	}
 	export class DesktopAvailableModel {
+	    provider: string;
+	    base_url: string;
 	    id: string;
 	    display_name: string;
 	    owner: string;
@@ -199,6 +201,8 @@ export namespace main {
 
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.provider = source["provider"];
+	        this.base_url = source["base_url"];
 	        this.id = source["id"];
 	        this.display_name = source["display_name"];
 	        this.owner = source["owner"];
@@ -336,6 +340,7 @@ export namespace main {
 	    message: string;
 	    preferred_node: string;
 	    allow_worker: boolean;
+	    model_name: string;
 	    input_mode: string;
 	    product_task_id: string;
 
@@ -351,6 +356,7 @@ export namespace main {
 	        this.message = source["message"];
 	        this.preferred_node = source["preferred_node"];
 	        this.allow_worker = source["allow_worker"];
+	        this.model_name = source["model_name"];
 	        this.input_mode = source["input_mode"];
 	        this.product_task_id = source["product_task_id"];
 	    }
@@ -487,14 +493,37 @@ export namespace main {
 	        this.metadata = source["metadata"];
 	    }
 	}
+	export class DesktopChatUIHints {
+	    interaction_class: string;
+	    requires_user_input: boolean;
+	    missing_input?: string;
+	    inline_execution: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopChatUIHints(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.interaction_class = source["interaction_class"];
+	        this.requires_user_input = source["requires_user_input"];
+	        this.missing_input = source["missing_input"];
+	        this.inline_execution = source["inline_execution"];
+	    }
+	}
 	export class DesktopRunStep {
 	    id: string;
+	    run_id?: string;
 	    step_type: string;
 	    title: string;
 	    status: string;
 	    input?: Record<string, any>;
 	    output?: Record<string, any>;
 	    error?: Record<string, any>;
+	    started_at?: string;
+	    finished_at?: string;
+	    duration_ms?: number;
+	    created_at?: string;
 
 	    static createFrom(source: any = {}) {
 	        return new DesktopRunStep(source);
@@ -503,12 +532,17 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
+	        this.run_id = source["run_id"];
 	        this.step_type = source["step_type"];
 	        this.title = source["title"];
 	        this.status = source["status"];
 	        this.input = source["input"];
 	        this.output = source["output"];
 	        this.error = source["error"];
+	        this.started_at = source["started_at"];
+	        this.finished_at = source["finished_at"];
+	        this.duration_ms = source["duration_ms"];
+	        this.created_at = source["created_at"];
 	    }
 	}
 	export class DesktopChatResponse {
@@ -519,6 +553,7 @@ export namespace main {
 	    selected_agent_id: string;
 	    response: string;
 	    steps: DesktopRunStep[];
+	    ui?: DesktopChatUIHints;
 	    model_calls: DesktopModelCall[];
 	    product_task?: DesktopProductTask;
 	    artifacts?: DesktopArtifactSummary[];
@@ -537,6 +572,7 @@ export namespace main {
 	        this.selected_agent_id = source["selected_agent_id"];
 	        this.response = source["response"];
 	        this.steps = this.convertValues(source["steps"], DesktopRunStep);
+	        this.ui = this.convertValues(source["ui"], DesktopChatUIHints);
 	        this.model_calls = this.convertValues(source["model_calls"], DesktopModelCall);
 	        this.product_task = this.convertValues(source["product_task"], DesktopProductTask);
 	        this.artifacts = this.convertValues(source["artifacts"], DesktopArtifactSummary);
@@ -561,6 +597,7 @@ export namespace main {
 		    return a;
 		}
 	}
+
 	export class DesktopConfirmation {
 	    id: string;
 	    run_id: string;
@@ -675,6 +712,102 @@ export namespace main {
 		    return a;
 		}
 	}
+	export class DesktopConversationActionRequest {
+	    id: string;
+	    reason: string;
+	    group_id: string;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopConversationActionRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.reason = source["reason"];
+	        this.group_id = source["group_id"];
+	    }
+	}
+	export class DesktopConversationSummary {
+	    id: string;
+	    channel: string;
+	    user_id: string;
+	    title: string;
+	    active_agent_id: string;
+	    topic: string;
+	    group_id: string;
+	    lifecycle_status: string;
+	    pinned: boolean;
+	    last_message: string;
+	    last_role: string;
+	    latest_run_id: string;
+	    message_count: number;
+	    metadata: Record<string, any>;
+	    created_at?: string;
+	    updated_at?: string;
+	    archived_at?: string;
+	    trashed_at?: string;
+	    purge_after?: string;
+	    restored_at?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopConversationSummary(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.channel = source["channel"];
+	        this.user_id = source["user_id"];
+	        this.title = source["title"];
+	        this.active_agent_id = source["active_agent_id"];
+	        this.topic = source["topic"];
+	        this.group_id = source["group_id"];
+	        this.lifecycle_status = source["lifecycle_status"];
+	        this.pinned = source["pinned"];
+	        this.last_message = source["last_message"];
+	        this.last_role = source["last_role"];
+	        this.latest_run_id = source["latest_run_id"];
+	        this.message_count = source["message_count"];
+	        this.metadata = source["metadata"];
+	        this.created_at = source["created_at"];
+	        this.updated_at = source["updated_at"];
+	        this.archived_at = source["archived_at"];
+	        this.trashed_at = source["trashed_at"];
+	        this.purge_after = source["purge_after"];
+	        this.restored_at = source["restored_at"];
+	    }
+	}
+	export class DesktopConversationActionResponse {
+	    conversation: DesktopConversationSummary;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopConversationActionResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.conversation = this.convertValues(source["conversation"], DesktopConversationSummary);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class DesktopConversationMessage {
 	    id: string;
 	    conversation_id: string;
@@ -699,42 +832,6 @@ export namespace main {
 	        this.attachments = source["attachments"];
 	        this.metadata = source["metadata"];
 	        this.created_at = source["created_at"];
-	    }
-	}
-	export class DesktopConversationSummary {
-	    id: string;
-	    channel: string;
-	    user_id: string;
-	    title: string;
-	    active_agent_id: string;
-	    topic: string;
-	    last_message: string;
-	    last_role: string;
-	    latest_run_id: string;
-	    message_count: number;
-	    metadata: Record<string, any>;
-	    created_at?: string;
-	    updated_at?: string;
-
-	    static createFrom(source: any = {}) {
-	        return new DesktopConversationSummary(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.channel = source["channel"];
-	        this.user_id = source["user_id"];
-	        this.title = source["title"];
-	        this.active_agent_id = source["active_agent_id"];
-	        this.topic = source["topic"];
-	        this.last_message = source["last_message"];
-	        this.last_role = source["last_role"];
-	        this.latest_run_id = source["latest_run_id"];
-	        this.message_count = source["message_count"];
-	        this.metadata = source["metadata"];
-	        this.created_at = source["created_at"];
-	        this.updated_at = source["updated_at"];
 	    }
 	}
 	export class DesktopConversationDetailResponse {
@@ -768,6 +865,96 @@ export namespace main {
 		    }
 		    return a;
 		}
+	}
+	export class DesktopConversationFilter {
+	    view: string;
+	    group_id: string;
+	    limit: number;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopConversationFilter(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.view = source["view"];
+	        this.group_id = source["group_id"];
+	        this.limit = source["limit"];
+	    }
+	}
+	export class DesktopConversationGroup {
+	    id: string;
+	    name: string;
+	    sort_order: number;
+	    collapsed: boolean;
+	    metadata: Record<string, any>;
+	    created_at?: string;
+	    updated_at?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopConversationGroup(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.sort_order = source["sort_order"];
+	        this.collapsed = source["collapsed"];
+	        this.metadata = source["metadata"];
+	        this.created_at = source["created_at"];
+	        this.updated_at = source["updated_at"];
+	    }
+	}
+	export class DesktopConversationGroupListResponse {
+	    groups: DesktopConversationGroup[];
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopConversationGroupListResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.groups = this.convertValues(source["groups"], DesktopConversationGroup);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class DesktopConversationGroupRequest {
+	    id: string;
+	    name: string;
+	    sort_order: number;
+	    collapsed: boolean;
+	    metadata: Record<string, any>;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopConversationGroupRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.sort_order = source["sort_order"];
+	        this.collapsed = source["collapsed"];
+	        this.metadata = source["metadata"];
+	    }
 	}
 	export class DesktopConversationListResponse {
 	    conversations: DesktopConversationSummary[];
@@ -972,6 +1159,7 @@ export namespace main {
 	    provider: string;
 	    base_url: string;
 	    name: string;
+	    reasoning_name: string;
 	    timeout_seconds: number;
 	    max_retries: number;
 
@@ -984,6 +1172,7 @@ export namespace main {
 	        this.provider = source["provider"];
 	        this.base_url = source["base_url"];
 	        this.name = source["name"];
+	        this.reasoning_name = source["reasoning_name"];
 	        this.timeout_seconds = source["timeout_seconds"];
 	        this.max_retries = source["max_retries"];
 	    }
@@ -1007,6 +1196,50 @@ export namespace main {
 	        this.api_key = source["api_key"];
 	        this.timeout_seconds = source["timeout_seconds"];
 	    }
+	}
+	export class DesktopModelListRequest {
+	    provider: string;
+	    base_url: string;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopModelListRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.provider = source["provider"];
+	        this.base_url = source["base_url"];
+	    }
+	}
+	export class DesktopModelListResponse {
+	    models: DesktopAvailableModel[];
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopModelListResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.models = this.convertValues(source["models"], DesktopAvailableModel);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 
 	export class DesktopModelSettingsRequest {
@@ -1544,6 +1777,7 @@ export namespace main {
 	    log_dir: string;
 	    model_provider: string;
 	    model_name: string;
+	    model_reasoning_name: string;
 	    model_base_url: string;
 	    telegram_enabled: boolean;
 	    telegram_allowed_user_ids: string;
@@ -1567,6 +1801,7 @@ export namespace main {
 	        this.log_dir = source["log_dir"];
 	        this.model_provider = source["model_provider"];
 	        this.model_name = source["model_name"];
+	        this.model_reasoning_name = source["model_reasoning_name"];
 	        this.model_base_url = source["model_base_url"];
 	        this.telegram_enabled = source["telegram_enabled"];
 	        this.telegram_allowed_user_ids = source["telegram_allowed_user_ids"];

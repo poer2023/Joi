@@ -67,7 +67,94 @@ func (db *DB) ApplySQLiteSchemaSQL(ctx context.Context, schemaSQL string) error 
 	if _, err := db.sql.ExecContext(ctx, schemaSQL); err != nil {
 		return err
 	}
+	if err := db.EnsureSQLiteConversationLifecycle(ctx); err != nil {
+		return err
+	}
 	return db.RebuildSQLiteMemoryFTS(ctx)
+}
+
+func (db *DB) EnsureSQLiteConversationLifecycle(ctx context.Context) error {
+	additions := []struct {
+		column string
+		sql    string
+	}{
+		{"lifecycle_status", `ALTER TABLE conversations ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'active'`},
+		{"group_id", `ALTER TABLE conversations ADD COLUMN group_id TEXT`},
+		{"pinned", `ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`},
+		{"archived_at", `ALTER TABLE conversations ADD COLUMN archived_at TEXT`},
+		{"trashed_at", `ALTER TABLE conversations ADD COLUMN trashed_at TEXT`},
+		{"purge_after", `ALTER TABLE conversations ADD COLUMN purge_after TEXT`},
+		{"restored_at", `ALTER TABLE conversations ADD COLUMN restored_at TEXT`},
+	}
+	for _, addition := range additions {
+		exists, err := db.sqliteColumnExists(ctx, "conversations", addition.column)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			if _, err := db.sql.ExecContext(ctx, addition.sql); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := db.sql.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS conversation_groups (
+		  id TEXT PRIMARY KEY,
+		  name TEXT NOT NULL,
+		  sort_order INTEGER NOT NULL DEFAULT 0,
+		  collapsed INTEGER NOT NULL DEFAULT 0,
+		  metadata TEXT NOT NULL DEFAULT '{}',
+		  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+
+		CREATE TABLE IF NOT EXISTS conversation_lifecycle_events (
+		  id TEXT PRIMARY KEY,
+		  conversation_id TEXT NOT NULL REFERENCES conversations(id),
+		  action TEXT NOT NULL,
+		  actor TEXT NOT NULL DEFAULT 'desktop_ui',
+		  reason TEXT NOT NULL DEFAULT '',
+		  previous_status TEXT NOT NULL DEFAULT '',
+		  next_status TEXT NOT NULL DEFAULT '',
+		  metadata TEXT NOT NULL DEFAULT '{}',
+		  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+
+		UPDATE conversations
+		SET lifecycle_status='active'
+		WHERE lifecycle_status IS NULL OR lifecycle_status='';
+
+		CREATE INDEX IF NOT EXISTS idx_conversations_lifecycle ON conversations(lifecycle_status, pinned DESC, updated_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_conversations_group ON conversations(group_id, lifecycle_status, updated_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_conversation_groups_sort ON conversation_groups(sort_order, updated_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_conversation_lifecycle_events_conversation ON conversation_lifecycle_events(conversation_id, created_at DESC);
+	`)
+	return err
+}
+
+func (db *DB) sqliteColumnExists(ctx context.Context, table string, column string) (bool, error) {
+	if table != "conversations" {
+		return false, nil
+	}
+	rows, err := db.sql.QueryContext(ctx, `PRAGMA table_info(conversations)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (db *DB) RebuildSQLiteMemoryFTS(ctx context.Context) error {

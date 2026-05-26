@@ -179,7 +179,7 @@ func runAgentRuntime(ctx context.Context, tx *sql.Tx, firstAssembly PromptAssemb
 					output:   toolResult.NormalizedResult,
 				})
 				if status, ok := toolResult.NormalizedResult["status"].(string); ok && status == "queued" {
-					result.FinalAnswer = "已将任务派发到所选节点；worker 执行结果会写入 task_attempts、tool_runs 和 Run Trace。"
+					result.FinalAnswer = "已交给执行后台处理，结果会在这里更新。"
 					return result, nil
 				} else if finalAnswer := finalAnswerForCapabilityResult(parsed.Capability, toolResult.NormalizedResult); finalAnswer != "" {
 					result.FinalAnswer = finalAnswer
@@ -327,12 +327,27 @@ func finalAnswerForCapabilityResult(capability string, normalized map[string]any
 	case "web_research":
 		url := stringFromMap(normalized, "url", "目标 URL")
 		status := stringFromMap(normalized, "fetch_status", "unknown")
+		if status == "policy_blocked" {
+			reason := stringFromMap(normalized, "reason", "该地址不符合读取策略")
+			return fmt.Sprintf("policy_blocked：这个网页不能读取：%s。", reason)
+		}
+		if status != "succeeded" {
+			err := stringFromMap(normalized, "error", "读取失败")
+			return fmt.Sprintf("网页读取失败：%s。", err)
+		}
 		summary := stringFromMap(normalized, "summary", "")
 		if summary == "" {
 			summary = stringFromMap(normalized, "readable_text", "")
 		}
-		summary = truncateRunes(summary, 260)
-		return fmt.Sprintf("读取完成：%s fetch_status=%s。摘要：%s", url, status, summary)
+		summary = truncateRunes(summary, 520)
+		title := stringFromMap(normalized, "title", "")
+		if strings.TrimSpace(summary) == "" {
+			return fmt.Sprintf("已访问网页，但没有抽取到足够正文：%s。可能是页面需要浏览器渲染、登录，或正文被脚本延迟加载。", url)
+		}
+		if title != "" {
+			return fmt.Sprintf("已读取《%s》。正文提要：%s", title, summary)
+		}
+		return fmt.Sprintf("已读取网页正文。正文提要：%s", summary)
 	case "system_health_check":
 		status := stringFromMap(normalized, "status", "completed")
 		checks, _ := normalized["checks"].(map[string]any)
@@ -345,7 +360,7 @@ func finalAnswerForCapabilityResult(capability string, normalized map[string]any
 		if len(abnormal) == 0 {
 			abnormal = append(abnormal, "无")
 		}
-		return fmt.Sprintf("状态：%s。异常项：%s。关键服务：postgres、nats、orchestrator、console、worker-runtime 已检查。节点/队列/模型/成本摘要已写入 Run Trace。建议：如需排障，打开 Trace 查看 checks、recent_errors 和 thresholds。", status, strings.Join(abnormal, ", "))
+		return fmt.Sprintf("状态：%s。异常项：%s。关键服务：postgres、nats、orchestrator、console、worker-runtime 已检查。节点、队列、模型和成本摘要已归档到执行详情。", status, strings.Join(abnormal, ", "))
 	case "workspace_search":
 		query := stringFromMap(normalized, "query", "")
 		summary := stringFromMap(normalized, "summary", "")
@@ -361,9 +376,9 @@ func finalAnswerForCapabilityResult(capability string, normalized map[string]any
 			lines = append(lines, fmt.Sprintf("%s:%d %s", path, line, snippet))
 		}
 		if len(lines) == 0 {
-			return fmt.Sprintf("搜索完成：未在授权 workspace 中找到 %q。完整 Run Trace 已记录 capability_requested、policy_checked、tool_compiled、node_selected、tool_started、tool_finished。", query)
+			return fmt.Sprintf("搜索完成：未在授权 workspace 中找到 %q。", query)
 		}
-		return fmt.Sprintf("搜索完成：%s 前 %d 条：%s。完整 Run Trace 已记录文件、行号、摘要和执行链路。", summary, len(lines), strings.Join(lines, " | "))
+		return fmt.Sprintf("搜索完成：%s 前 %d 条：%s。", summary, len(lines), strings.Join(lines, " | "))
 	case "file_analyze":
 		path := stringFromMap(normalized, "path", "unknown")
 		summary := stringFromMap(normalized, "summary", "")
