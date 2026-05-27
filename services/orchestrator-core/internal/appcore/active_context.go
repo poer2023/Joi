@@ -18,6 +18,7 @@ type artifactRewriteInput struct {
 	Message        string
 	UserID         string
 	Channel        string
+	EventSink      func(eventName string, payload map[string]any)
 }
 
 func isArtifactRewriteRequest(message string) bool {
@@ -28,7 +29,7 @@ func isArtifactRewriteRequest(message string) bool {
 }
 
 func (a *AppCore) handleSQLiteArtifactRewrite(ctx context.Context, tx *sql.Tx, input artifactRewriteInput) (*sqliteRuntimeResult, []ArtifactSummary, error) {
-	result := &sqliteRuntimeResult{Steps: []store.RunStepBrief{}}
+	result := &sqliteRuntimeResult{Steps: []store.RunStepBrief{}, EventSink: input.EventSink}
 	for _, step := range []sqliteStepDefinition{
 		{stepType: "input_received", title: "Input received", input: map[string]any{"message": input.Message, "channel": input.Channel}, output: map[string]any{"conversation_id": input.ConversationID, "message_id": input.UserMessageID}},
 		{stepType: "router_selected", title: "Router selected agent", input: map[string]any{"message": input.Message}, output: map[string]any{"intent": "artifact_followup", "route_mode": "single", "lead_agent": input.AgentID, "route_source": "desktop_appcore"}},
@@ -299,6 +300,7 @@ func activeContextPromptTx(ctx context.Context, tx *sql.Tx, conversationID strin
 
 func finalizeArtifactRewriteResponse(ctx context.Context, tx *sql.Tx, runID string, agentID string, response string, result *sqliteRuntimeResult) error {
 	response = store.RedactSensitiveText(response)
+	emitAssistantResponseDeltas(result, runID, response)
 	brief, err := insertSQLiteRunStep(ctx, tx, runID, "agent_call_finished", "Artifact follow-up handled", map[string]any{"agent_id": agentID, "deterministic": true}, map[string]any{"response": response})
 	if err != nil {
 		return err

@@ -79,6 +79,71 @@ CREATE TABLE tool_workflows (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE mcp_servers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  transport TEXT NOT NULL DEFAULT 'stdio',
+  command TEXT NOT NULL DEFAULT '',
+  args JSONB NOT NULL DEFAULT '[]'::jsonb,
+  env_secret_refs JSONB NOT NULL DEFAULT '{}'::jsonb,
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  status TEXT NOT NULL DEFAULT 'inactive',
+  trust TEXT NOT NULL DEFAULT 'untrusted_until_wrapped',
+  last_sync_at TIMESTAMPTZ,
+  last_sync_error TEXT NOT NULL DEFAULT '',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE mcp_inventory_items (
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  schema JSONB NOT NULL DEFAULT '{}'::jsonb,
+  uri TEXT NOT NULL DEFAULT '',
+  mime_type TEXT NOT NULL DEFAULT '',
+  arguments JSONB NOT NULL DEFAULT '[]'::jsonb,
+  wrapped_capability_id TEXT REFERENCES capabilities(id),
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(server_id, kind, name)
+);
+
+CREATE TABLE skill_definitions (
+  id TEXT PRIMARY KEY,
+  version TEXT NOT NULL DEFAULT 'v1',
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  trigger_phrases JSONB NOT NULL DEFAULT '[]'::jsonb,
+  required_capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+  forbidden_capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+  prompt TEXT NOT NULL DEFAULT '',
+  output_contract TEXT NOT NULL DEFAULT '',
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE skill_runs (
+  id TEXT PRIMARY KEY,
+  run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+  skill_id TEXT REFERENCES skill_definitions(id),
+  status TEXT NOT NULL DEFAULT 'pending',
+  input JSONB NOT NULL DEFAULT '{}'::jsonb,
+  output_plan JSONB NOT NULL DEFAULT '{}'::jsonb,
+  capability_requests JSONB NOT NULL DEFAULT '[]'::jsonb,
+  rejection_reason TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  finished_at TIMESTAMPTZ
+);
+
 CREATE TABLE conversations (
   id TEXT PRIMARY KEY,
   channel TEXT NOT NULL,
@@ -442,6 +507,12 @@ CREATE INDEX idx_nodes_status ON nodes(status);
 CREATE INDEX idx_nodes_capabilities ON nodes USING GIN(capabilities);
 CREATE INDEX idx_tasks_status ON tasks(status);
 CREATE INDEX idx_tool_runs_run_id ON tool_runs(run_id);
+CREATE INDEX idx_mcp_servers_status ON mcp_servers(status, enabled);
+CREATE INDEX idx_mcp_inventory_server ON mcp_inventory_items(server_id, kind, name);
+CREATE INDEX idx_mcp_inventory_wrapped ON mcp_inventory_items(wrapped_capability_id);
+CREATE INDEX idx_skill_definitions_enabled ON skill_definitions(enabled, updated_at DESC);
+CREATE INDEX idx_skill_runs_run_id ON skill_runs(run_id, created_at DESC);
+CREATE INDEX idx_skill_runs_skill_id ON skill_runs(skill_id, created_at DESC);
 CREATE INDEX idx_product_tasks_status ON product_tasks(status, updated_at DESC);
 CREATE INDEX idx_product_tasks_conversation ON product_tasks(created_from_conversation_id, updated_at DESC);
 CREATE INDEX idx_product_tasks_latest_run ON product_tasks(latest_run_id);

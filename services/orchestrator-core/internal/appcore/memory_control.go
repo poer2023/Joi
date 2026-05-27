@@ -41,6 +41,7 @@ type memoryControlInput struct {
 	UserMessageID  string
 	AgentID        string
 	Message        string
+	EventSink      func(eventName string, payload map[string]any)
 }
 
 func (a *AppCore) GetMemoryStateSummary(ctx context.Context) (*MemoryStateSummary, error) {
@@ -86,7 +87,7 @@ func (a *AppCore) GetMemoryStateSummary(ctx context.Context) (*MemoryStateSummar
 }
 
 func (a *AppCore) handleSQLiteMemoryControl(ctx context.Context, tx *sql.Tx, input memoryControlInput, intent memoryControlIntent) (*sqliteRuntimeResult, error) {
-	result := &sqliteRuntimeResult{Steps: []store.RunStepBrief{}}
+	result := &sqliteRuntimeResult{Steps: []store.RunStepBrief{}, EventSink: input.EventSink}
 	for _, step := range []sqliteStepDefinition{
 		{stepType: "input_received", title: "Input received", input: map[string]any{"message": input.Message, "channel": "desktop"}, output: map[string]any{"conversation_id": input.ConversationID, "message_id": input.UserMessageID}},
 		{stepType: "router_selected", title: "Router selected agent", input: map[string]any{"message": input.Message}, output: map[string]any{"intent": "memory_control", "route_mode": "single", "lead_agent": input.AgentID, "route_source": "desktop_appcore", "handler": intent.Kind}},
@@ -444,6 +445,7 @@ func writeMemorySection(builder *strings.Builder, title string, memories []store
 
 func finalizeMemoryControlResponse(ctx context.Context, tx *sql.Tx, runID string, agentID string, response string, result *sqliteRuntimeResult) error {
 	response = store.RedactSensitiveText(response)
+	emitAssistantResponseDeltas(result, runID, response)
 	brief, err := insertSQLiteRunStep(ctx, tx, runID, "agent_call_finished", "Memory control handled", map[string]any{"agent_id": agentID, "deterministic": true}, map[string]any{"response": response})
 	if err != nil {
 		return err

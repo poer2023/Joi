@@ -430,6 +430,105 @@ func (h *Handlers) ListCapabilities(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, http.StatusOK, result, "")
 }
 
+func (h *Handlers) ListMCPServers(w http.ResponseWriter, r *http.Request) {
+	result, err := h.core.ListMCPServers(r.Context())
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, result, "")
+}
+
+func (h *Handlers) SaveMCPServer(w http.ResponseWriter, r *http.Request) {
+	var request appcore.MCPServerSaveRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid JSON request body", map[string]any{}, "")
+			return
+		}
+	}
+	if id := strings.TrimSpace(r.PathValue("id")); id != "" {
+		request.ID = id
+	}
+	result, err := h.core.SaveMCPServer(r.Context(), request)
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, map[string]any{"server": result}, "")
+}
+
+func (h *Handlers) SyncMCPServer(w http.ResponseWriter, r *http.Request) {
+	result, err := h.core.SyncMCPServer(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, map[string]any{"server": result}, "")
+}
+
+func (h *Handlers) ListMCPInventory(w http.ResponseWriter, r *http.Request) {
+	result, err := h.core.ListMCPInventory(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, result, "")
+}
+
+func (h *Handlers) WrapMCPTool(w http.ResponseWriter, r *http.Request) {
+	var request appcore.MCPWrapToolRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid JSON request body", map[string]any{}, "")
+		return
+	}
+	result, err := h.core.WrapMCPTool(r.Context(), r.PathValue("id"), r.PathValue("tool_name"), request)
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, map[string]any{"capability": result}, "")
+}
+
+func (h *Handlers) ListSkills(w http.ResponseWriter, r *http.Request) {
+	result, err := h.core.ListSkills(r.Context())
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, result, "")
+}
+
+func (h *Handlers) SaveSkill(w http.ResponseWriter, r *http.Request) {
+	var request appcore.SkillSaveRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Invalid JSON request body", map[string]any{}, "")
+		return
+	}
+	if id := strings.TrimSpace(r.PathValue("id")); id != "" {
+		request.ID = id
+	}
+	result, err := h.core.SaveSkill(r.Context(), request)
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, map[string]any{"skill": result}, "")
+}
+
+func (h *Handlers) TestSkill(w http.ResponseWriter, r *http.Request) {
+	var request appcore.SkillTestRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&request)
+	}
+	result, err := h.core.TestSkill(r.Context(), r.PathValue("id"), request)
+	if err != nil {
+		writeStoreReadError(w, err, "")
+		return
+	}
+	writeOK(w, http.StatusOK, result, "")
+}
+
 func (h *Handlers) ListToolWorkflows(w http.ResponseWriter, r *http.Request) {
 	result, err := h.core.ListToolWorkflows(r.Context())
 	if err != nil {
@@ -469,8 +568,21 @@ func (h *Handlers) TestCapability(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, store.ErrPolicyDenied) {
 			code = "POLICY_DENIED"
 			status = http.StatusForbidden
+		} else if errors.Is(err, store.ErrCapabilityMismatch) {
+			code = "CAPABILITY_MISMATCH"
+			status = http.StatusBadRequest
+		} else if errors.Is(err, store.ErrCapabilityMissing) {
+			code = "CAPABILITY_MISSING"
+			status = http.StatusNotFound
+		} else if errors.Is(err, store.ErrMissingArgument) {
+			code = "MISSING_ARGUMENT"
+			status = http.StatusBadRequest
 		}
-		writeError(w, status, code, err.Error(), map[string]any{}, request.RunID)
+		details := map[string]any{}
+		if validation, ok := store.CapabilityValidationResultFromError(err); ok {
+			details["validation"] = validation
+		}
+		writeError(w, status, code, err.Error(), details, request.RunID)
 		return
 	}
 

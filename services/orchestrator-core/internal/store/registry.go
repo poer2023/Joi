@@ -118,10 +118,10 @@ func (db *DB) SeedRegistryFromDir(ctx context.Context, configDir string) error {
 
 	for _, capability := range capabilities.Capabilities {
 		name := valueOrDefault(capability.Name, capability.ID)
-		metadata := mustJSON(capability.Metadata)
+		metadata := mustJSON(mergeCapabilityContractMetadata(capability.ID, capability.Metadata))
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO capabilities (id, name, description, risk_level, enabled, metadata)
-			VALUES ($1, $2, $3, $4, TRUE, $5)
+			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
 				description = EXCLUDED.description,
@@ -165,12 +165,17 @@ func seedDefaultCapabilityKernel(ctx context.Context, tx *sql.Tx) error {
 		{ID: "server_diagnose", Name: "Server Diagnose", Description: "Read-only server diagnostics.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
 		{ID: "system_health_check", Name: "System Health Check", Description: "Read-only Joi self-check.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
 		{ID: "web_research", Name: "Web Research", Description: "Read-only public HTTP/HTTPS research.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
+		{ID: "browser_read", Name: "Browser Read", Description: "Read a URL through browser/web host policy.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
 		{ID: "workspace_search", Name: "Workspace Search", Description: "Search authorized workspace source and documents.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
 		{ID: "file_analyze", Name: "File Analyze", Description: "Analyze an authorized workspace file.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
+		{ID: "desktop_app_list", Name: "Desktop App List", Description: "List installed macOS applications as local metadata.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
+		{ID: "desktop_app_inspect", Name: "Desktop App Inspect", Description: "Inspect one macOS application bundle as local metadata.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
+		{ID: "computer_observe", Name: "Computer Observe", Description: "Read-only visible Joi desktop observation.", RiskLevel: "read_only", Enabled: true, Metadata: map[string]any{"kernel_default": true}},
 	} {
+		metadata := mergeCapabilityContractMetadata(capability.ID, capability.Metadata)
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO capabilities (id, name, description, risk_level, enabled, metadata)
-			VALUES ($1, $2, $3, $4, TRUE, $5)
+			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
 				description = EXCLUDED.description,
@@ -178,7 +183,7 @@ func seedDefaultCapabilityKernel(ctx context.Context, tx *sql.Tx) error {
 				enabled = EXCLUDED.enabled,
 				metadata = EXCLUDED.metadata,
 				updated_at = NOW()
-		`, capability.ID, capability.Name, capability.Description, capability.RiskLevel, mustJSON(capability.Metadata)); err != nil {
+		`, capability.ID, capability.Name, capability.Description, capability.RiskLevel, capability.Enabled, mustJSON(metadata)); err != nil {
 			return err
 		}
 	}
@@ -216,6 +221,38 @@ func seedDefaultCapabilityKernel(ctx context.Context, tx *sql.Tx) error {
 			return err
 		}
 	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO mcp_servers (id, name, transport, command, args, env_secret_refs, enabled, status, trust, metadata)
+		VALUES ('local_mcp_registry', 'Local MCP Registry', 'not_configured', '', '[]', '{}', FALSE, 'inactive', 'untrusted_until_wrapped', '{"policy":"MCP inventory is not executable until wrapped as a Joi capability."}')
+		ON CONFLICT(id) DO UPDATE SET
+			name=EXCLUDED.name,
+			transport=EXCLUDED.transport,
+			trust=EXCLUDED.trust,
+			metadata=EXCLUDED.metadata,
+			updated_at=NOW()
+	`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO skill_definitions (id, version, name, description, trigger_phrases, required_capabilities, forbidden_capabilities, prompt, output_contract, enabled, metadata)
+		VALUES
+		  ('web_summary_skill', 'v1', 'Web Summary', 'Read an explicit URL and produce a concise sourced summary.', '["总结这个网站","读取 URL","web summary"]', '["web_research"]', '["file_analyze","server_diagnose","system_health_check"]', 'Generate a skill_plan that requests web_research for an explicit URL only.', '{"output_type":"skill_plan","capability_requests":["web_research"]}', TRUE, '{"source":"native_skill_seed","intent_domain":"public_web_read"}'),
+		  ('desktop_inventory_skill', 'v1', 'Desktop Inventory', 'List local installed applications without reading app content.', '["列出本地所有 app","本机有哪些应用","本地所有应用","installed apps"]', '["desktop_app_list"]', '["system_health_check","server_diagnose","file_analyze"]', 'Generate a skill_plan that requests desktop_app_list only.', '{"output_type":"skill_plan","capability_requests":["desktop_app_list"]}', TRUE, '{"source":"native_skill_seed","intent_domain":"desktop_application_inventory"}')
+		ON CONFLICT(id) DO UPDATE SET
+			version=EXCLUDED.version,
+			name=EXCLUDED.name,
+			description=EXCLUDED.description,
+			trigger_phrases=EXCLUDED.trigger_phrases,
+			required_capabilities=EXCLUDED.required_capabilities,
+			forbidden_capabilities=EXCLUDED.forbidden_capabilities,
+			prompt=EXCLUDED.prompt,
+			output_contract=EXCLUDED.output_contract,
+			enabled=EXCLUDED.enabled,
+			metadata=EXCLUDED.metadata,
+			updated_at=NOW()
+	`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -236,9 +273,13 @@ func defaultToolSeeds() []toolSeed {
 		{ID: "extract_readable_text", Name: "Extract Readable Text", Description: "Extract bounded readable text from fetched content.", RiskLevel: "read_only", AllowedNodes: []string{"main-node", "local-worker-1"}, TimeoutSeconds: 5},
 		{ID: "extract_links", Name: "Extract Links", Description: "Extract bounded links from fetched content.", RiskLevel: "read_only", AllowedNodes: []string{"main-node", "local-worker-1"}, TimeoutSeconds: 5},
 		{ID: "summarize_sources", Name: "Summarize Sources", Description: "Summarize fetched public content.", RiskLevel: "read_only", AllowedNodes: []string{"main-node", "local-worker-1"}, TimeoutSeconds: 5},
+		{ID: "desktop_list_app_bundles", Name: "Desktop List App Bundles", Description: "List installed macOS .app bundles as bounded local metadata.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 10},
+		{ID: "desktop_inspect_app_bundle", Name: "Desktop Inspect App Bundle", Description: "Inspect one installed macOS .app bundle as local metadata.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 10},
 		{ID: "workspace_walk_search", Name: "Workspace Walk Search", Description: "Search authorized workspace paths without arbitrary shell flags.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 10},
 		{ID: "file_read_authorized", Name: "File Read Authorized", Description: "Read a bounded authorized workspace file.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 10},
 		{ID: "file_summarize_excerpts", Name: "File Summarize Excerpts", Description: "Summarize bounded file excerpts.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 10},
+		{ID: "computer_observe_visible_ui", Name: "Computer Observe Visible UI", Description: "Read visible Joi desktop UI state without interaction.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 5},
+		{ID: "mcp_tool_call", Name: "MCP Tool Call", Description: "Call an MCP tool only through a wrapped Joi capability.", RiskLevel: "read_only", AllowedNodes: []string{"main-node"}, TimeoutSeconds: 30},
 	}
 }
 
@@ -248,8 +289,12 @@ func defaultWorkflowSeeds() []workflowSeed {
 		{ID: "workflow_server_diagnose_v1", CapabilityID: "server_diagnose", Name: "server_diagnose_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "docker_list_containers", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "docker_inspect_container", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "docker_read_logs", Args: map[string]any{"tail": 200}, RiskLevel: "read_only"}, {Tool: "check_port", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "http_probe", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "system_disk_usage", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "system_memory_usage", Args: map[string]any{}, RiskLevel: "read_only"}}},
 		{ID: "workflow_system_health_check_v1", CapabilityID: "system_health_check", Name: "system_health_check_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "postgres_ping", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "nats_port_check", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "console_http_probe", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "system_disk_usage", Args: map[string]any{}, RiskLevel: "read_only"}}},
 		{ID: "workflow_web_research_v2", CapabilityID: "web_research", Name: "web_research_v2", Version: "v2", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "fetch_url", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "extract_readable_text", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "extract_links", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "summarize_sources", Args: map[string]any{}, RiskLevel: "read_only"}}},
+		{ID: "workflow_browser_read_v1", CapabilityID: "browser_read", Name: "browser_read_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "fetch_url", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "extract_readable_text", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "extract_links", Args: map[string]any{}, RiskLevel: "read_only"}}},
+		{ID: "workflow_desktop_app_list_v1", CapabilityID: "desktop_app_list", Name: "desktop_app_list_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "desktop_list_app_bundles", Args: map[string]any{}, RiskLevel: "read_only"}}},
+		{ID: "workflow_desktop_app_inspect_v1", CapabilityID: "desktop_app_inspect", Name: "desktop_app_inspect_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "desktop_inspect_app_bundle", Args: map[string]any{}, RiskLevel: "read_only"}}},
 		{ID: "workflow_workspace_search_v1", CapabilityID: "workspace_search", Name: "workspace_search_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "workspace_walk_search", Args: map[string]any{}, RiskLevel: "read_only"}}},
 		{ID: "workflow_file_analyze_v1", CapabilityID: "file_analyze", Name: "file_analyze_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "file_read_authorized", Args: map[string]any{}, RiskLevel: "read_only"}, {Tool: "file_summarize_excerpts", Args: map[string]any{}, RiskLevel: "read_only"}}},
+		{ID: "workflow_computer_observe_v1", CapabilityID: "computer_observe", Name: "computer_observe_v1", Version: "v1", RiskLevel: "read_only", Steps: []ToolWorkflowStep{{Tool: "computer_observe_visible_ui", Args: map[string]any{"target": "joi_current_window"}, RiskLevel: "read_only"}}},
 	}
 }
 
@@ -332,7 +377,7 @@ func (db *DB) ListCapabilities(ctx context.Context) ([]CapabilityRecord, error) 
 		if err := rows.Scan(&capability.ID, &capability.Name, &capability.Description, &capability.RiskLevel, &capability.Enabled, &metadataRaw); err != nil {
 			return nil, err
 		}
-		capability.Metadata = decodeObject(metadataRaw)
+		capability.Metadata = mergeCapabilityContractMetadata(capability.ID, decodeObject(metadataRaw))
 		capabilities = append(capabilities, capability)
 	}
 	return capabilities, rows.Err()

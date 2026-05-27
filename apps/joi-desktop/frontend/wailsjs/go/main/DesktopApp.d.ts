@@ -56,6 +56,8 @@ export function ListConversationGroups():Promise<main.DesktopConversationGroupLi
 
 export function ListConversations(arg1:main.DesktopConversationFilter):Promise<main.DesktopConversationListResponse>;
 
+export function ListMCPServers():Promise<main.DesktopMCPServerListResponse>;
+
 export function ListMemories(arg1:main.DesktopMemoryFilter):Promise<main.DesktopMemoryListResponse>;
 
 export function ListNodes():Promise<main.DesktopNodeListResponse>;
@@ -67,6 +69,8 @@ export function ListProactiveMessages(arg1:main.DesktopProactiveMessageFilter):P
 export function ListProductTasks(arg1:main.DesktopProductTaskFilter):Promise<main.DesktopProductTaskListResponse>;
 
 export function ListSavedModels(arg1:main.DesktopModelListRequest):Promise<main.DesktopModelListResponse>;
+
+export function ListSkills():Promise<main.DesktopSkillListResponse>;
 
 export function ListToolRuns():Promise<main.DesktopToolRunListResponse>;
 
@@ -84,6 +88,8 @@ export function RestoreConversation(arg1:main.DesktopConversationActionRequest):
 
 export function SaveConversationGroup(arg1:main.DesktopConversationGroupRequest):Promise<main.DesktopConversationGroup>;
 
+export function SaveMCPServer(arg1:main.DesktopMCPServerSaveRequest):Promise<main.DesktopMCPServerSyncResponse>;
+
 export function SaveModelConfig(arg1:main.DesktopModelConfigRequest):Promise<void>;
 
 export function SaveModelSettings(arg1:main.DesktopModelSettingsRequest):Promise<void>;
@@ -91,6 +97,8 @@ export function SaveModelSettings(arg1:main.DesktopModelSettingsRequest):Promise
 export function SaveOperationalSettings(arg1:main.DesktopOperationalSettingsRequest):Promise<void>;
 
 export function SaveSecret(arg1:main.DesktopSecretRequest):Promise<void>;
+
+export function SaveSkill(arg1:main.DesktopSkillSaveRequest):Promise<main.DesktopSkillRecord>;
 
 export function SaveTelegramConfig(arg1:main.DesktopTelegramConfigRequest):Promise<void>;
 
@@ -102,10 +110,16 @@ export function SendTestTelegramMessage(arg1:main.DesktopTelegramTestMessageRequ
 
 export function SetToolWorkflowEnabled(arg1:main.DesktopToolWorkflowEnabledRequest):Promise<void>;
 
+export function SyncMCPServer(arg1:string):Promise<main.DesktopMCPServerSyncResponse>;
+
 export function TestModelConnection(arg1:main.DesktopModelConnectionTestRequest):Promise<main.DesktopConnectionTestResponse>;
+
+export function TestSkill(arg1:string,arg2:main.DesktopSkillTestRequest):Promise<Record<string, any>>;
 
 export function TestTelegramConnection():Promise<main.DesktopConnectionTestResponse>;
 
 export function TrashConversation(arg1:main.DesktopConversationActionRequest):Promise<main.DesktopConversationActionResponse>;
 
 export function UpdateMemory(arg1:main.DesktopMemoryActionRequest):Promise<void>;
+
+export function WrapMCPTool(arg1:string,arg2:string,arg3:main.DesktopMCPWrapToolRequest):Promise<main.DesktopMCPWrapToolResponse>;

@@ -1000,6 +1000,266 @@ export namespace main {
 	        this.path = source["path"];
 	    }
 	}
+	export class DesktopMCPPromptRecord {
+	    name: string;
+	    description: string;
+	    arguments: string[];
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopMCPPromptRecord(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.description = source["description"];
+	        this.arguments = source["arguments"];
+	    }
+	}
+	export class DesktopMCPResourceRecord {
+	    uri: string;
+	    name: string;
+	    description: string;
+	    mime_type: string;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopMCPResourceRecord(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.uri = source["uri"];
+	        this.name = source["name"];
+	        this.description = source["description"];
+	        this.mime_type = source["mime_type"];
+	    }
+	}
+	export class DesktopMCPToolRecord {
+	    name: string;
+	    description: string;
+	    wrapped_as: string;
+	    enabled: boolean;
+	    schema: Record<string, any>;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopMCPToolRecord(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.description = source["description"];
+	        this.wrapped_as = source["wrapped_as"];
+	        this.enabled = source["enabled"];
+	        this.schema = source["schema"];
+	    }
+	}
+	export class DesktopMCPServerRecord {
+	    id: string;
+	    name: string;
+	    transport: string;
+	    command?: string;
+	    args?: string[];
+	    enabled: boolean;
+	    status: string;
+	    trust: string;
+	    last_sync_at?: string;
+	    last_sync_error?: string;
+	    tools: DesktopMCPToolRecord[];
+	    resources: DesktopMCPResourceRecord[];
+	    prompts: DesktopMCPPromptRecord[];
+	    metadata: Record<string, any>;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopMCPServerRecord(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.transport = source["transport"];
+	        this.command = source["command"];
+	        this.args = source["args"];
+	        this.enabled = source["enabled"];
+	        this.status = source["status"];
+	        this.trust = source["trust"];
+	        this.last_sync_at = source["last_sync_at"];
+	        this.last_sync_error = source["last_sync_error"];
+	        this.tools = this.convertValues(source["tools"], DesktopMCPToolRecord);
+	        this.resources = this.convertValues(source["resources"], DesktopMCPResourceRecord);
+	        this.prompts = this.convertValues(source["prompts"], DesktopMCPPromptRecord);
+	        this.metadata = source["metadata"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class DesktopMCPServerListResponse {
+	    servers: DesktopMCPServerRecord[];
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopMCPServerListResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.servers = this.convertValues(source["servers"], DesktopMCPServerRecord);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+	export class DesktopMCPServerSaveRequest {
+	    id: string;
+	    name: string;
+	    transport: string;
+	    command: string;
+	    args: string[];
+	    env_secret_refs: Record<string, string>;
+	    enabled?: boolean;
+	    metadata: Record<string, any>;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopMCPServerSaveRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.transport = source["transport"];
+	        this.command = source["command"];
+	        this.args = source["args"];
+	        this.env_secret_refs = source["env_secret_refs"];
+	        this.enabled = source["enabled"];
+	        this.metadata = source["metadata"];
+	    }
+	}
+	export class DesktopMCPServerSyncResponse {
+	    server: DesktopMCPServerRecord;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopMCPServerSyncResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.server = this.convertValues(source["server"], DesktopMCPServerRecord);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+	export class DesktopMCPWrapToolRequest {
+	    capability_id: string;
+	    description: string;
+	    intent_domain: string;
+	    positive_examples: string[];
+	    negative_examples: string[];
+	    input_schema: Record<string, any>;
+	    output_schema: Record<string, any>;
+	    risk_level: string;
+	    privacy_level: string;
+	    ui_visibility: string;
+	    enabled?: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopMCPWrapToolRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.capability_id = source["capability_id"];
+	        this.description = source["description"];
+	        this.intent_domain = source["intent_domain"];
+	        this.positive_examples = source["positive_examples"];
+	        this.negative_examples = source["negative_examples"];
+	        this.input_schema = source["input_schema"];
+	        this.output_schema = source["output_schema"];
+	        this.risk_level = source["risk_level"];
+	        this.privacy_level = source["privacy_level"];
+	        this.ui_visibility = source["ui_visibility"];
+	        this.enabled = source["enabled"];
+	    }
+	}
+	export class DesktopMCPWrapToolResponse {
+	    capability: DesktopCapabilityRecord;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopMCPWrapToolResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.capability = this.convertValues(source["capability"], DesktopCapabilityRecord);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class DesktopMemory {
 	    id: string;
 	    type: string;
@@ -1810,6 +2070,115 @@ export namespace main {
 	        this.backup_dir = source["backup_dir"];
 	        this.auto_backup_enabled = source["auto_backup_enabled"];
 	        this.docker_required = source["docker_required"];
+	    }
+	}
+	export class DesktopSkillRecord {
+	    id: string;
+	    version: string;
+	    name: string;
+	    description: string;
+	    trigger_phrases: string[];
+	    required_capabilities: string[];
+	    forbidden_capabilities: string[];
+	    output_contract: string;
+	    enabled: boolean;
+	    metadata: Record<string, any>;
+	    recent_run?: Record<string, any>;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopSkillRecord(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.version = source["version"];
+	        this.name = source["name"];
+	        this.description = source["description"];
+	        this.trigger_phrases = source["trigger_phrases"];
+	        this.required_capabilities = source["required_capabilities"];
+	        this.forbidden_capabilities = source["forbidden_capabilities"];
+	        this.output_contract = source["output_contract"];
+	        this.enabled = source["enabled"];
+	        this.metadata = source["metadata"];
+	        this.recent_run = source["recent_run"];
+	    }
+	}
+	export class DesktopSkillListResponse {
+	    skills: DesktopSkillRecord[];
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopSkillListResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.skills = this.convertValues(source["skills"], DesktopSkillRecord);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+	export class DesktopSkillSaveRequest {
+	    id: string;
+	    version: string;
+	    name: string;
+	    description: string;
+	    trigger_phrases: string[];
+	    required_capabilities: string[];
+	    forbidden_capabilities: string[];
+	    prompt: string;
+	    output_contract: string;
+	    enabled?: boolean;
+	    metadata: Record<string, any>;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopSkillSaveRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.version = source["version"];
+	        this.name = source["name"];
+	        this.description = source["description"];
+	        this.trigger_phrases = source["trigger_phrases"];
+	        this.required_capabilities = source["required_capabilities"];
+	        this.forbidden_capabilities = source["forbidden_capabilities"];
+	        this.prompt = source["prompt"];
+	        this.output_contract = source["output_contract"];
+	        this.enabled = source["enabled"];
+	        this.metadata = source["metadata"];
+	    }
+	}
+	export class DesktopSkillTestRequest {
+	    message: string;
+	    context: Record<string, any>;
+
+	    static createFrom(source: any = {}) {
+	        return new DesktopSkillTestRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.message = source["message"];
+	        this.context = source["context"];
 	    }
 	}
 	export class DesktopSystemHealthResponse {

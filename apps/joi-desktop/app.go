@@ -21,6 +21,7 @@ import (
 
 	"github.com/hao/agent-os/services/orchestrator-core/pkg/appcore"
 	"github.com/hao/agent-os/services/orchestrator-core/pkg/runtimeconfig"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type DesktopApp struct {
@@ -28,6 +29,7 @@ type DesktopApp struct {
 	lifecycle    *appcore.LifecycleManager
 	logger       *slog.Logger
 	startupError error
+	ctx          context.Context
 }
 
 type DesktopChatRequest struct {
@@ -127,6 +129,118 @@ type DesktopConversationDetailResponse struct {
 
 type DesktopCapabilityListResponse struct {
 	Capabilities []DesktopCapabilityRecord `json:"capabilities"`
+}
+
+type DesktopMCPServerListResponse struct {
+	Servers []DesktopMCPServerRecord `json:"servers"`
+}
+
+type DesktopMCPServerRecord struct {
+	ID            string                     `json:"id"`
+	Name          string                     `json:"name"`
+	Transport     string                     `json:"transport"`
+	Command       string                     `json:"command,omitempty"`
+	Args          []string                   `json:"args,omitempty"`
+	Enabled       bool                       `json:"enabled"`
+	Status        string                     `json:"status"`
+	Trust         string                     `json:"trust"`
+	LastSyncAt    string                     `json:"last_sync_at,omitempty"`
+	LastSyncError string                     `json:"last_sync_error,omitempty"`
+	Tools         []DesktopMCPToolRecord     `json:"tools"`
+	Resources     []DesktopMCPResourceRecord `json:"resources"`
+	Prompts       []DesktopMCPPromptRecord   `json:"prompts"`
+	Metadata      map[string]any             `json:"metadata"`
+}
+
+type DesktopMCPServerSaveRequest struct {
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	Transport     string            `json:"transport"`
+	Command       string            `json:"command"`
+	Args          []string          `json:"args"`
+	EnvSecretRefs map[string]string `json:"env_secret_refs"`
+	Enabled       *bool             `json:"enabled,omitempty"`
+	Metadata      map[string]any    `json:"metadata"`
+}
+
+type DesktopMCPToolRecord struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	WrappedAs   string         `json:"wrapped_as"`
+	Enabled     bool           `json:"enabled"`
+	Schema      map[string]any `json:"schema"`
+}
+
+type DesktopMCPResourceRecord struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	MimeType    string `json:"mime_type"`
+}
+
+type DesktopMCPPromptRecord struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Arguments   []string `json:"arguments"`
+}
+
+type DesktopMCPServerSyncResponse struct {
+	Server DesktopMCPServerRecord `json:"server"`
+}
+
+type DesktopMCPWrapToolRequest struct {
+	CapabilityID     string         `json:"capability_id"`
+	Description      string         `json:"description"`
+	IntentDomain     string         `json:"intent_domain"`
+	PositiveExamples []string       `json:"positive_examples"`
+	NegativeExamples []string       `json:"negative_examples"`
+	InputSchema      map[string]any `json:"input_schema"`
+	OutputSchema     map[string]any `json:"output_schema"`
+	RiskLevel        string         `json:"risk_level"`
+	PrivacyLevel     string         `json:"privacy_level"`
+	UIVisibility     string         `json:"ui_visibility"`
+	Enabled          *bool          `json:"enabled,omitempty"`
+}
+
+type DesktopMCPWrapToolResponse struct {
+	Capability DesktopCapabilityRecord `json:"capability"`
+}
+
+type DesktopSkillListResponse struct {
+	Skills []DesktopSkillRecord `json:"skills"`
+}
+
+type DesktopSkillRecord struct {
+	ID                    string         `json:"id"`
+	Version               string         `json:"version"`
+	Name                  string         `json:"name"`
+	Description           string         `json:"description"`
+	TriggerPhrases        []string       `json:"trigger_phrases"`
+	RequiredCapabilities  []string       `json:"required_capabilities"`
+	ForbiddenCapabilities []string       `json:"forbidden_capabilities"`
+	OutputContract        string         `json:"output_contract"`
+	Enabled               bool           `json:"enabled"`
+	Metadata              map[string]any `json:"metadata"`
+	RecentRun             map[string]any `json:"recent_run,omitempty"`
+}
+
+type DesktopSkillSaveRequest struct {
+	ID                    string         `json:"id"`
+	Version               string         `json:"version"`
+	Name                  string         `json:"name"`
+	Description           string         `json:"description"`
+	TriggerPhrases        []string       `json:"trigger_phrases"`
+	RequiredCapabilities  []string       `json:"required_capabilities"`
+	ForbiddenCapabilities []string       `json:"forbidden_capabilities"`
+	Prompt                string         `json:"prompt"`
+	OutputContract        string         `json:"output_contract"`
+	Enabled               *bool          `json:"enabled,omitempty"`
+	Metadata              map[string]any `json:"metadata"`
+}
+
+type DesktopSkillTestRequest struct {
+	Message string         `json:"message"`
+	Context map[string]any `json:"context"`
 }
 
 type DesktopToolWorkflowListResponse struct {
@@ -716,6 +830,7 @@ func NewDesktopApp() *DesktopApp {
 }
 
 func (a *DesktopApp) Startup(ctx context.Context) {
+	a.ctx = ctx
 	loadKeychainSecrets()
 	if os.Getenv("APP_MODE") == "" {
 		_ = os.Setenv("APP_MODE", "desktop")
@@ -747,6 +862,26 @@ func (a *DesktopApp) SendChat(req DesktopChatRequest) (*DesktopChatResponse, err
 	if err := a.ensureReady(); err != nil {
 		return nil, err
 	}
+	startedAt := time.Now()
+	a.emitActionStream("run.started", map[string]any{
+		"conversation_id": req.ConversationID,
+		"status":          "running",
+	})
+	if url := firstURLFromDesktopText(req.Message); url != "" {
+		sourceLabel := sourceLabelFromDesktopURL(url)
+		a.emitActionStream("action.started", map[string]any{
+			"action_id":    "web_research",
+			"kind":         "web",
+			"title":        "读取网页",
+			"status":       "running",
+			"summary":      "正在读取 " + sourceLabel,
+			"source_label": sourceLabel,
+			"details": []map[string]any{
+				{"label": "INPUT", "value": map[string]any{"url": url}},
+				{"label": "SOURCE", "value": url},
+			},
+		})
+	}
 	result, err := a.core.SendChat(context.Background(), appcore.ChatRequest{
 		ConversationID: req.ConversationID,
 		Channel:        req.Channel,
@@ -757,8 +892,15 @@ func (a *DesktopApp) SendChat(req DesktopChatRequest) (*DesktopChatResponse, err
 		ModelName:      req.ModelName,
 		InputMode:      req.InputMode,
 		ProductTaskID:  req.ProductTaskID,
+		EventSink: func(eventName string, payload map[string]any) {
+			a.emitActionStream(eventName, payload)
+		},
 	})
 	if err != nil {
+		a.emitActionStream("run.failed", map[string]any{
+			"status":  "failed",
+			"message": userFacingDesktopError(err),
+		})
 		return nil, err
 	}
 	trace, _ := a.core.GetRunTrace(context.Background(), result.RunID)
@@ -781,7 +923,240 @@ func (a *DesktopApp) SendChat(req DesktopChatRequest) (*DesktopChatResponse, err
 	if trace != nil {
 		response.ModelCalls = convertModelCalls(trace.ModelCalls)
 	}
+	a.emitRunCompletionEvents(result, trace, time.Since(startedAt))
 	return response, nil
+}
+
+func (a *DesktopApp) emitActionStream(eventName string, payload map[string]any) {
+	if a.ctx == nil {
+		return
+	}
+	ctx := a.ctx
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	eventPayload := make(map[string]any, len(payload)+3)
+	for key, value := range payload {
+		eventPayload[key] = value
+	}
+	eventPayload["event"] = eventName
+	eventPayload["type"] = eventName
+	eventPayload["emitted_at"] = time.Now().Format(time.RFC3339Nano)
+	go wailsruntime.EventsEmit(ctx, "joi:run:event", eventPayload)
+}
+
+func (a *DesktopApp) emitRunCompletionEvents(result *appcore.ChatResponse, trace *appcore.RunTrace, elapsed time.Duration) {
+	if result == nil {
+		return
+	}
+	if trace != nil {
+		for _, step := range trace.Steps {
+			if step.StepType != "tool_finished" && step.StepType != "capability_blocked" && step.StepType != "policy_blocked" {
+				continue
+			}
+			a.emitActionStream(actionEventNameForStep(step.StepType), map[string]any{
+				"run_id":       result.RunID,
+				"action_id":    step.ID,
+				"kind":         desktopActionKind(step),
+				"title":        desktopActionTitle(step),
+				"status":       desktopActionStatus(step),
+				"summary":      desktopActionSummary(step),
+				"source_label": desktopActionSourceLabel(step),
+				"duration_ms":  step.DurationMs,
+				"details":      desktopActionDetails(step),
+			})
+		}
+	}
+	for _, artifact := range result.Artifacts {
+		a.emitActionStream("artifact.created", map[string]any{
+			"run_id": result.RunID,
+			"id":     artifact.ID,
+			"title":  artifact.Title,
+			"type":   artifact.Type,
+		})
+	}
+	a.emitActionStream("run.completed", map[string]any{
+		"run_id":      result.RunID,
+		"status":      "succeeded",
+		"duration_ms": elapsed.Milliseconds(),
+	})
+}
+
+func firstURLFromDesktopText(text string) string {
+	for _, field := range strings.Fields(text) {
+		candidate := strings.Trim(field, " \t\r\n。！？、，；;,.()[]{}<>\"'")
+		parsed, err := url.Parse(candidate)
+		if err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func actionEventNameForStep(stepType string) string {
+	if strings.Contains(stepType, "blocked") || strings.Contains(stepType, "failed") {
+		return "action.failed"
+	}
+	return "action.completed"
+}
+
+func desktopActionTitle(step appcore.RunStepRecord) string {
+	source := strings.ToLower(fmt.Sprint(step.Input, step.Output, step.Title))
+	switch {
+	case strings.Contains(source, "web_research") || strings.Contains(source, "http"):
+		return "读取网页"
+	case strings.Contains(source, "workspace_search"):
+		return "搜索工作区"
+	case strings.Contains(source, "file_analyze"):
+		return "读取文件"
+	case strings.Contains(source, "shell") || strings.Contains(source, "command"):
+		return "运行命令"
+	default:
+		return "执行工具"
+	}
+}
+
+func desktopActionKind(step appcore.RunStepRecord) string {
+	title := desktopActionTitle(step)
+	switch title {
+	case "读取网页":
+		return "web"
+	case "搜索工作区":
+		return "workspace"
+	case "读取文件":
+		return "file"
+	case "运行命令":
+		return "command"
+	default:
+		return "command"
+	}
+}
+
+func desktopActionSummary(step appcore.RunStepRecord) string {
+	title := desktopActionTitle(step)
+	if desktopActionStatus(step) == "succeeded" || desktopActionStatus(step) == "completed" {
+		if title == "读取网页" {
+			return "已读取网页并提取正文"
+		}
+		return "已完成"
+	}
+	if title == "读取网页" {
+		return "正在提取正文"
+	}
+	return "正在执行"
+}
+
+func desktopActionSourceLabel(step appcore.RunStepRecord) string {
+	source := desktopURLFromStep(step)
+	if source == "" {
+		return ""
+	}
+	return sourceLabelFromDesktopURL(source)
+}
+
+func desktopActionStatus(step appcore.RunStepRecord) string {
+	if strings.Contains(step.StepType, "blocked") {
+		return "blocked"
+	}
+	if strings.Contains(step.StepType, "failed") || step.Status == "failed" {
+		return "failed"
+	}
+	return "completed"
+}
+
+func sourceLabelFromDesktopURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return rawURL
+	}
+	return strings.TrimPrefix(parsed.Hostname(), "www.")
+}
+
+func desktopActionDetails(step appcore.RunStepRecord) []map[string]any {
+	details := []map[string]any{}
+	if input := sanitizeDesktopActionData(step.Input); len(input) > 0 {
+		details = append(details, map[string]any{"label": "INPUT", "value": input})
+	}
+	if source := desktopURLFromStep(step); source != "" {
+		details = append(details, map[string]any{"label": "SOURCE", "value": source})
+	}
+	if output := sanitizeDesktopActionData(step.Output); len(output) > 0 {
+		details = append(details, map[string]any{"label": "RESULT", "value": output})
+	}
+	if errValue := sanitizeDesktopActionData(step.Error); len(errValue) > 0 {
+		details = append(details, map[string]any{"label": "ERROR", "value": errValue})
+	}
+	return details
+}
+
+func desktopURLFromStep(step appcore.RunStepRecord) string {
+	if value := nestedDesktopURL(step.Output); value != "" {
+		return value
+	}
+	if value := nestedDesktopURL(step.Input); value != "" {
+		return value
+	}
+	return firstURLFromDesktopText(fmt.Sprint(step.Input, step.Output))
+}
+
+func nestedDesktopURL(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return firstURLFromDesktopText(typed)
+	case map[string]any:
+		for _, key := range []string{"url", "source_url", "source"} {
+			if found := nestedDesktopURL(typed[key]); found != "" {
+				return found
+			}
+		}
+		for _, item := range typed {
+			if found := nestedDesktopURL(item); found != "" {
+				return found
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if found := nestedDesktopURL(item); found != "" {
+				return found
+			}
+		}
+	}
+	return ""
+}
+
+func sanitizeDesktopActionData(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return nil
+	}
+	hidden := map[string]bool{
+		"agent_id": true, "dynamic_tail_hash": true, "node_id": true, "prefix_hash": true,
+		"prompt_cache_key": true, "task_attempts": true, "task_id": true, "tool_run_id": true,
+		"tool_runs": true, "workflow_name": true, "worker_task_id": true,
+	}
+	output := map[string]any{}
+	for key, value := range input {
+		if hidden[key] {
+			continue
+		}
+		output[key] = value
+	}
+	return output
+}
+
+func userFacingDesktopAssistantText(content string) string {
+	return strings.TrimSpace(strings.NewReplacer(
+		"task_attempts", "执行记录",
+		"tool_runs", "工具执行",
+		"Run Trace", "执行详情",
+		"main-node", "本机",
+	).Replace(content))
+}
+
+func userFacingDesktopError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return userFacingDesktopAssistantText(err.Error())
 }
 
 func (a *DesktopApp) GetRunTrace(runID string) (*DesktopRunTrace, error) {
@@ -887,6 +1262,120 @@ func (a *DesktopApp) ListCapabilities() (*DesktopCapabilityListResponse, error) 
 		return nil, err
 	}
 	return &DesktopCapabilityListResponse{Capabilities: convertCapabilities(result.Capabilities)}, nil
+}
+
+func (a *DesktopApp) ListMCPServers() (*DesktopMCPServerListResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.ListMCPServers(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopMCPServerListResponse{Servers: convertMCPServers(result.Servers)}, nil
+}
+
+func (a *DesktopApp) SyncMCPServer(id string) (*DesktopMCPServerSyncResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.SyncMCPServer(context.Background(), id)
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopMCPServerSyncResponse{Server: convertMCPServer(*result)}, nil
+}
+
+func (a *DesktopApp) SaveMCPServer(request DesktopMCPServerSaveRequest) (*DesktopMCPServerSyncResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.SaveMCPServer(context.Background(), appcore.MCPServerSaveRequest{
+		ID:            request.ID,
+		Name:          request.Name,
+		Transport:     request.Transport,
+		Command:       request.Command,
+		Args:          request.Args,
+		EnvSecretRefs: request.EnvSecretRefs,
+		Enabled:       request.Enabled,
+		Metadata:      request.Metadata,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopMCPServerSyncResponse{Server: convertMCPServer(*result)}, nil
+}
+
+func (a *DesktopApp) WrapMCPTool(serverID string, toolName string, request DesktopMCPWrapToolRequest) (*DesktopMCPWrapToolResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.WrapMCPTool(context.Background(), serverID, toolName, appcore.MCPWrapToolRequest{
+		CapabilityID:     request.CapabilityID,
+		Description:      request.Description,
+		IntentDomain:     request.IntentDomain,
+		PositiveExamples: request.PositiveExamples,
+		NegativeExamples: request.NegativeExamples,
+		InputSchema:      request.InputSchema,
+		OutputSchema:     request.OutputSchema,
+		RiskLevel:        request.RiskLevel,
+		PrivacyLevel:     request.PrivacyLevel,
+		UIVisibility:     request.UIVisibility,
+		Enabled:          request.Enabled,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopMCPWrapToolResponse{Capability: convertCapability(*result)}, nil
+}
+
+func (a *DesktopApp) ListSkills() (*DesktopSkillListResponse, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.ListSkills(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &DesktopSkillListResponse{Skills: convertSkills(result.Skills)}, nil
+}
+
+func (a *DesktopApp) SaveSkill(request DesktopSkillSaveRequest) (*DesktopSkillRecord, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.SaveSkill(context.Background(), appcore.SkillSaveRequest{
+		ID:                    request.ID,
+		Version:               request.Version,
+		Name:                  request.Name,
+		Description:           request.Description,
+		TriggerPhrases:        request.TriggerPhrases,
+		RequiredCapabilities:  request.RequiredCapabilities,
+		ForbiddenCapabilities: request.ForbiddenCapabilities,
+		Prompt:                request.Prompt,
+		OutputContract:        request.OutputContract,
+		Enabled:               request.Enabled,
+		Metadata:              request.Metadata,
+	})
+	if err != nil {
+		return nil, err
+	}
+	records := convertSkills([]appcore.SkillRecord{*result})
+	return &records[0], nil
+}
+
+func (a *DesktopApp) TestSkill(id string, request DesktopSkillTestRequest) (map[string]any, error) {
+	if err := a.ensureReady(); err != nil {
+		return nil, err
+	}
+	result, err := a.core.TestSkill(context.Background(), id, appcore.SkillTestRequest{Message: request.Message, Context: request.Context})
+	if err != nil {
+		return nil, err
+	}
+	raw, _ := json.Marshal(result)
+	value := map[string]any{}
+	_ = json.Unmarshal(raw, &value)
+	return value, nil
 }
 
 func (a *DesktopApp) ListToolWorkflows() (*DesktopToolWorkflowListResponse, error) {
@@ -2224,7 +2713,70 @@ func convertConversationMessages(items []appcore.ConversationMessage) []DesktopC
 func convertCapabilities(items []appcore.CapabilityRecord) []DesktopCapabilityRecord {
 	result := make([]DesktopCapabilityRecord, 0, len(items))
 	for _, item := range items {
-		result = append(result, DesktopCapabilityRecord{ID: item.ID, Name: item.Name, Description: item.Description, RiskLevel: item.RiskLevel, Enabled: item.Enabled, Metadata: item.Metadata})
+		result = append(result, convertCapability(item))
+	}
+	return result
+}
+
+func convertCapability(item appcore.CapabilityRecord) DesktopCapabilityRecord {
+	return DesktopCapabilityRecord{ID: item.ID, Name: item.Name, Description: item.Description, RiskLevel: item.RiskLevel, Enabled: item.Enabled, Metadata: item.Metadata}
+}
+
+func convertMCPServers(items []appcore.MCPServerRecord) []DesktopMCPServerRecord {
+	result := make([]DesktopMCPServerRecord, 0, len(items))
+	for _, item := range items {
+		result = append(result, convertMCPServer(item))
+	}
+	return result
+}
+
+func convertMCPServer(item appcore.MCPServerRecord) DesktopMCPServerRecord {
+	tools := make([]DesktopMCPToolRecord, 0, len(item.Tools))
+	for _, tool := range item.Tools {
+		tools = append(tools, DesktopMCPToolRecord{Name: tool.Name, Description: tool.Description, WrappedAs: tool.WrappedAs, Enabled: tool.Enabled, Schema: tool.Schema})
+	}
+	resources := make([]DesktopMCPResourceRecord, 0, len(item.Resources))
+	for _, resource := range item.Resources {
+		resources = append(resources, DesktopMCPResourceRecord{URI: resource.URI, Name: resource.Name, Description: resource.Description, MimeType: resource.MimeType})
+	}
+	prompts := make([]DesktopMCPPromptRecord, 0, len(item.Prompts))
+	for _, prompt := range item.Prompts {
+		prompts = append(prompts, DesktopMCPPromptRecord{Name: prompt.Name, Description: prompt.Description, Arguments: prompt.Arguments})
+	}
+	return DesktopMCPServerRecord{ID: item.ID, Name: item.Name, Transport: item.Transport, Command: item.Command, Args: item.Args, Enabled: item.Enabled, Status: item.Status, Trust: item.Trust, LastSyncAt: item.LastSyncAt, LastSyncError: item.LastSyncError, Tools: tools, Resources: resources, Prompts: prompts, Metadata: item.Metadata}
+}
+
+func convertSkills(items []appcore.SkillRecord) []DesktopSkillRecord {
+	result := make([]DesktopSkillRecord, 0, len(items))
+	for _, item := range items {
+		result = append(result, DesktopSkillRecord{
+			ID:                    item.ID,
+			Version:               item.Version,
+			Name:                  item.Name,
+			Description:           item.Description,
+			TriggerPhrases:        item.TriggerPhrases,
+			RequiredCapabilities:  item.RequiredCapabilities,
+			ForbiddenCapabilities: item.ForbiddenCapabilities,
+			OutputContract:        item.OutputContract,
+			Enabled:               item.Enabled,
+			Metadata:              item.Metadata,
+			RecentRun:             anyToMap(item.RecentRun),
+		})
+	}
+	return result
+}
+
+func anyToMap(value any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	result := map[string]any{}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil
 	}
 	return result
 }

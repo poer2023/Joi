@@ -22,6 +22,10 @@ func CompileCapability(ctx context.Context, tx capabilityCompilerTx, request Cap
 	if request.Capability == "" {
 		return nil, fmt.Errorf("capability is required")
 	}
+	semanticResult, err := ValidateCapabilityRequestWithRegistry(ctx, tx, request)
+	if err != nil {
+		return nil, err
+	}
 	if request.Risk == "destructive" || request.Risk == "unsafe" {
 		return nil, ErrPolicyDenied
 	}
@@ -62,10 +66,11 @@ func CompileCapability(ctx context.Context, tx capabilityCompilerTx, request Cap
 	return &CapabilityExecutionResult{
 		CapabilityRequest: request,
 		PolicyDecision: map[string]any{
-			"risk":          request.Risk,
-			"decision":      "allow",
-			"reason":        "capability, workflow, and tools are enabled and within requested risk",
-			"workflow_name": workflow.WorkflowName,
+			"risk":                request.Risk,
+			"decision":            "allow",
+			"reason":              "capability, semantic contract, workflow, and tools are enabled and within requested risk",
+			"workflow_name":       workflow.WorkflowName,
+			"semantic_validation": semanticResult,
 		},
 		Workflow: workflow,
 	}, nil
@@ -160,6 +165,8 @@ func defaultWorkflowName(capability string) string {
 	switch CanonicalCapabilityName(capability) {
 	case "web_research":
 		return "web_research_v2"
+	case "browser_read":
+		return "browser_read_v1"
 	default:
 		return CanonicalCapabilityName(capability) + "_v1"
 	}

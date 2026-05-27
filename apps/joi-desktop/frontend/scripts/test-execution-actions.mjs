@@ -27,7 +27,7 @@ try {
   const modulePath = existsSync(join(outDir, 'executionActions.js'))
     ? join(outDir, 'executionActions.js')
     : join(outDir, 'src/executionActions.js');
-  const { projectRunTraceToActions } = await import(pathToFileURL(modulePath).href);
+  const { getExecutionDisplayMode, projectRunTraceToActions, visibleExecutionActions } = await import(pathToFileURL(modulePath).href);
 
   const baseTrace = (steps) => ({
     id: 'run_test',
@@ -63,7 +63,9 @@ try {
         output: { response: '你好' },
       },
     ]));
-    assert.deepEqual(actions.map((action) => action.title), ['理解任务', '生成回复']);
+    assert.deepEqual(actions.map((action) => action.title), ['理解任务', '生成回复', '模型回答']);
+    assert.equal(visibleExecutionActions(actions).length, 1);
+    assert.equal(visibleExecutionActions(actions)[0].description, '本轮未执行工具');
     assert(!JSON.stringify(withoutRawSteps(actions)).includes('prompt_cache_key'));
     assert(!JSON.stringify(withoutRawSteps(actions)).includes('dynamic_tail_hash'));
   }
@@ -101,9 +103,20 @@ try {
     ]));
     assert.equal(actions.length, 1);
     assert.equal(actions[0].title, '读取网页');
+    assert.equal(actions[0].kind, 'web');
+    assert.equal(actions[0].description, '本轮执行了工具：已读取网页并提取正文');
+    assert.equal(actions[0].sourceLabel, 'example.com');
+    assert.equal(actions[0].completedLabel, '已读取网页 · example.com');
     assert(actions[0].details.some((detail) => detail.label === 'SOURCE'));
     assert(actions[0].details.some((detail) => detail.label === 'RESULT'));
     assert(!JSON.stringify(actions[0].details).includes('scheduler'));
+    assert.equal(getExecutionDisplayMode({
+      actions,
+      status: 'completed',
+      hasArtifact: false,
+      hasProductTask: false,
+      isSeriousTask: false,
+    }), 'inline');
   }
 
   {
@@ -120,11 +133,76 @@ try {
 
   {
     const actions = projectRunTraceToActions(baseTrace([
+      { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'file_analyze', inputs: { path: '/Users/hao/Documents/Joi/README.md' } } },
+      { id: 'step_2', step_type: 'tool_compiled', title: 'Tool workflow compiled', status: 'succeeded', output: { workflow: { workflow_name: 'file_analyze_v1' } } },
+      { id: 'step_3', step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'completed', path: '/Users/hao/Documents/Joi/README.md', summary: 'README summary' } },
+    ]));
+    assert.equal(actions[0].kind, 'file');
+    assert.equal(actions[0].sourceLabel, 'README.md');
+    assert.equal(actions[0].completedLabel, '已读取文件 · README.md');
+  }
+
+  {
+    const actions = projectRunTraceToActions(baseTrace([
+      { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'desktop_app_list', inputs: { scope: 'installed_applications' } } },
+      { id: 'step_2', step_type: 'capability_semantic_checked', title: 'Semantic gate checked', status: 'succeeded', output: { code: 'OK' } },
+      { id: 'step_3', step_type: 'workflow_compiled', title: 'Workflow compiled', status: 'succeeded', output: { workflow: { workflow_name: 'desktop_app_list_v1' } } },
+      { id: 'step_4', step_type: 'tool_step_started', title: 'desktop_list_app_bundles started', status: 'succeeded', output: { tool: 'desktop_list_app_bundles' } },
+      { id: 'step_5', step_type: 'tool_step_completed', title: 'desktop_list_app_bundles completed', status: 'succeeded', output: { tool: 'desktop_list_app_bundles' } },
+      { id: 'step_6', step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'completed', mode: 'desktop_app_list_v1_bundle_scan', total: 2 } },
+    ]));
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].title, '列出本机 App');
+    assert.equal(actions[0].status, 'completed');
+    assert.equal(actions[0].completedLabel, '列出本机 App');
+  }
+
+  {
+    const actions = projectRunTraceToActions(baseTrace([
       { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'shell_command', inputs: { command: 'rm -rf /tmp/nope' } } },
       { id: 'step_2', step_type: 'policy_blocked', title: 'Policy checked', status: 'blocked', output: { reason: 'requires confirmation' }, error: { code: 'POLICY_DENIED' } },
     ]));
     assert.equal(actions[0].status, 'blocked');
     assert(actions[0].details.some((detail) => detail.label === 'ERROR'));
+  }
+
+  {
+    const actions = projectRunTraceToActions(baseTrace([
+      {
+        id: 'step_1',
+        step_type: 'conversation_context_resolved',
+        title: 'Conversation context resolved',
+        status: 'succeeded',
+        output: { message_count: 2, tool_evidence_count: 1 },
+      },
+      {
+        id: 'step_2',
+        step_type: 'recent_tool_evidence_resolved',
+        title: 'Recent tool evidence resolved',
+        status: 'succeeded',
+        output: { evidence_count: 1, sources: [{ run_id: 'run_prev', tool_run_id: 'toolrun_prev', capability_id: 'desktop_app_list' }] },
+      },
+      {
+        id: 'step_3',
+        step_type: 'followup_grounded',
+        title: 'Follow-up grounded',
+        status: 'succeeded',
+        output: { source_run_id: 'run_prev', tool_run_id: 'toolrun_prev', capability_id: 'desktop_app_list', matches: [{ name: '赛博朋克 2077', path: '/Users/hao/Applications/赛博朋克 2077.app' }] },
+      },
+      {
+        id: 'step_4',
+        step_type: 'response_generated',
+        title: 'Response generated',
+        status: 'succeeded',
+        output: { response: '根据上一轮 desktop_app_list 工具结果...' },
+      },
+    ]));
+    const visible = visibleExecutionActions(actions);
+    assert.equal(visible.length, 1);
+    assert.equal(visible[0].kind, 'evidence');
+    assert.equal(visible[0].title, '引用工具证据');
+    assert.equal(visible[0].description, '本轮引用了上一轮工具证据');
+    assert(JSON.stringify(visible[0].details).includes('toolrun_prev'));
   }
 
   {

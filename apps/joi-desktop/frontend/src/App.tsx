@@ -1,6 +1,6 @@
 import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
-import { WindowSetMinSize } from '../wailsjs/runtime/runtime';
+import { EventsOn, WindowSetMinSize } from '../wailsjs/runtime/runtime';
 import {
   desktopApi,
   type ArtifactDetail,
@@ -14,6 +14,7 @@ import {
   type ConfirmationRecord,
   type MemoryRecord,
   type MemorySearchResult,
+  type MCPServerRecord,
   type ModelCall,
   type NodeRecord,
   type OnboardingStatus,
@@ -24,6 +25,7 @@ import {
   type RunTrace,
   type SecretStatus,
   type SettingsRecord,
+  type SkillRecord,
   type SystemHealth,
   type ToolRunRecord,
   type ToolWorkflowRecord,
@@ -32,12 +34,48 @@ import {
 } from './api/desktop';
 import joiAvatar from './assets/joi-avatar-circle.png';
 import { ScrollArea } from './components/ScrollArea';
-import { projectRunTraceToActions, type ExecutionAction, type ExecutionActionDetail } from './executionActions';
+import {
+  createOptimisticExecutionActions,
+  getExecutionDisplayMode,
+  projectRunTraceToActions,
+  summarizeExecutionActions,
+  visibleExecutionActions,
+  sourceLabelFromURL,
+  type ExecutionAction,
+  type ExecutionActionDetail,
+  type ExecutionActionKind,
+  type ExecutionActionStatus,
+} from './executionActions';
 
 type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
 type SettingsTab = Exclude<Tab, 'chat'>;
 type SettingsCategory = 'models' | 'chatEntrances' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
 type ExecutionTarget = 'main-node' | 'auto' | 'local-worker-1' | 'vps-la-1';
+type StreamingAssistantMessage = ConversationMessage & {
+  complete?: boolean;
+};
+type ExecutionRunStatus = 'pending' | 'running' | 'completed' | 'failed';
+type ExecutionEvent = {
+  type?: string;
+  event?: string;
+  run_id?: string;
+  runID?: string;
+  action_id?: string;
+  actionID?: string;
+  kind?: string;
+  title?: string;
+  status?: string;
+  summary?: string;
+  source_label?: string;
+  sourceLabel?: string;
+  duration_ms?: number;
+  durationMs?: number;
+  text?: string;
+  delta?: string;
+  message?: string;
+  message_id?: string;
+  details?: ExecutionActionDetail[];
+};
 type ModelSettingsDraft = {
   provider: string;
   base_url: string;
@@ -82,8 +120,8 @@ const defaultSettingsObjectByCategory: Record<SettingsCategory, string> = {
   privacySecurity: 'secrets',
   advanced: 'diagnostics',
 };
-const DEFAULT_SIDEBAR_WIDTH = 288;
-const MIN_SIDEBAR_WIDTH = 232;
+const DEFAULT_SIDEBAR_WIDTH = 224;
+const MIN_SIDEBAR_WIDTH = 192;
 const MAX_SIDEBAR_WIDTH = 560;
 const CHAT_MAIN_MIN_WIDTH = 560;
 const RIGHT_PANEL_MIN_WIDTH = 260;
@@ -101,6 +139,9 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [lastPrompt, setLastPrompt] = useState('');
   const [pendingUserMessage, setPendingUserMessage] = useState<ConversationMessage | null>(null);
+  const [streamingAssistantMessage, setStreamingAssistantMessage] = useState<StreamingAssistantMessage | null>(null);
+  const [activeExecutionActions, setActiveExecutionActions] = useState<ExecutionAction[]>([]);
+  const [activeExecutionStatus, setActiveExecutionStatus] = useState<ExecutionRunStatus>('pending');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [executionTarget, setExecutionTarget] = useState<ExecutionTarget>('main-node');
   const [selectedModelName, setSelectedModelName] = useState('');
@@ -113,6 +154,8 @@ export default function App() {
   const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([]);
   const [capabilities, setCapabilities] = useState<CapabilityRecord[]>([]);
   const [workflows, setWorkflows] = useState<ToolWorkflowRecord[]>([]);
+  const [mcpServers, setMCPServers] = useState<MCPServerRecord[]>([]);
+  const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [toolRuns, setToolRuns] = useState<ToolRunRecord[]>([]);
   const [workspaceSettings, setWorkspaceSettings] = useState<WorkspaceSettings | null>(null);
   const [health, setHealth] = useState<SystemHealth | null>(null);
@@ -144,6 +187,10 @@ export default function App() {
   const [errorKey, setErrorKey] = useState(0);
   const [noticeKey, setNoticeKey] = useState(0);
   const shellRef = useRef<HTMLElement | null>(null);
+  const pendingAssistantIDRef = useRef('');
+  const pendingConversationIDRef = useRef('');
+  const receivedAssistantDeltaRef = useRef(false);
+  const receivedAssistantDeltaRunIDRef = useRef('');
 
   const stepCount = useMemo(() => trace?.steps?.length ?? 0, [trace]);
   const firstModelCall = trace?.model_calls?.[0] ?? chat?.model_calls?.[0];
@@ -175,6 +222,16 @@ export default function App() {
     }
 
     void refreshAll();
+  }, []);
+
+  useEffect(() => {
+    try {
+      return EventsOn('joi:run:event', (event: ExecutionEvent) => {
+        dispatchExecutionEvent(event);
+      });
+    } catch {
+      return undefined;
+    }
   }, []);
 
   useEffect(() => {
@@ -254,6 +311,63 @@ export default function App() {
     setErrorKey((current) => current + 1);
   }
 
+  function dispatchExecutionEvent(event: ExecutionEvent) {
+    const eventType = event.type || event.event || '';
+    if (!eventType) return;
+
+    if (eventType === 'run.started') {
+      setActiveExecutionStatus('running');
+      receivedAssistantDeltaRef.current = false;
+      receivedAssistantDeltaRunIDRef.current = '';
+      return;
+    }
+
+    if (eventType === 'action.started') {
+      setActiveExecutionStatus('running');
+      setActiveExecutionActions((current) => upsertExecutionAction(current, event, 'running'));
+      return;
+    }
+
+    if (eventType === 'action.completed') {
+      setActiveExecutionActions((current) => upsertExecutionAction(current, event, 'completed'));
+      return;
+    }
+
+    if (eventType === 'action.failed') {
+      setActiveExecutionActions((current) => upsertExecutionAction(current, event, 'failed'));
+      return;
+    }
+
+    if (eventType === 'assistant.delta') {
+      const text = String(event.text ?? event.delta ?? '');
+      if (!text) return;
+      const runID = event.run_id || event.runID || '';
+      const messageID = String(event.message_id || event.message || pendingAssistantIDRef.current || `streaming-${runID || Date.now()}`);
+      const conversationID = pendingConversationIDRef.current || currentConversationID || 'pending-conversation';
+      receivedAssistantDeltaRef.current = true;
+      receivedAssistantDeltaRunIDRef.current = runID;
+      setStreamingAssistantMessage((current) => ({
+        id: current?.id || messageID,
+        conversation_id: current?.conversation_id || conversationID,
+        role: 'assistant',
+        content: `${current?.content || ''}${text}`.trimStart(),
+        run_id: runID || current?.run_id,
+        complete: false,
+      }));
+      return;
+    }
+
+    if (eventType === 'run.completed') {
+      setActiveExecutionStatus('completed');
+      setStreamingAssistantMessage((current) => (current ? { ...current, complete: true } : current));
+      return;
+    }
+
+    if (eventType === 'run.failed') {
+      setActiveExecutionStatus('failed');
+    }
+  }
+
   async function refreshAll() {
     setError('');
     try {
@@ -263,6 +377,8 @@ export default function App() {
         trashedConversationList,
         capabilityList,
         workflowList,
+        mcpServerList,
+        skillList,
         toolRunList,
         workspaceConfig,
         systemHealth,
@@ -286,6 +402,8 @@ export default function App() {
         desktopApi.listConversations({ view: 'trash', limit: 100 }),
         desktopApi.listCapabilities(),
         desktopApi.listToolWorkflows(),
+        desktopApi.listMCPServers(),
+        desktopApi.listSkills(),
         desktopApi.listToolRuns(),
         desktopApi.getWorkspaceSettings(),
         desktopApi.getSystemHealth(),
@@ -309,6 +427,8 @@ export default function App() {
       setTrashedConversations(trashedConversationList.conversations ?? []);
       setCapabilities(capabilityList.capabilities ?? []);
       setWorkflows(workflowList.workflows ?? []);
+      setMCPServers(mcpServerList.servers ?? []);
+      setSkills(skillList.skills ?? []);
       setToolRuns(toolRunList.tool_runs ?? []);
       setWorkspaceSettings(workspaceConfig);
       setHealth(systemHealth);
@@ -331,15 +451,61 @@ export default function App() {
     }
   }
 
+  async function syncMCPServer(serverID: string) {
+    setError('');
+    try {
+      const result = await desktopApi.syncMCPServer(serverID);
+      setMCPServers((current) => current.map((server) => (server.id === serverID ? result.server : server)));
+      showNotice('MCP inventory 已刷新；执行仍需 wrapped capability 授权。');
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function wrapMCPTool(server: MCPServerRecord, toolName: string) {
+    setError('');
+    const tool = server.tools.find((item) => item.name === toolName);
+    if (!tool) return;
+    try {
+      const safeID = `mcp_${server.id}_${tool.name}`.toLowerCase().replace(/[^a-z0-9_]+/g, '_');
+      const result = await desktopApi.wrapMCPTool(server.id, tool.name, {
+        capability_id: safeID,
+        description: tool.description || `Wrapped MCP tool ${tool.name}`,
+        intent_domain: `mcp_${server.id}_${tool.name}`.toLowerCase().replace(/[^a-z0-9_]+/g, '_'),
+        positive_examples: [`使用 ${tool.name}`, `调用 ${server.name} 的 ${tool.name}`],
+        negative_examples: ['列出本地所有 app', '检查 Joi 服务健康状态'],
+        input_schema: tool.schema || { type: 'object', additionalProperties: true },
+        output_schema: { type: 'object', additionalProperties: true },
+        risk_level: 'read_only',
+        privacy_level: 'private_content',
+        ui_visibility: 'chat',
+      });
+      setCapabilities((current) => [...current.filter((item) => item.id !== result.capability.id), result.capability]);
+      const refreshed = await desktopApi.listMCPServers();
+      setMCPServers(refreshed.servers ?? []);
+      showNotice('MCP tool 已 wrapped 为 Joi capability；执行仍会经过 semantic/policy gate。');
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function submit(event?: FormEvent) {
     event?.preventDefault();
     setError('');
     setNotice('');
     setTrace(null);
+    setStreamingAssistantMessage(null);
+    setActiveExecutionActions([]);
+    setActiveExecutionStatus('pending');
     if (isSubmitting) return;
     const prompt = message.trim();
     if (!prompt) return;
+    const optimisticActions = createOptimisticExecutionActions(prompt);
     const pendingConversationID = currentConversationID || 'pending-conversation';
+    pendingConversationIDRef.current = pendingConversationID;
+    pendingAssistantIDRef.current = '';
+    receivedAssistantDeltaRef.current = false;
+    receivedAssistantDeltaRunIDRef.current = '';
     setLastPrompt(prompt);
     setPendingUserMessage({
       id: `pending-${Date.now()}`,
@@ -348,6 +514,8 @@ export default function App() {
       content: prompt,
     });
     setMessage('');
+    setActiveExecutionActions(optimisticActions);
+    setActiveExecutionStatus(optimisticActions.length > 0 ? 'running' : 'pending');
     setIsSubmitting(true);
     const routing = executionTargetOptions.find((item) => item.value === executionTarget) ?? executionTargetOptions[0];
     const modelName = selectedModelName || settings?.model_name || 'deepseek-v4-flash';
@@ -365,6 +533,8 @@ export default function App() {
         product_task_id: activeProductTaskID || undefined,
       });
       setChat(result);
+      pendingAssistantIDRef.current = result.assistant_message_id;
+      pendingConversationIDRef.current = result.conversation_id;
       setCurrentConversationID(result.conversation_id);
       if (result.product_task?.id) {
         setActiveProductTaskID(result.product_task.id);
@@ -376,18 +546,67 @@ export default function App() {
       setMessage('');
       const runTrace = await desktopApi.getRunTrace(result.run_id);
       setTrace(runTrace);
+      const visibleActions = visibleExecutionActions(projectRunTraceToActions(runTrace));
+      setActiveExecutionActions(visibleActions);
+      setActiveExecutionStatus(normalizeRunExecutionStatus(runTrace.status));
+      if (receivedAssistantDeltaRef.current && (!receivedAssistantDeltaRunIDRef.current || receivedAssistantDeltaRunIDRef.current === result.run_id)) {
+        setStreamingAssistantMessage((current) => ({
+          id: current?.id || result.assistant_message_id,
+          conversation_id: current?.conversation_id || result.conversation_id,
+          role: 'assistant',
+          content: userFacingAssistantText(current?.content || result.response),
+          run_id: result.run_id,
+          complete: true,
+        }));
+        await sleep(120);
+      } else {
+        await streamAssistantText({
+          id: result.assistant_message_id,
+          conversation_id: result.conversation_id,
+          role: 'assistant',
+          content: '',
+          run_id: result.run_id,
+        }, userFacingAssistantText(result.response));
+      }
       const detail = await desktopApi.getConversation(result.conversation_id);
       setConversationMessages(detail.messages ?? []);
       setPendingUserMessage(null);
+      setStreamingAssistantMessage(null);
+      setActiveExecutionActions([]);
+      setActiveExecutionStatus('pending');
+      pendingAssistantIDRef.current = '';
+      pendingConversationIDRef.current = '';
       await refreshAll();
       setActiveTab('chat');
     } catch (err) {
       setPendingUserMessage(null);
+      setStreamingAssistantMessage(null);
+      setActiveExecutionActions([]);
+      setActiveExecutionStatus('failed');
+      pendingAssistantIDRef.current = '';
+      pendingConversationIDRef.current = '';
       setMessage(prompt);
       showError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsSubmitting(false);
     }
+  }
+
+  async function streamAssistantText(base: StreamingAssistantMessage, fullText: string) {
+    const chunks = splitStreamingChunks(fullText);
+    if (chunks.length === 0) {
+      setStreamingAssistantMessage({ ...base, content: fullText, complete: true });
+      return;
+    }
+    setStreamingAssistantMessage({ ...base, content: '', complete: false });
+    let next = '';
+    for (const chunk of chunks) {
+      next += chunk;
+      setStreamingAssistantMessage({ ...base, content: next.trimStart(), complete: false });
+      await sleep(Math.min(90, Math.max(28, chunk.length * 8)));
+    }
+    setStreamingAssistantMessage({ ...base, content: fullText, complete: true });
+    await sleep(120);
   }
 
   async function loadConversation(conversationID: string) {
@@ -613,17 +832,12 @@ export default function App() {
         <ConversationSidebar
           activeTab={activeTab}
           archiveConversation={archiveConversation}
-          artifacts={artifacts}
           chat={chat}
           collapsed={sidebarCollapsed}
           conversations={conversations}
           currentConversationID={currentConversationID}
           health={health}
           loadConversation={loadConversation}
-          productTasks={productTasks}
-          activeProductTaskID={activeProductTaskID}
-          openArtifact={openArtifact}
-          selectProductTask={selectProductTask}
           setActiveTab={setActiveTab}
           trace={trace}
         />
@@ -647,6 +861,8 @@ export default function App() {
           <ChatHome
             activeProductTask={activeProductTaskDetail}
             artifacts={artifacts}
+            activeExecutionActions={activeExecutionActions}
+            activeExecutionStatus={activeExecutionStatus}
             autoRightPanelCollapsed={autoRightPanelCollapsed}
             chat={chat}
             conversationMessages={conversationMessages}
@@ -660,6 +876,7 @@ export default function App() {
             lastPrompt={lastPrompt}
             message={message}
             pendingUserMessage={pendingUserMessage}
+            streamingAssistantMessage={streamingAssistantMessage}
             proactiveMessages={proactiveMessages}
             productTasks={productTasks}
             savedModels={savedModels}
@@ -704,6 +921,7 @@ export default function App() {
               health={health}
               memories={memories}
               memoryQuery={memoryQuery}
+              mcpServers={mcpServers}
               nodes={nodes}
               refreshAll={refreshAll}
               restoreBackup={restoreBackup}
@@ -715,6 +933,9 @@ export default function App() {
               setMemoryQuery={setMemoryQuery}
               setNodeDisabled={setNodeDisabled}
               setNotice={showNotice}
+              skills={skills}
+              syncMCPServer={syncMCPServer}
+              wrapMCPTool={wrapMCPTool}
               setWorkflowEnabled={setWorkflowEnabled}
               settings={settings}
               stepCount={stepCount}
@@ -949,23 +1170,6 @@ function ModelSettingsDialog({
   );
 }
 
-function modelOptionValues(presetModels: string[], availableModels: AvailableModel[], currentValues: string[]) {
-  const source = availableModels.length > 0 ? availableModels.map((model) => model.id) : presetModels;
-  return uniqueStrings([...currentValues, ...source].filter(Boolean));
-}
-
-function modelOptionLabel(modelID: string, availableModels: AvailableModel[]) {
-  const model = availableModels.find((item) => item.id === modelID);
-  if (!model?.display_name || model.display_name === modelID) {
-    return modelID;
-  }
-  return `${model.display_name} (${modelID})`;
-}
-
-function uniqueStrings(values: string[]) {
-  return Array.from(new Set(values));
-}
-
 function formatNumber(value: number) {
   return new Intl.NumberFormat('en-US').format(value);
 }
@@ -1025,6 +1229,7 @@ function SettingsConsole({
   health,
   memories,
   memoryQuery,
+  mcpServers,
   nodes,
   refreshAll,
   restoreBackup,
@@ -1036,6 +1241,9 @@ function SettingsConsole({
   setMemoryQuery,
   setNodeDisabled,
   setNotice,
+  skills,
+  syncMCPServer,
+  wrapMCPTool,
   setWorkflowEnabled,
   settings,
   stepCount,
@@ -1063,6 +1271,7 @@ function SettingsConsole({
   health: SystemHealth | null;
   memories: MemoryRecord[];
   memoryQuery: string;
+  mcpServers: MCPServerRecord[];
   nodes: NodeRecord[];
   refreshAll: () => Promise<void>;
   restoreBackup: (path: string) => Promise<void>;
@@ -1074,6 +1283,9 @@ function SettingsConsole({
   setMemoryQuery: (value: string) => void;
   setNodeDisabled: (nodeID: string, disabled: boolean) => Promise<void>;
   setNotice: (value: string) => void;
+  skills: SkillRecord[];
+  syncMCPServer: (serverID: string) => Promise<void>;
+  wrapMCPTool: (server: MCPServerRecord, toolName: string) => Promise<void>;
   setWorkflowEnabled: (name: string, enabled: boolean) => Promise<void>;
   settings: SettingsRecord | null;
   stepCount: number;
@@ -1167,7 +1379,9 @@ function SettingsConsole({
       timeout_seconds: Number(modelTimeout) || 60,
       max_retries: Number(modelRetryCount) || 1,
     });
-    setTestStatus(`连接状态：${formatStatus(result.status)}${result.error_summary ? ` · ${result.error_summary}` : ''}`);
+    const message = `连接测试：${formatStatus(result.status)}${result.error_summary ? ` · ${result.error_summary}` : ''}`;
+    setTestStatus(message);
+    setNotice(message);
   }
 
   async function fetchModelList() {
@@ -1187,7 +1401,9 @@ function SettingsConsole({
     if (models.length > 0 && !models.some((model) => model.id === reasoningModel)) {
       setReasoningModel(preferredReasoningModel(models));
     }
-    setTestStatus(`模型列表：${formatStatus(result.status)}${result.error_summary ? ` · ${result.error_summary}` : ''}`);
+    const message = `模型列表：${formatStatus(result.status)}${result.error_summary ? ` · ${result.error_summary}` : ` · ${models.length} 个模型`}`;
+    setTestStatus(message);
+    setNotice(message);
     await refreshAll();
   }
 
@@ -1295,9 +1511,6 @@ function SettingsConsole({
   }
 
   function renderModelDetail() {
-    const defaultModelOptions = modelOptionValues(modelPreset.models, availableModels, [modelName]);
-    const reasoningModelOptions = modelOptionValues([modelPreset.reasoningModel, ...modelPreset.models], availableModels, [reasoningModel, modelName]);
-
     return (
       <section className="settings-detail-panel">
         <DetailHeader title={activeObject.label} description={`配置 ${activeObject.label} API 连接与模型参数`} />
@@ -1305,18 +1518,6 @@ function SettingsConsole({
           <label className="field-row">
             <span>接口地址</span>
             <input value={modelBaseURL} onChange={(event) => setModelBaseURL(event.target.value)} />
-          </label>
-          <label className="field-row">
-            <span>默认模型</span>
-            <select value={modelName} onChange={(event) => setModelName(event.target.value)}>
-              {defaultModelOptions.map((item) => <option key={item} value={item}>{modelOptionLabel(item, availableModels)}</option>)}
-            </select>
-          </label>
-          <label className="field-row">
-            <span>推理模型</span>
-            <select value={reasoningModel} onChange={(event) => setReasoningModel(event.target.value)}>
-              {reasoningModelOptions.map((item) => <option key={item} value={item}>{modelOptionLabel(item, availableModels)}</option>)}
-            </select>
           </label>
           <label className="field-row">
             <span>API Key</span>
@@ -1333,7 +1534,6 @@ function SettingsConsole({
             <div className="connection-status">
               <span className={`live-dot ${settings?.model_name ? 'on' : ''}`} />
               <strong>{settings?.model_name ? '已配置' : '未配置'}</strong>
-              <small>{testStatus || `${activeObject.label} API 配置状态`}</small>
               <button type="button" onClick={testModelDetail}>测试连接</button>
               <button type="button" onClick={fetchModelList}>获取模型</button>
             </div>
@@ -1579,27 +1779,118 @@ function SettingsConsole({
 
   function renderCapabilitiesDetail() {
     const latestRuns = toolRuns.slice(0, 8);
+    const metadataValue = (capability: CapabilityRecord, key: string) => {
+      const metadata = capability.metadata ?? {};
+      const contract = (metadata.contract && typeof metadata.contract === 'object' ? metadata.contract : {}) as Record<string, unknown>;
+      return metadata[key] ?? contract[key];
+    };
+    const metadataArray = (capability: CapabilityRecord, key: string) => {
+      const value = metadataValue(capability, key);
+      return Array.isArray(value) ? value.map((item) => String(item)) : [];
+    };
+    const sourceFor = (capability: CapabilityRecord) => String(metadataValue(capability, 'source') ?? 'native');
+    const nativeCapabilities = capabilities.filter((capability) => sourceFor(capability) === 'native');
+    const mcpWrappedCapabilities = capabilities.filter((capability) => sourceFor(capability) === 'mcp_wrapped');
     return (
       <section className="settings-detail-panel">
         <DetailHeader title="Capability Console" description="查看能力、workflow、运行记录和 workspace 边界" />
         <dl className="metrics">
           <KV label="能力" value={`${capabilities.length} 个`} />
           <KV label="Workflow" value={`${workflows.length} 个`} />
+          <KV label="MCP Server" value={`${mcpServers.length} 个`} />
+          <KV label="Skills" value={`${skills.length} 个`} />
           <KV label="最近工具运行" value={`${toolRuns.length} 条`} />
           <KV label="默认根目录" value={workspaceSettings?.default_root ?? '未设置'} />
         </dl>
 
-        <h3>Capabilities</h3>
+        <h3>Native Capabilities</h3>
         <div className="capability-grid">
-          {capabilities.map((capability) => (
-            <CapabilityToggle
-              key={capability.id}
-              label={`${capability.id} · ${formatRiskLevel(capability.risk_level)}`}
-              enabled={capability.enabled}
-            />
+          {nativeCapabilities.map((capability) => (
+            <article key={capability.id} className="row-card compact capability-contract-card">
+              <div className="capability-contract-title">
+                <strong>{capability.id}</strong>
+                <small>{capability.enabled ? '已启用' : '已停用'}</small>
+              </div>
+              <p>{capability.description || '未记录描述'}</p>
+              <dl className="compact-kv">
+                <KV label="intent" value={String(metadataValue(capability, 'intent_domain') ?? '未设置')} />
+                <KV label="risk" value={formatRiskLevel(String(metadataValue(capability, 'risk_level') ?? capability.risk_level))} />
+                <KV label="privacy" value={String(metadataValue(capability, 'privacy_level') ?? 'public')} />
+                <KV label="workflow" value={String(metadataValue(capability, 'workflow_id') ?? '未绑定')} />
+              </dl>
+              <CollapsedData
+                label="查看 contract"
+                value={{
+                  positive_examples: metadataArray(capability, 'positive_examples'),
+                  negative_examples: metadataArray(capability, 'negative_examples'),
+                  input_schema: metadataValue(capability, 'input_schema') ?? {},
+                  output_schema: metadataValue(capability, 'output_schema') ?? {},
+                }}
+              />
+            </article>
           ))}
-          {capabilities.length === 0 && <p className="empty">暂无能力记录。</p>}
+          {nativeCapabilities.length === 0 && <p className="empty">暂无 Native capability。</p>}
         </div>
+
+        <h3>MCP</h3>
+        <RecordList
+          emptyText="暂无 MCP server。"
+          items={mcpServers}
+          renderItem={(server) => (
+            <article key={server.id} className="row-card">
+              <div>
+                <strong>{server.name}</strong>
+                <p>{server.transport} · {formatStatus(server.status)} · trust：{server.trust}</p>
+                <small>Tools：{server.tools.length} · Resources：{server.resources.length} · Prompts：{server.prompts.length}</small>
+                <small>MCP tool 只做 inventory，同步后仍需 wrapped capability 授权。</small>
+                {server.tools.length > 0 && (
+                  <div className="inline-chip-list">
+                    {server.tools.map((tool) => (
+                      <button key={tool.name} type="button" className="mini-button" onClick={() => wrapMCPTool(server, tool.name)} disabled={Boolean(tool.wrapped_as)}>
+                        {tool.wrapped_as ? `已授权 ${tool.wrapped_as}` : `Wrap ${tool.name}`}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <CollapsedData label="查看 MCP inventory" value={{ tools: server.tools, resources: server.resources, prompts: server.prompts, metadata: server.metadata }} />
+              </div>
+              <div className="row-actions">
+                <button type="button" onClick={() => syncMCPServer(server.id)}>刷新 inventory</button>
+              </div>
+            </article>
+          )}
+        />
+
+        {mcpWrappedCapabilities.length > 0 ? (
+          <>
+            <h3>MCP-wrapped Capabilities</h3>
+            <div className="capability-grid">
+              {mcpWrappedCapabilities.map((capability) => (
+                <article key={capability.id} className="row-card compact capability-contract-card">
+                  <strong>{capability.id}</strong>
+                  <p>{capability.description || '未记录描述'}</p>
+                  <small>{formatRiskLevel(capability.risk_level)} · {String(metadataValue(capability, 'privacy_level') ?? 'public')}</small>
+                  <CollapsedData label="查看 wrapped contract" value={capability.metadata ?? {}} />
+                </article>
+              ))}
+            </div>
+          </>
+        ) : null}
+
+        <h3>Skills</h3>
+        <RecordList
+          emptyText="暂无 Skill。"
+          items={skills}
+          renderItem={(skill) => (
+            <article key={skill.id} className="row-card compact">
+              <strong>{skill.name}</strong>
+              <p>{skill.description}</p>
+              <small>{skill.id} · v{skill.version} · {skill.enabled ? '已启用' : '已停用'}</small>
+              <small>Required：{skill.required_capabilities.join('、') || '无'} · Forbidden：{skill.forbidden_capabilities.join('、') || '无'}</small>
+              <CollapsedData label="查看 Skill contract" value={{ trigger_phrases: skill.trigger_phrases, output_contract: skill.output_contract, metadata: skill.metadata }} />
+            </article>
+          )}
+        />
 
         <h3>Tool Workflows</h3>
         <RecordList
@@ -2240,34 +2531,24 @@ function ConversationLifecycleSettingsList({
 
 function ConversationSidebar({
   activeTab,
-  activeProductTaskID,
   archiveConversation,
-  artifacts,
   chat,
   collapsed,
   conversations,
   currentConversationID,
   health,
   loadConversation,
-  openArtifact,
-  productTasks,
-  selectProductTask,
   setActiveTab,
   trace,
 }: {
   activeTab: Tab;
-  activeProductTaskID: string;
   archiveConversation: (conversationID: string) => Promise<void>;
-  artifacts: ArtifactSummary[];
   chat: ChatResponse | null;
   collapsed: boolean;
   conversations: ConversationSummary[];
   currentConversationID: string;
   health: SystemHealth | null;
   loadConversation: (conversationID: string) => Promise<void>;
-  openArtifact: (id: string) => Promise<void>;
-  productTasks: ProductTask[];
-  selectProductTask: (id: string) => Promise<void>;
   setActiveTab: (tab: Tab) => void;
   trace: RunTrace | null;
 }) {
@@ -2285,11 +2566,10 @@ function ConversationSidebar({
           return (
             <div key={item.id} className={`conversation-row-wrap ${active && isConversationContext ? 'active' : ''}`}>
               <button
-                className={`conversation-item ${active && isConversationContext ? 'active' : ''}`}
+                className={`conversation-item conversation-chat-item ${active && isConversationContext ? 'active' : ''}`}
                 type="button"
                 onClick={() => loadConversation(item.id)}
               >
-                <img className={`conversation-avatar ${active ? '' : 'muted'}`} src={joiAvatar} alt="" />
                 <span>
                   <strong>{conversationTitle(item)}</strong>
                 </span>
@@ -2301,48 +2581,13 @@ function ConversationSidebar({
             </div>
           );
         }) : (
-          <button className={`conversation-item ${activeTab === 'chat' || activeTab === 'trace' ? 'active' : ''}`} type="button" onClick={() => setActiveTab('chat')}>
-            <img className="conversation-avatar" src={joiAvatar} alt="" />
+          <button className={`conversation-item conversation-chat-item ${activeTab === 'chat' || activeTab === 'trace' ? 'active' : ''}`} type="button" onClick={() => setActiveTab('chat')}>
             <span>
               <strong>{chat ? '当前对话' : '新对话'}</strong>
             </span>
             <time>{trace ? '刚刚' : ''}</time>
           </button>
         )}
-        <RailSectionTitle label="任务" />
-        {productTasks.filter((task) => ['planning', 'running', 'waiting_confirmation', 'blocked'].includes(task.status)).slice(0, 8).map((task) => (
-          <button
-            key={task.id}
-            className={`conversation-item task-rail-item ${activeProductTaskID === task.id ? 'active' : ''}`}
-            type="button"
-            onClick={() => selectProductTask(task.id)}
-          >
-            <span className={`task-status-dot status-${task.status}`} />
-            <span>
-              <strong>{task.title}</strong>
-              <small>{formatStatus(task.status)} · {task.progress_percent}%</small>
-            </span>
-            <time>{formatShortTime(task.updated_at)}</time>
-          </button>
-        ))}
-        {productTasks.length === 0 && <p className="rail-empty">还没有进行中的任务。</p>}
-        <RailSectionTitle label="交付物" />
-        {artifacts.slice(0, 8).map((artifact) => (
-          <button
-            key={artifact.id}
-            className="conversation-item artifact-rail-item"
-            type="button"
-            onClick={() => openArtifact(artifact.id)}
-          >
-            <span className="artifact-type-mark">{artifact.type.slice(0, 1).toUpperCase()}</span>
-            <span>
-              <strong>{artifact.title}</strong>
-              <small>{formatArtifactType(artifact.type)} · {artifact.source_run_id || '无来源'}</small>
-            </span>
-            <time>{formatShortTime(artifact.updated_at)}</time>
-          </button>
-        ))}
-        {artifacts.length === 0 && <p className="rail-empty">还没有交付物。</p>}
       </ScrollArea>
 
       <div className="sidebar-footer">
@@ -2444,6 +2689,8 @@ function SidebarIcon({ name }: { name: 'plus' | 'search' | 'collapse' | 'expand'
 
 function ChatHome({
   activeProductTask,
+  activeExecutionActions,
+  activeExecutionStatus,
   artifacts,
   autoRightPanelCollapsed,
   chat,
@@ -2458,6 +2705,7 @@ function ChatHome({
   openArtifact,
   openLoops,
   pendingUserMessage,
+  streamingAssistantMessage,
   proactiveMessages,
   productTasks,
   savedModels,
@@ -2472,6 +2720,8 @@ function ChatHome({
   trace,
 }: {
   activeProductTask: ProductTaskDetail | null;
+  activeExecutionActions: ExecutionAction[];
+  activeExecutionStatus: ExecutionRunStatus;
   artifacts: ArtifactSummary[];
   autoRightPanelCollapsed: boolean;
   chat: ChatResponse | null;
@@ -2486,6 +2736,7 @@ function ChatHome({
   openArtifact: (id: string) => Promise<void>;
   openLoops: OpenLoop[];
   pendingUserMessage: ConversationMessage | null;
+  streamingAssistantMessage: StreamingAssistantMessage | null;
   proactiveMessages: ProactiveMessage[];
   productTasks: ProductTask[];
   savedModels: AvailableModel[];
@@ -2507,13 +2758,27 @@ function ChatHome({
         { id: chat.assistant_message_id, conversation_id: chat.conversation_id, role: 'assistant', content: chat.response, run_id: chat.run_id },
       ]
       : [];
-  const displayMessages = pendingUserMessage ? [...settledMessages, pendingUserMessage] : settledMessages;
+  const displayMessages = dedupeConversationMessages([
+    ...settledMessages,
+    ...(pendingUserMessage ? [pendingUserMessage] : []),
+    ...(streamingAssistantMessage ? [streamingAssistantMessage] : []),
+  ]);
   const hasThread = displayMessages.length > 0;
   const activeTaskBelongsToCurrentRun = Boolean(activeProductTask?.task.latest_run_id && activeProductTask.task.latest_run_id === (chat?.run_id || trace?.id));
   const latestTask = chat?.product_task ? { task: chat.product_task, steps: [], deliverables: chat.artifacts ?? [] } : activeTaskBelongsToCurrentRun ? activeProductTask : null;
   const executionActions = useMemo(() => projectRunTraceToActions(trace), [trace]);
-  const showInlineActionFlow = shouldShowExecutionActionFlow(executionActions);
-  const showRunDetails = shouldShowInlineRunDetails(chat, trace, latestTask, executionActions);
+  const visibleTraceActions = useMemo(() => visibleExecutionActions(executionActions), [executionActions]);
+  const liveExecutionActions = activeExecutionActions.length > 0 ? activeExecutionActions : visibleTraceActions;
+  const executionRunStatus = activeExecutionStatus !== 'pending' ? activeExecutionStatus : normalizeRunExecutionStatus(trace?.status);
+  const executionDisplayMode = getExecutionDisplayMode({
+    actions: liveExecutionActions,
+    status: executionRunStatus,
+    hasArtifact: Boolean((chat?.artifacts?.length ?? 0) > 0),
+    hasProductTask: Boolean(latestTask || chat?.product_task),
+    isSeriousTask: Boolean(latestTask || chat?.ui?.interaction_class === 'serious_task' || trace?.metadata?.interaction_class === 'serious_task'),
+  });
+  const showInlineActionFlow = shouldShowExecutionActionFlow(liveExecutionActions) && executionDisplayMode !== 'task';
+  const showRunDetails = shouldShowInlineRunDetails(chat, trace, latestTask, liveExecutionActions);
   const [manualRightPanelCollapsed, setManualRightPanelCollapsed] = useState(true);
   const [executionTargetOpen, setExecutionTargetOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
@@ -2634,18 +2899,24 @@ function ChatHome({
           {hasThread ? (
             <>
               {displayMessages.map((item) => {
-                const shouldInsertActionFlow = item.role === 'assistant' && item.run_id && trace?.id === item.run_id && showInlineActionFlow;
+                const shouldInsertActionFlow = item.role === 'assistant' && showInlineActionFlow && (
+                  (item.run_id && trace?.id === item.run_id)
+                  || (streamingAssistantMessage?.id === item.id && liveExecutionActions.length > 0)
+                );
                 return (
                   <Fragment key={item.id}>
                     {shouldInsertActionFlow ? (
                       <ExecutionActionFlow
-                        key={`${trace.id}-inline-actions`}
-                        actions={executionActions}
+                        key={`${item.run_id || 'pending'}-inline-actions`}
+                        actions={liveExecutionActions}
+                        collapsed={Boolean((streamingAssistantMessage?.id === item.id && streamingAssistantMessage.complete) || (item.run_id && trace?.id === item.run_id && !isSubmitting))}
+                        runStatus={executionRunStatus}
+                        displayMode={executionDisplayMode}
                         mode="inline"
                         openTrace={() => setActiveTab('trace')}
                       />
                     ) : null}
-                    <article className={`message-row ${item.role === 'assistant' ? 'assistant-message' : 'user-message'}`}>
+                    <article className={`message-row ${item.role === 'assistant' ? 'assistant-message' : 'user-message'}${streamingAssistantMessage?.id === item.id && !streamingAssistantMessage.complete ? ' streaming-message' : ''}`}>
                       {item.role === 'assistant' ? <img className="message-avatar assistant" src={joiAvatar} alt="Joi" /> : <div className="message-avatar">你</div>}
                       <div className="message-bubble">
                         <p>{item.role === 'assistant' ? userFacingAssistantText(item.content) : item.content}</p>
@@ -2654,7 +2925,17 @@ function ChatHome({
                   </Fragment>
                 );
               })}
-              {isSubmitting && (
+              {isSubmitting && showInlineActionFlow && !streamingAssistantMessage && (
+                <ExecutionActionFlow
+                  actions={liveExecutionActions}
+                  collapsed={false}
+                  runStatus={executionRunStatus}
+                  displayMode={executionDisplayMode}
+                  mode="inline"
+                  openTrace={() => setActiveTab('trace')}
+                />
+              )}
+              {isSubmitting && !showInlineActionFlow && (
                 <article className="message-row assistant-message pending-message">
                   <img className="message-avatar assistant" src={joiAvatar} alt="Joi" />
                   <div className="message-bubble">
@@ -2662,7 +2943,7 @@ function ChatHome({
                   </div>
                 </article>
               )}
-              {latestTask && showRunDetails && !showInlineActionFlow && <TaskCard detail={latestTask} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />}
+              {latestTask && showRunDetails && <TaskCard detail={latestTask} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />}
             </>
           ) : (
             <>
@@ -2796,6 +3077,16 @@ function TaskCard({ detail, openArtifact, openTrace }: { detail: ProductTaskDeta
       </footer>
     </article>
   );
+}
+
+function dedupeConversationMessages(messages: ConversationMessage[]) {
+  const seen = new Set<string>();
+  return messages.filter((message) => {
+    const key = message.id || `${message.role}:${message.run_id || ''}:${message.content}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function CompanionInsightPanel({
@@ -3042,30 +3333,65 @@ function formatMemoryReason(reason?: string) {
 
 function ExecutionActionFlow({
   actions,
+  collapsed = false,
+  displayMode,
   mode = 'inline',
   openTrace,
+  runStatus = 'completed',
 }: {
   actions: ExecutionAction[];
+  collapsed?: boolean;
+  displayMode?: 'inline' | 'rail' | 'task';
   mode?: 'inline' | 'detail';
   openTrace?: () => void;
+  runStatus?: string;
 }) {
-  if (actions.length === 0) return null;
-  const content = (
-    <div className={`execution-action-flow execution-action-flow-${mode}`}>
-      <header className="execution-action-flow-header">
-        <div>
-          <strong>执行过程</strong>
-          <small>{actions.length} 个动作 · 默认折叠</small>
-        </div>
-        {mode === 'inline' && openTrace ? (
-          <button type="button" onClick={openTrace}>打开详情</button>
-        ) : null}
-      </header>
-      <div className="execution-action-list">
-        {actions.map((action) => (
-          <ExecutionActionCard key={action.id} action={action} />
-        ))}
+  const [manuallyExpanded, setManuallyExpanded] = useState(false);
+  const visibleActions = visibleExecutionActions(actions);
+  if (visibleActions.length === 0) return null;
+  const resolvedDisplayMode = mode === 'detail' ? 'rail' : displayMode ?? getExecutionDisplayMode({ actions: visibleActions, status: runStatus });
+  if (resolvedDisplayMode === 'task' && mode !== 'detail') return null;
+  if (resolvedDisplayMode === 'inline' && mode === 'inline') {
+    const action = visibleActions[0];
+    const content = (
+      <div className="execution-inline-wrap">
+        <ExecutionInlineStatus action={action} onExpand={() => setManuallyExpanded((value) => !value)} expanded={manuallyExpanded} />
+        {manuallyExpanded ? <ExecutionInlineDetails action={action} openTrace={openTrace} /> : null}
       </div>
+    );
+    return <article className="message-row execution-flow-row">{content}</article>;
+  }
+  const railCollapsed = mode === 'inline' && collapsed && !manuallyExpanded;
+  const summary = summarizeExecutionActions(actions);
+  const content = (
+    <div className={`execution-action-flow execution-action-flow-${mode}${railCollapsed ? ' is-collapsed' : ''}`}>
+      <ExecutionActionRail
+        actions={visibleActions}
+        collapsed={railCollapsed}
+        onExpand={() => setManuallyExpanded(true)}
+        runStatus={runStatus}
+      />
+      {!railCollapsed && mode === 'detail' ? (
+        <div className="execution-action-list">
+          {visibleActions.map((action, index) => (
+            <ExecutionActionCard
+              key={action.id}
+              action={action}
+              defaultOpen={action.status === 'running' || action.status === 'queued' || (index === visibleActions.length - 1 && mode === 'detail')}
+            />
+          ))}
+        </div>
+      ) : null}
+      {!railCollapsed && mode === 'inline' && visibleActions.some((action) => hasActionDetails(action)) ? (
+        <details className="execution-rail-details">
+          <summary>展开</summary>
+          <div className="execution-action-list">
+            {visibleActions.map((action) => (
+              <ExecutionInlineDetails key={action.id} action={action} openTrace={openTrace} />
+            ))}
+          </div>
+        </details>
+      ) : null}
     </div>
   );
   if (mode === 'detail') return content;
@@ -3076,9 +3402,88 @@ function ExecutionActionFlow({
   );
 }
 
-function ExecutionActionCard({ action }: { action: ExecutionAction }) {
+function ExecutionInlineStatus({ action, expanded, onExpand }: { action: ExecutionAction; expanded?: boolean; onExpand: () => void }) {
   return (
-    <details className={`execution-action-card action-${action.kind} status-${action.status}`}>
+    <div className="execution-inline-status">
+      <span className="status-dot done" />
+      <span>{action.completedLabel || action.summary || action.title}</span>
+      <button className="inline-link" type="button" aria-expanded={expanded} onClick={onExpand}>展开</button>
+    </div>
+  );
+}
+
+function ExecutionActionRail({
+  actions,
+  collapsed,
+  onExpand,
+  runStatus,
+}: {
+  actions: ExecutionAction[];
+  collapsed?: boolean;
+  onExpand: () => void;
+  runStatus: string;
+}) {
+  const running = runStatus === 'running' || actions.some((action) => action.status === 'running' || action.status === 'queued');
+  const failed = actions.some((action) => action.status === 'failed' || action.status === 'blocked' || action.status === 'limited');
+  if (collapsed && !running && !failed) {
+    return (
+      <header className="execution-action-flow-header compact">
+        <strong>{summarizeExecutionActions(actions)}</strong>
+        <button type="button" onClick={onExpand}>展开</button>
+      </header>
+    );
+  }
+  return (
+    <div className="execution-action-rail">
+      <header className="execution-action-rail-header">
+        <strong>{running ? 'Joi 正在处理' : summarizeExecutionActions(actions)}</strong>
+      </header>
+      <div className="execution-action-rail-list">
+        {actions.map((action) => (
+          <div key={action.id} className={`execution-action-row status-${action.status}`}>
+            <span className={`status-dot ${action.status === 'running' || action.status === 'queued' ? 'running' : action.status === 'failed' || action.status === 'blocked' ? 'failed' : 'done'}`} />
+            <span>
+              <strong>{actionLineTitle(action, running)}</strong>
+              {running || action.summary || action.limitations?.length ? <small>{actionRowSummary(action, running)}</small> : null}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ExecutionInlineDetails({ action, openTrace }: { action: ExecutionAction; openTrace?: () => void }) {
+  const sections = action.details.filter((detail) => detail.label !== 'COMMAND' || action.kind === 'command');
+  return (
+    <div className="execution-inline-details">
+      {sections.map((detail) => (
+        <ExecutionActionDetailBlock key={`${action.id}-${detail.label}`} detail={detail} />
+      ))}
+      {openTrace ? <button className="developer-diagnostics-link" type="button" onClick={openTrace}>开发者诊断</button> : null}
+    </div>
+  );
+}
+
+function ExecutionActionCard({ action, defaultOpen = false }: { action: ExecutionAction; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const [userTouched, setUserTouched] = useState(false);
+
+  useEffect(() => {
+    if (!userTouched) {
+      setOpen(action.status === 'running' || action.status === 'queued');
+    }
+  }, [action.status, userTouched]);
+
+  return (
+    <details
+      className={`execution-action-card action-${action.kind} status-${action.status}`}
+      open={open}
+      onToggle={(event) => {
+        setUserTouched(true);
+        setOpen(event.currentTarget.open);
+      }}
+    >
       <summary>
         <span className="execution-action-dot" />
         <span className="execution-action-copy">
@@ -3096,7 +3501,6 @@ function ExecutionActionCard({ action }: { action: ExecutionAction }) {
         )) : (
           <p className="empty">没有额外输出。</p>
         )}
-        <CollapsedData label="原始步骤" value={action.raw_steps} />
       </div>
     </details>
   );
@@ -3115,9 +3519,118 @@ function ExecutionActionDetailBlock({ detail }: { detail: ExecutionActionDetail 
   );
 }
 
+function hasActionDetails(action: ExecutionAction) {
+  return action.details.length > 0 || Boolean(action.limitations?.length);
+}
+
+function actionLineTitle(action: ExecutionAction, running: boolean) {
+  const suffix = action.sourceLabel ? ` ${action.sourceLabel}` : '';
+  if (running && (action.status === 'running' || action.status === 'queued')) {
+    if (action.kind === 'web') return `读取网页${suffix}`;
+    if (action.kind === 'workspace') return `搜索工作区${suffix}`;
+    if (action.kind === 'file') return `读取文件${suffix}`;
+  }
+  return `${action.title}${suffix}`;
+}
+
+function actionRowSummary(action: ExecutionAction, running: boolean) {
+  if (running && (action.status === 'running' || action.status === 'queued')) {
+    if (action.kind === 'web') return '正在提取正文...';
+    return action.summary || action.description || '正在执行...';
+  }
+  if (action.limitations?.length) return action.limitations.join('；');
+  return action.summary || action.description;
+}
+
+function upsertExecutionAction(actions: ExecutionAction[], event: ExecutionEvent, status: ExecutionActionStatus): ExecutionAction[] {
+  const sourceLabel = String(event.source_label || event.sourceLabel || sourceLabelFromExecutionEvent(event));
+  const title = String(event.title || defaultActionTitle(event.kind));
+  const kind = normalizeExecutionActionKind(event.kind);
+  const actionID = String(event.action_id || event.actionID || `${kind}-${title}-${sourceLabel || 'default'}`);
+  const next: ExecutionAction = {
+    id: actionID,
+    kind,
+    title,
+    description: String(event.summary || event.status || title),
+    summary: String(event.summary || ''),
+    sourceLabel,
+    status,
+    completedLabel: status === 'completed' ? completedLabelFromEvent(kind, sourceLabel, title) : undefined,
+    duration_ms: typeof event.duration_ms === 'number' ? event.duration_ms : event.durationMs,
+    durationMs: typeof event.duration_ms === 'number' ? event.duration_ms : event.durationMs,
+    details: event.details ?? [],
+    raw_steps: [],
+  };
+  const index = actions.findIndex((action) => (
+    action.id === actionID
+    || (action.kind === kind && action.title === title && (!sourceLabel || action.sourceLabel === sourceLabel))
+    || (action.kind === kind && action.status === 'running' && status === 'completed')
+  ));
+  if (index < 0) return [...actions, next];
+  const copy = [...actions];
+  copy[index] = {
+    ...copy[index],
+    ...next,
+    details: next.details.length > 0 ? next.details : copy[index].details,
+    completedLabel: next.completedLabel || copy[index].completedLabel,
+    sourceLabel: next.sourceLabel || copy[index].sourceLabel,
+    summary: next.summary || copy[index].summary,
+  };
+  return copy;
+}
+
+function normalizeExecutionActionKind(kind: unknown): ExecutionActionKind {
+  const value = String(kind || '').toLowerCase();
+  if (value === 'web' || value === 'workspace' || value === 'file' || value === 'command' || value === 'artifact' || value === 'memory' || value === 'evidence' || value === 'model' || value === 'proactive' || value === 'confirmation' || value === 'diagnostic') {
+    return value;
+  }
+  if (value === 'tool') return 'command';
+  return 'command';
+}
+
+function defaultActionTitle(kind: unknown) {
+  if (kind === 'web') return '读取网页';
+  if (kind === 'workspace') return '搜索工作区';
+  if (kind === 'file') return '读取文件';
+  if (kind === 'evidence') return '引用工具证据';
+  if (kind === 'model') return '模型回答';
+  return '执行动作';
+}
+
+function completedLabelFromEvent(kind: ExecutionActionKind, sourceLabel: string, title: string) {
+  if (kind === 'web') return `已读取网页${sourceLabel ? ` · ${sourceLabel}` : ''}`;
+  if (kind === 'file') return `已读取文件${sourceLabel ? ` · ${sourceLabel}` : ''}`;
+  if (kind === 'workspace') return `已搜索工作区${sourceLabel ? ` · ${sourceLabel}` : ''}`;
+  return title;
+}
+
+function sourceLabelFromExecutionEvent(event: ExecutionEvent) {
+  const sourceDetail = event.details?.find((detail) => detail.label === 'SOURCE')?.value;
+  if (typeof sourceDetail === 'string') return sourceLabelFromURL(sourceDetail) || sourceDetail;
+  return '';
+}
+
+function normalizeRunExecutionStatus(status?: string): ExecutionRunStatus {
+  if (status === 'succeeded' || status === 'success' || status === 'completed') return 'completed';
+  if (status === 'running') return 'running';
+  if (status === 'failed') return 'failed';
+  return 'pending';
+}
+
 function formatDuration(value: number) {
   if (value < 1000) return `${Math.round(value)} ms`;
   return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)} s`;
+}
+
+function splitStreamingChunks(value: string) {
+  const text = value.trim();
+  if (!text) return [];
+  const chunks = text.match(/[^。！？.!?\n]+[。！？.!?\n]?\s*/g);
+  return chunks?.filter(Boolean) ?? [text];
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
 
 function userFacingAssistantText(content: string) {
@@ -3133,7 +3646,7 @@ function userFacingAssistantText(content: string) {
 }
 
 function shouldShowExecutionActionFlow(actions: ExecutionAction[]) {
-  return actions.some((action) => action.kind === 'tool' || action.kind === 'artifact' || action.kind === 'memory' || action.title === '创建任务');
+  return visibleExecutionActions(actions).length > 0;
 }
 
 function shouldShowInlineRunDetails(chat: ChatResponse | null, trace: RunTrace | null, latestTask: ProductTaskDetail | null, executionActions: ExecutionAction[]): boolean {
@@ -3386,7 +3899,7 @@ function TraceStage({
 }
 
 function TracePanel({ trace, stepCount, firstModelCall }: { trace: RunTrace | null; stepCount: number; firstModelCall?: ModelCall }) {
-  const actions = projectRunTraceToActions(trace);
+  const actions = visibleExecutionActions(projectRunTraceToActions(trace));
   return (
     <section className="panel trace-panel">
       <h2>运行记录</h2>
@@ -3400,7 +3913,7 @@ function TracePanel({ trace, stepCount, firstModelCall }: { trace: RunTrace | nu
             <KV label="服务商" value={firstModelCall?.provider ?? '无'} />
             <KV label="令牌" value={firstModelCall ? `${firstModelCall.input_tokens}/${firstModelCall.output_tokens}` : '0/0'} />
           </dl>
-          <ExecutionActionFlow actions={actions} mode="detail" />
+          {actions.length > 0 ? <ExecutionActionFlow actions={actions} mode="detail" /> : <p className="empty">这次运行没有需要展示的执行动作。</p>}
         </>
       ) : (
         <p className="empty">发送一条消息后会生成运行记录。</p>
@@ -3411,13 +3924,13 @@ function TracePanel({ trace, stepCount, firstModelCall }: { trace: RunTrace | nu
 
 function TraceDetail({ trace, stepCount, firstModelCall }: { trace: RunTrace | null; stepCount: number; firstModelCall?: ModelCall }) {
   if (!trace) return <section className="panel wide"><p className="empty">暂无运行记录。</p></section>;
-  const actions = projectRunTraceToActions(trace);
+  const actions = visibleExecutionActions(projectRunTraceToActions(trace));
   return (
     <section className="panel wide">
       <h2>执行过程</h2>
       <dl className="metrics">
         <KV label="状态" value={formatStatus(trace.status)} />
-        <KV label="动作数" value={`${actions.length} 个`} />
+        <KV label="可见动作" value={`${actions.length} 个`} />
         <KV label="耗时" value={`${firstModelCall?.latency_ms ?? 0} ms`} />
       </dl>
       {actions.length > 0 ? (
@@ -4061,6 +4574,7 @@ function formatStatus(status: string) {
   const labels: Record<string, string> = {
     succeeded: '成功',
     success: '成功',
+    completed: '已完成',
     ok: '正常',
     preview: '预览',
     pending: '待处理',
@@ -4084,16 +4598,26 @@ function formatStepType(type: string) {
   const labels: Record<string, string> = {
     input_received: '收到输入',
     router_selected: '选择路由',
+    skill_selected: '选择 Skill',
+    skill_plan_generated: '生成 Skill 计划',
+    skill_rejected: '拒绝 Skill',
     prompt_assembled: '组装提示词',
     model_call_finished: '模型调用完成',
     agent_output_parsed: '解析代理输出',
     agent_call_finished: '代理运行完成',
     response_generated: '生成回复',
     capability_requested: '请求能力',
+    capability_semantic_checked: '语义校验',
+    capability_rejected: '拒绝能力',
     policy_checked: '策略检查',
+    workflow_compiled: '编译 Workflow',
     tool_compiled: '编译工具链',
     node_selected: '选择节点',
     tool_started: '工具开始',
+    tool_step_started: '工具步骤开始',
+    tool_step_completed: '工具步骤完成',
+    mcp_tool_call_started: 'MCP 调用开始',
+    mcp_tool_call_completed: 'MCP 调用完成',
     tool_finished: '工具完成',
     capability_blocked: '能力被阻止',
     policy_blocked: '策略阻止',

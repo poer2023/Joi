@@ -361,6 +361,37 @@ func finalAnswerForCapabilityResult(capability string, normalized map[string]any
 			abnormal = append(abnormal, "无")
 		}
 		return fmt.Sprintf("状态：%s。异常项：%s。关键服务：postgres、nats、orchestrator、console、worker-runtime 已检查。节点、队列、模型和成本摘要已归档到执行详情。", status, strings.Join(abnormal, ", "))
+	case "desktop_app_list":
+		total := intFromMap(normalized, "total", 0)
+		apps := mapSliceFromAny(normalized["apps"])
+		names := []string{}
+		for _, item := range apps {
+			if name := strings.TrimSpace(stringFromMap(item, "name", "")); name != "" {
+				names = append(names, name)
+			}
+		}
+		if len(names) == 0 {
+			return fmt.Sprintf("已读取本机应用列表，共发现 %d 个 app。", total)
+		}
+		lines := make([]string, 0, len(names)+1)
+		lines = append(lines, fmt.Sprintf("已读取本机应用列表，共发现 %d 个 app。完整列表：", total))
+		for i, name := range names {
+			lines = append(lines, fmt.Sprintf("%d. %s", i+1, name))
+		}
+		return strings.Join(lines, "\n")
+	case "desktop_app_inspect":
+		total := intFromMap(normalized, "total", 0)
+		matches := mapSliceFromAny(normalized["matches"])
+		if total == 0 || len(matches) == 0 {
+			return "未找到匹配的本机 app。"
+		}
+		first := matches[0]
+		return fmt.Sprintf("已检查本机 app：%s。Bundle ID：%s。版本：%s。路径：%s。", stringFromMap(first, "name", "unknown"), stringFromMap(first, "bundle_id", "unknown"), stringFromMap(first, "version", "unknown"), stringFromMap(first, "path", "unknown"))
+	case "computer_observe":
+		title := stringFromMap(normalized, "window_title", "Joi")
+		bundleID := stringFromMap(normalized, "bundle_id", "com.hao.joi.desktop")
+		summary := stringFromMap(normalized, "visible_text_summary", "已完成只读观察。")
+		return fmt.Sprintf("已只读观察当前 Joi 窗口：%s（%s）。%s", title, bundleID, summary)
 	case "workspace_search":
 		query := stringFromMap(normalized, "query", "")
 		summary := stringFromMap(normalized, "summary", "")

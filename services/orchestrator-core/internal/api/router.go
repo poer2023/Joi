@@ -39,6 +39,16 @@ func NewRouter(core *appcore.AppCore, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /api/memories/{id}/feedback", handlers.RecordMemoryFeedback)
 	mux.HandleFunc("PATCH /api/memories/{id}", handlers.UpdateMemoryGovernance)
 	mux.HandleFunc("GET /api/capabilities", handlers.ListCapabilities)
+	mux.HandleFunc("GET /api/mcp/servers", handlers.ListMCPServers)
+	mux.HandleFunc("POST /api/mcp/servers", handlers.SaveMCPServer)
+	mux.HandleFunc("PATCH /api/mcp/servers/{id}", handlers.SaveMCPServer)
+	mux.HandleFunc("POST /api/mcp/servers/{id}/sync", handlers.SyncMCPServer)
+	mux.HandleFunc("GET /api/mcp/servers/{id}/inventory", handlers.ListMCPInventory)
+	mux.HandleFunc("POST /api/mcp/servers/{id}/tools/{tool_name}/wrap", handlers.WrapMCPTool)
+	mux.HandleFunc("GET /api/skills", handlers.ListSkills)
+	mux.HandleFunc("POST /api/skills", handlers.SaveSkill)
+	mux.HandleFunc("PATCH /api/skills/{id}", handlers.SaveSkill)
+	mux.HandleFunc("POST /api/skills/{id}/test", handlers.TestSkill)
 	mux.HandleFunc("GET /api/tool-workflows", handlers.ListToolWorkflows)
 	mux.HandleFunc("GET /api/tool-runs", handlers.ListToolRuns)
 	mux.HandleFunc("POST /api/capabilities/{id}/test", handlers.TestCapability)
@@ -84,6 +94,8 @@ func adminProtectedPath(path string) bool {
 		"/api/nodes",
 		"/api/tool-workflows",
 		"/api/tool-runs",
+		"/api/mcp",
+		"/api/skills",
 		"/api/model-calls",
 		"/api/model-usage-summary",
 		"/api/provider-cache-stats",

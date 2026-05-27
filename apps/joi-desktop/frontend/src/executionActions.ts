@@ -2,10 +2,25 @@ import type { RunTrace } from './api/desktop';
 
 type RunStep = NonNullable<RunTrace['steps']>[number];
 
-export type ExecutionActionKind = 'prepare' | 'model' | 'tool' | 'artifact' | 'memory' | 'finalize' | 'diagnostic';
+export type ExecutionActionKind =
+  | 'web'
+  | 'workspace'
+  | 'file'
+  | 'command'
+  | 'artifact'
+  | 'memory'
+  | 'evidence'
+  | 'proactive'
+  | 'confirmation'
+  | 'diagnostic'
+  | 'prepare'
+  | 'model'
+  | 'finalize';
+
+export type ExecutionActionStatus = 'pending' | 'running' | 'completed' | 'failed' | 'limited' | 'blocked' | 'queued';
 
 export type ExecutionActionDetail = {
-  label: 'COMMAND' | 'INPUT' | 'SOURCE' | 'RESULT' | 'ERROR';
+  label: 'COMMAND' | 'INPUT' | 'SOURCE' | 'RESULT' | 'LIMITATIONS' | 'ERROR';
   value: unknown;
 };
 
@@ -14,19 +29,59 @@ export type ExecutionAction = {
   kind: ExecutionActionKind;
   title: string;
   description: string;
-  status: string;
+  status: ExecutionActionStatus;
+  summary?: string;
+  sourceLabel?: string;
+  inputPreview?: string;
+  outputPreview?: string;
+  limitations?: string[];
+  completedLabel?: string;
+  visible?: boolean;
   started_at?: string;
   finished_at?: string;
   duration_ms?: number;
+  durationMs?: number;
   details: ExecutionActionDetail[];
   raw_steps: RunStep[];
 };
+
+export type ExecutionRunViewState = {
+  actions: ExecutionAction[];
+  status: string;
+  hasArtifact?: boolean;
+  hasProductTask?: boolean;
+  isSeriousTask?: boolean;
+};
+
+export type ExecutionDisplayMode = 'inline' | 'rail' | 'task';
+
+export const VISIBLE_KINDS = [
+  'web',
+  'workspace',
+  'file',
+  'command',
+  'artifact',
+  'confirmation',
+  'memory',
+  'evidence',
+  'model',
+  'proactive',
+] as const;
+
+export const HIDDEN_KINDS = [
+  'prepare',
+  'finalize',
+  'diagnostic',
+] as const;
 
 const prepareStepTypes = new Set([
   'task_classified',
   'input_received',
   'router_selected',
   'active_context_resolved',
+  'conversation_context_resolved',
+  'skill_selected',
+  'skill_plan_generated',
   'prompt_assembled',
   'model_call_finished',
   'agent_output_parsed',
@@ -34,12 +89,20 @@ const prepareStepTypes = new Set([
 
 const toolStepTypes = new Set([
   'capability_requested',
+  'capability_semantic_checked',
+  'capability_rejected',
   'capability_blocked',
+  'skill_rejected',
   'policy_checked',
   'policy_blocked',
+  'workflow_compiled',
   'tool_compiled',
   'node_selected',
   'tool_started',
+  'tool_step_started',
+  'tool_step_completed',
+  'mcp_tool_call_started',
+  'mcp_tool_call_completed',
   'task_dispatched',
   'tool_finished',
   'worker_finished',
@@ -66,6 +129,7 @@ const hiddenDetailKeys = new Set([
   'memory_context_pack_id',
   'memory_profile_version',
   'model_id',
+  'node_id',
   'prefix_hash',
   'privacy_level',
   'prompt_assembly_id',
@@ -75,8 +139,35 @@ const hiddenDetailKeys = new Set([
   'running_tasks',
   'scheduler',
   'task_attempts',
+  'task_id',
+  'tool_run_id',
   'tool_schema_version',
+  'workflow_name',
+  'worker_task_id',
 ]);
+
+const visibleActionKinds = new Set<ExecutionActionKind>(VISIBLE_KINDS);
+const hiddenActionKinds = new Set<ExecutionActionKind>(HIDDEN_KINDS);
+
+export function getExecutionDisplayMode(run: ExecutionRunViewState): ExecutionDisplayMode {
+  const visibleActions = visibleExecutionActions(run.actions);
+
+  if (
+    visibleActions.length === 1
+    && !run.hasArtifact
+    && !run.isSeriousTask
+    && normalizeRunStatus(run.status) === 'completed'
+    && ['web', 'file', 'workspace'].includes(visibleActions[0].kind)
+  ) {
+    return 'inline';
+  }
+
+  if (run.isSeriousTask || run.hasProductTask || run.hasArtifact) {
+    return 'task';
+  }
+
+  return 'rail';
+}
 
 export function projectRunTraceToActions(trace: RunTrace | null): ExecutionAction[] {
   const steps = trace?.steps ?? [];
@@ -93,6 +184,7 @@ export function projectRunTraceToActions(trace: RunTrace | null): ExecutionActio
       kind: 'prepare',
       title: '理解任务',
       description: '已判断任务类型并选择执行方式',
+      visible: false,
       steps: prepareSteps,
       details: buildDetails([
         ['INPUT', sanitizeForDisplay(firstKnown(prepareSteps, ['message', 'requested_input_mode']))],
@@ -106,7 +198,7 @@ export function projectRunTraceToActions(trace: RunTrace | null): ExecutionActio
     markUsed([step], usedStepIDs);
     actions.push(makeAction({
       id: `${step.id}-product-task`,
-      kind: 'prepare',
+      kind: 'artifact',
       title: '创建任务',
       description: '已建立可交付任务',
       steps: [step],
@@ -127,6 +219,12 @@ export function projectRunTraceToActions(trace: RunTrace | null): ExecutionActio
     markUsed(toolSteps, usedStepIDs);
     actions.push(projectToolSteps(trace?.id ?? 'run', toolSteps));
     index += Math.max(0, toolSteps.length - 1);
+  }
+
+  const evidenceSteps = collectUnusedSteps(steps, usedStepIDs, (step) => step.step_type === 'followup_grounded' || step.step_type === 'recent_tool_evidence_resolved');
+  if (evidenceSteps.length > 0) {
+    markUsed(evidenceSteps, usedStepIDs);
+    actions.push(projectEvidenceSteps(trace?.id ?? 'run', evidenceSteps));
   }
 
   const artifactSteps = collectUnusedSteps(steps, usedStepIDs, (step) => step.step_type === 'artifact_created');
@@ -150,7 +248,7 @@ export function projectRunTraceToActions(trace: RunTrace | null): ExecutionActio
     markUsed([step], usedStepIDs);
     actions.push(makeAction({
       id: `${step.id}-proactive`,
-      kind: 'memory',
+      kind: 'proactive',
       title: '生成提醒候选',
       description: '已生成后续跟进候选',
       steps: [step],
@@ -184,6 +282,7 @@ export function projectRunTraceToActions(trace: RunTrace | null): ExecutionActio
       kind: 'finalize',
       title: '生成回复',
       description: '已生成最终回复',
+      visible: false,
       steps: finalizeSteps,
       details: buildDetails([
         ['RESULT', sanitizeForDisplay(lastOutput(finalizeSteps))],
@@ -191,40 +290,190 @@ export function projectRunTraceToActions(trace: RunTrace | null): ExecutionActio
     }));
   }
 
+  if (visibleExecutionActions(actions).length === 0) {
+    const modelOnlySteps = steps.filter((step) => step.step_type === 'model_call_finished' || step.step_type === 'response_generated' || step.step_type === 'agent_call_finished');
+    if (modelOnlySteps.length > 0) {
+      actions.push(makeAction({
+        id: `${trace?.id ?? 'run'}-model-only`,
+        kind: 'model',
+        title: '模型回答',
+        description: '本轮未执行工具',
+        summary: '本轮未执行工具',
+        steps: modelOnlySteps,
+        details: buildDetails([
+          ['RESULT', sanitizeForDisplay(lastOutput(modelOnlySteps))],
+        ]),
+      }));
+    }
+  }
+
   return actions.sort((left, right) => stepOrder(left.raw_steps[0], steps) - stepOrder(right.raw_steps[0], steps));
+}
+
+export function visibleExecutionActions(actions: ExecutionAction[]): ExecutionAction[] {
+  return actions.filter((action) => (
+    action.visible !== false
+    && !hiddenActionKinds.has(action.kind)
+    && (
+      visibleActionKinds.has(action.kind)
+      || action.status === 'failed'
+      || action.status === 'blocked'
+      || action.status === 'limited'
+    )
+  ));
+}
+
+export function summarizeExecutionActions(actions: ExecutionAction[]) {
+  const visible = visibleExecutionActions(actions);
+  const completed = visible.filter((action) => action.status === 'completed').length;
+  const failed = visible.filter((action) => action.status === 'failed' || action.status === 'blocked').length;
+  const webReads = visible.filter((action) => action.kind === 'web').length;
+  const artifacts = visible.filter((action) => action.kind === 'artifact').length;
+  const memories = visible.filter((action) => action.kind === 'memory').length;
+  const duration = visible.reduce((sum, action) => sum + actionDurationMs(action), 0);
+  const parts = [`已完成 ${completed || visible.length} 步`];
+  if (visible.length <= 3) {
+    parts.push(...visible.map((action) => action.title));
+  } else if (webReads > 0) {
+    parts.push(`读取 ${webReads} 个网页`);
+  }
+  if (artifacts > 0) parts.push(`生成 ${artifacts} 个交付物`);
+  if (memories > 0) parts.push(`处理 ${memories} 个记忆动作`);
+  if (failed > 0) parts.push(`${failed} 个需要查看`);
+  if (duration > 0) parts.push(formatActionDuration(duration));
+  return parts.join(' · ');
+}
+
+export function createOptimisticExecutionActions(prompt: string): ExecutionAction[] {
+  const text = prompt.trim();
+  if (!shouldCreateOptimisticActions(text)) return [];
+  const now = new Date().toISOString();
+  const url = firstURL(text);
+  if (url) {
+    return [{
+      id: `optimistic-web-${now}`,
+      kind: 'web',
+      title: '读取网页',
+      description: `正在读取 ${sourceLabelFromURL(url) || '网页'}...`,
+      summary: '正在提取正文...',
+      sourceLabel: sourceLabelFromURL(url),
+      status: 'running',
+      started_at: now,
+      details: [
+        { label: 'INPUT', value: { url } },
+        { label: 'SOURCE', value: url },
+      ],
+      raw_steps: [],
+    }];
+  }
+  if (/记住|写入记忆|memory/i.test(text)) {
+    return [{
+      id: `optimistic-memory-${now}`,
+      kind: 'memory',
+      title: '写入记忆候选',
+      description: '正在整理可确认的记忆...',
+      status: 'running',
+      started_at: now,
+      details: [{ label: 'INPUT', value: text }],
+      raw_steps: [],
+    }];
+  }
+  if (/认真执行|交付物|计划|方案|实现|开发/i.test(text)) {
+    return [{
+      id: `optimistic-task-${now}`,
+      kind: 'command',
+      title: '执行任务',
+      description: '正在交给执行后台处理...',
+      status: 'running',
+      started_at: now,
+      details: [{ label: 'INPUT', value: text }],
+      raw_steps: [],
+    }];
+  }
+  return [];
 }
 
 function projectToolSteps(runID: string, steps: RunStep[]): ExecutionAction {
   const capabilityStep = steps.find((step) => step.step_type === 'capability_requested') ?? steps[0];
   const capability = capabilityFromStep(capabilityStep);
-  const compiled = steps.find((step) => step.step_type === 'tool_compiled');
-  const selected = steps.find((step) => step.step_type === 'node_selected');
-  const dispatched = steps.find((step) => step.step_type === 'task_dispatched');
+  const compiled = steps.find((step) => step.step_type === 'tool_compiled' || step.step_type === 'workflow_compiled');
   const finished = [...steps].reverse().find((step) => ['tool_finished', 'worker_finished', 'worker_failed', 'capability_blocked', 'policy_blocked'].includes(step.step_type));
   const workflow = objectFromUnknown(compiled?.output?.workflow);
   const toolName = String(workflow.workflow_name || workflow.name || workflow.tool_name || capability || '');
   const title = titleForCapability(capability, toolName);
-  const node = String(selected?.output?.node_id || dispatched?.output?.node_id || finished?.output?.node_id || '');
-  const statusDetail = node ? `执行节点：${node}` : '已执行工具动作';
+  const kind = kindForCapability(capability, toolName, title);
+  const status = statusForSteps(steps);
+  const statusDetail = descriptionForToolAction(title, status);
   const resultOutput = sanitizeForDisplay(finished?.output ?? lastOutput(steps));
   const source = extractSource(steps);
+  const sourceLabel = extractSourceLabel(source);
   const command = extractCommand(steps);
   const error = extractError(steps);
+  const limitations = limitationsFromValue(extractLimitations(steps));
 
   return makeAction({
     id: `${runID}-tool-${capabilityStep?.id ?? steps[0]?.id ?? 'unknown'}`,
-    kind: 'tool',
+    kind,
     title,
     description: statusDetail,
+    summary: statusDetail,
+    sourceLabel,
+    completedLabel: completedLabelForAction(kind, sourceLabel, title),
+    limitations,
     steps,
     details: buildDetails([
       ['COMMAND', command],
       ['INPUT', sanitizeForDisplay(extractInput(capabilityStep, steps))],
       ['SOURCE', source],
       ['RESULT', resultOutput],
+      ['LIMITATIONS', extractLimitations(steps)],
       ['ERROR', error],
     ]),
   });
+}
+
+function projectEvidenceSteps(runID: string, steps: RunStep[]): ExecutionAction {
+  const grounded = steps.find((step) => step.step_type === 'followup_grounded');
+  const evidence = grounded ?? steps[steps.length - 1];
+  const output = objectFromUnknown(evidence?.output);
+  const sourceRunID = String(output.source_run_id || '');
+  const toolRunID = String(output.tool_run_id || firstKnown(steps, ['tool_run_id']) || '');
+  const capability = String(output.capability_id || firstKnown(steps, ['capability_id']) || 'tool evidence');
+  const description = grounded ? '本轮引用了上一轮工具证据' : '本轮注入了最近工具证据';
+  return makeAction({
+    id: `${runID}-evidence-${evidence?.id ?? 'recent'}`,
+    kind: 'evidence',
+    title: '引用工具证据',
+    description,
+    summary: description,
+    completedLabel: description,
+    steps,
+    details: buildDetails([
+      ['SOURCE', sanitizeForDisplay(`source_run_id=${sourceRunID} tool_run_id=${toolRunID} capability_id=${capability}`)],
+      ['RESULT', sanitizeForDisplay(output)],
+    ]),
+  });
+}
+
+function descriptionForToolAction(title: string, status: ExecutionActionStatus) {
+  if (status === 'running' || status === 'queued') {
+    if (title === '读取网页') return '正在读取网页...';
+    if (title === '搜索工作区') return '正在搜索工作区...';
+    if (title === '读取文件') return '正在读取文件...';
+    if (title === '列出本机 App') return '正在列出本机 App...';
+    if (title === '检查本机 App') return '正在检查本机 App...';
+    if (title === '运行命令') return '正在运行命令...';
+    return '正在执行...';
+  }
+  if (status === 'failed') return '执行失败，展开可查看原因';
+  if (status === 'blocked' || status === 'limited') return '需要确认或权限不足';
+  if (title === '读取网页') return '本轮执行了工具：已读取网页并提取正文';
+  if (title === '搜索工作区') return '本轮执行了工具：已搜索工作区';
+  if (title === '读取文件') return '本轮执行了工具：已读取文件';
+  if (title === '列出本机 App') return '本轮执行了工具：已列出本机 App';
+  if (title === '检查本机 App') return '本轮执行了工具：已检查本机 App';
+  if (title === '运行命令') return '本轮执行了工具：已运行命令';
+  return '本轮执行了工具：已完成工具动作';
 }
 
 function collectToolWindow(steps: RunStep[], startIndex: number, usedStepIDs: Set<string>) {
@@ -247,32 +496,48 @@ function makeAction(input: {
   kind: ExecutionActionKind;
   title: string;
   description: string;
+  summary?: string;
+  sourceLabel?: string;
+  inputPreview?: string;
+  outputPreview?: string;
+  limitations?: string[];
+  completedLabel?: string;
+  visible?: boolean;
   steps: RunStep[];
   details: ExecutionActionDetail[];
 }): ExecutionAction {
   const first = input.steps[0];
   const last = input.steps[input.steps.length - 1];
+  const durationMs = totalDuration(input.steps);
   return {
     id: input.id,
     kind: input.kind,
     title: input.title,
     description: input.description,
+    summary: input.summary ?? input.description,
+    sourceLabel: input.sourceLabel,
+    inputPreview: input.inputPreview,
+    outputPreview: input.outputPreview,
+    limitations: input.limitations,
+    completedLabel: input.completedLabel,
+    visible: input.visible ?? !hiddenActionKinds.has(input.kind),
     status: statusForSteps(input.steps),
     started_at: first?.started_at || first?.created_at,
     finished_at: last?.finished_at,
-    duration_ms: totalDuration(input.steps),
+    duration_ms: durationMs,
+    durationMs,
     details: input.details,
     raw_steps: input.steps,
   };
 }
 
-function statusForSteps(steps: RunStep[]) {
+function statusForSteps(steps: RunStep[]): ExecutionActionStatus {
   if (steps.some((step) => step.step_type.includes('blocked') || step.status === 'blocked')) return 'blocked';
   if (steps.some((step) => step.step_type.includes('failed') || step.status === 'failed' || step.error)) return 'failed';
   if (steps.some((step) => step.status === 'running')) return 'running';
   if (steps.some((step) => step.step_type === 'task_dispatched')) return 'queued';
-  if (steps.every((step) => step.status === 'succeeded' || step.status === 'success' || step.status === 'completed')) return 'succeeded';
-  return steps[steps.length - 1]?.status || 'pending';
+  if (steps.every((step) => step.status === 'succeeded' || step.status === 'success' || step.status === 'completed')) return 'completed';
+  return normalizeActionStatus(steps[steps.length - 1]?.status);
 }
 
 function totalDuration(steps: RunStep[]) {
@@ -305,12 +570,31 @@ function capabilityFromStep(step?: RunStep) {
 function titleForCapability(capability: string, workflow: string) {
   const key = `${capability} ${workflow}`.toLowerCase();
   if (key.includes('web') || key.includes('research') || key.includes('fetch') || key.includes('crawl')) return '读取网页';
+  if (key.includes('desktop_app_list') || key.includes('desktop_list_app')) return '列出本机 App';
+  if (key.includes('desktop_app_inspect') || key.includes('desktop_inspect_app')) return '检查本机 App';
   if (key.includes('workspace_search') || key.includes('search')) return '搜索工作区';
   if (key.includes('file') || key.includes('read')) return '读取文件';
   if (key.includes('shell') || key.includes('bash') || key.includes('command')) return '运行命令';
   if (key.includes('memory')) return '处理记忆';
   if (capability && capability !== 'unknown') return formatCapabilityTitle(capability);
   return '执行工具';
+}
+
+function kindForCapability(capability: string, workflow: string, title: string): ExecutionActionKind {
+  const key = `${capability} ${workflow} ${title}`.toLowerCase();
+  if (key.includes('web') || key.includes('research') || key.includes('fetch') || key.includes('crawl')) return 'web';
+  if (key.includes('workspace') || key.includes('search')) return 'workspace';
+  if (key.includes('file') || key.includes('read')) return 'file';
+  if (key.includes('shell') || key.includes('bash') || key.includes('command')) return 'command';
+  if (key.includes('memory')) return 'memory';
+  return 'command';
+}
+
+function completedLabelForAction(kind: ExecutionActionKind, sourceLabel: string | undefined, title: string) {
+  if (kind === 'web') return `已读取网页${sourceLabel ? ` · ${sourceLabel}` : ''}`;
+  if (kind === 'file') return `已读取文件${sourceLabel ? ` · ${sourceLabel}` : ''}`;
+  if (kind === 'workspace') return `已搜索工作区${sourceLabel ? ` · ${sourceLabel}` : ''}`;
+  return title;
 }
 
 function formatCapabilityTitle(value: string) {
@@ -332,6 +616,11 @@ function extractSource(steps: RunStep[]) {
   return sanitizeForDisplay(found);
 }
 
+function extractSourceLabel(source: unknown) {
+  if (typeof source !== 'string') return undefined;
+  return sourceLabelFromURL(source) || fileLabelFromPath(source) || truncatePlainLabel(source, 36);
+}
+
 function extractCommand(steps: RunStep[]) {
   const value = findNestedValue(steps, ['command', 'cmd', 'shell']);
   return typeof value === 'string' ? value : undefined;
@@ -342,6 +631,59 @@ function extractError(steps: RunStep[]) {
   if (stepWithError?.error) return sanitizeForDisplay(stepWithError.error);
   const blocked = steps.find((step) => step.step_type.includes('blocked') || step.status === 'blocked' || step.status === 'failed');
   return sanitizeForDisplay(blocked?.output);
+}
+
+function extractLimitations(steps: RunStep[]) {
+  const value = findNestedValue(steps, ['limitations', 'warning', 'warnings', 'truncated', 'readable_text_truncated']);
+  return sanitizeForDisplay(value);
+}
+
+function limitationsFromValue(value: unknown): string[] | undefined {
+  if (!hasDisplayValue(value)) return undefined;
+  if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean);
+  if (typeof value === 'boolean') return value ? ['内容可能被截断'] : undefined;
+  if (typeof value === 'string') return [value];
+  return [formatPreview(value)];
+}
+
+function shouldCreateOptimisticActions(text: string) {
+  return Boolean(firstURL(text)) || /@research|认真执行|交付物|计划|方案|实现|开发|记住|写入记忆|memory/i.test(text);
+}
+
+function firstURL(text: string) {
+  const match = text.match(/https?:\/\/[^\s"'<>]+/i);
+  return match?.[0] ?? '';
+}
+
+export function sourceLabelFromURL(value: string) {
+  try {
+    return new URL(value).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function formatActionDuration(value: number) {
+  if (value < 1000) return `${Math.round(value)}ms`;
+  return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}s`;
+}
+
+export function actionDurationMs(action: ExecutionAction) {
+  return action.durationMs ?? action.duration_ms ?? 0;
+}
+
+function normalizeActionStatus(status?: string): ExecutionActionStatus {
+  if (status === 'succeeded' || status === 'success') return 'completed';
+  if (status === 'completed' || status === 'running' || status === 'pending' || status === 'failed' || status === 'blocked' || status === 'queued' || status === 'limited') {
+    return status;
+  }
+  return 'pending';
+}
+
+function normalizeRunStatus(status?: string) {
+  if (status === 'succeeded' || status === 'success') return 'completed';
+  if (status === 'completed' || status === 'running' || status === 'failed') return status;
+  return status || 'pending';
 }
 
 function findNestedValue(value: unknown, keys: string[]): unknown {
@@ -404,6 +746,28 @@ function sanitizeForDisplay(value: unknown): unknown {
     if (hasDisplayValue(next)) result[key] = next;
   }
   return Object.keys(result).length ? result : undefined;
+}
+
+function truncatePlainLabel(value: string, maxLength: number) {
+  const text = value.trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 1)}…`;
+}
+
+function fileLabelFromPath(value: string) {
+  const text = value.trim();
+  if (!text.includes('/') && !text.includes('\\')) return '';
+  const parts = text.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || '';
+}
+
+function formatPreview(value: unknown) {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function objectFromUnknown(value: unknown): Record<string, unknown> {

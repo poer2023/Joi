@@ -91,6 +91,71 @@ CREATE TABLE IF NOT EXISTS tool_workflows (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS mcp_servers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  transport TEXT NOT NULL DEFAULT 'stdio',
+  command TEXT NOT NULL DEFAULT '',
+  args TEXT NOT NULL DEFAULT '[]',
+  env_secret_refs TEXT NOT NULL DEFAULT '{}',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'inactive',
+  trust TEXT NOT NULL DEFAULT 'untrusted_until_wrapped',
+  last_sync_at TEXT,
+  last_sync_error TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS mcp_inventory_items (
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  schema TEXT NOT NULL DEFAULT '{}',
+  uri TEXT NOT NULL DEFAULT '',
+  mime_type TEXT NOT NULL DEFAULT '',
+  arguments TEXT NOT NULL DEFAULT '[]',
+  wrapped_capability_id TEXT REFERENCES capabilities(id),
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(server_id, kind, name)
+);
+
+CREATE TABLE IF NOT EXISTS skill_definitions (
+  id TEXT PRIMARY KEY,
+  version TEXT NOT NULL DEFAULT 'v1',
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  trigger_phrases TEXT NOT NULL DEFAULT '[]',
+  required_capabilities TEXT NOT NULL DEFAULT '[]',
+  forbidden_capabilities TEXT NOT NULL DEFAULT '[]',
+  prompt TEXT NOT NULL DEFAULT '',
+  output_contract TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS skill_runs (
+  id TEXT PRIMARY KEY,
+  run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+  skill_id TEXT REFERENCES skill_definitions(id),
+  status TEXT NOT NULL DEFAULT 'pending',
+  input TEXT NOT NULL DEFAULT '{}',
+  output_plan TEXT NOT NULL DEFAULT '{}',
+  capability_requests TEXT NOT NULL DEFAULT '[]',
+  rejection_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   channel TEXT NOT NULL,
@@ -606,6 +671,12 @@ CREATE INDEX IF NOT EXISTS idx_task_attempts_task_id ON task_attempts(task_id, a
 CREATE INDEX IF NOT EXISTS idx_worker_gateway_audit_node ON worker_gateway_audit_logs(node_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_run_id ON tool_runs(run_id);
 CREATE INDEX IF NOT EXISTS idx_tool_runs_node_id ON tool_runs(node_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_status ON mcp_servers(status, enabled);
+CREATE INDEX IF NOT EXISTS idx_mcp_inventory_server ON mcp_inventory_items(server_id, kind, name);
+CREATE INDEX IF NOT EXISTS idx_mcp_inventory_wrapped ON mcp_inventory_items(wrapped_capability_id);
+CREATE INDEX IF NOT EXISTS idx_skill_definitions_enabled ON skill_definitions(enabled, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_runs_run_id ON skill_runs(run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_runs_skill_id ON skill_runs(skill_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_product_tasks_status ON product_tasks(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_product_tasks_conversation ON product_tasks(created_from_conversation_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_product_tasks_latest_run ON product_tasks(latest_run_id);

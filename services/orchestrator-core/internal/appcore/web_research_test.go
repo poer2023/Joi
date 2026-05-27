@@ -210,10 +210,16 @@ func TestSQLiteWebResearchWithURLRunsWithoutProductTask(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	var streamed []string
 	result, err := core.SendChat(ctx, ChatRequest{
 		Channel: "test",
 		UserID:  "tester",
 		Message: "请读取 " + server.URL + " 并总结",
+		EventSink: func(eventName string, payload map[string]any) {
+			if eventName == "assistant.delta" {
+				streamed = append(streamed, stringValue(payload["text"]))
+			}
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -221,8 +227,16 @@ func TestSQLiteWebResearchWithURLRunsWithoutProductTask(t *testing.T) {
 	if result.ProductTask != nil || len(result.Artifacts) != 0 {
 		t.Fatalf("URL summary should run capability without product task/artifact by default: task=%+v artifacts=%d", result.ProductTask, len(result.Artifacts))
 	}
-	if !strings.Contains(result.Response, "Joi public page summary fixture") {
-		t.Fatalf("URL response should include extracted page content, got: %s", result.Response)
+	if len(streamed) < 2 || strings.Join(streamed, "") != result.Response {
+		t.Fatalf("URL summary should stream final response deltas before completion: chunks=%d joined=%q response=%q", len(streamed), strings.Join(streamed, ""), result.Response)
+	}
+	for _, heading := range []string{"一句话总结：", "主要内容：", "值得关注：", "来源："} {
+		if !strings.Contains(result.Response, heading) {
+			t.Fatalf("URL response should be structured summary and include %q, got: %s", heading, result.Response)
+		}
+	}
+	if strings.Contains(result.Response, "正文提要") {
+		t.Fatalf("URL response should not expose raw excerpt framing, got: %s", result.Response)
 	}
 	for _, leaked := range []string{"fetch_status", "task_attempts", "tool_runs", "Run Trace"} {
 		if strings.Contains(result.Response, leaked) {
@@ -239,9 +253,69 @@ func TestSQLiteWebResearchWithURLRunsWithoutProductTask(t *testing.T) {
 	if len(trace.ModelCalls) != 0 {
 		t.Fatalf("deterministic URL research should not record model calls, got: %+v", trace.ModelCalls)
 	}
-	for _, stepType := range []string{"capability_requested", "tool_started", "tool_finished"} {
+	for _, stepType := range []string{"capability_requested", "tool_started", "tool_finished", "web_summary_written"} {
 		if !hasSQLiteStep(trace.Steps, stepType) {
 			t.Fatalf("URL summary trace missing %s: %+v", stepType, trace.Steps)
 		}
+	}
+}
+
+func TestSQLiteWebResearchFollowupUsesPreviousURL(t *testing.T) {
+	ctx := context.Background()
+	core := newTestAppCore(t, ctx)
+	defer core.Shutdown(ctx)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<html><head><title>Followup Page</title></head><body><article><h1>Followup Page</h1><p>Joi followup URL reuse fixture explains app summaries and report reuse.</p></article></body></html>`))
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := core.SaveWorkspaceSettings(ctx, WorkspaceSettingsRequest{
+		AllowedRoots:                 []string{root},
+		DefaultRoot:                  root,
+		BrowserAllowedHosts:          []string{parsed.Host},
+		WebResearchAllowPrivateHosts: true,
+		FileAnalyzeMaxBytes:          1024,
+		WorkspaceSearchMaxResults:    10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := core.SendChat(ctx, ChatRequest{
+		Channel: "test",
+		UserID:  "tester",
+		Message: "帮我总结这个网站内容 " + server.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	followup, err := core.SendChat(ctx, ChatRequest{
+		ConversationID: first.ConversationID,
+		Channel:        "test",
+		UserID:         "tester",
+		Message:        "帮我把这个网页总结整理成一份 Markdown 报告",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(followup.Response, "请把网页链接发给我") || strings.Contains(followup.Response, "网页链接") {
+		t.Fatalf("follow-up should reuse previous URL instead of asking again: %s", followup.Response)
+	}
+	if !strings.Contains(followup.Response, "一句话总结：") || !strings.Contains(followup.Response, server.URL) {
+		t.Fatalf("follow-up should summarize previous URL with source, got: %s", followup.Response)
+	}
+	if followup.UI == nil || !followup.UI.InlineExecution {
+		t.Fatalf("follow-up URL reuse should still be inline execution: %+v", followup.UI)
+	}
+	trace, err := core.GetRunTrace(ctx, followup.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasSQLiteCapability(trace.Steps, "web_research") || !hasSQLiteStep(trace.Steps, "tool_finished") {
+		t.Fatalf("follow-up URL reuse should execute web_research: %+v", trace.Steps)
 	}
 }

@@ -161,6 +161,72 @@ export type CapabilityRecord = {
   metadata?: Record<string, unknown>;
 };
 
+export type MCPToolRecord = {
+  name: string;
+  description: string;
+  wrapped_as?: string;
+  enabled: boolean;
+  schema?: Record<string, unknown>;
+};
+
+export type MCPResourceRecord = {
+  uri: string;
+  name: string;
+  description: string;
+  mime_type: string;
+};
+
+export type MCPPromptRecord = {
+  name: string;
+  description: string;
+  arguments?: string[];
+};
+
+export type MCPServerRecord = {
+  id: string;
+  name: string;
+  transport: string;
+  command?: string;
+  args?: string[];
+  enabled?: boolean;
+  status: string;
+  trust: string;
+  last_sync_at?: string;
+  last_sync_error?: string;
+  tools: MCPToolRecord[];
+  resources: MCPResourceRecord[];
+  prompts: MCPPromptRecord[];
+  metadata?: Record<string, unknown>;
+};
+
+export type MCPWrapToolRequest = {
+  capability_id?: string;
+  description: string;
+  intent_domain: string;
+  positive_examples: string[];
+  negative_examples: string[];
+  input_schema?: Record<string, unknown>;
+  output_schema?: Record<string, unknown>;
+  risk_level: string;
+  privacy_level: string;
+  ui_visibility: string;
+  enabled?: boolean;
+};
+
+export type SkillRecord = {
+  id: string;
+  version: string;
+  name: string;
+  description: string;
+  trigger_phrases: string[];
+  required_capabilities: string[];
+  forbidden_capabilities: string[];
+  output_contract: string;
+  enabled: boolean;
+  metadata?: Record<string, unknown>;
+  recent_run?: Record<string, unknown>;
+};
+
 export type ToolWorkflowStep = {
   tool: string;
   args?: Record<string, unknown>;
@@ -542,6 +608,10 @@ type DesktopBindings = {
   RestoreConversation(req: ConversationActionRequest): Promise<ConversationActionResponse>;
   PurgeConversation(req: ConversationActionRequest): Promise<ConversationActionResponse>;
   ListCapabilities(): Promise<{ capabilities: CapabilityRecord[] }>;
+  ListMCPServers(): Promise<{ servers: MCPServerRecord[] }>;
+  SyncMCPServer(id: string): Promise<{ server: MCPServerRecord }>;
+  WrapMCPTool(serverID: string, toolName: string, req: MCPWrapToolRequest): Promise<{ capability: CapabilityRecord }>;
+  ListSkills(): Promise<{ skills: SkillRecord[] }>;
   ListToolWorkflows(): Promise<{ workflows: ToolWorkflowRecord[] }>;
   ListToolRuns(): Promise<{ tool_runs: ToolRunRecord[] }>;
   SetToolWorkflowEnabled(req: { name: string; enabled: boolean }): Promise<void>;
@@ -688,14 +758,28 @@ function bindings(): DesktopBindings {
       async ListCapabilities() {
         return {
           capabilities: [
-            { id: 'workspace_search', name: 'Workspace Search', description: 'Search authorized workspace source and documents.', risk_level: 'read_only', enabled: true },
-            { id: 'file_analyze', name: 'File Analyze', description: 'Analyze an authorized workspace file.', risk_level: 'read_only', enabled: true },
+            { id: 'desktop_app_list', name: 'Desktop App List', description: 'List installed macOS applications as local metadata.', risk_level: 'read_only', enabled: true, metadata: { source: 'native', intent_domain: 'desktop_application_inventory' } },
+            { id: 'workspace_search', name: 'Workspace Search', description: 'Search authorized workspace source and documents.', risk_level: 'read_only', enabled: true, metadata: { source: 'native', intent_domain: 'workspace_search' } },
+            { id: 'file_analyze', name: 'File Analyze', description: 'Analyze an authorized workspace file.', risk_level: 'read_only', enabled: true, metadata: { source: 'native', intent_domain: 'authorized_file_read' } },
           ],
         };
+      },
+      async ListMCPServers() {
+        return { servers: [{ id: 'local_mcp_registry', name: 'Local MCP Registry', transport: 'not_configured', status: 'inactive', trust: 'untrusted_until_wrapped', tools: [], resources: [], prompts: [], metadata: { policy: 'MCP tools require wrapping before execution.' } }] };
+      },
+      async SyncMCPServer(id) {
+        return { server: { id, name: 'Local MCP Registry', transport: 'not_configured', status: 'inactive', trust: 'untrusted_until_wrapped', tools: [], resources: [], prompts: [], metadata: { last_sync_result: 'no configured MCP transport' } } };
+      },
+      async WrapMCPTool(serverID, toolName, req) {
+        return { capability: { id: req.capability_id || `mcp_${serverID}_${toolName}`, name: toolName, description: req.description, risk_level: req.risk_level, enabled: true, metadata: { source: 'mcp_wrapped', intent_domain: req.intent_domain } } };
+      },
+      async ListSkills() {
+        return { skills: [{ id: 'desktop_inventory_skill', version: 'v1', name: 'Desktop Inventory', description: 'List local installed applications without reading app content.', trigger_phrases: ['列出本地所有 app'], required_capabilities: ['desktop_app_list'], forbidden_capabilities: ['system_health_check'], output_contract: 'final_answer with bounded app metadata', enabled: true, metadata: { source: 'native_skill_registry' } }] };
       },
       async ListToolWorkflows() {
         return {
           workflows: [
+            { id: 'workflow_desktop_app_list_v1', capability_id: 'desktop_app_list', name: 'desktop_app_list_v1', version: 'v1', risk_level: 'read_only', enabled: true, steps: [{ tool: 'desktop_list_app_bundles', risk_level: 'read_only' }] },
             { id: 'workflow_workspace_search_v1', capability_id: 'workspace_search', name: 'workspace_search_v1', version: 'v1', risk_level: 'read_only', enabled: true, steps: [{ tool: 'workspace_walk_search', risk_level: 'read_only' }] },
             { id: 'workflow_file_analyze_v1', capability_id: 'file_analyze', name: 'file_analyze_v1', version: 'v1', risk_level: 'read_only', enabled: true, steps: [{ tool: 'file_read_authorized', risk_level: 'read_only' }] },
           ],
@@ -948,6 +1032,10 @@ export const desktopApi = {
   restoreConversation: (req: ConversationActionRequest) => bindings().RestoreConversation(req),
   purgeConversation: (req: ConversationActionRequest) => bindings().PurgeConversation(req),
   listCapabilities: () => bindings().ListCapabilities(),
+  listMCPServers: () => bindings().ListMCPServers(),
+  syncMCPServer: (id: string) => bindings().SyncMCPServer(id),
+  wrapMCPTool: (serverID: string, toolName: string, req: MCPWrapToolRequest) => bindings().WrapMCPTool(serverID, toolName, req),
+  listSkills: () => bindings().ListSkills(),
   listToolWorkflows: () => bindings().ListToolWorkflows(),
   listToolRuns: () => bindings().ListToolRuns(),
   setToolWorkflowEnabled: (req: { name: string; enabled: boolean }) => bindings().SetToolWorkflowEnabled(req),

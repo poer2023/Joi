@@ -110,6 +110,10 @@ export function ListConversations(arg1) {
   return window['go']['main']['DesktopApp']['ListConversations'](arg1);
 }
 
+export function ListMCPServers() {
+  return window['go']['main']['DesktopApp']['ListMCPServers']();
+}
+
 export function ListMemories(arg1) {
   return window['go']['main']['DesktopApp']['ListMemories'](arg1);
 }
@@ -132,6 +136,10 @@ export function ListProductTasks(arg1) {
 
 export function ListSavedModels(arg1) {
   return window['go']['main']['DesktopApp']['ListSavedModels'](arg1);
+}
+
+export function ListSkills() {
+  return window['go']['main']['DesktopApp']['ListSkills']();
 }
 
 export function ListToolRuns() {
@@ -166,6 +174,10 @@ export function SaveConversationGroup(arg1) {
   return window['go']['main']['DesktopApp']['SaveConversationGroup'](arg1);
 }
 
+export function SaveMCPServer(arg1) {
+  return window['go']['main']['DesktopApp']['SaveMCPServer'](arg1);
+}
+
 export function SaveModelConfig(arg1) {
   return window['go']['main']['DesktopApp']['SaveModelConfig'](arg1);
 }
@@ -180,6 +192,10 @@ export function SaveOperationalSettings(arg1) {
 
 export function SaveSecret(arg1) {
   return window['go']['main']['DesktopApp']['SaveSecret'](arg1);
+}
+
+export function SaveSkill(arg1) {
+  return window['go']['main']['DesktopApp']['SaveSkill'](arg1);
 }
 
 export function SaveTelegramConfig(arg1) {
@@ -202,8 +218,16 @@ export function SetToolWorkflowEnabled(arg1) {
   return window['go']['main']['DesktopApp']['SetToolWorkflowEnabled'](arg1);
 }
 
+export function SyncMCPServer(arg1) {
+  return window['go']['main']['DesktopApp']['SyncMCPServer'](arg1);
+}
+
 export function TestModelConnection(arg1) {
   return window['go']['main']['DesktopApp']['TestModelConnection'](arg1);
+}
+
+export function TestSkill(arg1, arg2) {
+  return window['go']['main']['DesktopApp']['TestSkill'](arg1, arg2);
 }
 
 export function TestTelegramConnection() {
@@ -216,4 +240,8 @@ export function TrashConversation(arg1) {
 
 export function UpdateMemory(arg1) {
   return window['go']['main']['DesktopApp']['UpdateMemory'](arg1);
+}
+
+export function WrapMCPTool(arg1, arg2, arg3) {
+  return window['go']['main']['DesktopApp']['WrapMCPTool'](arg1, arg2, arg3);
 }

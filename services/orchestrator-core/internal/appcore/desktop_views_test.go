@@ -236,6 +236,9 @@ func TestSQLiteCapabilityConsoleListsRegistryWorkflowsAndToolRuns(t *testing.T) 
 	if !hasCapabilityRecord(capabilities.Capabilities, "file_analyze") || !hasCapabilityRecord(capabilities.Capabilities, "workspace_search") {
 		t.Fatalf("kernel capabilities missing: %+v", capabilities.Capabilities)
 	}
+	if !hasCapabilityRecord(capabilities.Capabilities, "desktop_app_list") {
+		t.Fatalf("desktop_app_list capability missing: %+v", capabilities.Capabilities)
+	}
 
 	workflows, err := core.ListToolWorkflows(ctx)
 	if err != nil {
@@ -243,6 +246,24 @@ func TestSQLiteCapabilityConsoleListsRegistryWorkflowsAndToolRuns(t *testing.T) 
 	}
 	if !hasWorkflowRecord(workflows.Workflows, "file_analyze_v1") || !hasWorkflowRecord(workflows.Workflows, "workspace_search_v1") {
 		t.Fatalf("kernel workflows missing: %+v", workflows.Workflows)
+	}
+	if !hasWorkflowRecord(workflows.Workflows, "desktop_app_list_v1") {
+		t.Fatalf("desktop_app_list_v1 workflow missing: %+v", workflows.Workflows)
+	}
+
+	mcpServers, err := core.ListMCPServers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mcpServers.Servers) == 0 || !strings.Contains(stringValue(mcpServers.Servers[0].Metadata["policy"]), "wrapped") {
+		t.Fatalf("MCP inventory policy missing: %+v", mcpServers.Servers)
+	}
+	skills, err := core.ListSkills(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skills.Skills) == 0 || len(skills.Skills[0].RequiredCapabilities) == 0 {
+		t.Fatalf("skill registry missing required capabilities: %+v", skills.Skills)
 	}
 
 	toolRuns, err := core.ListToolRuns(ctx, 20)

@@ -192,9 +192,17 @@ func (db *DB) SeedSQLiteDefaults(ctx context.Context) error {
 		  ('web_research', 'Web Research', 'Read-only URL fetch capability alias.', 'read_only', 1, '{"desktop_default":true,"alias_for":"web_research_v2"}'),
 		  ('web_research_v1', 'Web Research v1', 'Read-only URL fetch and summarization legacy alias.', 'read_only', 1, '{"desktop_default":true,"alias_for":"web_research_v2"}'),
 		  ('web_research_v2', 'Web Research v2', 'Read-only public HTTP/HTTPS fetch and summarization.', 'read_only', 1, '{"desktop_default":true}'),
+		  ('browser_read', 'Browser Read', 'Read-only URL/page read through browser/web host policy.', 'read_only', 1, '{"desktop_default":true,"source":"native"}'),
+		  ('browser_read_v1', 'Browser Read v1', 'Read-only URL/page read through browser/web host policy.', 'read_only', 1, '{"desktop_default":true,"alias_for":"browser_read"}'),
 		  ('workspace_search', 'Workspace Search', 'Search authorized workspace source and documents.', 'read_only', 1, '{"desktop_default":true}'),
-		  ('file_analyze', 'File Analyze', 'Analyze an authorized workspace file.', 'read_only', 1, '{"desktop_default":true}')
-		ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, risk_level=excluded.risk_level, enabled=excluded.enabled, updated_at=datetime('now');
+		  ('file_analyze', 'File Analyze', 'Analyze an authorized workspace file.', 'read_only', 1, '{"desktop_default":true}'),
+		  ('desktop_app_list', 'Desktop App List', 'List installed macOS applications as local metadata.', 'read_only', 1, '{"desktop_default":true,"source":"native"}'),
+		  ('desktop_app_list_v1', 'Desktop App List v1', 'List installed macOS applications as local metadata.', 'read_only', 1, '{"desktop_default":true,"alias_for":"desktop_app_list"}'),
+		  ('desktop_app_inspect', 'Desktop App Inspect', 'Inspect one macOS application bundle as local metadata.', 'read_only', 1, '{"desktop_default":true,"source":"native"}'),
+		  ('desktop_app_inspect_v1', 'Desktop App Inspect v1', 'Inspect one macOS application bundle as local metadata.', 'read_only', 1, '{"desktop_default":true,"alias_for":"desktop_app_inspect"}'),
+		  ('computer_observe', 'Computer Observe', 'Read-only visible Joi desktop observation.', 'read_only', 1, '{"desktop_default":true,"source":"native"}'),
+		  ('computer_observe_v1', 'Computer Observe v1', 'Read-only visible Joi desktop observation.', 'read_only', 1, '{"desktop_default":true,"alias_for":"computer_observe"}')
+		ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, risk_level=excluded.risk_level, enabled=excluded.enabled, metadata=excluded.metadata, updated_at=datetime('now');
 
 		INSERT INTO tools (id, name, description, risk_level, allowed_nodes, timeout_seconds, enabled, metadata)
 		VALUES
@@ -213,9 +221,13 @@ func (db *DB) SeedSQLiteDefaults(ctx context.Context) error {
 		  ('extract_readable_text', 'Extract Readable Text', 'Extract bounded readable text from fetched content.', 'read_only', '["main-node","local-worker-1"]', 5, 1, '{"desktop_default":true}'),
 		  ('extract_links', 'Extract Links', 'Extract bounded links from fetched content.', 'read_only', '["main-node","local-worker-1"]', 5, 1, '{"desktop_default":true}'),
 		  ('summarize_sources', 'Summarize Sources', 'Summarize fetched public content.', 'read_only', '["main-node","local-worker-1"]', 5, 1, '{"desktop_default":true}'),
+		  ('desktop_list_app_bundles', 'Desktop List App Bundles', 'List installed macOS .app bundles as bounded local metadata.', 'read_only', '["main-node"]', 10, 1, '{"desktop_default":true}'),
+		  ('desktop_inspect_app_bundle', 'Desktop Inspect App Bundle', 'Inspect one installed macOS .app bundle as local metadata.', 'read_only', '["main-node"]', 10, 1, '{"desktop_default":true}'),
 		  ('workspace_walk_search', 'Workspace Walk Search', 'Search authorized workspace paths without arbitrary shell flags.', 'read_only', '["main-node"]', 10, 1, '{"desktop_default":true}'),
 		  ('file_read_authorized', 'File Read Authorized', 'Read a bounded authorized workspace file.', 'read_only', '["main-node"]', 10, 1, '{"desktop_default":true}'),
-		  ('file_summarize_excerpts', 'File Summarize Excerpts', 'Summarize bounded file excerpts.', 'read_only', '["main-node"]', 10, 1, '{"desktop_default":true}')
+		  ('file_summarize_excerpts', 'File Summarize Excerpts', 'Summarize bounded file excerpts.', 'read_only', '["main-node"]', 10, 1, '{"desktop_default":true}'),
+		  ('computer_observe_visible_ui', 'Computer Observe Visible UI', 'Read visible Joi desktop UI state without interaction.', 'read_only', '["main-node"]', 5, 1, '{"desktop_default":true}'),
+		  ('mcp_tool_call', 'MCP Tool Call', 'Call an MCP tool only through a wrapped Joi capability.', 'read_only', '["main-node"]', 30, 1, '{"desktop_default":true,"requires_wrapped_capability":true}')
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, risk_level=excluded.risk_level, allowed_nodes=excluded.allowed_nodes, timeout_seconds=excluded.timeout_seconds, enabled=excluded.enabled, updated_at=datetime('now');
 
 		INSERT INTO tool_workflows (id, capability_id, name, version, risk_level, steps, enabled, metadata)
@@ -224,14 +236,41 @@ func (db *DB) SeedSQLiteDefaults(ctx context.Context) error {
 		  ('workflow_server_diagnose_v1', 'server_diagnose', 'server_diagnose_v1', 'v1', 'read_only', '[{"tool":"docker_list_containers","args":{},"risk_level":"read_only"},{"tool":"docker_inspect_container","args":{},"risk_level":"read_only"},{"tool":"docker_read_logs","args":{"tail":200},"risk_level":"read_only"},{"tool":"check_port","args":{},"risk_level":"read_only"},{"tool":"http_probe","args":{},"risk_level":"read_only"},{"tool":"system_disk_usage","args":{},"risk_level":"read_only"},{"tool":"system_memory_usage","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
 		  ('workflow_system_health_check_v1', 'system_health_check', 'system_health_check_v1', 'v1', 'read_only', '[{"tool":"postgres_ping","args":{},"risk_level":"read_only"},{"tool":"nats_port_check","args":{},"risk_level":"read_only"},{"tool":"console_http_probe","args":{},"risk_level":"read_only"},{"tool":"system_disk_usage","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
 		  ('workflow_web_research_v2', 'web_research', 'web_research_v2', 'v2', 'read_only', '[{"tool":"fetch_url","args":{},"risk_level":"read_only"},{"tool":"extract_readable_text","args":{},"risk_level":"read_only"},{"tool":"extract_links","args":{},"risk_level":"read_only"},{"tool":"summarize_sources","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
+		  ('workflow_browser_read_v1', 'browser_read', 'browser_read_v1', 'v1', 'read_only', '[{"tool":"fetch_url","args":{},"risk_level":"read_only"},{"tool":"extract_readable_text","args":{},"risk_level":"read_only"},{"tool":"extract_links","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
+		  ('workflow_desktop_app_list_v1', 'desktop_app_list', 'desktop_app_list_v1', 'v1', 'read_only', '[{"tool":"desktop_list_app_bundles","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
+		  ('workflow_desktop_app_inspect_v1', 'desktop_app_inspect', 'desktop_app_inspect_v1', 'v1', 'read_only', '[{"tool":"desktop_inspect_app_bundle","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
 		  ('workflow_workspace_search_v1', 'workspace_search', 'workspace_search_v1', 'v1', 'read_only', '[{"tool":"workspace_walk_search","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
-		  ('workflow_file_analyze_v1', 'file_analyze', 'file_analyze_v1', 'v1', 'read_only', '[{"tool":"file_read_authorized","args":{},"risk_level":"read_only"},{"tool":"file_summarize_excerpts","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}')
+		  ('workflow_file_analyze_v1', 'file_analyze', 'file_analyze_v1', 'v1', 'read_only', '[{"tool":"file_read_authorized","args":{},"risk_level":"read_only"},{"tool":"file_summarize_excerpts","args":{},"risk_level":"read_only"}]', 1, '{"desktop_default":true}'),
+		  ('workflow_computer_observe_v1', 'computer_observe', 'computer_observe_v1', 'v1', 'read_only', '[{"tool":"computer_observe_visible_ui","args":{"target":"joi_current_window"},"risk_level":"read_only"}]', 1, '{"desktop_default":true}')
 		ON CONFLICT(id) DO UPDATE SET capability_id=excluded.capability_id, name=excluded.name, version=excluded.version, risk_level=excluded.risk_level, steps=excluded.steps, enabled=excluded.enabled, metadata=excluded.metadata, updated_at=datetime('now');
+
+		INSERT INTO mcp_servers (id, name, transport, command, args, env_secret_refs, enabled, status, trust, metadata)
+		VALUES ('local_mcp_registry', 'Local MCP Registry', 'not_configured', '', '[]', '{}', 0, 'inactive', 'untrusted_until_wrapped', '{"policy":"MCP inventory is not executable until wrapped as a Joi capability."}')
+		ON CONFLICT(id) DO UPDATE SET name=excluded.name, transport=excluded.transport, trust=excluded.trust, metadata=excluded.metadata, updated_at=datetime('now');
+
+		INSERT INTO skill_definitions (id, version, name, description, trigger_phrases, required_capabilities, forbidden_capabilities, prompt, output_contract, enabled, metadata)
+		VALUES
+		  ('web_summary_skill', 'v1', 'Web Summary', 'Read an explicit URL and produce a concise sourced summary.', '["总结这个网站","读取 URL","web summary"]', '["web_research"]', '["file_analyze","server_diagnose","system_health_check"]', 'Generate a skill_plan that requests web_research for an explicit URL only.', '{"output_type":"skill_plan","capability_requests":["web_research"]}', 1, '{"source":"native_skill_seed","intent_domain":"public_web_read"}'),
+		  ('desktop_inventory_skill', 'v1', 'Desktop Inventory', 'List local installed applications without reading app content.', '["列出本地所有 app","本机有哪些应用","本地所有应用","installed apps"]', '["desktop_app_list"]', '["system_health_check","server_diagnose","file_analyze"]', 'Generate a skill_plan that requests desktop_app_list only.', '{"output_type":"skill_plan","capability_requests":["desktop_app_list"]}', 1, '{"source":"native_skill_seed","intent_domain":"desktop_application_inventory"}')
+		ON CONFLICT(id) DO UPDATE SET version=excluded.version, name=excluded.name, description=excluded.description, trigger_phrases=excluded.trigger_phrases, required_capabilities=excluded.required_capabilities, forbidden_capabilities=excluded.forbidden_capabilities, prompt=excluded.prompt, output_contract=excluded.output_contract, enabled=excluded.enabled, metadata=excluded.metadata, updated_at=datetime('now');
 	`)
 	if err != nil {
 		return err
 	}
+	if err := db.seedSQLiteCapabilityContracts(ctx); err != nil {
+		return err
+	}
 	return db.RegisterSQLiteMainNode(ctx)
+}
+
+func (db *DB) seedSQLiteCapabilityContracts(ctx context.Context) error {
+	for _, contract := range CapabilityContracts() {
+		metadata := CapabilityContractMetadata(contract.ID)
+		if _, err := db.sql.ExecContext(ctx, `UPDATE capabilities SET metadata=?, updated_at=datetime('now') WHERE id=?`, mustJSON(mergeCapabilityContractMetadata(contract.ID, metadata)), contract.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (db *DB) RegisterSQLiteMainNode(ctx context.Context) error {
@@ -252,7 +291,7 @@ func (db *DB) RegisterSQLiteMainNode(ctx context.Context) error {
 			version=excluded.version,
 			metadata=excluded.metadata,
 			updated_at=datetime('now')
-	`, mustJSON([]string{"memory_search", "server_diagnose", "system_health_check", "web_research", "workspace_search", "file_analyze"}), mustJSON(map[string]any{"execution": "local"}), mustJSON(map[string]any{"scope": "local"}), mustJSON(map[string]any{"manual_assignable": true, "auto_assignable": true, "allow_private_context": true, "allow_secret_context": false}), mustJSON(map[string]any{"registered_by": "desktop_appcore"}))
+	`, mustJSON([]string{"memory_search", "server_diagnose", "system_health_check", "web_research", "browser_read", "workspace_search", "file_analyze", "desktop_app_list", "desktop_app_inspect", "computer_observe"}), mustJSON(map[string]any{"execution": "local"}), mustJSON(map[string]any{"scope": "local"}), mustJSON(map[string]any{"manual_assignable": true, "auto_assignable": true, "allow_private_context": true, "allow_secret_context": false}), mustJSON(map[string]any{"registered_by": "desktop_appcore"}))
 	return err
 }
 

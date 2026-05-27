@@ -241,6 +241,9 @@ func mockAgentRuntimeContent(dynamicTail string) string {
 	if strings.Contains(lower, "joi 自检") || strings.Contains(lower, "系统自检") || strings.Contains(lower, "system health") || strings.Contains(lower, "健康检查") {
 		return `{"output_type":"capability_request","capability":"system_health_check","goal":"执行 Joi 只读系统自检","inputs":{},"risk":"read_only","confidence":0.9}`
 	}
+	if isDesktopAppListIntent(strings.ToLower(userMessage)) {
+		return `{"output_type":"capability_request","capability":"desktop_app_list","goal":"列出本机所有已安装应用程序","inputs":{},"risk":"read_only","confidence":0.9}`
+	}
 	if strings.Contains(lower, "unknown-service") {
 		return `{"output_type":"final_answer","content":"无法确认 unknown-service 的诊断目标。请提供明确的容器名、端口或 URL；当前不会执行任何修改操作。"}`
 	}

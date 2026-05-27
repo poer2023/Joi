@@ -74,3 +74,36 @@ func TestSummarizeTextTruncatesByRunes(t *testing.T) {
 		t.Fatalf("summary exceeded rune limit: %d", runeCount(summary))
 	}
 }
+
+func TestDesktopAppListFinalAnswerIncludesAllAppNames(t *testing.T) {
+	apps := []map[string]any{
+		{"name": "Alpha"},
+		{"name": "Beta"},
+		{"name": "Gamma"},
+		{"name": "Delta"},
+		{"name": "Epsilon"},
+		{"name": "Zeta"},
+		{"name": "Eta"},
+		{"name": "Theta"},
+		{"name": "Iota"},
+		{"name": "Kappa"},
+	}
+
+	answer := FinalAnswerForCapabilityResult("desktop_app_list", map[string]any{
+		"total": len(apps),
+		"apps":  apps,
+	})
+
+	if strings.Contains(answer, "前几项包括") {
+		t.Fatalf("desktop app list answer should not be preview-only: %s", answer)
+	}
+	if !strings.Contains(answer, "完整列表") {
+		t.Fatalf("desktop app list answer should label the full list: %s", answer)
+	}
+	for _, app := range apps {
+		name := app["name"].(string)
+		if !strings.Contains(answer, name) {
+			t.Fatalf("desktop app list answer missing %q: %s", name, answer)
+		}
+	}
+}

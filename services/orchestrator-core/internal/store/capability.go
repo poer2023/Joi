@@ -41,6 +41,9 @@ type readableHTMLExtraction struct {
 }
 
 var ErrPolicyDenied = errors.New("policy denied")
+var ErrCapabilityMismatch = errors.New("capability mismatch")
+var ErrCapabilityMissing = errors.New("capability missing")
+var ErrMissingArgument = errors.New("missing capability argument")
 
 type CapabilityRequest struct {
 	Type          string         `json:"type"`
@@ -51,6 +54,8 @@ type CapabilityRequest struct {
 	RunID         string         `json:"run_id"`
 	PreferredNode string         `json:"preferred_node"`
 	AllowWorker   bool           `json:"allow_worker"`
+	Source        string         `json:"source"`
+	Evidence      string         `json:"evidence"`
 }
 
 type ToolWorkflow struct {
@@ -207,11 +212,53 @@ func executeCapabilityLocally(ctx context.Context, request CapabilityRequest) (*
 		return executeServerDiagnose(ctx, request)
 	case "web_research":
 		return executeWebResearch(ctx, request)
+	case "browser_read":
+		return executeWebResearch(ctx, request)
 	case "system_health_check":
 		return executeSystemHealthCheck(ctx, nil, request)
+	case "desktop_app_list":
+		return executeDesktopAppList(ctx, request)
+	case "desktop_app_inspect":
+		return executeDesktopAppInspect(ctx, request)
+	case "computer_observe":
+		return executeComputerObserve(ctx, request)
 	default:
 		return nil, fmt.Errorf("unsupported capability: %s", request.Capability)
 	}
+}
+
+func executeComputerObserve(ctx context.Context, request CapabilityRequest) (*CapabilityExecutionResult, error) {
+	target := strings.TrimSpace(stringInput(request.Inputs, "target", "joi_current_window"))
+	if target == "" {
+		target = "joi_current_window"
+	}
+	if target != "joi_current_window" {
+		return nil, ErrPolicyDenied
+	}
+	normalized := map[string]any{
+		"status":               "succeeded",
+		"target":               target,
+		"window_title":         "Joi",
+		"bundle_id":            "com.hao.joi.desktop",
+		"visible_text_summary": "Joi desktop current window is visible to the local desktop runtime. This read-only capability does not click, type, drag, or operate other apps.",
+		"buttons":              []string{},
+		"inputs":               []string{},
+		"truncated":            false,
+		"privacy_level":        "private_content",
+		"interaction_allowed":  false,
+	}
+	return &CapabilityExecutionResult{
+		CapabilityRequest: request,
+		PolicyDecision:    map[string]any{"risk": "read_only", "decision": "allow", "reason": "computer_observe_v1 is read-only and limited to joi_current_window"},
+		Workflow: ToolWorkflow{
+			WorkflowName: "computer_observe_v1",
+			Capability:   "computer_observe",
+			RiskLevel:    "read_only",
+			Steps:        []ToolWorkflowStep{{Tool: "computer_observe_visible_ui", Args: map[string]any{"target": target}, RiskLevel: "read_only"}},
+		},
+		SelectedNodeID:   "main-node",
+		NormalizedResult: normalized,
+	}, nil
 }
 
 func ExecuteCapabilityLocally(ctx context.Context, request CapabilityRequest) (*CapabilityExecutionResult, error) {
@@ -222,6 +269,14 @@ func CanonicalCapabilityName(capability string) string {
 	switch capability {
 	case "server_diagnose_v1":
 		return "server_diagnose"
+	case "desktop_app_list_v1":
+		return "desktop_app_list"
+	case "desktop_app_inspect_v1":
+		return "desktop_app_inspect"
+	case "computer_observe_v1":
+		return "computer_observe"
+	case "browser_read_v1":
+		return "browser_read"
 	case "web_research_v1", "web_research_v2", "fetch_url":
 		return "web_research"
 	case "system_health_check_v1":
@@ -696,7 +751,9 @@ func isMetadataAddr(ip netip.Addr) bool {
 func (db *DB) writeCapabilityTraceSteps(ctx context.Context, runID string, result *CapabilityExecutionResult) error {
 	steps := []stepDefinition{
 		{stepType: "capability_requested", title: "Capability requested", input: map[string]any{"run_id": runID}, output: map[string]any{"capability_request": result.CapabilityRequest}},
+		{stepType: "capability_semantic_checked", title: "Capability semantic contract checked", input: map[string]any{"capability": result.CapabilityRequest.Capability, "goal": result.CapabilityRequest.Goal, "source": result.CapabilityRequest.Source}, output: map[string]any{"validation": result.PolicyDecision["semantic_validation"]}},
 		{stepType: "policy_checked", title: "Policy checked", input: map[string]any{"risk": result.CapabilityRequest.Risk}, output: result.PolicyDecision},
+		{stepType: "workflow_compiled", title: "Workflow compiled", input: map[string]any{"capability": result.CapabilityRequest.Capability}, output: map[string]any{"workflow": result.Workflow}},
 		{stepType: "tool_compiled", title: "Tool workflow compiled", input: map[string]any{"capability": result.CapabilityRequest.Capability}, output: map[string]any{"workflow": result.Workflow}},
 		{stepType: "node_selected", title: "Node selected", input: map[string]any{"capability": result.CapabilityRequest.Capability}, output: map[string]any{"node_id": result.SelectedNodeID, "assignment_reason": "default_main_node"}},
 		{stepType: "tool_started", title: "Tool runtime started", input: map[string]any{"workflow_name": result.Workflow.WorkflowName, "tool_run_id": result.ToolRunID}, output: map[string]any{"node_id": result.SelectedNodeID}},

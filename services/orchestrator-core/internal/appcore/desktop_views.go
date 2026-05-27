@@ -97,6 +97,72 @@ type CapabilityListResponse struct {
 	Capabilities []store.CapabilityRecord `json:"capabilities"`
 }
 
+type MCPServerListResponse struct {
+	Servers []MCPServerRecord `json:"servers"`
+}
+
+type MCPServerRecord struct {
+	ID            string                 `json:"id"`
+	Name          string                 `json:"name"`
+	Transport     string                 `json:"transport"`
+	Command       string                 `json:"command,omitempty"`
+	Args          []string               `json:"args,omitempty"`
+	Enabled       bool                   `json:"enabled"`
+	Status        string                 `json:"status"`
+	Trust         string                 `json:"trust"`
+	LastSyncAt    string                 `json:"last_sync_at,omitempty"`
+	LastSyncError string                 `json:"last_sync_error,omitempty"`
+	Tools         []MCPToolRecord        `json:"tools"`
+	Resources     []MCPResourceRecord    `json:"resources"`
+	Prompts       []MCPSkillPromptRecord `json:"prompts"`
+	Metadata      map[string]any         `json:"metadata"`
+}
+
+type MCPToolRecord struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	WrappedAs   string         `json:"wrapped_as"`
+	Enabled     bool           `json:"enabled"`
+	Schema      map[string]any `json:"schema"`
+}
+
+type MCPResourceRecord struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	MimeType    string `json:"mime_type"`
+}
+
+type MCPSkillPromptRecord struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Arguments   []string `json:"arguments"`
+}
+
+type SkillListResponse struct {
+	Skills []SkillRecord `json:"skills"`
+}
+
+type SkillRecord struct {
+	ID                    string          `json:"id"`
+	Version               string          `json:"version"`
+	Name                  string          `json:"name"`
+	Description           string          `json:"description"`
+	TriggerPhrases        []string        `json:"trigger_phrases"`
+	RequiredCapabilities  []string        `json:"required_capabilities"`
+	ForbiddenCapabilities []string        `json:"forbidden_capabilities"`
+	OutputContract        string          `json:"output_contract"`
+	Enabled               bool            `json:"enabled"`
+	Metadata              map[string]any  `json:"metadata"`
+	RecentRun             *store.SkillRun `json:"recent_run,omitempty"`
+}
+
+type MCPServerSaveRequest = store.MCPServerRequest
+type MCPWrapToolRequest = store.MCPWrapToolRequest
+type SkillSaveRequest = store.SkillRequest
+type SkillTestRequest = store.SkillTestRequest
+type SkillTestResult = store.SkillTestResult
+
 type ToolWorkflowListResponse struct {
 	Workflows []ToolWorkflowRecord `json:"workflows"`
 }
@@ -251,6 +317,148 @@ func (a *AppCore) ListCapabilities(ctx context.Context) (*CapabilityListResponse
 		return nil, err
 	}
 	return &CapabilityListResponse{Capabilities: capabilities}, nil
+}
+
+func (a *AppCore) ListMCPServers(ctx context.Context) (*MCPServerListResponse, error) {
+	if a.db == nil {
+		return nil, errors.New("appcore db is not available")
+	}
+	servers, err := a.db.ListMCPServers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &MCPServerListResponse{Servers: convertStoreMCPServers(servers)}, nil
+}
+
+func (a *AppCore) SyncMCPServer(ctx context.Context, serverID string) (*MCPServerRecord, error) {
+	server, err := a.db.SyncMCPServer(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	converted := convertStoreMCPServer(server)
+	return &converted, nil
+}
+
+func (a *AppCore) SaveMCPServer(ctx context.Context, req MCPServerSaveRequest) (*MCPServerRecord, error) {
+	if a.db == nil {
+		return nil, errors.New("appcore db is not available")
+	}
+	server, err := a.db.SaveMCPServer(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	converted := convertStoreMCPServer(server)
+	return &converted, nil
+}
+
+func (a *AppCore) ListMCPInventory(ctx context.Context, serverID string) (map[string]any, error) {
+	if a.db == nil {
+		return nil, errors.New("appcore db is not available")
+	}
+	items, err := a.db.ListMCPInventory(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"items": items}, nil
+}
+
+func (a *AppCore) WrapMCPTool(ctx context.Context, serverID string, toolName string, req MCPWrapToolRequest) (*store.CapabilityRecord, error) {
+	if a.db == nil {
+		return nil, errors.New("appcore db is not available")
+	}
+	capability, err := a.db.WrapMCPTool(ctx, serverID, toolName, req)
+	if err != nil {
+		return nil, err
+	}
+	return &capability, nil
+}
+
+func (a *AppCore) ListSkills(ctx context.Context) (*SkillListResponse, error) {
+	if a.db == nil {
+		return nil, errors.New("appcore db is not available")
+	}
+	skills, err := a.db.ListSkillDefinitions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	records := make([]SkillRecord, 0, len(skills))
+	for _, skill := range skills {
+		records = append(records, SkillRecord{
+			ID:                    skill.ID,
+			Version:               skill.Version,
+			Name:                  skill.Name,
+			Description:           skill.Description,
+			TriggerPhrases:        skill.TriggerPhrases,
+			RequiredCapabilities:  skill.RequiredCapabilities,
+			ForbiddenCapabilities: skill.ForbiddenCapabilities,
+			OutputContract:        skill.OutputContract,
+			Enabled:               skill.Enabled,
+			Metadata:              skill.Metadata,
+			RecentRun:             skill.RecentRun,
+		})
+	}
+	return &SkillListResponse{Skills: records}, nil
+}
+
+func (a *AppCore) SaveSkill(ctx context.Context, req SkillSaveRequest) (*SkillRecord, error) {
+	if a.db == nil {
+		return nil, errors.New("appcore db is not available")
+	}
+	skill, err := a.db.SaveSkillDefinition(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return &SkillRecord{ID: skill.ID, Version: skill.Version, Name: skill.Name, Description: skill.Description, TriggerPhrases: skill.TriggerPhrases, RequiredCapabilities: skill.RequiredCapabilities, ForbiddenCapabilities: skill.ForbiddenCapabilities, OutputContract: skill.OutputContract, Enabled: skill.Enabled, Metadata: skill.Metadata, RecentRun: skill.RecentRun}, nil
+}
+
+func (a *AppCore) TestSkill(ctx context.Context, skillID string, req SkillTestRequest) (*SkillTestResult, error) {
+	if a.db == nil {
+		return nil, errors.New("appcore db is not available")
+	}
+	result, err := a.db.TestSkillDefinition(ctx, skillID, req)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func convertStoreMCPServers(items []store.MCPServerRecord) []MCPServerRecord {
+	servers := make([]MCPServerRecord, 0, len(items))
+	for _, item := range items {
+		servers = append(servers, convertStoreMCPServer(item))
+	}
+	return servers
+}
+
+func convertStoreMCPServer(item store.MCPServerRecord) MCPServerRecord {
+	tools := make([]MCPToolRecord, 0, len(item.Tools))
+	for _, tool := range item.Tools {
+		tools = append(tools, MCPToolRecord{Name: tool.Name, Description: tool.Description, WrappedAs: tool.WrappedCapabilityID, Enabled: tool.Enabled, Schema: tool.Schema})
+	}
+	resources := make([]MCPResourceRecord, 0, len(item.Resources))
+	for _, resource := range item.Resources {
+		resources = append(resources, MCPResourceRecord{URI: resource.URI, Name: resource.Name, Description: resource.Description, MimeType: resource.MimeType})
+	}
+	prompts := make([]MCPSkillPromptRecord, 0, len(item.Prompts))
+	for _, prompt := range item.Prompts {
+		prompts = append(prompts, MCPSkillPromptRecord{Name: prompt.Name, Description: prompt.Description, Arguments: prompt.Arguments})
+	}
+	return MCPServerRecord{
+		ID:            item.ID,
+		Name:          item.Name,
+		Transport:     item.Transport,
+		Command:       item.Command,
+		Args:          item.Args,
+		Enabled:       item.Enabled,
+		Status:        item.Status,
+		Trust:         item.Trust,
+		LastSyncAt:    item.LastSyncAt,
+		LastSyncError: item.LastSyncError,
+		Tools:         tools,
+		Resources:     resources,
+		Prompts:       prompts,
+		Metadata:      item.Metadata,
+	}
 }
 
 func (a *AppCore) ListToolWorkflows(ctx context.Context) (*ToolWorkflowListResponse, error) {
