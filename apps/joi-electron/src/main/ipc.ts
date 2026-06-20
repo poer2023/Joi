@@ -423,7 +423,7 @@ async function runElectronToolCallingTurn(
     max_steps: 6,
     timeout_seconds: 60,
     signal: options.signal,
-    executeTool: async (call) => {
+    executeTool: async (call, toolOptions) => {
       try {
         if (shouldPauseElectronToolForConfirmation(call.name)) {
           const risk = electronRiskForCapability(call.name);
@@ -442,7 +442,7 @@ async function runElectronToolCallingTurn(
             },
           };
         }
-        const executed = await executeElectronCapability(call.name, call.arguments, req, store);
+        const executed = await executeElectronCapability(call.name, call.arguments, req, store, { signal: toolOptions?.signal });
         return {
           call_id: call.id,
           name: call.name,
@@ -454,6 +454,7 @@ async function runElectronToolCallingTurn(
           },
         } satisfies PersistedToolResult;
       } catch (error) {
+        if (error instanceof Error && isAbortError(error)) throw error;
         return {
           call_id: call.id,
           name: call.name,
@@ -535,6 +536,7 @@ async function resumeElectronToolCallingRun(
   }
 
   let finalMessage = String(toolResult.output.summary || '已执行批准的工具调用。');
+  let modelError = '';
   let usage = { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 };
   let modelResponses: Array<Record<string, unknown>> = [];
   const baseURL = modelBaseURLForSettings(settings);
@@ -585,8 +587,10 @@ async function resumeElectronToolCallingRun(
       usage = finalTurn.usage;
       modelResponses = finalTurn.model_responses;
     } catch (error) {
-      finalMessage = `${finalMessage}\n\n最终模型回复失败：${error instanceof Error ? error.message : String(error)}`;
+      modelError = error instanceof Error ? error.message : String(error);
     }
+  } else {
+    modelError = 'Real model configuration is missing during approval resume.';
   }
 
   store.completeApprovedToolCallingResume(resume.confirmation_id, {
@@ -594,6 +598,7 @@ async function resumeElectronToolCallingRun(
     model_name: modelName || resume.model_name || 'model',
     final_message: finalMessage,
     tool_result: toolResult,
+    model_error: modelError || undefined,
     usage,
     model_responses: modelResponses,
   });
@@ -625,7 +630,13 @@ async function executeElectronCapability(
   inputs: Record<string, unknown>,
   req: ChatRequest,
   store: JoiSQLiteStore,
+  options: { signal?: AbortSignal } = {},
 ): Promise<{ output: Record<string, unknown> } | undefined> {
+  const permissionProfile = String(req.permission_profile || inputs.permission_profile || 'read_only');
+  const inputsWithPermission: Record<string, unknown> & { permission_profile: string } = {
+    ...inputs,
+    permission_profile: permissionProfile,
+  };
   switch (capability) {
     case 'workspace_search':
       return { output: executeWorkspaceSearch(inputs, store.getWorkspaceSettings()) };
@@ -637,12 +648,12 @@ async function executeElectronCapability(
       if (typeof inputs.url !== 'string' || !inputs.url.trim()) return undefined;
       return { output: await executeWebResearch(inputs, store.getWorkspaceSettings()) };
     case 'shell_command':
-      return { output: await executeShellCommand(inputs, store.getWorkspaceSettings()) };
+      return { output: await executeShellCommand(inputsWithPermission, store.getWorkspaceSettings(), { signal: options.signal }) };
     case 'test_command':
-      return { output: await executeTestCommand(inputs, store.getWorkspaceSettings()) };
+      return { output: await executeTestCommand(inputsWithPermission, store.getWorkspaceSettings(), { signal: options.signal }) };
     case 'apply_patch':
       if (!['workspace_write', 'danger_full_access'].includes(String(req.permission_profile || ''))) return undefined;
-      return { output: executeApplyPatch(inputs, store.getWorkspaceSettings()) };
+      return { output: executeApplyPatch(inputsWithPermission, store.getWorkspaceSettings()) };
     case 'computer_observe':
       return { output: await executeComputerObserve(inputs) };
     case 'browser_observe':

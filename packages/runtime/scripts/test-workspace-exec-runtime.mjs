@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -8,7 +8,7 @@ import {
   executeTestCommand,
 } from '../src/workspace-exec.ts';
 
-const root = mkdtempSync(join(tmpdir(), 'joi-workspace-exec-'));
+const root = mkdtempSync(join(process.cwd(), '.tmp-workspace-exec-'));
 const outside = mkdtempSync(join(tmpdir(), 'joi-workspace-exec-outside-'));
 
 try {
@@ -18,6 +18,8 @@ try {
   writeFileSync(join(root, 'package.json'), JSON.stringify({
     scripts: {
       'test:fixture': 'node -e "console.log(\'fixture ok\')"',
+      'test:slow': 'node -e "setInterval(() => {}, 1000)"',
+      'test:write-root': 'node -e "require(\'node:fs\').writeFileSync(\'generated.txt\', \'written\')"',
     },
   }));
   writeFileSync(join(root, 'target.txt'), 'old\nkeep\n');
@@ -37,6 +39,10 @@ try {
   assert.ok(String(shell.output).includes('hello workspace'));
   assert.ok(!String(shell.output).includes('SHOULD_NOT_LEAK'));
   assert.ok(String(shell.output).includes('token=[REDACTED]'));
+  if (process.platform === 'darwin' && existsSync('/usr/bin/sandbox-exec')) {
+    assert.equal(shell.sandbox.enforced, true);
+    assert.equal(shell.sandbox.engine, 'sandbox-exec');
+  }
 
   await assert.rejects(() => executeShellCommand({ cmd: ['rm', 'docs/info.txt'], cwd: root }, settings), /policy_denied/);
   await assert.rejects(() => executeShellCommand({ cmd: ['cat', join(outside, 'secret.txt')], cwd: root }, settings), /policy_denied/);
@@ -45,6 +51,27 @@ try {
   assert.equal(test.mode, 'test_command_v1_allowlisted_exec');
   assert.equal(test.test_status, 'succeeded');
   assert.ok(String(test.output).includes('fixture ok'));
+
+  {
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const slow = executeTestCommand({ cmd: ['npm', 'run', 'test:slow'], cwd: root, timeout_seconds: 30 }, settings, { signal: controller.signal });
+    setTimeout(() => controller.abort(new Error('interrupted by test')), 100).unref();
+    await assert.rejects(slow, /interrupted|abort|cancel/i);
+    assert.ok(Date.now() - startedAt < 5000);
+  }
+
+  if (process.platform === 'darwin' && existsSync('/usr/bin/sandbox-exec')) {
+    const generatedPath = join(root, 'generated.txt');
+    const readOnlyWrite = await executeTestCommand({ cmd: ['npm', 'run', 'test:write-root'], cwd: root, timeout_seconds: 30 }, settings);
+    assert.equal(readOnlyWrite.sandbox.enforced, true);
+    assert.equal(readOnlyWrite.sandbox.engine, 'sandbox-exec');
+    assert.equal(readOnlyWrite.test_status, 'failed');
+    assert.equal(existsSync(generatedPath), false);
+    const workspaceWrite = await executeTestCommand({ cmd: ['npm', 'run', 'test:write-root'], cwd: root, timeout_seconds: 30, permission_profile: 'workspace_write' }, settings);
+    assert.equal(workspaceWrite.test_status, 'succeeded');
+    assert.equal(readFileSync(generatedPath, 'utf8'), 'written');
+  }
 
   await assert.rejects(() => executeTestCommand({ cmd: ['node', '-e', 'console.log(1)'], cwd: root }, settings), /policy_denied/);
 

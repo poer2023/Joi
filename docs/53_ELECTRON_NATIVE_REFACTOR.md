@@ -8,7 +8,7 @@ The cutover has moved the default desktop app to Electron-native:
 
 - `apps/joi-electron` is the Electron-native app shell.
 - The current React renderer routes through `window.joi.invoke` under Electron.
-- Browser preview keeps a deterministic mock fallback for UI development.
+- Browser preview keeps a deterministic local fallback for UI development.
 - The Wails `window.go`/`window.runtime` renderer fallback, generated `wailsjs` files, Wails app entrypoint, and Wails packaging scripts are removed from the default tree.
 
 ## Entrypoints
@@ -66,7 +66,7 @@ The Electron shell currently provides:
 - Electron `SendChat` now injects the real TS workspace/file/web/exec/browser/computer/desktop-app/diagnostics capability executor for `workspace_search`, `file_analyze`, `file_read`, URL-backed `web_research`, `shell_command`, `test_command`, permission-gated `apply_patch`, `computer_observe`, `browser_observe`, `browser_navigate`, permission-gated `browser_click`/`browser_type`, `desktop_app_list`/`desktop_app_inspect`, `system_health_check`, and `server_diagnose`, and persists the real output into Run Trace `tool_finished` and `tool_runs`.
 - Electron real tool-calling now pauses `apply_patch` before execution, records `waiting_confirmation` runs with anchored `confirmation_requests`, marks rejected confirmations as failed runs, resumes approved confirmations by executing the original tool call and appending a final model response, and cancels waiting runs without leaving pending confirmations behind.
 - Electron real tool-calling now creates the SQLite run before the model request, emits `run.started` immediately, keeps an active `AbortController` per run, and lets the renderer stop an in-flight request through `InterruptRun`.
-- Mock fallback handlers remain for mock-provider mode, deterministic eval parity, and unconfigured model settings.
+- Deterministic preview/eval handlers remain outside the Electron SendChat product fallback; unconfigured real model settings fail fast.
 
 ## Remaining Cutover Work
 

@@ -33,6 +33,7 @@ import {
   type WorkspaceSettings,
 } from './api/desktop';
 import { eventsOn, windowSetMinSize } from './api/runtime';
+import { permissionProfileForPrompt } from './permissionProfile';
 import joiAvatar from './assets/joi-avatar-circle.png';
 import { ScrollArea } from './components/ScrollArea';
 import { buildConversationRenderItems, sortBySeq } from './features/chat/conversationProjector';
@@ -715,7 +716,7 @@ export default function App() {
         input_mode: inputMode,
         product_task_id: activeProductTaskID || undefined,
         runtime_mode: 'tool_calling',
-        permission_profile: 'read_only',
+        permission_profile: permissionProfileForPrompt(inputMode, prompt),
       });
       setChat(result);
       pendingAssistantIDRef.current = result.assistant_message_id;

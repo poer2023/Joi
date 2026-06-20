@@ -13,6 +13,7 @@ try {
   const bundle = join(outDir, 'bundle.mjs');
   writeFileSync(entry, `
     export { getExecutionDisplayMode, projectRunTraceToActions, visibleExecutionActions } from '${root}/src/executionActions.ts';
+    export { permissionProfileForPrompt } from '${root}/src/permissionProfile.ts';
   `);
   execFileSync('node_modules/.bin/esbuild', [
     entry,
@@ -23,7 +24,7 @@ try {
     '--outfile=' + bundle,
   ], { cwd: root, stdio: 'inherit' });
 
-  const { getExecutionDisplayMode, projectRunTraceToActions, visibleExecutionActions } = await import(pathToFileURL(bundle).href);
+  const { getExecutionDisplayMode, permissionProfileForPrompt, projectRunTraceToActions, visibleExecutionActions } = await import(pathToFileURL(bundle).href);
 
   const baseTrace = (steps) => ({
     id: 'run_test',
@@ -33,6 +34,13 @@ try {
   });
 
   const withoutRawSteps = (actions) => actions.map(({ raw_steps: _rawSteps, ...action }) => action);
+
+  assert.equal(permissionProfileForPrompt('chat_assist', '帮我分析 Joi 和 Hermes 的差距'), 'read_only');
+  assert.equal(permissionProfileForPrompt('serious_task', '帮我分析并形成计划'), 'workspace_write');
+  assert.equal(permissionProfileForPrompt('background_task', '后台完成剩余工作'), 'workspace_write');
+  assert.equal(permissionProfileForPrompt('auto', '将 finding 的内容全部修复'), 'workspace_write');
+  assert.equal(permissionProfileForPrompt('auto', '更新本地实现'), 'workspace_write');
+  assert.equal(permissionProfileForPrompt('auto', '总结一下当前状态'), 'read_only');
 
   {
     const actions = projectRunTraceToActions(baseTrace([

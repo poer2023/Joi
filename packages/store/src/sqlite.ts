@@ -157,6 +157,7 @@ export type PersistedToolCallingResume = {
   model_name: string;
   final_message: string;
   tool_result: PersistedToolResult;
+  model_error?: string;
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -226,7 +227,7 @@ export class JoiSQLiteStore {
     const modelName = req.model_name?.trim() || 'deterministic-test-model';
     const memoryPackID = `mcp_${newID()}`;
     const promptAssemblyID = `pa_${newID()}`;
-    const prefixHash = hashText('joi-electron-mock-prefix');
+    const prefixHash = hashText('joi-electron-deterministic-prefix');
     const dynamicTailHash = hashText(message);
     const promptCacheKey = `${modelName}:${prefixHash}:${dynamicTailHash}`;
 
@@ -254,7 +255,7 @@ export class JoiSQLiteStore {
 
       this.exec(
         `INSERT INTO models (id, provider, model_name, display_name, supports_json_mode, supports_tool_calling, enabled, metadata)
-         VALUES (?, 'mock_provider', ?, ?, 1, 1, 1, ?)
+         VALUES (?, 'deterministic_provider', ?, ?, 1, 1, 1, ?)
          ON CONFLICT(id) DO UPDATE SET model_name=excluded.model_name, display_name=excluded.display_name, enabled=1, updated_at=datetime('now')`,
         modelName,
         modelName,
@@ -353,7 +354,7 @@ export class JoiSQLiteStore {
         ['input_received', 'Input received', { message }, {}],
         ['router_selected', 'Router selected agent', { message }, { agent_id: plan.agentID, route: 'electron_sqlite_deterministic' }],
         ['prompt_assembled', 'Prompt assembly finished', { run_id: runID, agent_id: plan.agentID }, { prompt_assembly_id: promptAssemblyID, prefix_hash: prefixHash, dynamic_tail_hash: dynamicTailHash, prompt_cache_key: promptCacheKey, memory_profile_version: 'electron_deterministic_v1', tool_schema_version: 'tool_schema_v1' }],
-        ['model_call_finished', 'Model call finished', { agent_id: plan.agentID, model_id: modelName, prompt_assembly_id: promptAssemblyID }, { provider: 'mock_provider', model: modelName, fallback_to_mock: false, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, latency_ms: 0 }],
+        ['model_call_finished', 'Model call finished', { agent_id: plan.agentID, model_id: modelName, prompt_assembly_id: promptAssemblyID }, { provider: 'deterministic_provider', model: modelName, deterministic_runtime: true, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, latency_ms: 0 }],
         ['agent_output_parsed', 'Agent output parsed', { turn: 1 }, { repaired: false, output_type: 'final_answer' }],
         ...runtimeSteps,
         ['response_generated', 'Response generated', {}, { response }],
@@ -373,7 +374,7 @@ export class JoiSQLiteStore {
 
       this.exec(
         `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name, prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens, cached_input_tokens, latency_ms, status, raw_response, metadata, created_at)
-         VALUES (?, ?, ?, ?, ?, 'mock_provider', ?, ?, ?, ?, 0, 0, 0, 0, 'succeeded', ?, ?, datetime('now'))`,
+         VALUES (?, ?, ?, ?, ?, 'deterministic_provider', ?, ?, ?, ?, 0, 0, 0, 0, 'succeeded', ?, ?, datetime('now'))`,
         `mcall_${newID()}`,
         runID,
         plan.agentID,
@@ -389,7 +390,7 @@ export class JoiSQLiteStore {
       for (let index = 1; index < plan.modelCallCount; index++) {
         this.exec(
           `INSERT INTO model_calls (id, run_id, agent_id, model_id, provider, model_name, input_tokens, output_tokens, cached_input_tokens, latency_ms, status, raw_response, metadata, created_at)
-           VALUES (?, ?, ?, ?, 'mock_provider', ?, 0, 0, 0, 0, 'succeeded', ?, ?, datetime('now'))`,
+           VALUES (?, ?, ?, ?, 'deterministic_provider', ?, 0, 0, 0, 0, 'succeeded', ?, ?, datetime('now'))`,
           `mcall_${newID()}`,
           runID,
           plan.agentID,
@@ -2250,7 +2251,9 @@ export class JoiSQLiteStore {
   completeApprovedToolCallingResume(confirmationID: string, resume: PersistedToolCallingResume): ChatResponse | undefined {
     const request = this.loadApprovedToolCallingResume(confirmationID);
     if (!request) return undefined;
-    const response = resume.final_message.trim() || '已执行批准的工具调用。';
+    const baseResponse = resume.final_message.trim() || '已执行批准的工具调用。';
+    const modelError = resume.model_error?.trim() || '';
+    const response = modelError ? `${baseResponse}\n\n最终模型回复失败：${modelError}` : baseResponse;
     const toolResult = resume.tool_result;
     const capability = canonicalCapabilityName(request.capability_id || toolResult.name);
     const workflowName = workflowNameForGateway(capability);
@@ -2323,6 +2326,61 @@ export class JoiSQLiteStore {
         tool_run_id: toolRunID,
         operation_id: optionalString(request.input.operation_id) || operationIDForTool(productTaskID, capability, request.input, request.call_id),
       });
+      if (modelError) {
+        this.insertRunStep(request.run_id, 'model_call_failed', 'Model call failed after approval resume', { agent_id: request.agent_id, model_id: resume.model_name || request.model_name, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resume.provider || request.provider, model: resume.model_name || request.model_name, resumed: true, error: modelError, tool_run_ids: [toolRunID] }, 'failed');
+        this.exec(
+          `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name, prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens, cached_input_tokens, latency_ms, status, error_code, error_message, raw_response, metadata, created_at)
+           VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, 0, 'failed', 'approval_resume_model_failed', ?, ?, ?, datetime('now'))`,
+          modelCallID,
+          request.run_id,
+          request.agent_id,
+          request.model_id || resume.model_name || request.model_name,
+          optionalString(promptAssembly?.id) || '',
+          resume.provider || request.provider,
+          resume.model_name || request.model_name,
+          optionalString(promptAssembly?.prompt_cache_key) || '',
+          optionalString(promptAssembly?.prefix_hash) || '',
+          optionalString(promptAssembly?.dynamic_tail_hash) || '',
+          positiveNumber(usage.input_tokens),
+          positiveNumber(usage.output_tokens),
+          positiveNumber(usage.cached_input_tokens),
+          modelError,
+          json({ responses: resume.model_responses || [], error: modelError }),
+          json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, error: modelError }),
+        );
+        this.exec(
+          `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
+           VALUES (?, ?, 'assistant', ?, '[]', ?, datetime('now'))`,
+          assistantMessageID,
+          request.conversation_id,
+          response,
+          json({ run_id: request.run_id, source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, model_call_id: modelCallID, error: modelError }),
+        );
+        this.insertTurnItem(request.run_id, request.turn_id, this.nextTurnItemSeq(request.run_id), 'message', 'assistant', '', '', {}, response, {}, 'failed', { final_answer: true, resumed_from_confirmation_id: request.confirmation_id, error: modelError });
+        this.exec(
+          `UPDATE runs
+           SET status='failed', error_code='approval_resume_model_failed', error_message=?, finished_at=datetime('now'),
+               duration_ms=CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)
+           WHERE id=?`,
+          modelError,
+          request.run_id,
+        );
+        this.exec(
+          `UPDATE turns
+           SET status='failed', finished_at=datetime('now')
+           WHERE id=?`,
+          request.turn_id,
+        );
+        this.markProductTaskFailed(productTaskID, request.run_id, new Error(modelError), 'failed');
+        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.output.delta', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, resumed: true });
+        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.finished', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, resumed: true });
+        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'message.delta', { run_id: request.run_id, turn_id: request.turn_id, delta: response, status: 'failed', resumed: true, error: modelError });
+        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'run.failed', { run_id: request.run_id, turn_id: request.turn_id, status: 'failed', error: 'approval_resume_model_failed', message: modelError, resumed: true });
+        if (productTaskID) {
+          productTask = this.getProductTask(productTaskID).task;
+        }
+        return;
+      }
       this.insertRunStep(request.run_id, 'model_call_finished', 'Model call finished', { agent_id: request.agent_id, model_id: resume.model_name || request.model_name, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resume.provider || request.provider, model: resume.model_name || request.model_name, real_model: (resume.provider || request.provider) !== 'mock_provider', resumed: true, input_tokens: positiveNumber(usage.input_tokens), output_tokens: positiveNumber(usage.output_tokens), cached_input_tokens: positiveNumber(usage.cached_input_tokens), tool_run_ids: [toolRunID] });
       this.insertRunStep(request.run_id, 'agent_output_parsed', 'Agent output parsed', { turn: 1, resumed: true }, { repaired: false, output_type: 'final_answer' });
       this.insertRunStep(request.run_id, 'response_generated', 'Response generated', {}, { response, resumed: true });
@@ -3239,7 +3297,7 @@ export class JoiSQLiteStore {
   private seedDefaults(): void {
     this.exec(
       `INSERT INTO models (id, provider, model_name, display_name, supports_json_mode, supports_tool_calling, enabled, metadata)
-       VALUES ('mock-model', 'mock_provider', 'mock-model', 'Mock Model', 1, 1, 1, ?)
+       VALUES ('deterministic-local-model', 'deterministic_provider', 'deterministic-local-model', 'Deterministic Local Model', 1, 1, 1, ?)
        ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, model_name=excluded.model_name, display_name=excluded.display_name, supports_tool_calling=excluded.supports_tool_calling, enabled=excluded.enabled, updated_at=datetime('now')`,
       json({ desktop_default: true, electron_native: true }),
     );
@@ -3251,7 +3309,7 @@ export class JoiSQLiteStore {
     ] as const) {
       this.exec(
         `INSERT INTO agents (id, name, description, default_model_id, capabilities, route_hints, enabled, metadata)
-         VALUES (?, ?, ?, 'mock-model', ?, '{"keywords":[]}', 1, ?)
+         VALUES (?, ?, ?, 'deterministic-local-model', ?, '{"keywords":[]}', 1, ?)
          ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, default_model_id=excluded.default_model_id, capabilities=excluded.capabilities, route_hints=excluded.route_hints, enabled=excluded.enabled, updated_at=datetime('now')`,
         agent[0],
         agent[1],
@@ -3966,8 +4024,8 @@ function rowToRunEvent(row: SQLiteRow): RunEvent {
 function rowToModelCall(row: SQLiteRow): ModelCall {
   return {
     id: String(row.id),
-    provider: optionalString(row.provider) || 'mock_provider',
-    model_name: optionalString(row.model_name) || 'mock-model',
+    provider: optionalString(row.provider) || 'openai_compatible',
+    model_name: optionalString(row.model_name) || 'model',
     status: optionalString(row.status) || 'succeeded',
     input_tokens: Number(row.input_tokens ?? 0),
     output_tokens: Number(row.output_tokens ?? 0),

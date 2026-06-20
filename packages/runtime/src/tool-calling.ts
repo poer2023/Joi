@@ -19,7 +19,7 @@ export type ToolResult = {
   output: Record<string, unknown>;
 };
 
-export type ToolExecutor = (call: ToolCall) => Promise<ToolResult> | ToolResult;
+export type ToolExecutor = (call: ToolCall, options?: { signal?: AbortSignal }) => Promise<ToolResult> | ToolResult;
 
 export type ToolCallingTurnRequest = {
   base_url: string;
@@ -105,7 +105,7 @@ export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): P
     });
     for (const call of toolCalls) {
       throwIfAborted(req.signal);
-      const result = await req.executeTool(call);
+      const result = await req.executeTool(call, { signal: req.signal });
       toolResults.push(result);
       messages.push({
         role: 'tool',

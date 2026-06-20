@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -12,7 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { platform, tmpdir } from 'node:os';
 import type { PermissionProfile, WorkspaceSettings } from '../../shared-types/src/desktop-api';
 import type { CapabilityResult } from './capabilities.ts';
 import { normalizeWorkspaceSettings } from './capabilities.ts';
@@ -45,6 +46,20 @@ type CommandRunResult = {
   error: string;
 };
 
+type CommandExecutionOptions = {
+  signal?: AbortSignal;
+};
+
+type CommandSandbox = {
+  engine: string;
+  enforced: boolean;
+  permission_profile: PermissionProfile;
+  temp_dir: string;
+  writable_roots: string[];
+  reason: string;
+  profile_path?: string;
+};
+
 type WorkspacePatchOp = {
   kind: 'add' | 'update';
   path: string;
@@ -69,7 +84,7 @@ const maxTestCommandTimeoutSeconds = 180;
 const defaultTestCommandOutputBytes = 120000;
 const maxTestCommandOutputBytes = 240000;
 
-export async function executeShellCommand(req: ShellCommandRequest, settings: WorkspaceSettings): Promise<CapabilityResult> {
+export async function executeShellCommand(req: ShellCommandRequest, settings: WorkspaceSettings, options: CommandExecutionOptions = {}): Promise<CapabilityResult> {
   const normalized = normalizeWorkspaceSettings(settings);
   const argv = commandArgvFrom(req.cmd);
   if (argv.length === 0) throw new Error('shell_command cmd is required');
@@ -77,7 +92,7 @@ export async function executeShellCommand(req: ShellCommandRequest, settings: Wo
   validateShellCommandArgv(argv, cwd, normalized);
   const timeoutSeconds = boundedInteger(req.timeout_seconds, defaultShellCommandTimeoutSeconds, maxShellCommandTimeoutSeconds);
   const maxOutputBytes = boundedInteger(req.max_output_bytes, defaultShellCommandOutputBytes, maxShellCommandOutputBytes);
-  const result = await runCommand(argv, cwd, timeoutSeconds, maxOutputBytes, normalizedPermissionProfile(req.permission_profile), 'shell_command_v1_exec_context');
+  const result = await runCommand(argv, cwd, timeoutSeconds, maxOutputBytes, normalizedPermissionProfile(req.permission_profile), normalized.allowed_roots, 'shell_command_v1_exec_context', options.signal);
   return {
     status: 'completed',
     command_status: result.status,
@@ -99,7 +114,7 @@ export async function executeShellCommand(req: ShellCommandRequest, settings: Wo
   };
 }
 
-export async function executeTestCommand(req: TestCommandRequest, settings: WorkspaceSettings): Promise<CapabilityResult> {
+export async function executeTestCommand(req: TestCommandRequest, settings: WorkspaceSettings, options: CommandExecutionOptions = {}): Promise<CapabilityResult> {
   const normalized = normalizeWorkspaceSettings(settings);
   const argv = commandArgvFrom(req.cmd);
   if (argv.length === 0) throw new Error('test_command cmd is required');
@@ -107,7 +122,7 @@ export async function executeTestCommand(req: TestCommandRequest, settings: Work
   const cwd = resolveWorkspaceDirectory(req.cwd || normalized.default_root, normalized, 'test_command cwd must be a directory');
   const timeoutSeconds = boundedInteger(req.timeout_seconds, defaultTestCommandTimeoutSeconds, maxTestCommandTimeoutSeconds);
   const maxOutputBytes = boundedInteger(req.max_output_bytes, defaultTestCommandOutputBytes, maxTestCommandOutputBytes);
-  const result = await runCommand(argv, cwd, timeoutSeconds, maxOutputBytes, normalizedPermissionProfile(req.permission_profile), 'test_command_v1_allowlisted_exec');
+  const result = await runCommand(argv, cwd, timeoutSeconds, maxOutputBytes, normalizedPermissionProfile(req.permission_profile), normalized.allowed_roots, 'test_command_v1_allowlisted_exec', options.signal);
   let testStatus = result.status === 'completed' && result.exit_code === 0 ? 'succeeded' : 'failed';
   if (result.status === 'timed_out' || result.status === 'aborted') testStatus = result.status;
   return {
@@ -344,47 +359,66 @@ function runCommand(
   timeoutSeconds: number,
   maxOutputBytes: number,
   profile: PermissionProfile,
+  allowedRoots: string[],
   mode: string,
+  signal?: AbortSignal,
 ): Promise<CommandRunResult> {
   const tempDir = mkdtempSync(join(tmpdir(), 'joi-sandbox-'));
   for (const dir of ['go-cache', 'go-tmp', 'npm-cache', 'yarn-cache', 'pnpm-home', 'xdg-cache']) {
     mkdirSync(join(tempDir, dir), { recursive: true, mode: 0o700 });
   }
-  const sandbox = {
-    engine: 'none',
-    enforced: false,
-    profile,
-    temp_dir: tempDir,
-    reason: 'ts allowlisted spawn without shell',
-  };
-  return new Promise((resolveResult) => {
+  const sandbox = commandSandbox(tempDir, cwd, profile, allowedRoots);
+  const spawnArgv = sandboxedCommandArgv(argv, sandbox);
+  return new Promise((resolveResult, rejectResult) => {
     const start = Date.now();
     const stdout = new LimitedOutputBuffer(maxOutputBytes);
     const stderr = new LimitedOutputBuffer(maxOutputBytes);
     let settled = false;
     let timedOut = false;
+    let aborted = false;
     let spawnError = '';
-    const child = spawn(argv[0], argv.slice(1), {
+    let killTimer: NodeJS.Timeout | undefined;
+    const child = spawn(spawnArgv[0], spawnArgv.slice(1), {
       cwd,
       env: sandboxCommandEnv(tempDir),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      signal?.removeEventListener('abort', onAbort);
+      rmSync(tempDir, { recursive: true, force: true });
+    };
+    const killChild = () => {
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => child.kill('SIGKILL'), 1000);
+      killTimer.unref();
+    };
+    const onAbort = () => {
+      if (settled) return;
+      aborted = true;
+      killChild();
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 1000).unref();
+      killChild();
     }, timeoutSeconds * 1000);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
     child.stdout?.on('data', (chunk) => stdout.write(Buffer.from(chunk)));
     child.stderr?.on('data', (chunk) => stderr.write(Buffer.from(chunk)));
     child.on('error', (error) => {
       spawnError = error.message;
     });
-    child.on('close', (code, signal) => {
+    child.on('close', (code, closeSignal) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      rmSync(tempDir, { recursive: true, force: true });
+      cleanup();
+      if (aborted) {
+        rejectResult(abortError(signal));
+        return;
+      }
       const stdoutText = redactCommandText(stdout.text());
       const stderrText = redactCommandText(stderr.text());
       const output = `${stdoutText}\n${stderrText}`.trimEnd();
@@ -395,9 +429,9 @@ function runCommand(
         status = 'timed_out';
         exitCode = 1;
         error = 'command timed out';
-      } else if (signal && !spawnError) {
+      } else if (closeSignal && !spawnError) {
         status = 'aborted';
-        error = `command terminated by ${signal}`;
+        error = `command terminated by ${closeSignal}`;
       }
       resolveResult({
         status,
@@ -413,6 +447,95 @@ function runCommand(
       });
     });
   });
+}
+
+function commandSandbox(tempDir: string, cwd: string, profile: PermissionProfile, allowedRoots: string[]): CommandSandbox {
+  const writableRoots = sandboxWritableRoots(tempDir, profile, allowedRoots);
+  if (platform() !== 'darwin') {
+    return {
+      engine: 'none',
+      enforced: false,
+      permission_profile: profile,
+      temp_dir: tempDir,
+      writable_roots: writableRoots,
+      reason: 'sandbox-exec is only available on macOS',
+    };
+  }
+  if (!existsSync('/usr/bin/sandbox-exec')) {
+    return {
+      engine: 'none',
+      enforced: false,
+      permission_profile: profile,
+      temp_dir: tempDir,
+      writable_roots: writableRoots,
+      reason: 'macOS sandbox-exec is unavailable',
+    };
+  }
+  const profilePath = join(tempDir, 'sandbox.sb');
+  writeFileSync(profilePath, sandboxProfileText(writableRoots), { mode: 0o600 });
+  return {
+    engine: 'sandbox-exec',
+    enforced: true,
+    permission_profile: profile,
+    temp_dir: tempDir,
+    writable_roots: writableRoots,
+    profile_path: profilePath,
+    reason: `macOS sandbox-exec write boundary for cwd ${cwd}`,
+  };
+}
+
+function sandboxedCommandArgv(argv: string[], sandbox: CommandSandbox): string[] {
+  if (sandbox.enforced && sandbox.profile_path) return ['/usr/bin/sandbox-exec', '-f', sandbox.profile_path, ...argv];
+  return argv;
+}
+
+function sandboxWritableRoots(tempDir: string, profile: PermissionProfile, allowedRoots: string[]): string[] {
+  const roots = [
+    tempDir,
+    '/tmp',
+    '/private/tmp',
+    '/dev',
+  ];
+  if (permissionProfileAllowsWorkspaceWrite(profile)) roots.push(...allowedRoots);
+  return uniquePaths(roots.map((root) => safeRealPath(root)));
+}
+
+function sandboxProfileText(writableRoots: string[]): string {
+  return [
+    '(version 1)',
+    '(deny default)',
+    '(allow process*)',
+    '(allow signal (target self))',
+    '(allow sysctl-read)',
+    '(allow mach-lookup)',
+    '(allow file-read*)',
+    ...writableRoots.map((root) => `(allow file-write* (subpath ${JSON.stringify(root)}))`),
+  ].join('\n');
+}
+
+function uniquePaths(paths: string[]): string[] {
+  const result: string[] = [];
+  for (const path of paths) {
+    if (!path || result.some((existing) => existing === path || pathWithinRoot(path, existing))) continue;
+    result.push(path);
+  }
+  return result;
+}
+
+function safeRealPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+function abortError(signal?: AbortSignal): Error {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  const error = new Error(typeof reason === 'string' && reason.trim() ? reason : 'command execution aborted');
+  error.name = 'AbortError';
+  return error;
 }
 
 class LimitedOutputBuffer {

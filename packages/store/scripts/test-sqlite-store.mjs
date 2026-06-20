@@ -40,9 +40,12 @@ try {
   assert.equal(trace.events?.length, 4);
   assert.equal(trace.events?.[1]?.delta, response.response);
   assert.equal(trace.model_calls?.[0]?.model_name, 'deepseek-v4-flash');
+  assert.equal(trace.model_calls?.[0]?.provider, 'deterministic_provider');
 
   const models = store.listSavedModels().models.map((model) => model.id);
   assert.ok(models.includes('deepseek-v4-flash'));
+  assert.ok(models.includes('deterministic-local-model'));
+  assert.ok(!models.includes('mock-model'));
 
   const health = store.systemHealth();
   assert.deepEqual(health.service_status, { sqlite: true, electron: 'running', runtime: 'electron_ts_sqlite' });
@@ -409,6 +412,63 @@ try {
   assert.equal(store.getConversation(resumableChat.conversation_id).messages.at(-1).content, 'Patch resumed final answer.');
   assert.equal(JSON.parse(store['get'](`SELECT output FROM tool_runs WHERE run_id=?`, resumableChat.run_id).output).summary, 'patch applied by approval resume');
   assert.ok(store.listConfirmations().items.find((item) => item.id === resumableConfirmation.id).resumed_at);
+
+  const failingResumeChat = store.recordToolCallingChat({
+    message: 'Use a model-generated patch whose final resume model call fails',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'waiting_confirmation',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'confirmation_required: workspace write requires approval before execution',
+    tool_results: [{
+      call_id: 'call_apply_patch_resume_fail',
+      name: 'apply_patch',
+      arguments: { patch: '*** Begin Patch\n*** End Patch\n', reason: 'resume approval with model failure' },
+      output: {
+        status: 'waiting_confirmation',
+        message: 'confirmation_required: workspace write requires approval before execution',
+        capability: 'apply_patch',
+        risk: 'workspace_write',
+      },
+    }],
+    usage: { input_tokens: 8, output_tokens: 2 },
+    model_responses: [{ id: 'chatcmpl_resumable_fail', choices: [{ message: { tool_calls: [] } }] }],
+  });
+  const failingResumeConfirmation = store.listConfirmations().items.find((item) => item.run_id === failingResumeChat.run_id);
+  store.decideConfirmation({ id: failingResumeConfirmation.id, approve: true, actor: 'test', reason: 'approve model failure test' });
+  const failingResumeRequest = store.loadApprovedToolCallingResume(failingResumeConfirmation.id);
+  const failedResume = store.completeApprovedToolCallingResume(failingResumeConfirmation.id, {
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    final_message: 'patch applied before final model failure',
+    model_error: 'resume model down',
+    tool_result: {
+      call_id: 'call_apply_patch_resume_fail',
+      name: 'apply_patch',
+      arguments: failingResumeRequest.input,
+      output: { status: 'completed', summary: 'patch applied before model failure' },
+    },
+    usage: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 },
+    model_responses: [],
+  });
+  assert.equal(failedResume.run_id, failingResumeChat.run_id);
+  assert.equal(failedResume.product_task.status, 'blocked');
+  const failedResumeTrace = store.getRunTrace(failingResumeChat.run_id);
+  assert.equal(failedResumeTrace.status, 'failed');
+  assert.ok(failedResumeTrace.steps.some((step) => step.step_type === 'model_call_failed' && step.status === 'failed'));
+  assert.ok(failedResumeTrace.events.some((event) => event.event_type === 'tool.finished'));
+  assert.ok(failedResumeTrace.events.some((event) => event.event_type === 'run.failed'));
+  assert.ok(!failedResumeTrace.events.some((event) => event.event_type === 'run.completed'));
+  const failedResumeModelCall = store['get'](`SELECT status, error_code, error_message FROM model_calls WHERE run_id=? AND error_code='approval_resume_model_failed'`, failingResumeChat.run_id);
+  assert.equal(failedResumeModelCall.status, 'failed');
+  assert.equal(failedResumeModelCall.error_message, 'resume model down');
+  assert.equal(store.getConversation(failingResumeChat.conversation_id).messages.at(-1).content.includes('最终模型回复失败：resume model down'), true);
+  assert.equal(store['get'](`SELECT status FROM turn_items WHERE run_id=? AND item_type='message' AND role='assistant' ORDER BY seq DESC LIMIT 1`, failingResumeChat.run_id).status, 'failed');
+  assert.ok(store.listConfirmations().items.find((item) => item.id === failingResumeConfirmation.id).resumed_at);
 
   const liveStarted = store.beginToolCallingChat({
     message: 'Begin a cancellable real model run',
