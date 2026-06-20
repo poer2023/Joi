@@ -8,6 +8,8 @@ import {
   createXAIOAuthAuthorizationRequest,
   exchangeXAIOAuthCode,
   isXAIOAuthProvider,
+  loginWithXAIOAuthLoopback,
+  normalizeXAIOAuthManualCode,
   normalizeXAIOAuthState,
   resolveXAIOAuthCredentials,
   validateXAIRedirectURI,
@@ -122,6 +124,36 @@ assert.equal(codeState.scope, XAI_OAUTH_HERMES_SCOPES.join(' '));
 assert.equal(codeState.tokens.access_token, 'access-code');
 assert.equal(codeState.tokens.refresh_token, 'refresh-code');
 
+const manualCode = 'BjHT4zJevv_9h3OB6NAdpNz99C4_lMDCPOyXYoBgqeT9kUOjQSuREU59uWT_i4hzdOcchSkaZQzwnXBPaLCjFw';
+assert.equal(normalizeXAIOAuthManualCode(manualCode), manualCode);
+assert.equal(normalizeXAIOAuthManualCode('https://accounts.x.ai/oauth2/consent?code=bad'), '');
+
+const loginExchangeCalls = [];
+let openedLoginURL = '';
+let clipboardValue = '';
+const manualLoginResult = await loginWithXAIOAuthLoopback({
+  saveSecret,
+  fetchImpl: fakeManualLoginFetch,
+  redirectURI: 'http://127.0.0.1:56129/callback',
+  timeoutSeconds: 2,
+  manualCodePollIntervalMs: 10,
+  openURL(url) {
+    openedLoginURL = url;
+    setTimeout(() => {
+      clipboardValue = manualCode;
+    }, 30);
+  },
+  readClipboard() {
+    return clipboardValue;
+  },
+});
+assert.equal(new URL(openedLoginURL).searchParams.get('scope'), XAI_OAUTH_HERMES_SCOPES.join(' '));
+assert.equal(loginExchangeCalls[0].code, manualCode);
+assert.equal(loginExchangeCalls[0].redirect_uri, 'http://127.0.0.1:56129/callback');
+assert.equal(Boolean(loginExchangeCalls[0].code_verifier), true);
+assert.equal(manualLoginResult.source, 'manual_code_pkce');
+assert.equal(JSON.parse(stored.get(XAI_OAUTH_SECRET_NAME)).source, 'manual_code_pkce');
+
 console.log('xai oauth runtime tests passed');
 
 async function saveSecret(name, value) {
@@ -151,6 +183,31 @@ async function fakeCodeExchangeFetch(url, init) {
     access_token: 'access-code',
     refresh_token: 'refresh-code',
     id_token: 'id-code',
+    token_type: 'Bearer',
+    expires_in: 21600,
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+async function fakeManualLoginFetch(url, init) {
+  if (url === 'https://auth.x.ai/.well-known/openid-configuration') {
+    return new Response(JSON.stringify({
+      authorization_endpoint: 'https://auth.x.ai/oauth2/authorize',
+      token_endpoint: 'https://auth.x.ai/oauth2/token',
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+  assert.equal(url, 'https://auth.x.ai/oauth2/token');
+  const body = new URLSearchParams(init.body);
+  loginExchangeCalls.push(Object.fromEntries(body.entries()));
+  return new Response(JSON.stringify({
+    access_token: 'access-manual',
+    refresh_token: 'refresh-manual',
+    id_token: 'id-manual',
     token_type: 'Bearer',
     expires_in: 21600,
   }), {

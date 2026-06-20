@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { desktopIpcMethods, type DesktopIpcMethod, type JoiInvokeRequest } from '../../../../packages/shared-types/src/preload-api';
@@ -279,6 +279,7 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
       const result = await loginWithXAIOAuthLoopback({
         saveSecret: (name, value) => secrets.save(name, value),
         openURL: (url) => shell.openExternal(url),
+        readClipboard: () => clipboard.readText(),
         timeoutSeconds: 240,
       });
       const modelName = 'grok-4.3';

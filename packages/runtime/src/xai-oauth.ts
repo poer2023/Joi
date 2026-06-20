@@ -73,7 +73,9 @@ export type XAIOAuthAuthorizationRequest = {
 type LoginOptions = {
   saveSecret: XAIOAuthSecretSaver;
   openURL: (url: string) => Promise<void> | void;
+  readClipboard?: () => Promise<string> | string;
   timeoutSeconds?: number;
+  manualCodePollIntervalMs?: number;
   fetchImpl?: typeof fetch;
   redirectURI?: string;
   scopes?: string[];
@@ -176,21 +178,61 @@ export async function loginWithXAIOAuthLoopback(options: LoginOptions): Promise<
 
   let server: Server | undefined;
   let settled = false;
+  const initialManualCode = normalizeXAIOAuthManualCode(options.readClipboard ? await safeReadClipboard(options.readClipboard) : '');
 
   try {
     const resultPromise = new Promise<XAIOAuthLoginResult>((resolve, reject) => {
       const timeout = setTimeout(() => {
         reject(new Error(`xAI OAuth login timed out after ${timeoutSeconds}s`));
       }, timeoutSeconds * 1000);
+      let manualCodePoll: ReturnType<typeof setInterval> | undefined;
+
+      const stopWaiting = () => {
+        clearTimeout(timeout);
+        if (manualCodePoll) {
+          clearInterval(manualCodePoll);
+          manualCodePoll = undefined;
+        }
+      };
 
       const finish = (fn: () => Promise<XAIOAuthLoginResult>) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeout);
+        stopWaiting();
         fn().then(resolve, reject).finally(() => {
           closeServer(server);
         });
       };
+
+      const exchangeCode = async (code: string, source: string) => {
+        const oauthState = await exchangeXAIOAuthCode({
+          code,
+          codeVerifier: request.codeVerifier,
+          redirectURI: request.redirectURI,
+          discovery: request.discovery,
+          scopes: request.scopes,
+          fetchImpl: options.fetchImpl,
+          timeoutSeconds,
+        });
+        const sourcedState = normalizeXAIOAuthState({ ...oauthState, source });
+        await saveXAIOAuthState(options.saveSecret, sourcedState);
+        return loginResultFromState(sourcedState);
+      };
+
+      if (options.readClipboard) {
+        const intervalMs = Math.max(250, options.manualCodePollIntervalMs || 1000);
+        manualCodePoll = setInterval(() => {
+          if (settled) return;
+          Promise.resolve(options.readClipboard?.() || '').then((value) => {
+            const code = normalizeXAIOAuthManualCode(value);
+            if (!code || code === initialManualCode) return;
+            finish(() => exchangeCode(code, 'manual_code_pkce'));
+          }).catch(() => {
+            // Clipboard reads can fail transiently while the browser is active.
+          });
+        }, intervalMs);
+        manualCodePoll.unref?.();
+      }
 
       server = createServer((req, res) => {
         const incoming = new URL(req.url || '/', request.redirectURI);
@@ -224,28 +266,16 @@ export async function loginWithXAIOAuthLoopback(options: LoginOptions): Promise<
 
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
         res.end(oauthHTML('xAI 登录成功', '可以关闭这个窗口并回到 Joi。'));
-        finish(async () => {
-          const oauthState = await exchangeXAIOAuthCode({
-            code,
-            codeVerifier: request.codeVerifier,
-            redirectURI: request.redirectURI,
-            discovery: request.discovery,
-            scopes: request.scopes,
-            fetchImpl: options.fetchImpl,
-            timeoutSeconds,
-          });
-          await saveXAIOAuthState(options.saveSecret, oauthState);
-          return loginResultFromState(oauthState);
-        });
+        finish(() => exchangeCode(code, 'loopback_pkce'));
       });
 
       server.on('error', (error) => {
-        clearTimeout(timeout);
+        stopWaiting();
         reject(error);
       });
       server.listen(Number(callbackURL.port), callbackURL.hostname, () => {
         Promise.resolve(options.openURL(request.url)).catch((error) => {
-          clearTimeout(timeout);
+          stopWaiting();
           reject(error);
           closeServer(server);
         });
@@ -379,6 +409,12 @@ export async function exchangeXAIOAuthCode(options: {
   } finally {
     clearTimeout(timer);
   }
+}
+
+export function normalizeXAIOAuthManualCode(value: string): string {
+  const candidate = stringValue(value);
+  if (!/^[A-Za-z0-9_-]{32,512}$/.test(candidate)) return '';
+  return candidate;
 }
 
 export async function refreshXAIOAuthState(
@@ -537,6 +573,14 @@ function numberValue(value: unknown): number | undefined {
 function normalizeScopes(scopes: string[] | readonly string[] | undefined): string[] {
   const values = scopes?.length ? scopes : XAI_OAUTH_HERMES_SCOPES;
   return [...new Set(values.map((item) => item.trim()).filter(Boolean))];
+}
+
+async function safeReadClipboard(readClipboard: NonNullable<LoginOptions['readClipboard']>): Promise<string> {
+  try {
+    return stringValue(await readClipboard());
+  } catch {
+    return '';
+  }
 }
 
 function randomBase64URL(bytes: number): string {
