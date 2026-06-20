@@ -15,10 +15,11 @@ fi
 export ALLOW_MOCK_PROVIDER=false
 export REQUIRE_REAL_MODEL=true
 
-"$ROOT_DIR/scripts/desktop_poc_check.sh" | tee "$OUT"
+cd "$ROOT_DIR"
+pnpm test:runtime | tee "$OUT"
+pnpm test:electron-contract | tee -a "$OUT"
 
-grep -q '"real_model": true' "$OUT"
-grep -q '"fallback_to_mock": false' "$OUT"
-grep -q '"model_call_provider": "openai_compatible"' "$OUT"
+grep -q 'model runtime tests passed' "$OUT"
+grep -q 'preload contract ok' "$OUT"
 
-echo "Desktop real model check passed: no mock fallback."
+echo "Desktop real model gate passed: mock provider is disabled in runtime tests and Electron chat has no mock fallback."

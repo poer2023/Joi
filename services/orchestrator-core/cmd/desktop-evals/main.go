@@ -26,9 +26,9 @@ type desktopCase struct {
 	ExpectAssignment          string   `json:"expect_assignment_reason"`
 	ExpectStepTypes           []string `json:"expect_step_types"`
 	ExpectNoStepTypes         []string `json:"expect_no_step_types"`
-	ExpectMinModelCalls       int      `json:"expect_min_model_calls"`
-	ExpectMinAssemblies       int      `json:"expect_min_prompt_assemblies"`
-	ExpectMinMemoryPacks      int      `json:"expect_min_memory_context_packs"`
+	ExpectMinModelCalls       *int     `json:"expect_min_model_calls"`
+	ExpectMinAssemblies       *int     `json:"expect_min_prompt_assemblies"`
+	ExpectMinMemoryPacks      *int     `json:"expect_min_memory_context_packs"`
 	ExpectMinTasks            int      `json:"expect_min_tasks"`
 	ExpectToolRun             bool     `json:"expect_tool_run"`
 	ExpectMemoryUsage         bool     `json:"expect_memory_usage"`
@@ -137,14 +137,14 @@ func runCase(ctx context.Context, core *appcore.AppCore, tc desktopCase) error {
 	if tc.ExpectResponseSubstr != "" && !strings.Contains(chat.Response, tc.ExpectResponseSubstr) {
 		return fmt.Errorf("response %q does not contain %q", chat.Response, tc.ExpectResponseSubstr)
 	}
-	if len(trace.ModelCalls) < maxInt(tc.ExpectMinModelCalls, 1) {
-		return fmt.Errorf("model_calls got %d", len(trace.ModelCalls))
+	if tc.ExpectMinModelCalls != nil && len(trace.ModelCalls) < *tc.ExpectMinModelCalls {
+		return fmt.Errorf("model_calls got %d want at least %d", len(trace.ModelCalls), *tc.ExpectMinModelCalls)
 	}
-	if len(trace.PromptAssemblies) < maxInt(tc.ExpectMinAssemblies, 1) {
-		return fmt.Errorf("prompt_assemblies got %d", len(trace.PromptAssemblies))
+	if tc.ExpectMinAssemblies != nil && len(trace.PromptAssemblies) < *tc.ExpectMinAssemblies {
+		return fmt.Errorf("prompt_assemblies got %d want at least %d", len(trace.PromptAssemblies), *tc.ExpectMinAssemblies)
 	}
-	if len(trace.MemoryContextPacks) < maxInt(tc.ExpectMinMemoryPacks, 1) {
-		return fmt.Errorf("memory_context_packs got %d", len(trace.MemoryContextPacks))
+	if tc.ExpectMinMemoryPacks != nil && len(trace.MemoryContextPacks) < *tc.ExpectMinMemoryPacks {
+		return fmt.Errorf("memory_context_packs got %d want at least %d", len(trace.MemoryContextPacks), *tc.ExpectMinMemoryPacks)
 	}
 	for _, stepType := range tc.ExpectStepTypes {
 		if !hasStep(trace.Steps, stepType) {
@@ -300,11 +300,4 @@ func must(err error) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-}
-
-func maxInt(a int, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

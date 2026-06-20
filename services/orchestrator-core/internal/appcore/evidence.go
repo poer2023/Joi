@@ -40,7 +40,7 @@ func buildEvidenceLedger(steps []ProductTaskStep, response string) EvidenceLedge
 		ledger.Refs = append(ledger.Refs, refs...)
 	}
 	if len(ledger.Refs) == 0 {
-		ledger.Limitations = append(ledger.Limitations, "本次任务没有可引用的 workspace_search/file_analyze/tool_run 证据，结论只能作为待验证判断。")
+		ledger.Limitations = append(ledger.Limitations, "本次任务没有可引用的 workspace_search/file_read/file_analyze/tool_run 证据，结论只能作为待验证判断。")
 	}
 	if hasUnsupportedNumericClaimsWithoutEvidence(response, ledger) {
 		ledger.Limitations = append(ledger.Limitations, "检测到数字或比例类断言，但没有证据引用；artifact 不应把这些数字当作已验证事实。")
@@ -63,6 +63,12 @@ func evidenceRefsFromStep(step ProductTaskStep, capability string) []EvidenceRef
 		}
 		if len(refs) > 0 {
 			return refs
+		}
+	case "file_read":
+		path := stringFromAny(step.Output["path"])
+		content := firstNonEmpty(stringFromAny(step.Output["content"]), stringFromAny(step.Output["summary"]))
+		if path != "" || content != "" {
+			return []EvidenceRef{{Type: "file_read", SourceID: sourceID, Capability: capability, Path: path, Snippet: truncate(content, 240), Summary: firstNonEmpty(path, truncate(content, 80))}}
 		}
 	case "file_analyze":
 		path := stringFromAny(step.Output["path"])

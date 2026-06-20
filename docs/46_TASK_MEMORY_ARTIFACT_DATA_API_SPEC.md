@@ -339,7 +339,7 @@ expired
 failed
 ```
 
-## 9. AppCore / Wails API
+## 9. Electron IPC / App API
 
 所有响应仍遵守：
 
@@ -352,7 +352,7 @@ failed
 }
 ```
 
-Wails 绑定可沿用当前直接返回 DTO 的风格，但内部错误仍要映射为同样的错误结构。
+Electron IPC 通过受控 preload 暴露 DTO；内部错误仍要映射为同样的错误结构。
 
 ### 9.1 Product Task API
 
@@ -465,8 +465,9 @@ Postgres 同步创建等价索引。
 services/orchestrator-core: go test ./...
 services/worker-runtime: go test ./...
 services/telegram-gateway: go test ./...
-./scripts/desktop_poc_check.sh
-./scripts/run_desktop_evals.sh
+pnpm test:store
+pnpm eval:desktop:ts
+pnpm build:electron
 ```
 
 并新增最少 1 个 SQLite migration check：

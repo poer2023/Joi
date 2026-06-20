@@ -1,0 +1,49 @@
+{
+  "name": "@joi/electron",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev --host 127.0.0.1",
+    "build": "tsc --noEmit && electron-vite build",
+    "package:mac": "pnpm build && electron-builder --mac dir --arm64 --config.mac.identity=null",
+    "test:contract": "node scripts/test-preload-contract.mjs"
+  },
+  "dependencies": {
+    "@joi/shared-types": "workspace:*",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "react-router-dom": "7.9.6",
+    "zod": "^4.4.3"
+  },
+  "build": {
+    "appId": "com.hao.joi.desktop",
+    "productName": "Joi",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "package.json"
+    ],
+    "mac": {
+      "target": [
+        "zip"
+      ],
+      "category": "public.app-category.productivity"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "22.12.0",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "^5.1.2",
+    "electron": "^42.4.1",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "typescript": "^6.0.3",
+    "vite": "^7.3.3"
+  }
+}

@@ -7,6 +7,7 @@ export type ExecutionActionKind =
   | 'workspace'
   | 'file'
   | 'command'
+  | 'observe'
   | 'artifact'
   | 'memory'
   | 'evidence'
@@ -60,6 +61,7 @@ export const VISIBLE_KINDS = [
   'workspace',
   'file',
   'command',
+  'observe',
   'artifact',
   'confirmation',
   'memory',
@@ -157,7 +159,7 @@ export function getExecutionDisplayMode(run: ExecutionRunViewState): ExecutionDi
     && !run.hasArtifact
     && !run.isSeriousTask
     && normalizeRunStatus(run.status) === 'completed'
-    && ['web', 'file', 'workspace'].includes(visibleActions[0].kind)
+    && ['web', 'file', 'workspace', 'observe'].includes(visibleActions[0].kind)
   ) {
     return 'inline';
   }
@@ -462,6 +464,11 @@ function descriptionForToolAction(title: string, status: ExecutionActionStatus) 
     if (title === '读取文件') return '正在读取文件...';
     if (title === '列出本机 App') return '正在列出本机 App...';
     if (title === '检查本机 App') return '正在检查本机 App...';
+    if (title === '导航浏览器') return '正在导航浏览器...';
+    if (title === '点击浏览器') return '正在点击浏览器...';
+    if (title === '输入浏览器') return '正在输入浏览器...';
+    if (title === '观察浏览器') return '正在观察当前浏览器...';
+    if (title === '观察屏幕') return '正在观察当前窗口...';
     if (title === '运行命令') return '正在运行命令...';
     return '正在执行...';
   }
@@ -472,6 +479,11 @@ function descriptionForToolAction(title: string, status: ExecutionActionStatus) 
   if (title === '读取文件') return '本轮执行了工具：已读取文件';
   if (title === '列出本机 App') return '本轮执行了工具：已列出本机 App';
   if (title === '检查本机 App') return '本轮执行了工具：已检查本机 App';
+  if (title === '导航浏览器') return '本轮执行了工具：已导航浏览器';
+  if (title === '点击浏览器') return '本轮执行了工具：已点击浏览器';
+  if (title === '输入浏览器') return '本轮执行了工具：已输入浏览器';
+  if (title === '观察浏览器') return '本轮执行了工具：已观察当前浏览器';
+  if (title === '观察屏幕') return '本轮执行了工具：已观察当前窗口';
   if (title === '运行命令') return '本轮执行了工具：已运行命令';
   return '本轮执行了工具：已完成工具动作';
 }
@@ -572,6 +584,11 @@ function titleForCapability(capability: string, workflow: string) {
   if (key.includes('web') || key.includes('research') || key.includes('fetch') || key.includes('crawl')) return '读取网页';
   if (key.includes('desktop_app_list') || key.includes('desktop_list_app')) return '列出本机 App';
   if (key.includes('desktop_app_inspect') || key.includes('desktop_inspect_app')) return '检查本机 App';
+  if (key.includes('browser_navigate') || key.includes('browser_navigate_url')) return '导航浏览器';
+  if (key.includes('browser_click') || key.includes('browser_click_element')) return '点击浏览器';
+  if (key.includes('browser_type') || key.includes('browser_type_text')) return '输入浏览器';
+  if (key.includes('browser_observe') || key.includes('browser_snapshot')) return '观察浏览器';
+  if (key.includes('computer_observe') || key.includes('computer_snapshot')) return '观察屏幕';
   if (key.includes('workspace_search') || key.includes('search')) return '搜索工作区';
   if (key.includes('file') || key.includes('read')) return '读取文件';
   if (key.includes('shell') || key.includes('bash') || key.includes('command')) return '运行命令';
@@ -583,6 +600,9 @@ function titleForCapability(capability: string, workflow: string) {
 function kindForCapability(capability: string, workflow: string, title: string): ExecutionActionKind {
   const key = `${capability} ${workflow} ${title}`.toLowerCase();
   if (key.includes('web') || key.includes('research') || key.includes('fetch') || key.includes('crawl')) return 'web';
+  if (key.includes('browser_click') || key.includes('browser_type') || title === '点击浏览器' || title === '输入浏览器') return 'command';
+  if (key.includes('browser_navigate') || title === '导航浏览器') return 'observe';
+  if (key.includes('observe') || key.includes('snapshot')) return 'observe';
   if (key.includes('workspace') || key.includes('search')) return 'workspace';
   if (key.includes('file') || key.includes('read')) return 'file';
   if (key.includes('shell') || key.includes('bash') || key.includes('command')) return 'command';
@@ -594,6 +614,7 @@ function completedLabelForAction(kind: ExecutionActionKind, sourceLabel: string 
   if (kind === 'web') return `已读取网页${sourceLabel ? ` · ${sourceLabel}` : ''}`;
   if (kind === 'file') return `已读取文件${sourceLabel ? ` · ${sourceLabel}` : ''}`;
   if (kind === 'workspace') return `已搜索工作区${sourceLabel ? ` · ${sourceLabel}` : ''}`;
+  if (kind === 'observe') return `${title}${sourceLabel ? ` · ${sourceLabel}` : ''}`;
   return title;
 }
 
@@ -612,7 +633,7 @@ function extractInput(capabilityStep: RunStep | undefined, steps: RunStep[]) {
 }
 
 function extractSource(steps: RunStep[]) {
-  const found = findNestedValue(steps, ['url', 'source_url', 'source', 'path', 'root', 'query']);
+  const found = findNestedValue(steps.map((step) => ({ input: step.input, output: step.output })), ['url', 'source_url', 'source', 'path', 'root', 'query', 'title', 'window_title', 'frontmost_app', 'browser_app']);
   return sanitizeForDisplay(found);
 }
 
@@ -623,7 +644,9 @@ function extractSourceLabel(source: unknown) {
 
 function extractCommand(steps: RunStep[]) {
   const value = findNestedValue(steps, ['command', 'cmd', 'shell']);
-  return typeof value === 'string' ? value : undefined;
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value;
+  return undefined;
 }
 
 function extractError(steps: RunStep[]) {

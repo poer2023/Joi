@@ -5,7 +5,7 @@ Desktop Mode is the default product shape. Server Mode is an advanced deployment
 | Area | Desktop Mode | Server Mode | Worker Mode |
 | --- | --- | --- | --- |
 | Entry | `Joi.app` | Web Console + orchestrator service | `worker-runtime` |
-| UI | Embedded Wails UI | `apps/console-web` | none |
+| UI | Embedded Electron UI | `apps/console-web` | none |
 | Storage | SQLite local file | Postgres | none |
 | Queue | SQLiteTaskQueue | Postgres or NATS JetStream | remote gateway or server queue |
 | Secrets | macOS Keychain, env fallback for dev | env / secret manager | worker token / node secret |

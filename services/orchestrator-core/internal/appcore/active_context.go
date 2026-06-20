@@ -300,7 +300,9 @@ func activeContextPromptTx(ctx context.Context, tx *sql.Tx, conversationID strin
 
 func finalizeArtifactRewriteResponse(ctx context.Context, tx *sql.Tx, runID string, agentID string, response string, result *sqliteRuntimeResult) error {
 	response = store.RedactSensitiveText(response)
-	emitAssistantResponseDeltas(result, runID, response)
+	if err := emitAssistantResponseDeltas(ctx, tx, result, runID, response); err != nil {
+		return err
+	}
 	brief, err := insertSQLiteRunStep(ctx, tx, runID, "agent_call_finished", "Artifact follow-up handled", map[string]any{"agent_id": agentID, "deterministic": true}, map[string]any{"response": response})
 	if err != nil {
 		return err

@@ -11,7 +11,7 @@ The fixture is generated at runtime instead of committing a binary database file
 ## Command
 
 ```bash
-cd /Users/hao/Documents/Joi
+cd /Users/hao/project/Joi
 ./scripts/sqlite_migration_check.sh
 ```
 

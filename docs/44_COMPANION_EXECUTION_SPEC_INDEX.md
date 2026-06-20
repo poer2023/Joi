@@ -31,11 +31,11 @@ Joi 是一个长期了解用户的 AI 伙伴。
 | 文档 | 用途 |
 |---|---|
 | [45 产品与闭环规格](45_COMPANION_EXECUTION_PRODUCT_SPEC.md) | 定义产品定位、模式切换、伙伴循环、执行循环、范围和成功标准 |
-| [46 数据模型与 API 规格](46_TASK_MEMORY_ARTIFACT_DATA_API_SPEC.md) | 定义 Product Task、Memory Candidate、Artifact、Open Loop、Proactive Message 的表、DTO、AppCore/Wails API |
+| [46 数据模型与 API 规格](46_TASK_MEMORY_ARTIFACT_DATA_API_SPEC.md) | 定义 Product Task、Memory Candidate、Artifact、Open Loop、Proactive Message 的表、DTO、Electron IPC/API |
 | [47 Reflection 与主动触达规格](47_REFLECTION_PROACTIVE_SPEC.md) | 定义 Conversation Reflection Job、记忆抽取、任务候选、主动消息候选、评分、审核和发送策略 |
 | [48 桌面 UI 规格](48_DESKTOP_UI_COMPANION_EXECUTION_SPEC.md) | 定义三栏主界面、任务卡片、右侧伙伴理解/执行面板、交付物面板、设置页降级 |
 | [49 实施计划与验收规格](49_COMPANION_EXECUTION_IMPLEMENTATION_PLAN.md) | 定义分阶段开发顺序、验收用例、测试命令、回归边界和风险控制 |
-| [50 文件级开发拆解](50_COMPANION_EXECUTION_FILE_LEVEL_TASKS.md) | 定义具体要改的后端、SQLite、Wails、前端、eval 和文档路径 |
+| [50 文件级开发拆解](50_COMPANION_EXECUTION_FILE_LEVEL_TASKS.md) | 定义具体要改的后端、SQLite、Electron IPC、前端、eval 和文档路径 |
 
 ## 3. 本轮不改变的架构红线
 

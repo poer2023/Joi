@@ -242,6 +242,50 @@ CREATE TABLE IF NOT EXISTS run_steps (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS turns (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  turn_index INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running',
+  active_model_call_id TEXT,
+  cancellation_key TEXT,
+  started_at TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  UNIQUE(run_id, turn_index)
+);
+
+CREATE TABLE IF NOT EXISTS turn_items (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  turn_id TEXT REFERENCES turns(id) ON DELETE CASCADE,
+  turn_index INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  item_type TEXT NOT NULL,
+  role TEXT,
+  call_id TEXT,
+  tool_name TEXT,
+  arguments TEXT NOT NULL DEFAULT '{}',
+  content TEXT NOT NULL DEFAULT '',
+  output TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'completed',
+  provider_item_id TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS run_events (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+  seq INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(run_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS prompt_templates (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -638,16 +682,26 @@ CREATE TABLE IF NOT EXISTS confirmation_requests (
   risk_level TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   input TEXT NOT NULL DEFAULT '{}',
+  call_id TEXT,
+  turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+  approval_scope TEXT NOT NULL DEFAULT 'once',
+  approval_key TEXT NOT NULL DEFAULT '',
   approved_by TEXT,
   rejected_by TEXT,
   decision_reason TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  decided_at TEXT
+  decided_at TEXT,
+  resumed_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_run_steps_run_id ON run_steps(run_id);
+CREATE INDEX IF NOT EXISTS idx_turns_run_id ON turns(run_id, turn_index);
+CREATE INDEX IF NOT EXISTS idx_turn_items_run_id ON turn_items(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_turn_items_call_id ON turn_items(call_id);
+CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_confirmation_requests_call_id ON confirmation_requests(call_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_lifecycle ON conversations(lifecycle_status, pinned DESC, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_group ON conversations(group_id, lifecycle_status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversation_groups_sort ON conversation_groups(sort_order, updated_at DESC);

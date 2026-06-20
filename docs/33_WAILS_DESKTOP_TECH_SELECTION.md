@@ -1,15 +1,15 @@
-# Wails Desktop Tech Selection
+# Legacy Wails Desktop Tech Selection
 
-Decision: Joi Desktop uses Wails by default.
+Status: superseded by the Electron-native refactor in `docs/53_ELECTRON_NATIVE_REFACTOR.md`.
 
 ## Decision
 
-- Default: Wails
-- Not first choice: Electron
+- Historical default: Wails
+- Current default: Electron-native
 - Not first choice: Tauri
 - Backup option: Tauri + Go sidecar
 
-## Why Wails
+## Why Wails Was Chosen
 
 Joi's core backend is already Go. Wails lets the desktop application bind Go methods directly to a modern frontend without making the desktop shell call its own localhost HTTP server.
 
@@ -24,15 +24,15 @@ This matches the product target:
 - no default NATS
 - minimal operational surface for the user
 
-## Why Not Electron First
+## Why Electron Became Default Later
 
-Electron would work, but it would add a heavier runtime and would still need a Go sidecar or a service boundary. That pushes the project back toward "desktop wrapper around local SaaS."
+The current refactor moves the long-term desktop runtime to Electron main/preload/renderer plus TypeScript services, removing the Go sidecar as the default architecture. This changes the earlier tradeoff: Electron is now the target shell, while Wails remains a legacy/parity path during cutover.
 
 ## Why Not Tauri First
 
 Tauri is a strong desktop framework, but Joi's backend is Go. A Tauri design would typically require a Rust shell plus Go sidecar. That is a valid fallback, not the shortest path to reusing AppCore.
 
-## Wails Boundary
+## Legacy Wails Boundary
 
 Wails binds a `DesktopApp` object:
 
@@ -42,7 +42,7 @@ type DesktopApp struct {
 }
 ```
 
-The frontend calls bound methods:
+The legacy frontend calls bound methods:
 
 - `SendChat`
 - `GetRunTrace`
@@ -50,7 +50,7 @@ The frontend calls bound methods:
 - `ListNodes`
 - `GetSystemHealth`
 
-The frontend does not call `localhost` in Desktop Mode.
+The Electron renderer now calls the controlled `window.joi` preload API instead of Wails bindings.
 
 ## Server Mode Remains
 

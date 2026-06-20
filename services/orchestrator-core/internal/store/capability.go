@@ -52,6 +52,10 @@ type CapabilityRequest struct {
 	Inputs        map[string]any `json:"inputs"`
 	Risk          string         `json:"risk"`
 	RunID         string         `json:"run_id"`
+	CallID        string         `json:"call_id"`
+	TurnID        string         `json:"turn_id"`
+	ApprovalScope string         `json:"approval_scope"`
+	ApprovalKey   string         `json:"approval_key"`
 	PreferredNode string         `json:"preferred_node"`
 	AllowWorker   bool           `json:"allow_worker"`
 	Source        string         `json:"source"`
@@ -277,6 +281,18 @@ func CanonicalCapabilityName(capability string) string {
 		return "computer_observe"
 	case "browser_read_v1":
 		return "browser_read"
+	case "browser_observe_v1":
+		return "browser_observe"
+	case "browser_navigate_v1":
+		return "browser_navigate"
+	case "browser_click_v1":
+		return "browser_click"
+	case "browser_type_v1":
+		return "browser_type"
+	case "file_read_v1":
+		return "file_read"
+	case "shell_command_v1":
+		return "shell_command"
 	case "web_research_v1", "web_research_v2", "fetch_url":
 		return "web_research"
 	case "system_health_check_v1":

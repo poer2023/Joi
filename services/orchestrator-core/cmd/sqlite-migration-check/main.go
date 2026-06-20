@@ -28,16 +28,24 @@ func main() {
 	must(db.SeedSQLiteDefaults(ctx))
 
 	out := map[string]any{
-		"ok":                    false,
-		"fixture":               dbPath,
-		"sqlite_integrity":      scalarString(ctx, db.SQL(), `PRAGMA integrity_check`),
-		"memories_readable":     scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM memories WHERE id='mem_old_1' AND content LIKE '%Desktop%'`),
-		"runs_readable":         scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM runs WHERE id='run_old_1'`),
-		"settings_readable":     scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM desktop_settings WHERE key='app_mode' AND value='desktop'`),
-		"agents_readable":       scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM agents WHERE id='general_agent'`),
-		"capabilities_readable": scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM capabilities WHERE id='memory_search'`),
-		"fts_hit_count":         scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM memory_fts WHERE memory_fts MATCH 'Desktop'`),
-		"gateway_tables":        scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('worker_gateway_nonces','worker_gateway_audit_logs')`),
+		"ok":                          false,
+		"fixture":                     dbPath,
+		"sqlite_integrity":            scalarString(ctx, db.SQL(), `PRAGMA integrity_check`),
+		"memories_readable":           scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM memories WHERE id='mem_old_1' AND content LIKE '%Desktop%'`),
+		"runs_readable":               scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM runs WHERE id='run_old_1'`),
+		"settings_readable":           scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM desktop_settings WHERE key='app_mode' AND value='desktop'`),
+		"agents_readable":             scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM agents WHERE id='general_agent'`),
+		"capabilities_readable":       scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM capabilities WHERE id='memory_search'`),
+		"codex_capabilities":          scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM capabilities WHERE id IN ('file_read','apply_patch','shell_command','test_command','browser_observe','browser_navigate','browser_click','browser_type','computer_observe')`),
+		"codex_tools":                 scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM tools WHERE id IN ('file_read_bounded','patch_apply_workspace','shell_exec_sandboxed','browser_snapshot','browser_navigate_url','browser_click_element','browser_type_text','computer_observe_visible_ui')`),
+		"codex_workflows":             scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM tool_workflows WHERE name IN ('file_read_v1','apply_patch_v1','shell_command_v1','test_command_v1','browser_observe_v1','browser_navigate_v1','browser_click_v1','browser_type_v1','computer_observe_v1')`),
+		"general_agent_codex_tools":   scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM agents WHERE id='general_agent' AND capabilities LIKE '%shell_command%' AND capabilities LIKE '%browser_observe%' AND capabilities LIKE '%browser_navigate%' AND capabilities LIKE '%browser_click%' AND capabilities LIKE '%browser_type%' AND capabilities LIKE '%computer_observe%'`),
+		"confirmation_resume_columns": scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM pragma_table_info('confirmation_requests') WHERE name IN ('call_id','turn_id','approval_scope','approval_key','resumed_at')`),
+		"run_events_runtime_columns":  scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM pragma_table_info('run_events') WHERE name IN ('turn_id','payload')`),
+		"run_events_legacy_columns":   scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM pragma_table_info('run_events') WHERE name IN ('item_id','snapshot','delta')`),
+		"run_events_insertable":       runEventsInsertable(ctx, db.SQL()),
+		"fts_hit_count":               scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM memory_fts WHERE memory_fts MATCH 'Desktop'`),
+		"gateway_tables":              scalarInt(ctx, db.SQL(), `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('worker_gateway_nonces','worker_gateway_audit_logs')`),
 	}
 	ok := out["sqlite_integrity"] == "ok" &&
 		out["memories_readable"] == 1 &&
@@ -45,6 +53,14 @@ func main() {
 		out["settings_readable"] == 1 &&
 		out["agents_readable"] == 1 &&
 		out["capabilities_readable"] == 1 &&
+		out["codex_capabilities"] == 9 &&
+		out["codex_tools"] == 8 &&
+		out["codex_workflows"] == 9 &&
+		out["general_agent_codex_tools"] == 1 &&
+		out["confirmation_resume_columns"] == 5 &&
+		out["run_events_runtime_columns"] == 2 &&
+		out["run_events_legacy_columns"] == 0 &&
+		out["run_events_insertable"] == 1 &&
 		out["fts_hit_count"].(int) >= 1 &&
 		out["gateway_tables"] == 2
 	out["ok"] = ok
@@ -179,6 +195,39 @@ func seedOldVersionFixture(ctx context.Context, db *sql.DB) error {
 		  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
 		  last_used_at TEXT
 		);
+		CREATE TABLE confirmation_requests (
+		  id TEXT PRIMARY KEY,
+		  run_id TEXT REFERENCES runs(id),
+		  capability_id TEXT REFERENCES capabilities(id),
+		  requested_action TEXT NOT NULL,
+		  risk_level TEXT NOT NULL,
+		  status TEXT NOT NULL DEFAULT 'pending',
+		  input TEXT NOT NULL DEFAULT '{}',
+		  approved_by TEXT,
+		  rejected_by TEXT,
+		  decision_reason TEXT,
+		  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		  decided_at TEXT
+		);
+		CREATE TABLE run_events (
+		  id TEXT PRIMARY KEY,
+		  run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+		  seq INTEGER NOT NULL,
+		  event_type TEXT NOT NULL,
+		  item_id TEXT NOT NULL,
+		  item_type TEXT NOT NULL,
+		  status TEXT NOT NULL,
+		  parent_item_id TEXT,
+		  title TEXT NOT NULL DEFAULT '',
+		  summary TEXT NOT NULL DEFAULT '',
+		  snapshot TEXT NOT NULL DEFAULT '{}',
+		  delta TEXT NOT NULL DEFAULT '{}',
+		  error TEXT,
+		  metadata TEXT NOT NULL DEFAULT '{}',
+		  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		  UNIQUE(run_id, seq)
+		);
+		CREATE INDEX idx_run_events_run_seq ON run_events(run_id, seq);
 
 		INSERT INTO schema_migrations (version) VALUES ('desktop_rc0_old_fixture');
 		INSERT INTO desktop_settings (key, value) VALUES ('app_mode', 'desktop');
@@ -194,10 +243,23 @@ func seedOldVersionFixture(ctx context.Context, db *sql.DB) error {
 		VALUES ('msg_old_1', 'conv_old_1', 'user', 'old fixture message');
 		INSERT INTO runs (id, conversation_id, user_message_id, status, selected_agent_id)
 		VALUES ('run_old_1', 'conv_old_1', 'msg_old_1', 'succeeded', 'general_agent');
+		INSERT INTO run_events (id, run_id, seq, event_type, item_id, item_type, status, metadata)
+		VALUES ('evt_old_1', 'run_old_1', 1, 'legacy.item', 'item_old_1', 'tool', 'completed', '{"legacy":true}');
 		INSERT INTO memories (id, type, content, summary, status, confidence, pinned)
 		VALUES ('mem_old_1', 'preference', 'Desktop mode should stay local first.', 'Desktop local first', 'confirmed', 0.9, 1);
 	`)
 	return err
+}
+
+func runEventsInsertable(ctx context.Context, db *sql.DB) int {
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO run_events (id, run_id, turn_id, seq, event_type, payload)
+		VALUES ('evt_current_check', 'run_old_1', NULL, 2, 'assistant.completed', '{"ok":true}')
+	`)
+	if err != nil {
+		return 0
+	}
+	return 1
 }
 
 func scalarInt(ctx context.Context, db *sql.DB, query string) int {

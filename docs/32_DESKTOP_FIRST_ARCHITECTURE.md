@@ -1,6 +1,6 @@
 # Desktop-first Architecture
 
-Joi's default product shape is a local Wails Desktop App. Server Mode remains available, but it is no longer the default user path.
+Joi's default product shape is a local Electron-native Desktop App. Server Mode remains available, but it is no longer the default user path.
 
 ## Product Modes
 
@@ -10,7 +10,7 @@ Desktop Mode is the default.
 
 - Product entry: `Joi.app`
 - UI: embedded desktop UI
-- Orchestrator: embedded AppCore
+- Runtime: Electron main/preload/renderer with TypeScript store/runtime services
 - Storage: local SQLite
 - Task queue: SQLiteTaskQueue
 - Memory OS: local-first
@@ -83,9 +83,9 @@ Server Mode can continue to use NATS JetStream.
 
 ## UI
 
-The existing Web Console is retained in two roles:
+The existing React desktop UI is retained in two roles:
 
-- embedded UI source for Wails Desktop
+- embedded UI source for Electron Desktop
 - Server Mode UI
 
 The default product entry is not `localhost:3000`.
@@ -123,4 +123,4 @@ Secret storage moves toward macOS Keychain and Linux Secret Service.
 
 ## Architecture Rule
 
-Desktop Mode must not become a Web service wrapped in a desktop shell. Wails calls AppCore directly. Localhost HTTP may exist as a temporary compatibility bridge, but it is not the formal Desktop architecture.
+Desktop Mode must not become a Web service wrapped in a desktop shell. Electron calls local TypeScript services over a controlled preload IPC bridge. Localhost HTTP may exist as a temporary compatibility bridge, but it is not the formal Desktop architecture.

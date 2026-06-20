@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -72,39 +74,20 @@ func (a *AppCore) executeSQLiteWorkspaceSearch(ctx context.Context, tx *sql.Tx, 
 
 	results := []workspaceSearchResult{}
 	truncated := false
-	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
+	mode := "workspace_search_v1_go_walk"
+	if rgResults, rgTruncated, ok, err := searchWorkspaceWithRG(ctx, root, tokens, glob, maxResults, *settings); err != nil {
+		return nil, err
+	} else if ok {
+		results = rgResults
+		truncated = rgTruncated
+		mode = "workspace_search_v2_rg"
+	} else {
+		walkResults, walkTruncated, err := searchWorkspaceWithWalkDir(ctx, root, tokens, glob, maxResults, *settings)
+		if err != nil {
+			return nil, err
 		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if path != root && entry.IsDir() && shouldSkipWorkspaceSearchDir(path, entry.Name()) {
-			return filepath.SkipDir
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		if entry.Type()&fs.ModeSymlink != 0 || shouldSkipWorkspaceSearchFile(path, entry.Name(), glob) {
-			return nil
-		}
-		resolved, err := ResolveWorkspacePath(path, *settings)
-		if err != nil || resolved != filepath.Clean(path) {
-			return nil
-		}
-		matches, fileTruncated := searchWorkspaceFile(path, root, tokens, maxResults-len(results))
-		if fileTruncated {
-			truncated = true
-		}
-		results = append(results, matches...)
-		if len(results) >= maxResults {
-			truncated = true
-			return errWorkspaceSearchLimit
-		}
-		return nil
-	})
-	if walkErr != nil && !errors.Is(walkErr, errWorkspaceSearchLimit) {
-		return nil, walkErr
+		results = walkResults
+		truncated = walkTruncated
 	}
 	sort.SliceStable(results, func(i, j int) bool {
 		if results[i].Path == results[j].Path {
@@ -125,7 +108,7 @@ func (a *AppCore) executeSQLiteWorkspaceSearch(ctx context.Context, tx *sql.Tx, 
 		"results":     results,
 		"truncated":   truncated,
 		"summary":     summary,
-		"mode":        "workspace_search_v1_go_walk",
+		"mode":        mode,
 	}
 	return &store.CapabilityExecutionResult{
 		CapabilityRequest: request,
@@ -218,6 +201,181 @@ func (a *AppCore) executeSQLiteWebResearch(ctx context.Context, tx *sql.Tx, requ
 }
 
 var errWorkspaceSearchLimit = errors.New("workspace search result limit reached")
+
+type rgJSONEvent struct {
+	Type string `json:"type"`
+	Data struct {
+		Path struct {
+			Text string `json:"text"`
+		} `json:"path"`
+		Lines struct {
+			Text string `json:"text"`
+		} `json:"lines"`
+		LineNumber int `json:"line_number"`
+	} `json:"data"`
+}
+
+func searchWorkspaceWithWalkDir(ctx context.Context, root string, tokens []string, glob string, maxResults int, settings WorkspaceSettingsResponse) ([]workspaceSearchResult, bool, error) {
+	results := []workspaceSearchResult{}
+	truncated := false
+	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if path != root && entry.IsDir() && shouldSkipWorkspaceSearchDir(path, entry.Name()) {
+			return filepath.SkipDir
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if entry.Type()&fs.ModeSymlink != 0 || shouldSkipWorkspaceSearchFile(path, entry.Name(), glob) {
+			return nil
+		}
+		resolved, err := ResolveWorkspacePath(path, settings)
+		if err != nil || resolved != filepath.Clean(path) {
+			return nil
+		}
+		matches, fileTruncated := searchWorkspaceFile(path, root, tokens, maxResults-len(results))
+		if fileTruncated {
+			truncated = true
+		}
+		results = append(results, matches...)
+		if len(results) >= maxResults {
+			truncated = true
+			return errWorkspaceSearchLimit
+		}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, errWorkspaceSearchLimit) {
+		return nil, false, walkErr
+	}
+	return results, truncated, nil
+}
+
+func searchWorkspaceWithRG(ctx context.Context, root string, tokens []string, glob string, maxResults int, settings WorkspaceSettingsResponse) ([]workspaceSearchResult, bool, bool, error) {
+	rgPath, err := exec.LookPath("rg")
+	if err != nil {
+		return nil, false, false, nil
+	}
+	args := workspaceSearchRGArgs(tokens, glob, root)
+	cmd := exec.CommandContext(ctx, rgPath, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, false, true, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, false, false, nil
+	}
+	results := []workspaceSearchResult{}
+	truncated := false
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		result, ok := workspaceSearchResultFromRGLine(scanner.Bytes(), root, tokens, glob, settings)
+		if !ok {
+			continue
+		}
+		results = append(results, result)
+		if len(results) >= maxResults {
+			truncated = true
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			break
+		}
+	}
+	scanErr := scanner.Err()
+	waitErr := cmd.Wait()
+	if ctx.Err() != nil {
+		return nil, false, true, ctx.Err()
+	}
+	if scanErr != nil {
+		return nil, false, true, scanErr
+	}
+	if waitErr != nil && !truncated {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) && exitErr.ExitCode() == 1 {
+			return results, false, true, nil
+		}
+		return nil, false, false, nil
+	}
+	return results, truncated, true, nil
+}
+
+func workspaceSearchRGArgs(tokens []string, glob string, root string) []string {
+	args := []string{
+		"--json",
+		"--line-number",
+		"--with-filename",
+		"--no-heading",
+		"--color", "never",
+		"--ignore-case",
+		"--fixed-strings",
+		"--glob", "!**/.git/**",
+		"--glob", "!**/node_modules/**",
+		"--glob", "!**/dist/**",
+		"--glob", "!**/build/**",
+		"--glob", "!**/coverage/**",
+		"--glob", "!**/output/**",
+		"--glob", "!**/.next/**",
+		"--glob", "!**/.wails/**",
+		"--glob", "!**/.turbo/**",
+		"--glob", "!**/.cache/**",
+		"--glob", "!.env",
+		"--glob", "!**/.env",
+		"--glob", "!**/.ssh/**",
+	}
+	if strings.TrimSpace(glob) != "" {
+		args = append(args, "--glob", glob)
+	}
+	for _, token := range tokens {
+		if strings.TrimSpace(token) == "" {
+			continue
+		}
+		args = append(args, "-e", token)
+	}
+	args = append(args, root)
+	return args
+}
+
+func workspaceSearchResultFromRGLine(raw []byte, root string, tokens []string, glob string, settings WorkspaceSettingsResponse) (workspaceSearchResult, bool) {
+	var event rgJSONEvent
+	if err := json.Unmarshal(raw, &event); err != nil || event.Type != "match" {
+		return workspaceSearchResult{}, false
+	}
+	path := filepath.Clean(event.Data.Path.Text)
+	if path == "" || event.Data.LineNumber <= 0 {
+		return workspaceSearchResult{}, false
+	}
+	if shouldSkipWorkspaceSearchFile(path, filepath.Base(path), glob) {
+		return workspaceSearchResult{}, false
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&fs.ModeSymlink != 0 {
+		return workspaceSearchResult{}, false
+	}
+	resolved, err := ResolveWorkspacePath(path, settings)
+	if err != nil || resolved != filepath.Clean(path) {
+		return workspaceSearchResult{}, false
+	}
+	line := event.Data.Lines.Text
+	if !utf8.ValidString(line) || !workspaceLineMatches(line, tokens) {
+		return workspaceSearchResult{}, false
+	}
+	rel := path
+	if r, err := filepath.Rel(root, path); err == nil {
+		rel = r
+	}
+	return workspaceSearchResult{
+		Path:      filepath.ToSlash(rel),
+		Line:      event.Data.LineNumber,
+		Snippet:   sanitizeSnippet(line, 220),
+		Truncated: false,
+	}, true
+}
 
 func boundedWorkspaceSearchLimit(value any, fallback int) int {
 	limit := fallback

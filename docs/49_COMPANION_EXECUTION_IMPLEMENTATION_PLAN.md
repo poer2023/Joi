@@ -319,17 +319,18 @@ tool_run_links_product_task_step
 cd services/orchestrator-core && go test ./...
 cd services/worker-runtime && go test ./...
 cd services/telegram-gateway && go test ./...
-./scripts/desktop_poc_check.sh
-./scripts/run_desktop_evals.sh
+pnpm test:store
+pnpm eval:desktop:ts
 ```
 
 前端改造后增加：
 
 ```text
 cd apps/joi-desktop/frontend && npm run build
+pnpm build:electron
 ```
 
-如存在 Wails 构建脚本，再跑桌面构建。
+桌面打包验收使用 `./scripts/package_desktop_macos.sh`。
 
 ## 9. 2 周开发拆分
 
@@ -400,8 +401,7 @@ Day 5：
 
 ```text
 数据落库
-AppCore API 可读写
-Wails DTO 可调用
+Electron IPC / shared Desktop API 可读写
 UI 可见
 Run Trace 可追溯
 Memory/Artifact/Task 来源可回溯

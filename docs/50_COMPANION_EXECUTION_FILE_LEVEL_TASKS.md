@@ -120,10 +120,10 @@ dismiss proactive draft
 ### 4.1 修改路径
 
 ```text
-apps/joi-desktop/app.go
+apps/joi-electron/src/main/ipc.ts
 apps/joi-desktop/frontend/src/api/desktop.ts
-services/orchestrator-core/internal/appcore/appcore.go
-services/orchestrator-core/internal/store/chat.go
+packages/store/src/sqlite.ts
+packages/shared-types/src/desktop-api.ts
 ```
 
 ### 4.2 请求字段
@@ -276,7 +276,7 @@ Proactive：draft 可忽略、反馈、批准发送
 ### 8.1 修改路径
 
 ```text
-services/orchestrator-core/cmd/desktop-evals/main.go
+packages/runtime/scripts/desktop-evals.mjs
 evals/README.md
 scripts/run_desktop_evals.sh
 ```
@@ -299,8 +299,9 @@ cd services/orchestrator-core && go test ./...
 cd services/worker-runtime && go test ./...
 cd services/telegram-gateway && go test ./...
 cd apps/joi-desktop/frontend && npm run build
-./scripts/desktop_poc_check.sh
-./scripts/run_desktop_evals.sh
+pnpm test:store
+pnpm eval:desktop:ts
+pnpm build:electron
 ```
 
 ## 9. Step 8：截图验收

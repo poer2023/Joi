@@ -36,6 +36,7 @@ type AppCore struct {
 	db      *store.DB
 	logger  *slog.Logger
 	started bool
+	turns   *TurnManager
 }
 
 type Store interface {
@@ -45,16 +46,18 @@ type Store interface {
 type Runtime interface{}
 
 type ChatRequest struct {
-	ConversationID string                                         `json:"conversation_id"`
-	Channel        string                                         `json:"channel"`
-	UserID         string                                         `json:"user_id"`
-	Message        string                                         `json:"message"`
-	PreferredNode  string                                         `json:"preferred_node"`
-	AllowWorker    bool                                           `json:"allow_worker"`
-	ModelName      string                                         `json:"model_name"`
-	InputMode      string                                         `json:"input_mode"`
-	ProductTaskID  string                                         `json:"product_task_id"`
-	EventSink      func(eventName string, payload map[string]any) `json:"-"`
+	ConversationID    string                                         `json:"conversation_id"`
+	Channel           string                                         `json:"channel"`
+	UserID            string                                         `json:"user_id"`
+	Message           string                                         `json:"message"`
+	PreferredNode     string                                         `json:"preferred_node"`
+	AllowWorker       bool                                           `json:"allow_worker"`
+	ModelName         string                                         `json:"model_name"`
+	InputMode         string                                         `json:"input_mode"`
+	ProductTaskID     string                                         `json:"product_task_id"`
+	RuntimeMode       string                                         `json:"runtime_mode"`
+	PermissionProfile string                                         `json:"permission_profile"`
+	EventSink         func(eventName string, payload map[string]any) `json:"-"`
 }
 
 type ChatResponse struct {
@@ -79,6 +82,25 @@ type ChatUIHints struct {
 	MissingInput      string `json:"missing_input,omitempty"`
 	InlineExecution   bool   `json:"inline_execution"`
 }
+
+const (
+	runtimeModeLegacyJSON  = "legacy_json"
+	runtimeModeToolCalling = "tool_calling"
+)
+
+func normalizedRuntimeMode(requested string) string {
+	switch strings.TrimSpace(requested) {
+	case runtimeModeToolCalling:
+		return runtimeModeToolCalling
+	case runtimeModeLegacyJSON:
+		return runtimeModeLegacyJSON
+	}
+	if strings.TrimSpace(os.Getenv("JOI_RUNTIME_MODE")) == runtimeModeToolCalling {
+		return runtimeModeToolCalling
+	}
+	return runtimeModeLegacyJSON
+}
+
 type RunTrace = store.RunRecord
 type MemorySearchRequest = store.SearchMemoriesParams
 type MemorySearchResponse = store.SearchMemoriesResponse
@@ -196,13 +218,13 @@ func NewAppCore(ctx context.Context, cfg runtimeconfig.Config, logger *slog.Logg
 		if err != nil {
 			return nil, err
 		}
-		return &AppCore{Store: db, Config: cfg, db: db, logger: logger}, nil
+		return &AppCore{Store: db, Config: cfg, db: db, logger: logger, turns: NewTurnManager()}, nil
 	case "sqlite":
 		db, err := store.OpenSQLite(ctx, cfg.App.SQLitePath)
 		if err != nil {
 			return nil, err
 		}
-		return &AppCore{Store: db, Config: cfg, db: db, logger: logger}, nil
+		return &AppCore{Store: db, Config: cfg, db: db, logger: logger, turns: NewTurnManager()}, nil
 	default:
 		return nil, errors.New("unsupported DATA_STORE: " + cfg.App.DataStore)
 	}
@@ -676,8 +698,9 @@ func (a *AppCore) ListConfirmations(ctx context.Context) (*ConfirmationListRespo
 	}
 	rows, err := a.db.SQL().QueryContext(ctx, `
 		SELECT id, COALESCE(run_id, ''), capability_id, requested_action, risk_level, status,
-		       input, COALESCE(approved_by, ''), COALESCE(rejected_by, ''), COALESCE(decision_reason, ''),
-		       created_at, decided_at
+		       input, COALESCE(call_id, ''), COALESCE(turn_id, ''), COALESCE(approval_scope, 'once'),
+		       COALESCE(approval_key, ''), COALESCE(approved_by, ''), COALESCE(rejected_by, ''),
+		       COALESCE(decision_reason, ''), created_at, decided_at, resumed_at
 		FROM confirmation_requests
 		ORDER BY created_at DESC
 		LIMIT 100
@@ -691,7 +714,8 @@ func (a *AppCore) ListConfirmations(ctx context.Context) (*ConfirmationListRespo
 		var item store.ConfirmationRequestRecord
 		var inputRaw, createdAt string
 		var decidedAt sql.NullString
-		if err := rows.Scan(&item.ID, &item.RunID, &item.CapabilityID, &item.RequestedAction, &item.RiskLevel, &item.Status, &inputRaw, &item.ApprovedBy, &item.RejectedBy, &item.DecisionReason, &createdAt, &decidedAt); err != nil {
+		var resumedAt sql.NullString
+		if err := rows.Scan(&item.ID, &item.RunID, &item.CapabilityID, &item.RequestedAction, &item.RiskLevel, &item.Status, &inputRaw, &item.CallID, &item.TurnID, &item.ApprovalScope, &item.ApprovalKey, &item.ApprovedBy, &item.RejectedBy, &item.DecisionReason, &createdAt, &decidedAt, &resumedAt); err != nil {
 			return nil, err
 		}
 		item.Input = decodeObject([]byte(inputRaw))
@@ -699,6 +723,10 @@ func (a *AppCore) ListConfirmations(ctx context.Context) (*ConfirmationListRespo
 		if decidedAt.Valid {
 			t := parseSQLiteTime(decidedAt.String)
 			item.DecidedAt = &t
+		}
+		if resumedAt.Valid {
+			t := parseSQLiteTime(resumedAt.String)
+			item.ResumedAt = &t
 		}
 		items = append(items, item)
 	}
@@ -720,8 +748,52 @@ func (a *AppCore) DecideConfirmation(ctx context.Context, req ConfirmationDecisi
 		approvedBy = valueOrDefault(req.Actor, "desktop_admin")
 		rejectedBy = ""
 	}
-	_, err := a.db.SQL().ExecContext(ctx, `UPDATE confirmation_requests SET status=?, approved_by=NULLIF(?, ''), rejected_by=NULLIF(?, ''), decision_reason=?, decided_at=datetime('now') WHERE id=? AND status='pending'`, status, approvedBy, rejectedBy, req.Reason, req.ID)
-	return err
+	tx, err := a.db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var runID, turnID, callID, capabilityID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(run_id, ''), COALESCE(turn_id, ''), COALESCE(call_id, ''), capability_id
+		FROM confirmation_requests
+		WHERE id=? AND status='pending'
+	`, req.ID).Scan(&runID, &turnID, &callID, &capabilityID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE confirmation_requests SET status=?, approved_by=NULLIF(?, ''), rejected_by=NULLIF(?, ''), decision_reason=?, decided_at=datetime('now') WHERE id=? AND status='pending'`, status, approvedBy, rejectedBy, req.Reason, req.ID)
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{"confirmation_id": req.ID, "run_id": runID, "turn_id": turnID, "call_id": callID, "capability": capabilityID, "status": status, "approved": req.Approve, "reason": req.Reason}
+	if runID != "" {
+		if _, err := appendSQLiteRunEvent(ctx, tx, runID, turnID, "approval.resolved", payload); err != nil {
+			return err
+		}
+	}
+	if !req.Approve && runID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE runs SET status='failed', error_code='confirmation_rejected', error_message=?, finished_at=datetime('now'), duration_ms=CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER) WHERE id=? AND status='waiting_confirmation'`, valueOrDefault(req.Reason, "Confirmation rejected"), runID); err != nil {
+			return err
+		}
+		if turnID != "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE turns SET status='failed', finished_at=datetime('now') WHERE id=? AND status='waiting_confirmation'`, turnID); err != nil {
+				return err
+			}
+		}
+		if _, err := appendSQLiteRunEvent(ctx, tx, runID, turnID, "run.failed", map[string]any{"run_id": runID, "turn_id": turnID, "status": "failed", "error": "confirmation_rejected", "message": valueOrDefault(req.Reason, "Confirmation rejected")}); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if req.Approve && runID != "" {
+		return a.ResumeRun(ctx, runID)
+	}
+	return nil
 }
 
 func (a *AppCore) ModelUsageSummary(ctx context.Context) (*ModelUsageResponse, error) {
@@ -1301,6 +1373,8 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 	memoryIntent := intent.MemoryControl
 	artifactRewrite := intent.ArtifactRewrite
 	selectedModelName := valueOrDefault(strings.TrimSpace(req.ModelName), a.Config.Model.Name)
+	runtimeMode := normalizedRuntimeMode(req.RuntimeMode)
+	permissionProfile := string(normalizedPermissionProfile(req.PermissionProfile))
 	if productTaskID != "" && !intent.TaskFollowup && !intent.ArtifactFollowup {
 		productTaskID = ""
 	}
@@ -1391,10 +1465,14 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 			return nil, err
 		}
 	}
-	routeResult := map[string]any{"intent": intent.Name, "route_mode": "single", "lead_agent": selectedAgentID, "route_source": "desktop_appcore", "confidence": 0.8, "preferred_node": req.PreferredNode, "allow_worker": req.AllowWorker, "selected_model_name": selectedModelName, "priority": []string{"memory", "proactive", "tool_result_followup", "task_followup", "artifact_followup", "clarify", "serious_task", "chat"}}
+	routeResult := map[string]any{"intent": intent.Name, "route_mode": "single", "lead_agent": selectedAgentID, "route_source": "desktop_appcore", "confidence": 0.8, "preferred_node": req.PreferredNode, "allow_worker": req.AllowWorker, "selected_model_name": selectedModelName, "runtime_mode": runtimeMode, "permission_profile": permissionProfile, "priority": []string{"memory", "proactive", "tool_result_followup", "task_followup", "artifact_followup", "clarify", "serious_task", "chat"}}
 	routeRaw := mustJSON(routeResult)
-	metadataRaw := mustJSON(map[string]any{"app_mode": "desktop", "data_store": "sqlite", "task_queue": "sqlite", "input_mode": classification.InputMode, "conversation_mode": classification.Mode, "conversation_type": classification.ConversationType, "interaction_class": uiHints.InteractionClass, "requires_user_input": uiHints.RequiresUserInput, "missing_input": uiHints.MissingInput, "ui_inline_execution": uiHints.InlineExecution, "classification_note": classification.ClassificationNote, "preferred_node": req.PreferredNode, "allow_worker": req.AllowWorker, "selected_model_name": selectedModelName})
-	if _, err := tx.ExecContext(ctx, `INSERT INTO runs (id, conversation_id, user_message_id, status, selected_agent_id, route_result, finished_at, duration_ms, metadata) VALUES (?, ?, ?, 'succeeded', ?, ?, datetime('now'), 0, ?)`, runID, conversationID, userMessageID, selectedAgentID, routeRaw, metadataRaw); err != nil {
+	metadataRaw := mustJSON(map[string]any{"app_mode": "desktop", "data_store": "sqlite", "task_queue": "sqlite", "input_mode": classification.InputMode, "conversation_mode": classification.Mode, "conversation_type": classification.ConversationType, "interaction_class": uiHints.InteractionClass, "requires_user_input": uiHints.RequiresUserInput, "missing_input": uiHints.MissingInput, "ui_inline_execution": uiHints.InlineExecution, "classification_note": classification.ClassificationNote, "preferred_node": req.PreferredNode, "allow_worker": req.AllowWorker, "selected_model_name": selectedModelName, "runtime_mode": runtimeMode, "permission_profile": permissionProfile})
+	if runtimeMode == runtimeModeToolCalling {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO runs (id, conversation_id, user_message_id, status, selected_agent_id, route_result, metadata) VALUES (?, ?, ?, 'running', ?, ?, ?)`, runID, conversationID, userMessageID, selectedAgentID, routeRaw, metadataRaw); err != nil {
+			return nil, err
+		}
+	} else if _, err := tx.ExecContext(ctx, `INSERT INTO runs (id, conversation_id, user_message_id, status, selected_agent_id, route_result, finished_at, duration_ms, metadata) VALUES (?, ?, ?, 'succeeded', ?, ?, datetime('now'), 0, ?)`, runID, conversationID, userMessageID, selectedAgentID, routeRaw, metadataRaw); err != nil {
 		return nil, err
 	}
 	if _, err := insertSQLiteRunStep(ctx, tx, runID, "task_classified", "Task mode classified", map[string]any{"message": req.Message, "requested_input_mode": req.InputMode}, map[string]any{"input_mode": classification.InputMode, "mode": classification.Mode, "interaction_class": uiHints.InteractionClass, "conversation_type": classification.ConversationType, "should_create_task": classification.ShouldCreateTask, "requires_user_input": uiHints.RequiresUserInput, "missing_input": uiHints.MissingInput}); err != nil {
@@ -1449,17 +1527,18 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 
 	if intent.Clarify && classification.RequiresUserInput {
 		runtimeResult, err = a.finishSQLiteMissingInputClarification(ctx, tx, sqliteRuntimeInput{
-			RunID:          runID,
-			ConversationID: conversationID,
-			UserMessageID:  userMessageID,
-			AgentID:        selectedAgentID,
-			Message:        req.Message,
-			Channel:        channel,
-			ModelName:      selectedModelName,
-			InputMode:      classification.Mode,
-			RouteResult:    routeResult,
-			ContextURL:     contextURL,
-			EventSink:      req.EventSink,
+			RunID:             runID,
+			ConversationID:    conversationID,
+			UserMessageID:     userMessageID,
+			AgentID:           selectedAgentID,
+			Message:           req.Message,
+			Channel:           channel,
+			ModelName:         selectedModelName,
+			InputMode:         classification.Mode,
+			RouteResult:       routeResult,
+			ContextURL:        contextURL,
+			PermissionProfile: permissionProfile,
+			EventSink:         req.EventSink,
 		}, classification)
 		if err != nil {
 			return nil, err
@@ -1490,22 +1569,44 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 		if err != nil {
 			return nil, err
 		}
+	} else if runtimeMode == runtimeModeToolCalling {
+		runtimeResult, err = a.runSQLiteToolCallingRuntime(ctx, tx, sqliteRuntimeInput{
+			RunID:             runID,
+			ConversationID:    conversationID,
+			UserMessageID:     userMessageID,
+			AgentID:           selectedAgentID,
+			Message:           req.Message,
+			Channel:           channel,
+			ModelName:         selectedModelName,
+			PreferredNode:     req.PreferredNode,
+			AllowWorker:       req.AllowWorker,
+			InputMode:         classification.Mode,
+			ProductTaskID:     productTaskID,
+			RouteResult:       routeResult,
+			ContextURL:        contextURL,
+			PermissionProfile: permissionProfile,
+			EventSink:         req.EventSink,
+		})
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		runtimeResult, err = a.runSQLiteAgentRuntime(ctx, tx, sqliteRuntimeInput{
-			RunID:          runID,
-			ConversationID: conversationID,
-			UserMessageID:  userMessageID,
-			AgentID:        selectedAgentID,
-			Message:        req.Message,
-			Channel:        channel,
-			ModelName:      selectedModelName,
-			PreferredNode:  req.PreferredNode,
-			AllowWorker:    req.AllowWorker,
-			InputMode:      classification.Mode,
-			ProductTaskID:  productTaskID,
-			RouteResult:    routeResult,
-			ContextURL:     contextURL,
-			EventSink:      req.EventSink,
+			RunID:             runID,
+			ConversationID:    conversationID,
+			UserMessageID:     userMessageID,
+			AgentID:           selectedAgentID,
+			Message:           req.Message,
+			Channel:           channel,
+			ModelName:         selectedModelName,
+			PreferredNode:     req.PreferredNode,
+			AllowWorker:       req.AllowWorker,
+			InputMode:         classification.Mode,
+			ProductTaskID:     productTaskID,
+			RouteResult:       routeResult,
+			ContextURL:        contextURL,
+			PermissionProfile: permissionProfile,
+			EventSink:         req.EventSink,
 		})
 		if err != nil {
 			return nil, err
@@ -1594,6 +1695,72 @@ func (a *AppCore) sendSQLiteChat(ctx context.Context, req ChatRequest) (*ChatRes
 	if _, err := tx.ExecContext(ctx, `INSERT INTO messages (id, conversation_id, role, content, metadata) VALUES (?, ?, 'assistant', ?, ?)`, assistantMessageID, conversationID, response, mustJSON(messageMetadata)); err != nil {
 		return nil, err
 	}
+	if err := appendAndEmitSQLiteRunEvent(ctx, tx, req.EventSink, runID, "", "assistant.completed", map[string]any{
+		"run_id":               runID,
+		"item_id":              assistantMessageID,
+		"item_type":            "assistant_message",
+		"status":               "completed",
+		"title":                "Assistant response completed",
+		"assistant_message_id": assistantMessageID,
+		"message_id":           assistantMessageID,
+		"content":              response,
+		"snapshot": map[string]any{
+			"assistant_message_id": assistantMessageID,
+			"content":              response,
+		},
+	}); err != nil {
+		return nil, err
+	}
+	if runtimeResult.WaitingApproval {
+		if err := appendAndEmitSQLiteRunEvent(ctx, tx, req.EventSink, runID, "", "foreground_run.waiting_approval", map[string]any{
+			"run_id":               runID,
+			"item_id":              runID,
+			"item_type":            "run",
+			"status":               "waiting_approval",
+			"title":                "Foreground run waiting for approval",
+			"assistant_message_id": assistantMessageID,
+		}); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := appendAndEmitSQLiteRunEvent(ctx, tx, req.EventSink, runID, "", "foreground_run.completed", map[string]any{
+			"run_id":               runID,
+			"item_id":              runID,
+			"item_type":            "run",
+			"status":               "completed",
+			"title":                "Foreground run completed",
+			"summary":              "本轮回复已完成",
+			"assistant_message_id": assistantMessageID,
+			"has_background_work":  runtimeResult.Queued,
+			"snapshot": map[string]any{
+				"assistant_message_id": assistantMessageID,
+				"has_background_work":  runtimeResult.Queued,
+			},
+		}); err != nil {
+			return nil, err
+		}
+		if !runtimeResult.Queued {
+			if err := appendAndEmitSQLiteRunEvent(ctx, tx, req.EventSink, runID, "", "run.finalized", map[string]any{
+				"run_id":               runID,
+				"item_id":              runID,
+				"item_type":            "run",
+				"status":               "completed",
+				"title":                "Run finalized",
+				"foreground_completed": true,
+				"background_completed": true,
+				"reflection_completed": reflectionResult != nil,
+				"assistant_message_id": assistantMessageID,
+				"has_background_work":  false,
+				"snapshot": map[string]any{
+					"foreground_completed": true,
+					"background_completed": true,
+					"reflection_completed": reflectionResult != nil,
+				},
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -1615,28 +1782,30 @@ const (
 )
 
 type sqliteRuntimeInput struct {
-	RunID          string
-	ConversationID string
-	UserMessageID  string
-	AgentID        string
-	Message        string
-	Channel        string
-	PreferredNode  string
-	AllowWorker    bool
-	ModelName      string
-	InputMode      string
-	ProductTaskID  string
-	RouteResult    map[string]any
-	ContextURL     string
-	EventSink      func(eventName string, payload map[string]any)
+	RunID             string
+	ConversationID    string
+	UserMessageID     string
+	AgentID           string
+	Message           string
+	Channel           string
+	PreferredNode     string
+	AllowWorker       bool
+	ModelName         string
+	InputMode         string
+	ProductTaskID     string
+	RouteResult       map[string]any
+	ContextURL        string
+	PermissionProfile string
+	EventSink         func(eventName string, payload map[string]any)
 }
 
 type sqliteRuntimeResult struct {
-	Response     string
-	Steps        []store.RunStepBrief
-	UsedMemories []store.MemorySearchResult
-	Queued       bool
-	EventSink    func(eventName string, payload map[string]any)
+	Response        string
+	Steps           []store.RunStepBrief
+	UsedMemories    []store.MemorySearchResult
+	Queued          bool
+	WaitingApproval bool
+	EventSink       func(eventName string, payload map[string]any)
 }
 
 func chatUIHintsFor(classification conversationClassification, intent desktopIntent, inlineExecution bool) *ChatUIHints {
@@ -2190,7 +2359,7 @@ func (a *AppCore) runSQLiteAgentRuntime(ctx context.Context, tx *sql.Tx, input s
 				dynamicContext = "MEMORY_SEARCH_RESULT\n" + string(mustJSON(memoryResults))
 				continue
 			}
-			if capability == "server_diagnose" || capability == "web_research" || capability == "browser_read" || capability == "system_health_check" || capability == "workspace_search" || capability == "file_analyze" || capability == "desktop_app_list" || capability == "desktop_app_inspect" || capability == "computer_observe" {
+			if capability == "server_diagnose" || capability == "web_research" || capability == "browser_read" || capability == "browser_observe" || capability == "browser_navigate" || capability == "browser_click" || capability == "browser_type" || capability == "system_health_check" || capability == "workspace_search" || capability == "file_read" || capability == "file_analyze" || capability == "apply_patch" || capability == "shell_command" || capability == "test_command" || capability == "desktop_app_list" || capability == "desktop_app_inspect" || capability == "computer_observe" {
 				if capability == "server_diagnose" && isUnknownSQLiteServerDiagnoseTarget(parsed.Inputs, input.Message) {
 					response := "我需要明确真实的服务名、容器名、端口或 URL 后才能做只读诊断；unknown-service 这类占位目标不会触发工具执行。"
 					brief, err := insertSQLiteRunStep(ctx, tx, input.RunID, "capability_blocked", "Capability request blocked before execution", map[string]any{"capability": capability, "inputs": parsed.Inputs}, map[string]any{"reason": "unknown_service_target", "policy": "clarify_before_tool_run"})
@@ -2211,11 +2380,18 @@ func (a *AppCore) runSQLiteAgentRuntime(ctx context.Context, tx *sql.Tx, input s
 						return nil, err
 					}
 				}
+				inputs := cloneMap(parsed.Inputs)
+				if inputs == nil {
+					inputs = map[string]any{}
+				}
+				if _, ok := inputs["permission_profile"]; !ok {
+					inputs["permission_profile"] = string(normalizedPermissionProfile(input.PermissionProfile))
+				}
 				capabilityResult, err := a.executeAndRecordSQLiteCapability(ctx, tx, store.CapabilityRequest{
 					Type:          "capability_request",
 					Capability:    capability,
 					Goal:          parsed.Goal,
-					Inputs:        parsed.Inputs,
+					Inputs:        inputs,
 					Risk:          parsed.Risk,
 					RunID:         input.RunID,
 					PreferredNode: input.PreferredNode,
@@ -2344,7 +2520,9 @@ func (a *AppCore) runSQLiteAgentRuntime(ctx context.Context, tx *sql.Tx, input s
 
 func (a *AppCore) finishSQLiteAgentResponse(ctx context.Context, tx *sql.Tx, runID string, agentID string, modelCallID string, response string, result *sqliteRuntimeResult) error {
 	response = store.RedactSensitiveText(response)
-	emitAssistantResponseDeltas(result, runID, response)
+	if err := emitAssistantResponseDeltas(ctx, tx, result, runID, response); err != nil {
+		return err
+	}
 	brief, err := insertSQLiteRunStep(ctx, tx, runID, "agent_call_finished", "Agent runtime finished", map[string]any{"agent_id": agentID}, map[string]any{"response": response, "model_call_id": modelCallID})
 	if err != nil {
 		return err
@@ -2362,18 +2540,29 @@ func (a *AppCore) finishSQLiteAgentResponse(ctx context.Context, tx *sql.Tx, run
 	return nil
 }
 
-func emitAssistantResponseDeltas(result *sqliteRuntimeResult, runID string, response string) {
-	if result == nil || result.EventSink == nil {
-		return
+func emitAssistantResponseDeltas(ctx context.Context, tx *sql.Tx, result *sqliteRuntimeResult, runID string, response string) error {
+	if result == nil {
+		return nil
 	}
 	for _, chunk := range splitAssistantResponseDeltas(response) {
-		result.EventSink("assistant.delta", map[string]any{
-			"run_id": runID,
-			"text":   chunk,
-			"delta":  chunk,
-		})
+		payload := map[string]any{
+			"run_id":        runID,
+			"item_id":       runID + ":assistant_stream",
+			"item_type":     "assistant_message",
+			"status":        "running",
+			"text":          chunk,
+			"stream_source": "fallback_final_chunk",
+			"delta": map[string]any{
+				"text":          chunk,
+				"stream_source": "fallback_final_chunk",
+			},
+		}
+		if err := appendAndEmitSQLiteRunEvent(ctx, tx, result.EventSink, runID, "", "assistant.delta", payload); err != nil {
+			return err
+		}
 		time.Sleep(8 * time.Millisecond)
 	}
+	return nil
 }
 
 func splitAssistantResponseDeltas(response string) []string {
@@ -2741,10 +2930,28 @@ func (a *AppCore) executeAndRecordSQLiteCapability(ctx context.Context, tx *sql.
 		switch request.Capability {
 		case "workspace_search":
 			result, err = a.executeSQLiteWorkspaceSearch(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision)
+		case "file_read":
+			result, err = a.executeSQLiteFileRead(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision)
 		case "file_analyze":
 			result, err = a.executeSQLiteFileAnalyze(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision)
+		case "apply_patch":
+			result, err = a.executeSQLiteApplyPatch(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision)
+		case "shell_command":
+			result, err = a.executeSQLiteShellCommand(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision)
+		case "test_command":
+			result, err = a.executeSQLiteTestCommand(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision)
 		case "web_research":
 			result, err = a.executeSQLiteWebResearch(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision)
+		case "browser_observe":
+			result, err = a.executeSQLiteBrowserObserve(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision)
+		case "browser_navigate":
+			result, err = a.executeSQLiteBrowserNavigate(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision)
+		case "browser_click":
+			result, err = a.executeSQLiteBrowserInteraction(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision, "click")
+		case "browser_type":
+			result, err = a.executeSQLiteBrowserInteraction(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision, "type")
+		case "computer_observe":
+			result, err = a.executeSQLiteComputerObserve(ctx, tx, request, compiled.Workflow, compiled.PolicyDecision)
 		default:
 			result, err = store.ExecuteCapabilityLocally(ctx, request)
 		}
@@ -2764,7 +2971,7 @@ func (a *AppCore) executeAndRecordSQLiteCapability(ctx context.Context, tx *sql.
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO tool_runs (id, run_id, capability_id, workflow_name, tool_name, node_id, risk_level, status, input, output, finished_at, duration_ms, assignment_reason) VALUES (?, NULLIF(?, ''), ?, ?, ?, 'main-node', 'read_only', 'succeeded', ?, ?, datetime('now'), 0, ?)`, toolRunID, request.RunID, request.Capability, result.Workflow.WorkflowName, result.Workflow.WorkflowName, mustJSON(store.SanitizeForTrace(request)), mustJSON(store.SanitizeForTrace(result.NormalizedResult)), desktopDefaultAssignmentMain); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tool_runs (id, run_id, capability_id, workflow_name, tool_name, node_id, risk_level, status, input, output, finished_at, duration_ms, assignment_reason) VALUES (?, NULLIF(?, ''), ?, ?, ?, 'main-node', ?, 'succeeded', ?, ?, datetime('now'), 0, ?)`, toolRunID, request.RunID, request.Capability, result.Workflow.WorkflowName, result.Workflow.WorkflowName, result.Workflow.RiskLevel, mustJSON(store.SanitizeForTrace(request)), mustJSON(store.SanitizeForTrace(result.NormalizedResult)), desktopDefaultAssignmentMain); err != nil {
 		return nil, err
 	}
 	result.ToolRunID = toolRunID
@@ -2927,7 +3134,7 @@ func (a *AppCore) enqueueSQLiteWorkerTask(ctx context.Context, tx *sql.Tx, reque
 	if privacy == "" {
 		privacy = "public"
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks (id, run_id, capability_id, preferred_node_id, assigned_node_id, privacy_level, status, payload, timeout_seconds) VALUES (?, NULLIF(?, ''), ?, NULLIF(?, ''), ?, ?, 'pending', ?, 120)`, taskID, request.RunID, request.Capability, request.PreferredNode, schedule.NodeID, privacy, mustJSON(store.SanitizeForTrace(map[string]any{"type": request.Type, "capability": request.Capability, "goal": request.Goal, "inputs": request.Inputs, "risk": request.Risk, "run_id": request.RunID, "preferred_node": request.PreferredNode, "allow_worker": request.AllowWorker, "privacy_level": privacy}))); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks (id, run_id, capability_id, preferred_node_id, assigned_node_id, privacy_level, status, payload, timeout_seconds) VALUES (?, NULLIF(?, ''), ?, NULLIF(?, ''), ?, ?, 'pending', ?, 120)`, taskID, request.RunID, request.Capability, request.PreferredNode, schedule.NodeID, privacy, mustJSON(store.SanitizeForTrace(map[string]any{"type": request.Type, "capability": request.Capability, "goal": request.Goal, "inputs": request.Inputs, "risk": request.Risk, "run_id": request.RunID, "call_id": request.CallID, "turn_id": request.TurnID, "preferred_node": request.PreferredNode, "allow_worker": request.AllowWorker, "privacy_level": privacy}))); err != nil {
 		return nil, err
 	}
 	workflow := compiled.Workflow
@@ -2936,7 +3143,7 @@ func (a *AppCore) enqueueSQLiteWorkerTask(ctx context.Context, tx *sql.Tx, reque
 		PolicyDecision:    compiled.PolicyDecision,
 		Workflow:          workflow,
 		SelectedNodeID:    schedule.NodeID,
-		NormalizedResult:  map[string]any{"status": "queued", "task_id": taskID, "node_id": schedule.NodeID, "assignment_reason": schedule.AssignmentReason, "privacy_level": privacy, "running_tasks": schedule.RunningTasks, "scheduler": schedule.Scheduler, "task_attempts": 0},
+		NormalizedResult:  map[string]any{"status": "queued", "message": "已交给执行后台处理，结果会在这里更新。", "task_id": taskID, "node_id": schedule.NodeID, "assignment_reason": schedule.AssignmentReason, "privacy_level": privacy, "running_tasks": schedule.RunningTasks, "scheduler": schedule.Scheduler, "task_attempts": 0},
 	}
 	for _, step := range []sqliteStepDefinition{
 		{stepType: "policy_checked", title: "Policy checked", input: map[string]any{"risk": request.Risk}, output: result.PolicyDecision},
@@ -2983,8 +3190,34 @@ func (a *AppCore) getSQLiteRun(ctx context.Context, runID string) (*RunTrace, er
 	run.PromptAssemblies, _ = a.listSQLitePromptAssemblies(ctx, runID)
 	run.ModelCalls, _ = a.listSQLiteModelCalls(ctx, runID)
 	run.MemoryContextPacks, _ = a.listSQLiteMemoryContextPacks(ctx, runID)
+	run.Events, _ = a.listSQLiteRunEvents(ctx, runID)
 	run.Tasks, _ = a.listSQLiteRunTasks(ctx, runID)
 	return &run, nil
+}
+
+func (a *AppCore) listSQLiteRunEvents(ctx context.Context, runID string) ([]store.RunEventRecord, error) {
+	rows, err := a.db.SQL().QueryContext(ctx, `
+		SELECT id, run_id, COALESCE(turn_id, ''), seq, event_type, payload, created_at
+		FROM run_events
+		WHERE run_id=?
+		ORDER BY seq ASC, created_at ASC
+	`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	events := []store.RunEventRecord{}
+	for rows.Next() {
+		var event store.RunEventRecord
+		var payloadRaw, createdAt string
+		if err := rows.Scan(&event.ID, &event.RunID, &event.TurnID, &event.Seq, &event.EventType, &payloadRaw, &createdAt); err != nil {
+			return nil, err
+		}
+		event.Payload = decodeObject([]byte(payloadRaw))
+		event.CreatedAt = parseSQLiteTime(createdAt)
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }
 
 func (a *AppCore) listSQLiteRunSteps(ctx context.Context, runID string) ([]store.RunStepRecord, error) {
@@ -3628,7 +3861,7 @@ func desktopCacheablePrefix(agentID string) string {
 - Agent is a role; model is an execution engine.
 - The model must only output one JSON object with output_type: final_answer, capability_request, or memory_write_proposal.
 - final_answer schema: {"output_type":"final_answer","content":"..."}.
-- capability_request schema: {"output_type":"capability_request","capability":"memory_search|server_diagnose|system_health_check|web_research|browser_read|workspace_search|file_analyze|desktop_app_list|desktop_app_inspect|computer_observe","goal":"...","inputs":{},"risk":"read_only","confidence":0.0}.
+- capability_request schema: {"output_type":"capability_request","capability":"memory_search|server_diagnose|system_health_check|web_research|browser_read|browser_observe|browser_navigate|browser_click|browser_type|workspace_search|file_read|file_analyze|apply_patch|shell_command|test_command|desktop_app_list|desktop_app_inspect|computer_observe","goal":"...","inputs":{},"risk":"read_only|workspace_write|browser_interaction","confidence":0.0}.
 - memory_write_proposal schema: {"output_type":"memory_write_proposal","memory":{"type":"...","content":"...","confidence":0.0}}.
 - The model must not output raw shell, SQL, file_write, service_restart, restart, stop, rm, delete, chmod, or chown for execution.
 - If a capability lacks required inputs, such as web_research without a URL, return final_answer asking for the missing input instead of requesting the capability.

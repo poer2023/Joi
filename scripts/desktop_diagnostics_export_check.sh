@@ -2,6 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT/services/orchestrator-core"
+cd "$ROOT"
 
-go run ./cmd/desktop-diagnostics-check
+pnpm test:store
+pnpm --filter @joi/runtime test
+
+echo "Desktop diagnostics export check passed with TS store/runtime redaction coverage."

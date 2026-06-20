@@ -3,7 +3,7 @@
 Run:
 
 ```bash
-cd /Users/hao/Documents/Joi
+cd /Users/hao/project/Joi
 ./evals/run_evals.sh
 ```
 

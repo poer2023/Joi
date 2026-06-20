@@ -2,14 +2,19 @@ node_modules/
 .next/
 dist/
 build/
+release/
+release-*/
 coverage/
 backups/
 logs/
+reports/
 soak-results-*.jsonl
 output/
 blind-test-runs/
 services/orchestrator-core/blind-test-runs/
 JoiBlindTestWorkspace/
+.local/
+apps/joi-electron/release-*/
 
 .DS_Store
 *.log

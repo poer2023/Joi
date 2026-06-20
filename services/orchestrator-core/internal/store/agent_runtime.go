@@ -348,6 +348,39 @@ func finalAnswerForCapabilityResult(capability string, normalized map[string]any
 			return fmt.Sprintf("已读取《%s》。正文提要：%s", title, summary)
 		}
 		return fmt.Sprintf("已读取网页正文。正文提要：%s", summary)
+	case "browser_observe":
+		status := stringFromMap(normalized, "status", "completed")
+		if status == "fallback_to_computer" {
+			return "前台应用不是可直接读取的浏览器，已改为只读观察当前窗口。"
+		}
+		title := stringFromMap(normalized, "title", "当前浏览器标签页")
+		url := stringFromMap(normalized, "url", "")
+		summary := stringFromMap(normalized, "visible_text_summary", "已完成浏览器只读观察。")
+		if url != "" {
+			return fmt.Sprintf("已只读观察浏览器页面：%s（%s）。%s", title, url, summary)
+		}
+		return fmt.Sprintf("已只读观察浏览器页面：%s。%s", title, summary)
+	case "browser_navigate":
+		status := stringFromMap(normalized, "status", "completed")
+		url := stringFromMap(normalized, "url", "目标 URL")
+		if status != "completed" {
+			err := stringFromMap(normalized, "error", "导航失败")
+			return fmt.Sprintf("浏览器导航失败：%s。", err)
+		}
+		method := stringFromMap(normalized, "method", "browser_navigate")
+		return fmt.Sprintf("已导航浏览器到 %s。方式：%s。", url, method)
+	case "browser_click", "browser_type":
+		status := stringFromMap(normalized, "status", "completed")
+		action := stringFromMap(normalized, "action", capability)
+		selector := stringFromMap(normalized, "selector", "目标元素")
+		if status != "completed" {
+			err := stringFromMap(normalized, "error", "浏览器交互失败")
+			return fmt.Sprintf("浏览器交互失败：%s。", err)
+		}
+		if action == "type" {
+			return fmt.Sprintf("已在当前浏览器元素 %s 输入文本。", selector)
+		}
+		return fmt.Sprintf("已点击当前浏览器元素 %s。", selector)
 	case "system_health_check":
 		status := stringFromMap(normalized, "status", "completed")
 		checks, _ := normalized["checks"].(map[string]any)
@@ -410,6 +443,17 @@ func finalAnswerForCapabilityResult(capability string, normalized map[string]any
 			return fmt.Sprintf("搜索完成：未在授权 workspace 中找到 %q。", query)
 		}
 		return fmt.Sprintf("搜索完成：%s 前 %d 条：%s。", summary, len(lines), strings.Join(lines, " | "))
+	case "file_read":
+		path := stringFromMap(normalized, "path", "unknown")
+		startLine := intFromMap(normalized, "start_line", 1)
+		endLine := intFromMap(normalized, "end_line", 0)
+		lineCount := intFromMap(normalized, "line_count", 0)
+		truncated := boolFromMap(normalized, "truncated")
+		content := truncateRunes(stringFromMap(normalized, "content", ""), 1200)
+		if strings.TrimSpace(content) == "" {
+			return fmt.Sprintf("文件读取完成：%s，范围 L%d-L%d，返回 %d 行，truncated=%t。", path, startLine, endLine, lineCount, truncated)
+		}
+		return fmt.Sprintf("文件读取完成：%s，范围 L%d-L%d，返回 %d 行，truncated=%t。\n%s", path, startLine, endLine, lineCount, truncated, content)
 	case "file_analyze":
 		path := stringFromMap(normalized, "path", "unknown")
 		summary := stringFromMap(normalized, "summary", "")
@@ -427,6 +471,28 @@ func finalAnswerForCapabilityResult(capability string, normalized map[string]any
 			lines = append(lines, fmt.Sprintf("L%d %s", line, snippet))
 		}
 		return fmt.Sprintf("文件分析完成：%s，extension=%s，size=%d，truncated=%t。摘要：%s 关键摘录：%s", path, extension, size, truncated, summary, strings.Join(lines, " | "))
+	case "apply_patch":
+		count := intFromMap(normalized, "changed_file_count", 0)
+		changes := mapSliceFromAny(normalized["changed_files"])
+		files := []string{}
+		for _, item := range changes {
+			operation := stringFromMap(item, "operation", "change")
+			path := stringFromMap(item, "path", "unknown")
+			files = append(files, fmt.Sprintf("%s:%s", operation, path))
+		}
+		if len(files) == 0 {
+			return fmt.Sprintf("patch 已应用，修改 %d 个文件。", count)
+		}
+		return fmt.Sprintf("patch 已应用，修改 %d 个文件：%s。", count, strings.Join(files, " | "))
+	case "test_command":
+		status := stringFromMap(normalized, "status", "unknown")
+		exitCode := intFromMap(normalized, "exit_code", 0)
+		output := truncateRunes(stringFromMap(normalized, "output", ""), 1200)
+		cmd := strings.Join(stringListFromAny(normalized["cmd"]), " ")
+		if strings.TrimSpace(output) == "" {
+			return fmt.Sprintf("测试命令完成：%s，exit_code=%d，cmd=%s。", status, exitCode, cmd)
+		}
+		return fmt.Sprintf("测试命令完成：%s，exit_code=%d，cmd=%s。\n%s", status, exitCode, cmd, output)
 	default:
 		return ""
 	}
@@ -511,6 +577,24 @@ func boolFromMap(values map[string]any, key string) bool {
 	}
 	value, _ := values[key].(bool)
 	return value
+}
+
+func stringListFromAny(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return typed
+	case []any:
+		items := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text := strings.TrimSpace(fmt.Sprint(item))
+			if text != "" {
+				items = append(items, text)
+			}
+		}
+		return items
+	default:
+		return nil
+	}
 }
 
 func truncateRunes(value string, max int) string {

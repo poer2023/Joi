@@ -138,7 +138,7 @@ func TestWorkspaceSettingsDefaultsAndPathBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(defaults.AllowedRoots) != 1 || defaults.AllowedRoots[0] != "/Users/hao/Documents/Joi" || defaults.DefaultRoot != "/Users/hao/Documents/Joi" {
+	if len(defaults.AllowedRoots) != 1 || defaults.AllowedRoots[0] != "/Users/hao/project/Joi" || defaults.DefaultRoot != "/Users/hao/project/Joi" {
 		t.Fatalf("unexpected default workspace settings: %+v", defaults)
 	}
 

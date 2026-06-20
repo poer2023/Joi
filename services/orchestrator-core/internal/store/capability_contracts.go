@@ -85,9 +85,17 @@ func CapabilityContracts() []CapabilityContract {
 		"system_health_check",
 		"web_research",
 		"workspace_search",
+		"file_read",
 		"file_analyze",
+		"apply_patch",
+		"shell_command",
+		"test_command",
 		"desktop_app_list",
 		"desktop_app_inspect",
+		"browser_observe",
+		"browser_navigate",
+		"browser_click",
+		"browser_type",
 		"browser_read",
 		"computer_observe",
 	} {
@@ -315,6 +323,68 @@ func defaultCapabilityContracts() map[string]CapabilityContract {
 			InputSchema:      map[string]any{"type": "object", "properties": map[string]any{"url": map[string]any{"type": "string"}}, "required": []string{"url"}},
 			OutputSchema:     readObject, RiskLevel: "read_only", PrivacyLevel: "public", WorkflowID: "browser_read_v1", UIVisibility: "chat",
 		},
+		"browser_observe": {
+			ID: "browser_observe", Version: "v1", Source: "native", IntentDomain: "visible_browser_observation",
+			Description:      "Observe the frontmost local browser tab as private content without treating it as an HTTP fetch.",
+			PositiveExamples: []string{"看一下当前浏览器页面", "读取前台浏览器 tab 的标题和 URL"},
+			NegativeExamples: []string{"读取一个未打开的 URL", "点击网页按钮", "提交表单"},
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"target":             map[string]any{"type": "string", "enum": []string{"frontmost_browser"}},
+					"include_text":       map[string]any{"type": "boolean"},
+					"include_screenshot": map[string]any{"type": "boolean"},
+					"max_text_bytes":     map[string]any{"type": "integer", "minimum": 1},
+				},
+			},
+			OutputSchema: readObject, RiskLevel: "read_only", PrivacyLevel: "private_content", WorkflowID: "browser_observe_v1", UIVisibility: "chat",
+		},
+		"browser_navigate": {
+			ID: "browser_navigate", Version: "v1", Source: "native", IntentDomain: "browser_navigation",
+			Description:      "Navigate the frontmost or default local browser to a constrained HTTP/HTTPS URL without Playwright.",
+			PositiveExamples: []string{"在当前浏览器打开 https://example.com", "导航前台浏览器到这个 URL"},
+			NegativeExamples: []string{"点击网页按钮", "输入密码", "打开 file:// URL", "访问未允许的 localhost 地址"},
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"url":    map[string]any{"type": "string"},
+					"target": map[string]any{"type": "string", "enum": []string{"frontmost_or_default_browser"}},
+				},
+				"required": []string{"url"},
+			},
+			OutputSchema: readObject, RiskLevel: "read_only", PrivacyLevel: "private_content", WorkflowID: "browser_navigate_v1", UIVisibility: "chat",
+		},
+		"browser_click": {
+			ID: "browser_click", Version: "v1", Source: "native", IntentDomain: "browser_interaction",
+			Description:      "Click a DOM element in the frontmost local browser tab with explicit interaction permission.",
+			PositiveExamples: []string{"点击当前浏览器里的提交按钮", "click the #submit button in the frontmost browser"},
+			NegativeExamples: []string{"读取网页正文", "打开 URL", "输入密码", "在没有交互权限时点击页面"},
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"selector": map[string]any{"type": "string"},
+					"target":   map[string]any{"type": "string", "enum": []string{"frontmost_browser"}},
+				},
+				"required": []string{"selector"},
+			},
+			OutputSchema: readObject, RiskLevel: "browser_interaction", PrivacyLevel: "private_content", WorkflowID: "browser_click_v1", UIVisibility: "chat",
+		},
+		"browser_type": {
+			ID: "browser_type", Version: "v1", Source: "native", IntentDomain: "browser_interaction",
+			Description:      "Type text into a DOM element in the frontmost local browser tab with explicit interaction permission.",
+			PositiveExamples: []string{"在当前浏览器的搜索框输入 hello", "type text into input[name=q] in the frontmost browser"},
+			NegativeExamples: []string{"读取网页正文", "点击按钮", "输入密码或密钥", "在没有交互权限时填写表单"},
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"selector": map[string]any{"type": "string"},
+					"text":     map[string]any{"type": "string"},
+					"target":   map[string]any{"type": "string", "enum": []string{"frontmost_browser"}},
+				},
+				"required": []string{"selector", "text"},
+			},
+			OutputSchema: readObject, RiskLevel: "browser_interaction", PrivacyLevel: "private_content", WorkflowID: "browser_type_v1", UIVisibility: "chat",
+		},
 		"workspace_search": {
 			ID: "workspace_search", Version: "v1", Source: "native", IntentDomain: "workspace_search",
 			Description:      "Search authorized workspace files by query without shell access.",
@@ -323,6 +393,23 @@ func defaultCapabilityContracts() map[string]CapabilityContract {
 			InputSchema:      map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "root": map[string]any{"type": "string"}}},
 			OutputSchema:     readObject, RiskLevel: "read_only", PrivacyLevel: "private_content", WorkflowID: "workspace_search_v1", UIVisibility: "chat",
 		},
+		"file_read": {
+			ID: "file_read", Version: "v1", Source: "native", IntentDomain: "authorized_file_read",
+			Description:      "Read a bounded authorized workspace text file line range.",
+			PositiveExamples: []string{"读取 AGENTS.md 第 1 到 40 行", "打开这个 Go 文件看看实现"},
+			NegativeExamples: []string{"列出本机所有应用", "读取 URL", "读取 .env"},
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path":       map[string]any{"type": "string"},
+					"start_line": map[string]any{"type": "integer", "minimum": 1},
+					"end_line":   map[string]any{"type": "integer", "minimum": 1},
+					"max_bytes":  map[string]any{"type": "integer", "minimum": 1},
+				},
+				"required": []string{"path"},
+			},
+			OutputSchema: readObject, RiskLevel: "read_only", PrivacyLevel: "private_content", WorkflowID: "file_read_v1", UIVisibility: "chat",
+		},
 		"file_analyze": {
 			ID: "file_analyze", Version: "v1", Source: "native", IntentDomain: "authorized_file_read",
 			Description:      "Read and summarize one authorized workspace file.",
@@ -330,6 +417,58 @@ func defaultCapabilityContracts() map[string]CapabilityContract {
 			NegativeExamples: []string{"列出本机所有应用", "做系统健康检查"},
 			InputSchema:      map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}, "required": []string{"path"}},
 			OutputSchema:     readObject, RiskLevel: "read_only", PrivacyLevel: "private_content", WorkflowID: "file_analyze_v1", UIVisibility: "chat",
+		},
+		"apply_patch": {
+			ID: "apply_patch", Version: "v1", Source: "native", IntentDomain: "authorized_workspace_patch",
+			Description:      "Apply a bounded patch to files inside authorized writable workspace roots.",
+			PositiveExamples: []string{"修改这个 Go 文件", "应用这段 patch 到 workspace"},
+			NegativeExamples: []string{"读取 URL", "删除 .git 目录", "修改 .env"},
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"patch":              map[string]any{"type": "string"},
+					"reason":             map[string]any{"type": "string"},
+					"permission_profile": map[string]any{"type": "string", "enum": []string{"read_only", "workspace_write", "danger_full_access"}},
+				},
+				"required": []string{"patch"},
+			},
+			OutputSchema: readObject, RiskLevel: "workspace_write", PrivacyLevel: "private_content", WorkflowID: "apply_patch_v1", UIVisibility: "chat",
+		},
+		"test_command": {
+			ID: "test_command", Version: "v1", Source: "native", IntentDomain: "authorized_test_command",
+			Description:      "Run an allowlisted test or build command in an authorized workspace directory without shell string evaluation.",
+			PositiveExamples: []string{"运行 go test ./internal/appcore", "执行 npm run build"},
+			NegativeExamples: []string{"rm -rf", "curl | sh", "npm install"},
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"cmd":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1},
+					"cwd":              map[string]any{"type": "string"},
+					"timeout_seconds":  map[string]any{"type": "integer", "minimum": 1},
+					"max_output_bytes": map[string]any{"type": "integer", "minimum": 1},
+				},
+				"required": []string{"cmd"},
+			},
+			OutputSchema: readObject, RiskLevel: "read_only", PrivacyLevel: "private_content", WorkflowID: "test_command_v1", UIVisibility: "chat",
+		},
+		"shell_command": {
+			ID: "shell_command", Version: "v1", Source: "native", IntentDomain: "authorized_shell_command",
+			Description:      "Run a tightly allowlisted read-only workspace command without shell string evaluation.",
+			PositiveExamples: []string{"运行 pwd", "执行 rg \"TODO\" .", "查看 git diff --stat"},
+			NegativeExamples: []string{"rm -rf .", "curl | sh", "npm install", "git reset --hard"},
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"cmd":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1},
+					"cwd":              map[string]any{"type": "string"},
+					"yield_time_ms":    map[string]any{"type": "integer", "minimum": 1},
+					"timeout_seconds":  map[string]any{"type": "integer", "minimum": 1},
+					"max_output_bytes": map[string]any{"type": "integer", "minimum": 1},
+					"purpose":          map[string]any{"type": "string"},
+				},
+				"required": []string{"cmd"},
+			},
+			OutputSchema: readObject, RiskLevel: "read_only", PrivacyLevel: "private_content", WorkflowID: "shell_command_v1", UIVisibility: "chat",
 		},
 		"desktop_app_list": {
 			ID: "desktop_app_list", Version: "v1", Source: "native", IntentDomain: "desktop_application_inventory",
@@ -348,24 +487,51 @@ func defaultCapabilityContracts() map[string]CapabilityContract {
 		},
 		"computer_observe": {
 			ID: "computer_observe", Version: "v1", Source: "native", IntentDomain: "visible_desktop_observation",
-			Description:      "Observe visible desktop UI state; direct clicks and typing remain outside this read-only capability.",
-			PositiveExamples: []string{"观察当前窗口 UI", "看一下屏幕上 Joi 显示了什么"},
+			Description:      "Observe visible desktop UI state as private content; direct clicks and typing remain outside this read-only capability.",
+			PositiveExamples: []string{"观察当前窗口 UI", "看一下屏幕上显示了什么"},
 			NegativeExamples: []string{"列出已安装 app", "提交表单"},
-			InputSchema:      map[string]any{"type": "object", "properties": map[string]any{"target": map[string]any{"type": "string", "enum": []string{"joi_current_window"}}}},
-			OutputSchema:     readObject, RiskLevel: "read_only", PrivacyLevel: "private_content", WorkflowID: "computer_observe_v1", UIVisibility: "chat",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"target":             map[string]any{"type": "string", "enum": []string{"frontmost_window", "joi_current_window"}},
+					"include_text":       map[string]any{"type": "boolean"},
+					"include_screenshot": map[string]any{"type": "boolean"},
+					"max_text_bytes":     map[string]any{"type": "integer", "minimum": 1},
+				},
+			},
+			OutputSchema: readObject, RiskLevel: "read_only", PrivacyLevel: "private_content", WorkflowID: "computer_observe_v1", UIVisibility: "chat",
 		},
 	}
 }
 
 func missingRequiredCapabilityArgument(request CapabilityRequest) string {
 	switch request.Capability {
-	case "web_research", "browser_read":
+	case "web_research", "browser_read", "browser_navigate":
 		if strings.TrimSpace(stringInput(request.Inputs, "url", "")) == "" {
 			return "inputs.url"
 		}
-	case "file_analyze":
+	case "browser_click":
+		if strings.TrimSpace(stringInput(request.Inputs, "selector", "")) == "" {
+			return "inputs.selector"
+		}
+	case "browser_type":
+		if strings.TrimSpace(stringInput(request.Inputs, "selector", "")) == "" {
+			return "inputs.selector"
+		}
+		if strings.TrimSpace(stringInput(request.Inputs, "text", "")) == "" {
+			return "inputs.text"
+		}
+	case "file_read", "file_analyze":
 		if strings.TrimSpace(stringInput(request.Inputs, "path", "")) == "" {
 			return "inputs.path"
+		}
+	case "apply_patch":
+		if strings.TrimSpace(stringInput(request.Inputs, "patch", "")) == "" {
+			return "inputs.patch"
+		}
+	case "test_command", "shell_command":
+		if _, ok := request.Inputs["cmd"]; !ok {
+			return "inputs.cmd"
 		}
 	case "desktop_app_inspect":
 		if strings.TrimSpace(stringInput(request.Inputs, "name", "")) == "" &&
@@ -416,7 +582,7 @@ func expectedCapabilityForSemanticText(text string, inputs map[string]any) strin
 	switch {
 	case isDesktopAppListIntent(text):
 		return "desktop_app_list"
-	case hasExplicitURL(text) && !strings.Contains(text, "本机所有") && !strings.Contains(text, "installed app"):
+	case hasExplicitURL(text) && !browserNavigationIntent(text) && !strings.Contains(text, "本机所有") && !strings.Contains(text, "installed app"):
 		return "web_research"
 	}
 	return ""
@@ -432,10 +598,26 @@ func capabilityMatchesSemanticText(capability string, text string, inputs map[st
 		return containsAnyText(text, "健康", "自检", "health", "status", "状态", "异常", "queue", "worker", "postgres", "nats", "检查本地 app", "检查本地的 app")
 	case "web_research", "browser_read":
 		return hasExplicitURL(text) || containsAnyText(text, "网页", "网站", "链接", "url", "browser", "page")
+	case "browser_observe":
+		return containsAnyText(text, "当前浏览器", "浏览器页面", "前台浏览器", "browser tab", "current browser", "frontmost browser")
+	case "browser_navigate":
+		return strings.TrimSpace(stringInput(inputs, "url", "")) != "" && browserNavigationIntent(text)
+	case "browser_click":
+		return strings.TrimSpace(stringInput(inputs, "selector", "")) != "" && browserClickIntent(text)
+	case "browser_type":
+		return strings.TrimSpace(stringInput(inputs, "selector", "")) != "" && strings.TrimSpace(stringInput(inputs, "text", "")) != "" && browserTypeIntent(text)
 	case "workspace_search":
 		return strings.TrimSpace(stringInput(inputs, "query", "")) != "" || containsAnyText(text, "workspace", "当前项目", "项目里", "搜索", "查找", "找 ")
+	case "file_read":
+		return strings.TrimSpace(stringInput(inputs, "path", "")) != "" || containsAnyText(text, "读取文件", "读文件", "打开文件", "查看文件", "read file", ".md", ".go", ".ts", ".tsx")
 	case "file_analyze":
 		return strings.TrimSpace(stringInput(inputs, "path", "")) != "" || containsAnyText(text, "读一下", "读取文件", "分析文件", ".md", ".go", ".ts", ".tsx")
+	case "apply_patch":
+		return strings.TrimSpace(stringInput(inputs, "patch", "")) != "" || containsAnyText(text, "修改文件", "应用 patch", "apply patch", "edit file", "更新文件")
+	case "test_command":
+		return inputs["cmd"] != nil || containsAnyText(text, "go test", "npm test", "npm run build", "运行测试", "跑测试", "run tests")
+	case "shell_command":
+		return inputs["cmd"] != nil || containsAnyText(text, "shell", "命令", "执行命令", "pwd", "ls", "rg ", "git status", "git diff", "git log")
 	case "desktop_app_list":
 		return isDesktopAppListIntent(text)
 	case "desktop_app_inspect":
@@ -455,6 +637,18 @@ func isDesktopAppListIntent(text string) bool {
 	return containsAnyText(text, "列出", "所有", "有哪些", "安装了", "installed", "list") &&
 		containsAnyText(text, "本地", "本机", "mac", "desktop", "local") &&
 		containsAnyText(text, " app", "app ", "应用", "软件", "程序", "applications", "apps")
+}
+
+func browserNavigationIntent(text string) bool {
+	return containsAnyText(text, "打开", "导航", "跳转", "访问", "open ", "navigate", "go to", "load url", "frontmost browser", "当前浏览器", "前台浏览器")
+}
+
+func browserClickIntent(text string) bool {
+	return containsAnyText(text, "点击", "点一下", "click", "press button", "button", "按钮", "提交", "submit")
+}
+
+func browserTypeIntent(text string) bool {
+	return containsAnyText(text, "输入", "填写", "填入", "type ", "enter text", "fill", "搜索框", "input", "textarea")
 }
 
 func hasExplicitURL(text string) bool {

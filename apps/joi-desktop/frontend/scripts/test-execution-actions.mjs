@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -9,25 +9,21 @@ const root = process.cwd();
 const outDir = mkdtempSync(join(tmpdir(), 'joi-execution-actions-'));
 
 try {
-  execFileSync('node', [
-    'node_modules/typescript/bin/tsc',
-    'src/executionActions.ts',
-    'src/api/desktop.ts',
-    '--target',
-    'ES2020',
-    '--module',
-    'ES2020',
-    '--moduleResolution',
-    'Bundler',
-    '--skipLibCheck',
-    '--outDir',
-    outDir,
+  const entry = join(outDir, 'entry.ts');
+  const bundle = join(outDir, 'bundle.mjs');
+  writeFileSync(entry, `
+    export { getExecutionDisplayMode, projectRunTraceToActions, visibleExecutionActions } from '${root}/src/executionActions.ts';
+  `);
+  execFileSync('node_modules/.bin/esbuild', [
+    entry,
+    '--bundle',
+    '--format=esm',
+    '--platform=node',
+    '--target=es2020',
+    '--outfile=' + bundle,
   ], { cwd: root, stdio: 'inherit' });
 
-  const modulePath = existsSync(join(outDir, 'executionActions.js'))
-    ? join(outDir, 'executionActions.js')
-    : join(outDir, 'src/executionActions.js');
-  const { getExecutionDisplayMode, projectRunTraceToActions, visibleExecutionActions } = await import(pathToFileURL(modulePath).href);
+  const { getExecutionDisplayMode, projectRunTraceToActions, visibleExecutionActions } = await import(pathToFileURL(bundle).href);
 
   const baseTrace = (steps) => ({
     id: 'run_test',
@@ -133,9 +129,9 @@ try {
 
   {
     const actions = projectRunTraceToActions(baseTrace([
-      { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'file_analyze', inputs: { path: '/Users/hao/Documents/Joi/README.md' } } },
+      { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'file_analyze', inputs: { path: '/Users/hao/project/Joi/README.md' } } },
       { id: 'step_2', step_type: 'tool_compiled', title: 'Tool workflow compiled', status: 'succeeded', output: { workflow: { workflow_name: 'file_analyze_v1' } } },
-      { id: 'step_3', step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'completed', path: '/Users/hao/Documents/Joi/README.md', summary: 'README summary' } },
+      { id: 'step_3', step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'completed', path: '/Users/hao/project/Joi/README.md', summary: 'README summary' } },
     ]));
     assert.equal(actions[0].kind, 'file');
     assert.equal(actions[0].sourceLabel, 'README.md');
@@ -164,6 +160,76 @@ try {
     ]));
     assert.equal(actions[0].status, 'blocked');
     assert(actions[0].details.some((detail) => detail.label === 'ERROR'));
+  }
+
+  {
+    const actions = projectRunTraceToActions(baseTrace([
+      { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'shell_command', inputs: { cmd: ['pwd'] } } },
+      { id: 'step_2', step_type: 'workflow_compiled', title: 'Workflow compiled', status: 'succeeded', output: { workflow: { workflow_name: 'shell_command_v1' } } },
+      { id: 'step_3', step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'completed', cmd: ['pwd'], stdout: '/Users/hao/project/Joi\n', mode: 'shell_command_v1_exec_context' } },
+    ]));
+    assert.equal(actions[0].kind, 'command');
+    assert.equal(actions[0].title, '运行命令');
+    assert(actions[0].details.some((detail) => detail.label === 'COMMAND' && Array.isArray(detail.value)));
+  }
+
+  {
+    const actions = projectRunTraceToActions(baseTrace([
+      { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'browser_observe', inputs: { target: 'frontmost_browser' } } },
+      { id: 'step_2', step_type: 'workflow_compiled', title: 'Workflow compiled', status: 'succeeded', output: { workflow: { workflow_name: 'browser_observe_v1' } } },
+      { id: 'step_3', step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'fallback_to_computer', title: '', url: '', fallback_observe: { window_title: 'Joi Visible Fallback', visible_text: 'Fallback UI text' }, mode: 'browser_observe_v1_macos_snapshot' } },
+    ]));
+    assert.equal(actions[0].kind, 'observe');
+    assert.equal(actions[0].title, '观察浏览器');
+    assert.equal(actions[0].completedLabel, '观察浏览器 · Joi Visible Fallback');
+    assert(JSON.stringify(actions[0].details).includes('fallback_observe'));
+  }
+
+  {
+    const actions = projectRunTraceToActions(baseTrace([
+      { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'browser_navigate', inputs: { url: 'https://example.com' } } },
+      { id: 'step_2', step_type: 'workflow_compiled', title: 'Workflow compiled', status: 'succeeded', output: { workflow: { workflow_name: 'browser_navigate_v1' } } },
+      { id: 'step_3', step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'completed', url: 'https://example.com', method: 'frontmost_browser_applescript', playwright_used: false, http_fetch_used: false, mode: 'browser_navigate_v1_macos' } },
+    ]));
+    assert.equal(actions[0].kind, 'observe');
+    assert.equal(actions[0].title, '导航浏览器');
+    assert.equal(actions[0].sourceLabel, 'example.com');
+    assert.equal(actions[0].completedLabel, '导航浏览器 · example.com');
+    assert(JSON.stringify(actions[0].details).includes('"playwright_used":false'));
+  }
+
+  {
+    const actions = projectRunTraceToActions(baseTrace([
+      { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'browser_click', inputs: { selector: '#submit' } } },
+      { id: 'step_2', step_type: 'workflow_compiled', title: 'Workflow compiled', status: 'succeeded', output: { workflow: { workflow_name: 'browser_click_v1' } } },
+      { id: 'step_3', step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'completed', action: 'click', selector: '#submit', method: 'frontmost_browser_javascript', playwright_used: false, mode: 'browser_interaction_v1_macos' } },
+    ]));
+    assert.equal(actions[0].kind, 'command');
+    assert.equal(actions[0].title, '点击浏览器');
+    assert.equal(actions[0].completedLabel, '点击浏览器');
+    assert(JSON.stringify(actions[0].details).includes('"selector":"#submit"'));
+  }
+
+  {
+    const actions = projectRunTraceToActions(baseTrace([
+      { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'browser_type', inputs: { selector: 'input[name=q]', text: 'hello' } } },
+      { id: 'step_2', step_type: 'workflow_compiled', title: 'Workflow compiled', status: 'succeeded', output: { workflow: { workflow_name: 'browser_type_v1' } } },
+      { id: 'step_3', step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'completed', action: 'type', selector: 'input[name=q]', text_length: 5, method: 'frontmost_browser_javascript', playwright_used: false, mode: 'browser_interaction_v1_macos' } },
+    ]));
+    assert.equal(actions[0].kind, 'command');
+    assert.equal(actions[0].title, '输入浏览器');
+    assert.equal(actions[0].completedLabel, '输入浏览器');
+  }
+
+  {
+    const actions = projectRunTraceToActions(baseTrace([
+      { id: 'step_1', step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability: 'computer_observe', inputs: { target: 'frontmost_window' } } },
+      { id: 'step_2', step_type: 'workflow_compiled', title: 'Workflow compiled', status: 'succeeded', output: { workflow: { workflow_name: 'computer_observe_v1' } } },
+      { id: 'step_3', step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'completed', window_title: 'Joi Test Window', visible_text: 'Real UI text', mode: 'computer_observe_v2_macos_snapshot' } },
+    ]));
+    assert.equal(actions[0].kind, 'observe');
+    assert.equal(actions[0].title, '观察屏幕');
+    assert.equal(actions[0].sourceLabel, 'Joi Test Window');
   }
 
   {

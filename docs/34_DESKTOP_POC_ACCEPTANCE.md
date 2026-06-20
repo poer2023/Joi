@@ -24,7 +24,7 @@ Desktop Mode is the default Joi product path. The acceptance gate is intentional
 Expected output:
 
 ```text
-Desktop PoC passed: SQLite AppCore wrote chat, run trace, health, and backup without Docker/Postgres/NATS.
+Desktop PoC passed: Electron IPC, TS SQLite store, run trace, task/artifact flow, and desktop evals pass without Docker/Postgres/NATS.
 ```
 
 With real provider enforcement:
@@ -43,22 +43,21 @@ REQUIRE_REAL_MODEL=true
 Expected assertions:
 
 ```text
-real_model=true
-fallback_to_mock=false
-model_call_provider=openai_compatible
+model runtime tests passed
+preload contract ok
+Electron chat has no mock fallback
 ```
 
-Build the Wails app bundle:
+Build the Electron app bundle:
 
 ```bash
-cd apps/joi-desktop
-go run github.com/wailsapp/wails/v2/cmd/wails@v2.10.2 build
+./scripts/build_desktop_macos.sh
 ```
 
 The bundle is written under:
 
 ```text
-apps/joi-desktop/build/bin/joi-desktop.app
+apps/joi-electron/release-desktop/mac-arm64/Joi.app
 ```
 
 ## Non-Goals

@@ -21,8 +21,11 @@ func TestCompileCapabilitySeedsAndPolicy(t *testing.T) {
 		{"system_health_check", "system_health_check_v1"},
 		{"web_research", "web_research_v2"},
 		{"browser_read", "browser_read_v1"},
+		{"browser_observe", "browser_observe_v1"},
 		{"workspace_search", "workspace_search_v1"},
+		{"file_read", "file_read_v1"},
 		{"file_analyze", "file_analyze_v1"},
+		{"test_command", "test_command_v1"},
 		{"desktop_app_list", "desktop_app_list_v1"},
 		{"desktop_app_inspect", "desktop_app_inspect_v1"},
 		{"computer_observe", "computer_observe_v1"},
@@ -39,6 +42,102 @@ func TestCompileCapabilitySeedsAndPolicy(t *testing.T) {
 				t.Fatalf("workflow %s has no steps", tc.workflow)
 			}
 		})
+	}
+}
+
+func TestCompileBrowserNavigateCapability(t *testing.T) {
+	ctx := context.Background()
+	db := openCapabilityTestDB(t, ctx)
+	defer db.Close()
+
+	compiled, err := CompileCapability(ctx, db.SQL(), CapabilityRequest{
+		Capability: "browser_navigate",
+		Goal:       "在当前浏览器打开 https://example.com",
+		Evidence:   "用户要求导航前台浏览器到这个 URL",
+		Inputs:     map[string]any{"url": "https://example.com"},
+		Risk:       "read_only",
+	})
+	if err != nil {
+		t.Fatalf("browser_navigate CompileCapability() error = %v", err)
+	}
+	if compiled.Workflow.WorkflowName != "browser_navigate_v1" {
+		t.Fatalf("workflow = %s, want browser_navigate_v1", compiled.Workflow.WorkflowName)
+	}
+	if len(compiled.Workflow.Steps) != 1 || compiled.Workflow.Steps[0].Tool != "browser_navigate_url" {
+		t.Fatalf("workflow steps = %+v, want browser_navigate_url", compiled.Workflow.Steps)
+	}
+
+	_, err = CompileCapability(ctx, db.SQL(), CapabilityRequest{
+		Capability: "browser_navigate",
+		Goal:       "读取网页 https://example.com 并总结正文",
+		Evidence:   "用户要求总结网页内容",
+		Inputs:     map[string]any{"url": "https://example.com"},
+		Risk:       "read_only",
+	})
+	if !errors.Is(err, ErrCapabilityMismatch) {
+		t.Fatalf("summary-like URL should not route to browser_navigate, got %v", err)
+	}
+}
+
+func TestCompileBrowserInteractionCapabilities(t *testing.T) {
+	ctx := context.Background()
+	db := openCapabilityTestDB(t, ctx)
+	defer db.Close()
+
+	click, err := CompileCapability(ctx, db.SQL(), CapabilityRequest{
+		Capability: "browser_click",
+		Goal:       "点击当前浏览器里的提交按钮",
+		Evidence:   "click the submit button in the frontmost browser",
+		Inputs:     map[string]any{"selector": "#submit"},
+		Risk:       "browser_interaction",
+	})
+	if err != nil {
+		t.Fatalf("browser_click CompileCapability() error = %v", err)
+	}
+	if click.Workflow.WorkflowName != "browser_click_v1" || len(click.Workflow.Steps) != 1 || click.Workflow.Steps[0].Tool != "browser_click_element" {
+		t.Fatalf("browser_click workflow = %+v", click.Workflow)
+	}
+
+	typed, err := CompileCapability(ctx, db.SQL(), CapabilityRequest{
+		Capability: "browser_type",
+		Goal:       "在当前浏览器的搜索框输入 hello",
+		Evidence:   "type text into input[name=q] in the frontmost browser",
+		Inputs:     map[string]any{"selector": "input[name=q]", "text": "hello"},
+		Risk:       "browser_interaction",
+	})
+	if err != nil {
+		t.Fatalf("browser_type CompileCapability() error = %v", err)
+	}
+	if typed.Workflow.WorkflowName != "browser_type_v1" || len(typed.Workflow.Steps) != 1 || typed.Workflow.Steps[0].Tool != "browser_type_text" {
+		t.Fatalf("browser_type workflow = %+v", typed.Workflow)
+	}
+
+	_, err = CompileCapability(ctx, db.SQL(), CapabilityRequest{
+		Capability: "browser_click",
+		Goal:       "点击当前浏览器里的提交按钮",
+		Evidence:   "click submit",
+		Inputs:     map[string]any{"selector": "#submit"},
+		Risk:       "read_only",
+	})
+	if !errors.Is(err, ErrPolicyDenied) {
+		t.Fatalf("read-only browser_click error = %v, want ErrPolicyDenied", err)
+	}
+}
+
+func TestCompileCapabilityWorkspaceWriteRisk(t *testing.T) {
+	ctx := context.Background()
+	db := openCapabilityTestDB(t, ctx)
+	defer db.Close()
+
+	if _, err := CompileCapability(ctx, db.SQL(), CapabilityRequest{Capability: "apply_patch", Risk: "read_only"}); !errors.Is(err, ErrPolicyDenied) {
+		t.Fatalf("read-only apply_patch error = %v, want ErrPolicyDenied", err)
+	}
+	result, err := CompileCapability(ctx, db.SQL(), CapabilityRequest{Capability: "apply_patch", Risk: "workspace_write"})
+	if err != nil {
+		t.Fatalf("workspace_write apply_patch CompileCapability() error = %v", err)
+	}
+	if result.Workflow.WorkflowName != "apply_patch_v1" {
+		t.Fatalf("workflow = %s, want apply_patch_v1", result.Workflow.WorkflowName)
 	}
 }
 
@@ -278,6 +377,47 @@ func TestCompileCapabilityRiskPolicy(t *testing.T) {
 	}
 	if confirmations != 2 {
 		t.Fatalf("state_change workflow confirmations = %d, want 2", confirmations)
+	}
+}
+
+func TestCompileCapabilityRecordsConfirmationResumeAnchor(t *testing.T) {
+	ctx := context.Background()
+	db := openCapabilityTestDB(t, ctx)
+	defer db.Close()
+
+	if _, err := db.SQL().ExecContext(ctx, `
+		INSERT INTO conversations (id, channel) VALUES ('conv_confirm_resume', 'desktop');
+		INSERT INTO messages (id, conversation_id, role, content) VALUES ('msg_confirm_resume', 'conv_confirm_resume', 'user', 'restart service');
+		INSERT INTO runs (id, conversation_id, user_message_id, status) VALUES ('run_confirm_resume', 'conv_confirm_resume', 'msg_confirm_resume', 'running');
+		INSERT INTO turns (id, run_id, turn_index, status) VALUES ('turn_confirm_resume', 'run_confirm_resume', 1, 'running');
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := CompileCapability(ctx, db.SQL(), CapabilityRequest{
+		Capability:    "server_diagnose",
+		Risk:          "state_change",
+		Goal:          "restart service",
+		RunID:         "run_confirm_resume",
+		CallID:        "call_confirm_resume",
+		TurnID:        "turn_confirm_resume",
+		ApprovalScope: "once",
+		ApprovalKey:   "call_confirm_resume",
+	})
+	if !errors.Is(err, ErrPolicyDenied) {
+		t.Fatalf("state_change error = %v, want ErrPolicyDenied", err)
+	}
+
+	var callID, turnID, scope, key string
+	if err := db.SQL().QueryRowContext(ctx, `
+		SELECT COALESCE(call_id, ''), COALESCE(turn_id, ''), approval_scope, approval_key
+		FROM confirmation_requests
+		WHERE run_id='run_confirm_resume'
+	`).Scan(&callID, &turnID, &scope, &key); err != nil {
+		t.Fatal(err)
+	}
+	if callID != "call_confirm_resume" || turnID != "turn_confirm_resume" || scope != "once" || key != "call_confirm_resume" {
+		t.Fatalf("confirmation resume anchor = (%q, %q, %q, %q), want call/turn/scope/key", callID, turnID, scope, key)
 	}
 }
 

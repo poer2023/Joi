@@ -1,0 +1,4 @@
+packages:
+  - "apps/*"
+  - "apps/joi-desktop/frontend"
+  - "packages/*"

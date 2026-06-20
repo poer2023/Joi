@@ -56,6 +56,7 @@ test:
 build:
 	cd apps/console-web && npm run build
 	cd apps/joi-desktop/frontend && npm run build
+	pnpm build:electron
 
 backup:
 	./scripts/backup.sh

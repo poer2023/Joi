@@ -1,6 +1,5 @@
-import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
-import { EventsOn, WindowSetMinSize } from '../wailsjs/runtime/runtime';
 import {
   desktopApi,
   type ArtifactDetail,
@@ -12,6 +11,7 @@ import {
   type ConversationMessage,
   type ConversationSummary,
   type ConfirmationRecord,
+  type InputMode,
   type MemoryRecord,
   type MemorySearchResult,
   type MCPServerRecord,
@@ -32,8 +32,14 @@ import {
   type WorkerGatewayAuditRecord,
   type WorkspaceSettings,
 } from './api/desktop';
+import { eventsOn, windowSetMinSize } from './api/runtime';
 import joiAvatar from './assets/joi-avatar-circle.png';
 import { ScrollArea } from './components/ScrollArea';
+import { buildConversationRenderItems, sortBySeq } from './features/chat/conversationProjector';
+import { MessageList } from './features/chat/components/MessageList';
+import { TraceDrawer } from './features/chat/components/TraceDrawer';
+import { normalizeRunEvent } from './features/chat/runEventNormalizer';
+import type { NormalizedRunEvent } from './features/chat/types';
 import {
   createOptimisticExecutionActions,
   getExecutionDisplayMode,
@@ -52,16 +58,24 @@ type SettingsTab = Exclude<Tab, 'chat'>;
 type SettingsCategory = 'models' | 'chatEntrances' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
 type ExecutionTarget = 'main-node' | 'auto' | 'local-worker-1' | 'vps-la-1';
 type StreamingAssistantMessage = ConversationMessage & {
+  role: 'assistant';
   complete?: boolean;
 };
 type ExecutionRunStatus = 'pending' | 'running' | 'completed' | 'failed';
 type ExecutionEvent = {
+  id?: string;
   type?: string;
+  event_type?: string;
   event?: string;
+  seq?: number;
   run_id?: string;
   runID?: string;
+  item_id?: string;
+  item_type?: string;
   action_id?: string;
   actionID?: string;
+  confirmation_id?: string;
+  approved?: boolean;
   kind?: string;
   title?: string;
   status?: string;
@@ -71,9 +85,12 @@ type ExecutionEvent = {
   duration_ms?: number;
   durationMs?: number;
   text?: string;
-  delta?: string;
+  delta?: string | Record<string, unknown>;
   message?: string;
   message_id?: string;
+  payload?: Record<string, unknown>;
+  snapshot?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
   details?: ExecutionActionDetail[];
 };
 type ModelSettingsDraft = {
@@ -133,6 +150,68 @@ const executionTargetOptions: Array<{ value: ExecutionTarget; label: string; pre
   { value: 'local-worker-1', label: '本机 Worker', preferredNode: 'local-worker-1', allowWorker: true },
   { value: 'vps-la-1', label: '远端 Worker', preferredNode: 'vps-la-1', allowWorker: true },
 ];
+const inputModeOptions: Array<{ value: InputMode; label: string; title: string }> = [
+  { value: 'auto', label: 'Auto', title: '自动判断聊天、工具、任务或后台执行' },
+  { value: 'chat_assist', label: 'Chat', title: '普通问答，默认隐藏工具过程' },
+  { value: 'serious_task', label: 'Task', title: '认真执行，多步骤过程可见' },
+  { value: 'background_task', label: 'Bg', title: '后台执行，主聊天只保留任务入口' },
+];
+
+function mergeRunEvents(
+  current: Record<string, NormalizedRunEvent[]>,
+  runId: string,
+  incoming: NormalizedRunEvent[],
+): Record<string, NormalizedRunEvent[]> {
+  if (!runId || incoming.length === 0) return current;
+  const existing = current[runId] ?? [];
+  const merged = [...existing];
+  for (const event of incoming) {
+    const duplicate = merged.some((item) => (
+      item.id === event.id
+      || (event.seq > 0 && item.seq === event.seq && item.type === event.type)
+    ));
+    if (!duplicate) merged.push(event);
+  }
+  return {
+    ...current,
+    [runId]: sortBySeq(merged),
+  };
+}
+
+function latestActiveRunId(eventsByRunId: Record<string, NormalizedRunEvent[]>): string {
+  let latest = '';
+  let latestSeq = -1;
+  for (const [runId, events] of Object.entries(eventsByRunId)) {
+    if (!runId || events.length === 0) continue;
+    const sorted = sortBySeq(events);
+    const terminal = [...sorted].reverse().find((event) => (
+      event.type === 'run.completed'
+      || event.type === 'run.finalized'
+      || event.type === 'run.failed'
+      || event.type === 'run.interrupted'
+      || event.type === 'turn.aborted'
+    ));
+    const lastRunning = [...sorted].reverse().find((event) => (
+      event.type === 'run.started'
+      || event.type === 'turn.started'
+      || event.status === 'running'
+      || event.status === 'waiting_approval'
+    ));
+    if (!lastRunning) continue;
+    if (terminal && terminal.seq >= lastRunning.seq) continue;
+    if (lastRunning.seq >= latestSeq) {
+      latest = runId;
+      latestSeq = lastRunning.seq;
+    }
+  }
+  return latest;
+}
+
+function normalizeTraceEvents(trace: RunTrace | null): NormalizedRunEvent[] {
+  return (trace?.events ?? [])
+    .map((event) => normalizeRunEvent(event))
+    .filter((event) => Boolean(event.runId));
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('chat');
@@ -144,9 +223,11 @@ export default function App() {
   const [activeExecutionStatus, setActiveExecutionStatus] = useState<ExecutionRunStatus>('pending');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [executionTarget, setExecutionTarget] = useState<ExecutionTarget>('main-node');
+  const [inputMode, setInputMode] = useState<InputMode>('auto');
   const [selectedModelName, setSelectedModelName] = useState('');
   const [chat, setChat] = useState<ChatResponse | null>(null);
   const [trace, setTrace] = useState<RunTrace | null>(null);
+  const [runEventsByRunId, setRunEventsByRunId] = useState<Record<string, NormalizedRunEvent[]>>({});
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [archivedConversations, setArchivedConversations] = useState<ConversationSummary[]>([]);
   const [trashedConversations, setTrashedConversations] = useState<ConversationSummary[]>([]);
@@ -191,6 +272,8 @@ export default function App() {
   const pendingConversationIDRef = useRef('');
   const receivedAssistantDeltaRef = useRef(false);
   const receivedAssistantDeltaRunIDRef = useRef('');
+  const assistantCompletedRunIDsRef = useRef<Set<string>>(new Set());
+  const runCompletedFallbackTimersRef = useRef<Record<string, number>>({});
 
   const stepCount = useMemo(() => trace?.steps?.length ?? 0, [trace]);
   const firstModelCall = trace?.model_calls?.[0] ?? chat?.model_calls?.[0];
@@ -216,17 +299,22 @@ export default function App() {
 
   useEffect(() => {
     try {
-      WindowSetMinSize(MIN_APP_WIDTH, MIN_APP_HEIGHT);
+      windowSetMinSize(MIN_APP_WIDTH, MIN_APP_HEIGHT);
     } catch {
-      // Browser preview mode does not expose the Wails runtime.
+      // Browser preview mode does not expose native window controls.
     }
 
     void refreshAll();
   }, []);
 
+  useEffect(() => () => {
+    Object.values(runCompletedFallbackTimersRef.current).forEach((timer) => window.clearTimeout(timer));
+    runCompletedFallbackTimersRef.current = {};
+  }, []);
+
   useEffect(() => {
     try {
-      return EventsOn('joi:run:event', (event: ExecutionEvent) => {
+      return eventsOn('joi:run:event', (event: ExecutionEvent) => {
         dispatchExecutionEvent(event);
       });
     } catch {
@@ -312,13 +400,22 @@ export default function App() {
   }
 
   function dispatchExecutionEvent(event: ExecutionEvent) {
-    const eventType = event.type || event.event || '';
+    const normalized = normalizeRunEvent(event);
+    if (normalized.runId) {
+      setRunEventsByRunId((current) => mergeRunEvents(current, normalized.runId, [normalized]));
+    }
+
+    const eventType = normalized.type || event.type || event.event || '';
     if (!eventType) return;
 
     if (eventType === 'run.started') {
       setActiveExecutionStatus('running');
       receivedAssistantDeltaRef.current = false;
       receivedAssistantDeltaRunIDRef.current = '';
+      if (normalized.runId) {
+        assistantCompletedRunIDsRef.current.delete(normalized.runId);
+        clearRunCompletedFallback(normalized.runId);
+      }
       return;
     }
 
@@ -338,11 +435,58 @@ export default function App() {
       return;
     }
 
+    if (eventType === 'tool.started' || eventType === 'tool.call.started') {
+      setActiveExecutionStatus('running');
+      setActiveExecutionActions((current) => upsertExecutionAction(current, toolEventToExecutionAction(event), 'running'));
+      return;
+    }
+
+    if (eventType === 'tool.finished') {
+      const status = String(event.status || '').toLowerCase() === 'failed' ? 'failed' : 'completed';
+      setActiveExecutionActions((current) => upsertExecutionAction(current, toolEventToExecutionAction(event), status));
+      return;
+    }
+
+    if (eventType === 'tool.failed') {
+      setActiveExecutionActions((current) => upsertExecutionAction(current, toolEventToExecutionAction(event), 'failed'));
+      return;
+    }
+
+    if (eventType === 'approval.requested') {
+      setActiveExecutionStatus('running');
+      setActiveExecutionActions((current) => upsertExecutionAction(current, approvalEventToExecutionAction(event), 'blocked'));
+      return;
+    }
+
+    if (eventType === 'approval.resolved') {
+      const confirmationID = String(event.confirmation_id || event.action_id || '');
+      const approved = event.approved !== false && String(event.status || '').toLowerCase() !== 'rejected';
+      setActiveExecutionActions((current) => current.map((action) => (
+        action.id === confirmationID || (action.kind === 'confirmation' && confirmationID === '')
+          ? { ...action, status: approved ? 'completed' : 'failed', summary: approved ? '已批准' : '已拒绝' }
+          : action
+      )));
+      if (!approved) {
+        setActiveExecutionStatus('failed');
+      }
+      return;
+    }
+
+    if (eventType === 'turn.aborted') {
+      setActiveExecutionStatus('failed');
+      setActiveExecutionActions((current) => current.map((action) => (
+        action.status === 'running' || action.status === 'queued'
+          ? { ...action, status: 'failed', summary: '已中断', description: '执行已中断' }
+          : action
+      )));
+      return;
+    }
+
     if (eventType === 'assistant.delta') {
-      const text = String(event.text ?? event.delta ?? '');
+      const text = String(normalized.delta.text ?? event.text ?? event.delta ?? '');
       if (!text) return;
-      const runID = event.run_id || event.runID || '';
-      const messageID = String(event.message_id || event.message || pendingAssistantIDRef.current || `streaming-${runID || Date.now()}`);
+      const runID = normalized.runId || event.run_id || event.runID || '';
+      const messageID = String(normalized.metadata.message_id || normalized.snapshot.assistant_message_id || event.message_id || pendingAssistantIDRef.current || `streaming-${runID || Date.now()}`);
       const conversationID = pendingConversationIDRef.current || currentConversationID || 'pending-conversation';
       receivedAssistantDeltaRef.current = true;
       receivedAssistantDeltaRunIDRef.current = runID;
@@ -357,15 +501,53 @@ export default function App() {
       return;
     }
 
-    if (eventType === 'run.completed') {
+    if (eventType === 'assistant.completed') {
+      if (normalized.runId) {
+        assistantCompletedRunIDsRef.current.add(normalized.runId);
+        clearRunCompletedFallback(normalized.runId);
+      }
+      markStreamingAssistantComplete(normalized.runId);
+      return;
+    }
+
+    if (eventType === 'foreground_run.completed' || eventType === 'run.finalized') {
       setActiveExecutionStatus('completed');
-      setStreamingAssistantMessage((current) => (current ? { ...current, complete: true } : current));
+      return;
+    }
+
+    if (eventType === 'run.completed') {
+      scheduleRunCompletedFallback(normalized.runId);
       return;
     }
 
     if (eventType === 'run.failed') {
       setActiveExecutionStatus('failed');
     }
+  }
+
+  function markStreamingAssistantComplete(runId?: string) {
+    setStreamingAssistantMessage((current) => {
+      if (!current) return current;
+      if (runId && current.run_id && current.run_id !== runId) return current;
+      return { ...current, complete: true };
+    });
+  }
+
+  function clearRunCompletedFallback(runId: string) {
+    const timer = runCompletedFallbackTimersRef.current[runId];
+    if (!timer) return;
+    window.clearTimeout(timer);
+    delete runCompletedFallbackTimersRef.current[runId];
+  }
+
+  function scheduleRunCompletedFallback(runId: string) {
+    if (!runId || assistantCompletedRunIDsRef.current.has(runId)) return;
+    clearRunCompletedFallback(runId);
+    runCompletedFallbackTimersRef.current[runId] = window.setTimeout(() => {
+      delete runCompletedFallbackTimersRef.current[runId];
+      if (assistantCompletedRunIDsRef.current.has(runId)) return;
+      markStreamingAssistantComplete(runId);
+    }, 800);
   }
 
   async function refreshAll() {
@@ -506,6 +688,7 @@ export default function App() {
     pendingAssistantIDRef.current = '';
     receivedAssistantDeltaRef.current = false;
     receivedAssistantDeltaRunIDRef.current = '';
+    Object.keys(runCompletedFallbackTimersRef.current).forEach(clearRunCompletedFallback);
     setLastPrompt(prompt);
     setPendingUserMessage({
       id: `pending-${Date.now()}`,
@@ -529,8 +712,10 @@ export default function App() {
         preferred_node: routing.preferredNode,
         allow_worker: routing.allowWorker,
         model_name: modelName,
-        input_mode: 'auto',
+        input_mode: inputMode,
         product_task_id: activeProductTaskID || undefined,
+        runtime_mode: 'tool_calling',
+        permission_profile: 'read_only',
       });
       setChat(result);
       pendingAssistantIDRef.current = result.assistant_message_id;
@@ -546,6 +731,7 @@ export default function App() {
       setMessage('');
       const runTrace = await desktopApi.getRunTrace(result.run_id);
       setTrace(runTrace);
+      setRunEventsByRunId((current) => mergeRunEvents(current, result.run_id, normalizeTraceEvents(runTrace)));
       const visibleActions = visibleExecutionActions(projectRunTraceToActions(runTrace));
       setActiveExecutionActions(visibleActions);
       setActiveExecutionStatus(normalizeRunExecutionStatus(runTrace.status));
@@ -618,7 +804,9 @@ export default function App() {
       setConversationMessages(detail.messages ?? []);
       setChat(null);
       if (detail.conversation.latest_run_id) {
-        setTrace(await desktopApi.getRunTrace(detail.conversation.latest_run_id));
+        const runTrace = await desktopApi.getRunTrace(detail.conversation.latest_run_id);
+        setTrace(runTrace);
+        setRunEventsByRunId((current) => mergeRunEvents(current, detail.conversation.latest_run_id || '', normalizeTraceEvents(runTrace)));
       } else {
         setTrace(null);
       }
@@ -687,7 +875,9 @@ export default function App() {
         setConversationMessages(conversation.messages ?? []);
       }
       if (detail.task.latest_run_id) {
-        setTrace(await desktopApi.getRunTrace(detail.task.latest_run_id));
+        const runTrace = await desktopApi.getRunTrace(detail.task.latest_run_id);
+        setTrace(runTrace);
+        setRunEventsByRunId((current) => mergeRunEvents(current, detail.task.latest_run_id || '', normalizeTraceEvents(runTrace)));
       }
       setActiveTab('chat');
     } catch (err) {
@@ -711,6 +901,19 @@ export default function App() {
   async function decideConfirmation(id: string, approve: boolean) {
     await desktopApi.decideConfirmation({ id, approve, actor: 'desktop_admin', reason: approve ? 'approved_in_desktop' : 'rejected_in_desktop' });
     await refreshAll();
+  }
+
+  async function cancelRun(runID: string) {
+    if (!runID) return;
+    await desktopApi.interruptRun({ run_id: runID, reason: 'cancelled_in_desktop' });
+    showNotice(`已请求中断运行：${compactIdentifier(runID)}`);
+  }
+
+  async function continueProductTask(task: ProductTask) {
+    setActiveProductTaskID(task.id);
+    setInputMode(task.mode === 'background_task' ? 'background_task' : 'serious_task');
+    setMessage(`继续任务：${task.title}\n\n请根据已有任务契约继续执行未完成步骤，更新交付物，并在完成前写入验证结果。`);
+    showNotice(`已准备继续任务：${task.title}`);
   }
 
   async function setNodeDisabled(nodeID: string, disabled: boolean) {
@@ -862,13 +1065,15 @@ export default function App() {
             activeProductTask={activeProductTaskDetail}
             artifacts={artifacts}
             activeExecutionActions={activeExecutionActions}
-            activeExecutionStatus={activeExecutionStatus}
             autoRightPanelCollapsed={autoRightPanelCollapsed}
             chat={chat}
             conversationMessages={conversationMessages}
+            cancelRun={cancelRun}
+            continueProductTask={continueProductTask}
             decideProactiveMessage={decideProactiveMessage}
             executionTarget={executionTarget}
             health={health}
+            inputMode={inputMode}
             isSubmitting={isSubmitting}
             memories={memories}
             openArtifact={openArtifact}
@@ -879,10 +1084,13 @@ export default function App() {
             streamingAssistantMessage={streamingAssistantMessage}
             proactiveMessages={proactiveMessages}
             productTasks={productTasks}
+            runEventsByRunId={runEventsByRunId}
             savedModels={savedModels}
+            selectProductTask={selectProductTask}
             selectedModelName={selectedModelName || settings?.model_name || 'deepseek-v4-flash'}
             setActiveTab={setActiveTab}
             setExecutionTarget={setExecutionTarget}
+            setInputMode={setInputMode}
             setMessage={setMessage}
             setSelectedModelName={setSelectedModelName}
             settings={settings}
@@ -2690,14 +2898,16 @@ function SidebarIcon({ name }: { name: 'plus' | 'search' | 'collapse' | 'expand'
 function ChatHome({
   activeProductTask,
   activeExecutionActions,
-  activeExecutionStatus,
   artifacts,
   autoRightPanelCollapsed,
   chat,
   conversationMessages,
+  cancelRun,
+  continueProductTask,
   decideProactiveMessage,
   executionTarget,
   health,
+  inputMode,
   isSubmitting,
   lastPrompt,
   message,
@@ -2708,10 +2918,13 @@ function ChatHome({
   streamingAssistantMessage,
   proactiveMessages,
   productTasks,
+  runEventsByRunId,
   savedModels,
+  selectProductTask,
   selectedModelName,
   setActiveTab,
   setExecutionTarget,
+  setInputMode,
   setMessage,
   setSelectedModelName,
   settings,
@@ -2721,14 +2934,16 @@ function ChatHome({
 }: {
   activeProductTask: ProductTaskDetail | null;
   activeExecutionActions: ExecutionAction[];
-  activeExecutionStatus: ExecutionRunStatus;
   artifacts: ArtifactSummary[];
   autoRightPanelCollapsed: boolean;
   chat: ChatResponse | null;
   conversationMessages: ConversationMessage[];
+  cancelRun: (runID: string) => Promise<void>;
+  continueProductTask: (task: ProductTask) => Promise<void>;
   decideProactiveMessage: (id: string, action: string, feedback?: string) => Promise<void>;
   executionTarget: ExecutionTarget;
   health: SystemHealth | null;
+  inputMode: InputMode;
   isSubmitting: boolean;
   lastPrompt: string;
   message: string;
@@ -2739,10 +2954,13 @@ function ChatHome({
   streamingAssistantMessage: StreamingAssistantMessage | null;
   proactiveMessages: ProactiveMessage[];
   productTasks: ProductTask[];
+  runEventsByRunId: Record<string, NormalizedRunEvent[]>;
   savedModels: AvailableModel[];
+  selectProductTask: (id: string) => Promise<void>;
   selectedModelName: string;
   setActiveTab: (tab: Tab) => void;
   setExecutionTarget: (value: ExecutionTarget) => void;
+  setInputMode: (value: InputMode) => void;
   setMessage: (value: string) => void;
   setSelectedModelName: (value: string) => void;
   settings: SettingsRecord | null;
@@ -2758,27 +2976,26 @@ function ChatHome({
         { id: chat.assistant_message_id, conversation_id: chat.conversation_id, role: 'assistant', content: chat.response, run_id: chat.run_id },
       ]
       : [];
-  const displayMessages = dedupeConversationMessages([
-    ...settledMessages,
-    ...(pendingUserMessage ? [pendingUserMessage] : []),
-    ...(streamingAssistantMessage ? [streamingAssistantMessage] : []),
-  ]);
-  const hasThread = displayMessages.length > 0;
+  const liveRunId = latestActiveRunId(runEventsByRunId);
+  const activeRunId = streamingAssistantMessage?.run_id || chat?.run_id || trace?.id || liveRunId;
+  const conversationProjection = useMemo(() => buildConversationRenderItems({
+    messages: settledMessages,
+    pendingUserMessage,
+    streamingAssistant: streamingAssistantMessage,
+    runEventsByRunId,
+    activeRunId,
+    mode: inputMode,
+  }), [activeRunId, inputMode, pendingUserMessage, runEventsByRunId, settledMessages, streamingAssistantMessage]);
+  const renderItems = conversationProjection.items;
+  const hasThread = renderItems.length > 0;
   const activeTaskBelongsToCurrentRun = Boolean(activeProductTask?.task.latest_run_id && activeProductTask.task.latest_run_id === (chat?.run_id || trace?.id));
   const latestTask = chat?.product_task ? { task: chat.product_task, steps: [], deliverables: chat.artifacts ?? [] } : activeTaskBelongsToCurrentRun ? activeProductTask : null;
   const executionActions = useMemo(() => projectRunTraceToActions(trace), [trace]);
   const visibleTraceActions = useMemo(() => visibleExecutionActions(executionActions), [executionActions]);
   const liveExecutionActions = activeExecutionActions.length > 0 ? activeExecutionActions : visibleTraceActions;
-  const executionRunStatus = activeExecutionStatus !== 'pending' ? activeExecutionStatus : normalizeRunExecutionStatus(trace?.status);
-  const executionDisplayMode = getExecutionDisplayMode({
-    actions: liveExecutionActions,
-    status: executionRunStatus,
-    hasArtifact: Boolean((chat?.artifacts?.length ?? 0) > 0),
-    hasProductTask: Boolean(latestTask || chat?.product_task),
-    isSeriousTask: Boolean(latestTask || chat?.ui?.interaction_class === 'serious_task' || trace?.metadata?.interaction_class === 'serious_task'),
-  });
-  const showInlineActionFlow = shouldShowExecutionActionFlow(liveExecutionActions) && executionDisplayMode !== 'task';
   const showRunDetails = shouldShowInlineRunDetails(chat, trace, latestTask, liveExecutionActions);
+  const hasProjectedTaskEntry = renderItems.some((item) => item.type === 'task_entry' || item.type === 'compact_run_card');
+  const showInlineTaskCard = Boolean(latestTask && showRunDetails && inputMode !== 'background_task' && !hasProjectedTaskEntry);
   const [manualRightPanelCollapsed, setManualRightPanelCollapsed] = useState(true);
   const [executionTargetOpen, setExecutionTargetOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
@@ -2821,6 +3038,7 @@ function ChatHome({
   }
 
   function fillSeriousTaskSuggestion() {
+    setInputMode('serious_task');
     setMessage('认真执行：根据这个方向，给我整理一份开发 spec。');
   }
 
@@ -2898,44 +3116,15 @@ function ChatHome({
         <ScrollArea className={hasThread ? 'chat-thread' : 'chat-empty-state'}>
           {hasThread ? (
             <>
-              {displayMessages.map((item) => {
-                const shouldInsertActionFlow = item.role === 'assistant' && showInlineActionFlow && (
-                  (item.run_id && trace?.id === item.run_id)
-                  || (streamingAssistantMessage?.id === item.id && liveExecutionActions.length > 0)
-                );
-                return (
-                  <Fragment key={item.id}>
-                    {shouldInsertActionFlow ? (
-                      <ExecutionActionFlow
-                        key={`${item.run_id || 'pending'}-inline-actions`}
-                        actions={liveExecutionActions}
-                        collapsed={Boolean((streamingAssistantMessage?.id === item.id && streamingAssistantMessage.complete) || (item.run_id && trace?.id === item.run_id && !isSubmitting))}
-                        runStatus={executionRunStatus}
-                        displayMode={executionDisplayMode}
-                        mode="inline"
-                        openTrace={() => setActiveTab('trace')}
-                      />
-                    ) : null}
-                    <article className={`message-row ${item.role === 'assistant' ? 'assistant-message' : 'user-message'}${streamingAssistantMessage?.id === item.id && !streamingAssistantMessage.complete ? ' streaming-message' : ''}`}>
-                      {item.role === 'assistant' ? <img className="message-avatar assistant" src={joiAvatar} alt="Joi" /> : <div className="message-avatar">你</div>}
-                      <div className="message-bubble">
-                        <p>{item.role === 'assistant' ? userFacingAssistantText(item.content) : item.content}</p>
-                      </div>
-                    </article>
-                  </Fragment>
-                );
-              })}
-              {isSubmitting && showInlineActionFlow && !streamingAssistantMessage && (
-                <ExecutionActionFlow
-                  actions={liveExecutionActions}
-                  collapsed={false}
-                  runStatus={executionRunStatus}
-                  displayMode={executionDisplayMode}
-                  mode="inline"
-                  openTrace={() => setActiveTab('trace')}
-                />
-              )}
-              {isSubmitting && !showInlineActionFlow && (
+              <MessageList
+                assistantAvatarSrc={joiAvatar}
+                formatAssistantContent={userFacingAssistantText}
+                items={renderItems}
+                onOpenArtifact={(artifactId) => void openArtifact(artifactId)}
+                onOpenTask={(taskId) => void selectProductTask(taskId)}
+                onOpenTrace={() => setActiveTab('trace')}
+              />
+              {isSubmitting && !streamingAssistantMessage && !renderItems.some((item) => item.type === 'message' && item.role === 'assistant') && (
                 <article className="message-row assistant-message pending-message">
                   <img className="message-avatar assistant" src={joiAvatar} alt="Joi" />
                   <div className="message-bubble">
@@ -2943,7 +3132,7 @@ function ChatHome({
                   </div>
                 </article>
               )}
-              {latestTask && showRunDetails && <TaskCard detail={latestTask} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />}
+              {showInlineTaskCard && <TaskCard detail={latestTask!} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />}
             </>
           ) : (
             <>
@@ -2978,6 +3167,20 @@ function ChatHome({
               }
             }}
           >
+            <div className="composer-mode-control" role="group" aria-label="输入模式">
+              {inputModeOptions.map((item) => (
+                <button
+                  key={item.value}
+                  className={item.value === inputMode ? 'active' : ''}
+                  type="button"
+                  title={item.title}
+                  aria-pressed={item.value === inputMode}
+                  onClick={() => setInputMode(item.value)}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
             <div ref={modelControlRef} className="composer-model-control">
               <button
                 aria-expanded={modelMenuOpen}
@@ -3009,15 +3212,27 @@ function ChatHome({
               )}
             </div>
           </div>
-          <button
-            className="send-button"
-            disabled={isSubmitting || !message.trim()}
-            type="button"
-            title={isSubmitting ? '发送中' : '发送'}
-            onClick={() => void submit()}
-          >
-            ↑
-          </button>
+          {isSubmitting ? (
+            <button
+              className="send-button stop-button"
+              disabled={!activeRunId}
+              type="button"
+              title={activeRunId ? '中断运行' : '等待运行 ID'}
+              onClick={() => void cancelRun(activeRunId)}
+            >
+              ■
+            </button>
+          ) : (
+            <button
+              className="send-button"
+              disabled={!message.trim()}
+              type="button"
+              title="发送"
+              onClick={() => void submit()}
+            >
+              ↑
+            </button>
+          )}
         </form>
       </section>
       {!rightPanelCollapsed && (
@@ -3029,7 +3244,7 @@ function ChatHome({
         >
           <>
             {latestTask ? (
-              <TaskExecutionPanel detail={latestTask} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />
+              <TaskExecutionPanel detail={latestTask} cancelRun={cancelRun} continueProductTask={continueProductTask} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />
             ) : (
               <CompanionInsightPanel
                 memories={memories}
@@ -3166,8 +3381,23 @@ function CompanionInsightPanel({
   );
 }
 
-function TaskExecutionPanel({ detail, openArtifact, openTrace }: { detail: ProductTaskDetail; openArtifact: (id: string) => Promise<void>; openTrace: () => void }) {
+function TaskExecutionPanel({
+  cancelRun,
+  continueProductTask,
+  detail,
+  openArtifact,
+  openTrace,
+}: {
+  cancelRun: (runID: string) => Promise<void>;
+  continueProductTask: (task: ProductTask) => Promise<void>;
+  detail: ProductTaskDetail;
+  openArtifact: (id: string) => Promise<void>;
+  openTrace: () => void;
+}) {
   const task = detail.task;
+  const contract = task.task_contract;
+  const verification = task.verification;
+  const canInterrupt = Boolean(task.latest_run_id && ['running', 'waiting_confirmation', 'verifying'].includes(task.status));
   return (
     <section className="right-panel-section task-execution-panel">
       <header>
@@ -3179,6 +3409,16 @@ function TaskExecutionPanel({ detail, openArtifact, openTrace }: { detail: Produ
         <span>{formatRiskLevel(task.risk_level)}</span>
         <span>{task.progress_percent}%</span>
       </div>
+      {contract && (
+        <div className="task-contract-block">
+          <h3>任务契约</h3>
+          <p>{contract.objective}</p>
+          <div className="task-contract-grid">
+            <KV label="交付物" value={contract.deliverables.join('、') || '任务结果'} />
+            <KV label="验证" value={contract.verification_requirements.join('、') || '完成前验证'} />
+          </div>
+        </div>
+      )}
       <ol className="task-step-list">
         {detail.steps.map((step) => (
           <li key={step.id} className={`step-${step.status}`}>
@@ -3199,7 +3439,30 @@ function TaskExecutionPanel({ detail, openArtifact, openTrace }: { detail: Produ
           </InsightItem>
         ))}
       </InsightList>
-      <button className="trace-link-button" type="button" onClick={openTrace}>查看执行过程</button>
+      {verification && (
+        <div className={`task-verification-block verification-${verification.status}`}>
+          <h3>验证结果</h3>
+          <p>{verification.summary || formatStatus(verification.status)}</p>
+          {verification.checks.length > 0 && (
+            <ul>
+              {verification.checks.map((check) => (
+                <li key={check.name}>{check.name} · {formatStatus(check.status)}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+      <div className="task-panel-actions">
+        <button className="trace-link-button" type="button" onClick={openTrace}>查看执行过程</button>
+        <button type="button" onClick={() => void continueProductTask(task)}>继续</button>
+        <button
+          type="button"
+          disabled={!canInterrupt || !task.latest_run_id}
+          onClick={() => task.latest_run_id ? void cancelRun(task.latest_run_id) : undefined}
+        >
+          暂停
+        </button>
+      </div>
     </section>
   );
 }
@@ -3242,7 +3505,7 @@ function RecentArtifactsPanel({ artifacts, openArtifact }: { artifacts: Artifact
 }
 
 function TaskMiniList({ tasks }: { tasks: ProductTask[] }) {
-  const active = tasks.filter((task) => ['planning', 'running', 'waiting_confirmation', 'blocked'].includes(task.status)).slice(0, 3);
+  const active = tasks.filter((task) => ['planning', 'running', 'waiting_confirmation', 'paused', 'verifying', 'blocked'].includes(task.status)).slice(0, 3);
   if (active.length === 0) return null;
   return (
     <section className="right-panel-section compact-section">
@@ -3577,6 +3840,76 @@ function upsertExecutionAction(actions: ExecutionAction[], event: ExecutionEvent
     summary: next.summary || copy[index].summary,
   };
   return copy;
+}
+
+function toolEventToExecutionAction(event: ExecutionEvent): ExecutionEvent {
+  const raw = event as ExecutionEvent & { tool_name?: string; toolName?: string; call_id?: string; callID?: string; arguments?: unknown; output?: unknown };
+  const toolName = String(raw.tool_name || raw.toolName || raw.title || 'tool');
+  const kind = actionKindForToolName(toolName);
+  const title = actionTitleForToolName(toolName);
+  const actionID = String(raw.call_id || raw.callID || raw.action_id || raw.actionID || `${toolName}-tool`);
+  return {
+    ...event,
+    action_id: actionID,
+    kind,
+    title,
+    summary: String(event.summary || (String(event.status || '').toLowerCase() === 'failed' ? '执行失败' : title)),
+    source_label: String(event.source_label || event.sourceLabel || toolName),
+    details: mergeExecutionEventDetails([
+      { label: 'COMMAND', value: toolName },
+      { label: 'INPUT', value: raw.arguments },
+      { label: 'RESULT', value: raw.output },
+    ], event.details),
+  };
+}
+
+function approvalEventToExecutionAction(event: ExecutionEvent): ExecutionEvent {
+  const raw = event as ExecutionEvent & { confirmation_id?: string; capability?: string; risk?: string };
+  const capability = String(raw.capability || 'confirmation');
+  return {
+    ...event,
+    action_id: String(raw.confirmation_id || event.action_id || `${capability}-confirmation`),
+    kind: 'confirmation',
+    title: '等待确认',
+    summary: String(event.summary || `${capability} 需要确认`),
+    source_label: capability,
+    details: mergeExecutionEventDetails([
+      { label: 'INPUT', value: { capability, risk: raw.risk, confirmation_id: raw.confirmation_id } },
+    ], event.details),
+  };
+}
+
+function mergeExecutionEventDetails(base: ExecutionActionDetail[], extra?: ExecutionActionDetail[]): ExecutionActionDetail[] {
+  return [...base, ...(extra ?? [])].filter((detail) => (
+    detail.value !== undefined
+    && detail.value !== null
+    && detail.value !== ''
+  ));
+}
+
+function actionKindForToolName(toolName: string): ExecutionActionKind {
+  const key = toolName.toLowerCase();
+  if (key.includes('web') || key.includes('browser')) return 'web';
+  if (key.includes('workspace_search')) return 'workspace';
+  if (key.includes('file') || key.includes('patch')) return 'file';
+  if (key.includes('memory')) return 'memory';
+  if (key.includes('test') || key.includes('shell') || key.includes('command')) return 'command';
+  if (key.includes('health') || key.includes('diagnose')) return 'diagnostic';
+  return 'command';
+}
+
+function actionTitleForToolName(toolName: string): string {
+  const key = toolName.toLowerCase();
+  if (key.includes('web') || key.includes('browser')) return '读取网页';
+  if (key.includes('workspace_search')) return '搜索工作区';
+  if (key.includes('file_read')) return '读取文件';
+  if (key.includes('file_analyze')) return '分析文件';
+  if (key.includes('apply_patch')) return '修改文件';
+  if (key.includes('memory')) return '处理记忆';
+  if (key.includes('test') || key.includes('shell') || key.includes('command')) return '运行命令';
+  if (key.includes('health')) return '系统自检';
+  if (key.includes('diagnose')) return '诊断服务';
+  return '执行工具';
 }
 
 function normalizeExecutionActionKind(kind: unknown): ExecutionActionKind {
@@ -3952,6 +4285,10 @@ function TraceDetail({ trace, stepCount, firstModelCall }: { trace: RunTrace | n
           <StepList trace={trace} />
           <TraceRuntimeSummary trace={trace} />
         </div>
+        <section className="run-event-section">
+          <h3>Run Events</h3>
+          <TraceDrawer events={sortBySeq(normalizeTraceEvents(trace))} />
+        </section>
       </details>
     </section>
   );
@@ -4166,7 +4503,10 @@ function ConfirmationsPanel({ confirmations, decide }: { confirmations: Confirma
             <div>
               <strong>{item.requested_action}</strong>
               <p>{item.capability_id} · 风险 {formatRiskLevel(item.risk_level)} · {formatStatus(item.status)}</p>
-              <small>任务：{item.run_id}</small>
+              <small>任务：{item.run_id || '无'}{item.turn_id ? ` · Turn ${compactIdentifier(item.turn_id)}` : ''}{item.call_id ? ` · Call ${compactIdentifier(item.call_id)}` : ''}</small>
+              {item.approval_scope || item.approval_key ? (
+                <small>审批：{item.approval_scope || 'once'}{item.approval_key ? ` · ${compactIdentifier(item.approval_key)}` : ''}</small>
+              ) : null}
               {item.input ? <CollapsedData label="查看请求参数" value={item.input} /> : null}
             </div>
             {item.status === 'pending' && (
@@ -4181,6 +4521,11 @@ function ConfirmationsPanel({ confirmations, decide }: { confirmations: Confirma
       </div>
     </section>
   );
+}
+
+function compactIdentifier(value?: string) {
+  if (!value) return '';
+  return value.length > 22 ? `${value.slice(0, 14)}...${value.slice(-5)}` : value;
 }
 
 function SettingsPanel({
@@ -4580,6 +4925,9 @@ function formatStatus(status: string) {
     pending: '待处理',
     running: '运行中',
     queued: '已派发',
+    waiting_confirmation: '等待确认',
+    paused: '已暂停',
+    verifying: '验证中',
     failed: '失败',
     error: '错误',
     blocked: '已阻止',

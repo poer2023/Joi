@@ -64,7 +64,7 @@ func createPromptAssembly(ctx context.Context, tx *sql.Tx, input PromptAssemblyI
 - Agent is a role; model is an execution engine.
 - The model must only output one JSON object with output_type: final_answer, capability_request, or memory_write_proposal.
 - final_answer schema: {"output_type":"final_answer","content":"..."}.
-- capability_request schema: {"output_type":"capability_request","capability":"memory_search|server_diagnose|system_health_check|web_research|browser_read|workspace_search|file_analyze|desktop_app_list|desktop_app_inspect|computer_observe","goal":"...","inputs":{...},"risk":"read_only","confidence":0.0}.
+- capability_request schema: {"output_type":"capability_request","capability":"memory_search|server_diagnose|system_health_check|web_research|browser_read|browser_observe|browser_navigate|browser_click|browser_type|workspace_search|file_read|file_analyze|apply_patch|shell_command|test_command|desktop_app_list|desktop_app_inspect|computer_observe","goal":"...","inputs":{...},"risk":"read_only|workspace_write|browser_interaction","confidence":0.0}.
 - memory_write_proposal schema: {"output_type":"memory_write_proposal","memory":{"type":"...","content":"...","confidence":0.0}}.
 - The model must not output raw shell, SQL, file_write, service_restart, restart, stop, rm, delete, chmod, or chown for execution.
 - Tool access is only through capability_request and deterministic Tool Compiler.

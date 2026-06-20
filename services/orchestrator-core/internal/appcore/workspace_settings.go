@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	defaultWorkspaceRoot        = "/Users/hao/Documents/Joi"
+	defaultWorkspaceRoot        = "/Users/hao/project/Joi"
 	defaultFileAnalyzeMaxBytes  = 256 * 1024
 	defaultWorkspaceSearchLimit = 50
 )

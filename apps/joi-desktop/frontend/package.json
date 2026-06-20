@@ -7,7 +7,8 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "test:execution-actions": "node scripts/test-execution-actions.mjs"
+    "test:execution-actions": "node scripts/test-execution-actions.mjs",
+    "test:chat-projection": "node scripts/test-chat-projection.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",

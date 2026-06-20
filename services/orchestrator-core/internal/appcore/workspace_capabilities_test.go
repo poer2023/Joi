@@ -40,7 +40,7 @@ func TestSQLiteWorkspaceSearchCapability(t *testing.T) {
 		t.Fatalf("trace missing workspace_search capability request")
 	}
 	output := latestToolRunOutput(t, ctx, core, result.RunID)
-	if output["mode"] != "workspace_search_v1_go_walk" {
+	if output["mode"] != "workspace_search_v1_go_walk" && output["mode"] != "workspace_search_v2_rg" {
 		t.Fatalf("unexpected mode: %+v", output)
 	}
 	results := mapSliceForTest(t, output["results"])
@@ -311,6 +311,97 @@ func TestSQLiteFileAnalyzeCapability(t *testing.T) {
 	}
 }
 
+func TestSQLiteFileReadCapabilityReadsLineRange(t *testing.T) {
+	ctx := context.Background()
+	core := newTestAppCore(t, ctx)
+	defer core.Shutdown(ctx)
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "sample.go"), []byte("package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SaveWorkspaceSettings(ctx, WorkspaceSettingsRequest{
+		AllowedRoots:              []string{root},
+		DefaultRoot:               root,
+		FileAnalyzeMaxBytes:       1024,
+		WorkspaceSearchMaxResults: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runID := insertMinimalRun(t, ctx, core.DB().SQL())
+	tx, err := core.DB().SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	result, err := core.executeAndRecordSQLiteCapability(ctx, tx, store.CapabilityRequest{
+		Type:       "capability_request",
+		Capability: "file_read",
+		Goal:       "读取 sample.go 第 3 到 4 行",
+		Inputs:     map[string]any{"path": "sample.go", "start_line": 3, "end_line": 4, "max_bytes": 512},
+		Risk:       "read_only",
+		RunID:      runID,
+		Evidence:   "读取 sample.go 第 3 到 4 行",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := result.NormalizedResult
+	if output["mode"] != "file_read_v1_bounded_lines" {
+		t.Fatalf("unexpected mode: %+v", output)
+	}
+	if !strings.HasSuffix(stringValue(output["path"]), "sample.go") {
+		t.Fatalf("unexpected file_read path: %+v", output)
+	}
+	if intValue(output["start_line"]) != 3 || intValue(output["end_line"]) != 4 || intValue(output["line_count"]) != 2 {
+		t.Fatalf("unexpected line metadata: %+v", output)
+	}
+	content := stringValue(output["content"])
+	if !strings.Contains(content, "func main()") || !strings.Contains(content, "println(\"hello\")") {
+		t.Fatalf("file_read content missing requested lines: %q", content)
+	}
+	if strings.Contains(content, "package main") {
+		t.Fatalf("file_read content included line outside requested range: %q", content)
+	}
+}
+
+func TestSQLiteFileReadRejectsForbiddenPath(t *testing.T) {
+	ctx := context.Background()
+	core := newTestAppCore(t, ctx)
+	defer core.Shutdown(ctx)
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("API_KEY=SHOULD_NOT_READ\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SaveWorkspaceSettings(ctx, WorkspaceSettingsRequest{
+		AllowedRoots:              []string{root},
+		DefaultRoot:               root,
+		FileAnalyzeMaxBytes:       1024,
+		WorkspaceSearchMaxResults: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runID := insertMinimalRun(t, ctx, core.DB().SQL())
+	tx, err := core.DB().SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	_, err = core.executeAndRecordSQLiteCapability(ctx, tx, store.CapabilityRequest{
+		Type:       "capability_request",
+		Capability: "file_read",
+		Goal:       "读取 .env",
+		Inputs:     map[string]any{"path": ".env"},
+		Risk:       "read_only",
+		RunID:      runID,
+		Evidence:   "读取 .env",
+	})
+	if err == nil {
+		t.Fatalf("forbidden .env path was allowed")
+	}
+}
+
 func TestSQLiteReadmeStartupQuestionReturnsAnswerNotSearchDump(t *testing.T) {
 	ctx := context.Background()
 	core := newTestAppCore(t, ctx)
@@ -396,6 +487,47 @@ func TestSQLiteFileAnalyzeRejectsSymlinkEscape(t *testing.T) {
 	_ = tx.Rollback()
 	if err == nil {
 		t.Fatalf("symlink escape was allowed")
+	}
+}
+
+func TestSQLiteFileReadRejectsSymlinkEscape(t *testing.T) {
+	ctx := context.Background()
+	core := newTestAppCore(t, ctx)
+	defer core.Shutdown(ctx)
+
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.md"), []byte("secret=SHOULD_NOT_READ"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.md"), filepath.Join(root, "linked.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.SaveWorkspaceSettings(ctx, WorkspaceSettingsRequest{
+		AllowedRoots:              []string{root},
+		DefaultRoot:               root,
+		FileAnalyzeMaxBytes:       1024,
+		WorkspaceSearchMaxResults: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runID := insertMinimalRun(t, ctx, core.DB().SQL())
+	tx, err := core.DB().SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	_, err = core.executeAndRecordSQLiteCapability(ctx, tx, store.CapabilityRequest{
+		Type:       "capability_request",
+		Capability: "file_read",
+		Goal:       "try symlink escape",
+		Inputs:     map[string]any{"path": filepath.Join(root, "linked.md")},
+		Risk:       "read_only",
+		RunID:      runID,
+		Evidence:   "try symlink escape",
+	})
+	if err == nil {
+		t.Fatalf("file_read symlink escape was allowed")
 	}
 }
 

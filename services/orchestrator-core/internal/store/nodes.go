@@ -43,7 +43,7 @@ func (db *DB) RegisterMainNode(ctx context.Context) error {
 			version = EXCLUDED.version,
 			metadata = EXCLUDED.metadata,
 			updated_at = NOW()
-	`, mustJSON([]string{"memory_search", "server_diagnose", "system_health_check", "file_analyze", "memory_write_proposal"}), mustJSON(map[string]any{"execution": "local"}), mustJSON(map[string]any{"scope": "local"}), mustJSON(map[string]any{"manual_assignable": true, "auto_assignable": true, "allow_private_context": true, "allow_secret_context": false}), mustJSON(map[string]any{"registered_by": "orchestrator-core"}))
+	`, mustJSON([]string{"memory_search", "server_diagnose", "system_health_check", "browser_observe", "browser_navigate", "browser_click", "browser_type", "computer_observe", "file_read", "file_analyze", "apply_patch", "shell_command", "test_command", "memory_write_proposal"}), mustJSON(map[string]any{"execution": "local"}), mustJSON(map[string]any{"scope": "local"}), mustJSON(map[string]any{"manual_assignable": true, "auto_assignable": true, "allow_private_context": true, "allow_secret_context": false}), mustJSON(map[string]any{"registered_by": "orchestrator-core"}))
 	return err
 }
 

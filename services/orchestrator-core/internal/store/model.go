@@ -233,7 +233,7 @@ func mockAgentRuntimeContent(dynamicTail string) string {
 		return `{"output_type":"final_answer","content":"Joi 自检已完成。结果包含 postgres、nats、orchestrator、console、worker-runtime、磁盘和最近错误。"}`
 	}
 	if strings.Contains(lower, "当前项目") && (strings.Contains(lower, "run trace") || strings.Contains(dynamicTail, "Run Trace")) && (strings.Contains(dynamicTail, "找") || strings.Contains(lower, "search")) {
-		return `{"output_type":"capability_request","capability":"workspace_search","goal":"在授权 workspace 中搜索 Run Trace 设计文档","inputs":{"query":"Run Trace","root":"/Users/hao/Documents/Joi","glob":"*.md","max_results":20},"risk":"read_only","confidence":0.9}`
+		return `{"output_type":"capability_request","capability":"workspace_search","goal":"在授权 workspace 中搜索 Run Trace 设计文档","inputs":{"query":"Run Trace","root":"/Users/hao/project/Joi","glob":"*.md","max_results":20},"risk":"read_only","confidence":0.9}`
 	}
 	if strings.Contains(userMessage, "AGENTS.md") && (strings.Contains(userMessage, "读一下") || strings.Contains(lower, "read")) {
 		return `{"output_type":"capability_request","capability":"file_analyze","goal":"读取 AGENTS.md 并总结 capability 实现红线","inputs":{"path":"AGENTS.md","question":"总结 capability 实现不能违反哪些红线"},"risk":"read_only","confidence":0.9}`

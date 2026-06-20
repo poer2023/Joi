@@ -96,7 +96,7 @@ Secrets are not restored from `.joibak`. After restore, verify model, Telegram, 
 The non-destructive local drill uses a temporary data directory:
 
 ```bash
-cd /Users/hao/Documents/Joi
+cd /Users/hao/project/Joi
 ./scripts/desktop_backup_restore_drill.sh
 ```
 

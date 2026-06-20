@@ -308,6 +308,9 @@ func (a *AppCore) ackWorkerGatewayTask(ctx context.Context, nodeID string, taskI
 		if err := a.insertGatewayRunStep(ctx, task.RunID, "tool_finished", "Worker tool runtime finished", "succeeded", map[string]any{"task_id": task.ID, "node_id": task.AssignedNodeID, "tool_run_id": toolRunID}, result.Output, nil); err != nil {
 			return err
 		}
+		if err := a.resumeSQLiteWorkerTaskResult(ctx, task, result.Output, toolRunID); err != nil {
+			return err
+		}
 	}
 	return nil
 }

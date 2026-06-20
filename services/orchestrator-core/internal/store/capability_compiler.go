@@ -142,9 +142,9 @@ func createCapabilityConfirmation(ctx context.Context, tx capabilityCompilerTx, 
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO confirmation_requests (id, run_id, capability_id, requested_action, risk_level, input)
-		VALUES ($1, NULLIF($2, ''), $3, $4, $5, $6)
-	`, confirmationID, request.RunID, request.Capability, request.Goal, request.Risk, mustJSON(SanitizeForTrace(request.Inputs)))
+		INSERT INTO confirmation_requests (id, run_id, capability_id, requested_action, risk_level, input, call_id, turn_id, approval_scope, approval_key)
+		VALUES ($1, NULLIF($2, ''), $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9, $10)
+	`, confirmationID, request.RunID, request.Capability, request.Goal, request.Risk, mustJSON(SanitizeForTrace(request.Inputs)), request.CallID, request.TurnID, confirmationApprovalScope(request), confirmationApprovalKey(request))
 	return err
 }
 
@@ -177,6 +177,10 @@ func normalizedRisk(risk string) string {
 	switch risk {
 	case "", "readonly":
 		return "read_only"
+	case "write", "workspace-write":
+		return "workspace_write"
+	case "browser-interaction", "browser_interaction", "interaction":
+		return "browser_interaction"
 	default:
 		return risk
 	}
@@ -186,15 +190,17 @@ func riskRank(risk string) int {
 	switch normalizedRisk(risk) {
 	case "read_only":
 		return 0
-	case "write_candidate":
+	case "write_candidate", "workspace_write":
 		return 1
-	case "state_change":
+	case "browser_interaction":
 		return 2
-	case "destructive":
+	case "state_change":
 		return 3
-	case "unsafe":
+	case "destructive":
 		return 4
-	default:
+	case "unsafe":
 		return 5
+	default:
+		return 6
 	}
 }

@@ -2,11 +2,13 @@
 
 Version: `0.1.0-rc0`
 
+Historical note: the original RC0 checklist was written for the Wails desktop bundle. The current desktop release path is Electron-native; use `docs/36_DESKTOP_INSTALLATION.md` and `docs/53_ELECTRON_NATIVE_REFACTOR.md` for current build/package commands.
+
 ## Required Checks
 
 ```text
-Wails build: passed
-App bundle: apps/joi-desktop/build/bin/Joi.app
+Electron build: passed
+App bundle: apps/joi-electron/release-desktop/mac-arm64/Joi.app
 Data directory: ~/Library/Application Support/Joi
 SQLite: ~/Library/Application Support/Joi/joi.db
 Logs directory: ~/Library/Application Support/Joi/logs
@@ -42,8 +44,8 @@ NATS dependency: none in Desktop Mode
 ```text
 App version: 0.1.0-rc0
 Bundle name: Joi
-Bundle path: apps/joi-desktop/build/bin/Joi.app
-Executable: apps/joi-desktop/build/bin/Joi.app/Contents/MacOS/Joi
+Bundle path: apps/joi-electron/release-desktop/mac-arm64/Joi.app
+Executable: apps/joi-electron/release-desktop/mac-arm64/Joi.app/Contents/MacOS/Joi
 Data directory: verified
 Logs directory: verified
 Backups directory: verified
@@ -109,7 +111,8 @@ Before handing to another person:
 run go test for all Go modules
 run console-web build
 run joi-desktop frontend build
-run wails build
+run electron build
+run electron macOS package
 run golden/security/memory/agent/desktop evals
 run desktop_backup_restore_drill.sh
 verify no secrets, SQLite DBs, logs, backups, build output, or joibak files are staged

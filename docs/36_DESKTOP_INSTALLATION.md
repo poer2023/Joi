@@ -4,27 +4,27 @@ Version: `0.1.0-rc0`
 
 ## Product Mode
 
-Joi Desktop is the default product path. It runs as a Wails macOS app with embedded UI, embedded AppCore, SQLite storage, SQLite task queue, Memory OS, Worker Gateway, and optional Telegram.
+Joi Desktop is the default product path. It now runs as an Electron-native macOS app with the shared React renderer, TypeScript SQLite store/runtime, macOS Keychain, SQLite task queue, Memory OS, Worker Gateway, and optional Telegram.
 
 It does not require Docker, Postgres, NATS, or a browser localhost console.
 
 ## Build
 
 ```bash
-cd /Users/hao/Documents/Joi
+cd /Users/hao/project/Joi
 ./scripts/build_desktop_macos.sh
 ```
 
 Output:
 
 ```text
-apps/joi-desktop/build/bin/joi-desktop.app
+apps/joi-electron/release-desktop/mac-arm64/Joi.app
 ```
 
 ## Package
 
 ```bash
-cd /Users/hao/Documents/Joi
+cd /Users/hao/project/Joi
 ./scripts/package_desktop_macos.sh
 ```
 
@@ -49,13 +49,16 @@ Secrets are read from macOS Keychain first. Environment variables remain a devel
 ## Verification
 
 ```bash
-cd /Users/hao/Documents/Joi
-./scripts/desktop_poc_check.sh
-./scripts/run_desktop_evals.sh
+cd /Users/hao/project/Joi
+pnpm test:electron-contract
+pnpm test:runtime
+pnpm test:store
+pnpm eval:desktop:ts
+pnpm build:electron
 ```
 
-The Desktop RC0 acceptance target is:
+The TS desktop eval acceptance target is:
 
 ```text
-12 passed / 0 failed
+17 passed / 0 failed
 ```

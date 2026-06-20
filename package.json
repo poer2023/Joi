@@ -1,0 +1,18 @@
+{
+  "name": "joi-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "dev:electron": "pnpm --filter @joi/electron dev",
+    "build:electron": "pnpm --filter @joi/electron build",
+    "build:desktop": "./scripts/build_desktop_macos.sh",
+    "package:desktop:mac": "./scripts/package_desktop_macos.sh",
+    "package:electron:mac": "./scripts/package_electron_macos.sh",
+    "test:electron-contract": "pnpm --filter @joi/electron test:contract",
+    "test:runtime": "pnpm --filter @joi/runtime test",
+    "test:secrets": "pnpm --filter @joi/secrets test",
+    "test:store": "pnpm --filter @joi/store test",
+    "eval:desktop:ts": "node --experimental-strip-types packages/runtime/scripts/desktop-evals.mjs evals/desktop_cases.json"
+  }
+}

@@ -63,7 +63,7 @@ textarea,
 input,
 select {
   font: inherit;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 button {
@@ -101,7 +101,7 @@ button {
   bottom: 0;
   width: 8px;
   cursor: default;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .scroll-area-track {
@@ -165,7 +165,7 @@ button {
   overflow: hidden;
   background: var(--sidebar-bg);
   padding: calc(var(--titlebar-safe-top) + 14px) 12px 8px;
-  --wails-draggable: drag;
+  -webkit-app-region: drag;
 }
 
 .sidebar-top-controls {
@@ -176,7 +176,7 @@ button {
   display: grid;
   grid-template-columns: repeat(3, 30px);
   gap: 10px;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .sidebar-top-controls .round-icon-button {
@@ -200,7 +200,7 @@ button {
   color: var(--color-on-surface-variant);
   padding: 0;
   box-shadow: none;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .round-icon-button:hover,
@@ -238,7 +238,7 @@ button {
   left: calc(var(--sidebar-width) - 3px);
   width: 6px;
   cursor: col-resize;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .sidebar-resizer::before {
@@ -261,7 +261,7 @@ button {
 .conversation-list {
   flex: 1 1 auto;
   min-height: 0;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .conversation-list .scroll-area-content {
@@ -571,7 +571,7 @@ button {
   background: var(--sidebar-bg);
   min-height: 44px;
   padding: 4px 8px;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .settings-sidebar {
@@ -582,7 +582,7 @@ button {
 .settings-menu {
   flex: 1 1 auto;
   min-height: 0;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .settings-menu .scroll-area-content {
@@ -632,7 +632,7 @@ button {
   padding: 0 12px;
   color: var(--color-outline);
   font-size: 12px;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .user-avatar {
@@ -778,7 +778,7 @@ button {
   padding: 10px 34px 0;
   background: transparent;
   color: var(--color-on-surface);
-  --wails-draggable: drag;
+  -webkit-app-region: drag;
 }
 
 .sidebar-collapsed .chat-statusbar {
@@ -796,7 +796,7 @@ button {
   height: 32px;
   min-height: 32px;
   margin-left: auto;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .execution-target-trigger {
@@ -895,7 +895,7 @@ button {
   color: var(--color-outline);
   padding: 0 12px;
   font-size: 12px;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .execution-target-status strong {
@@ -1062,7 +1062,7 @@ img.message-avatar {
   color: var(--color-outline);
 }
 
-.streaming-message .message-bubble p::after {
+.streaming-message .message-bubble .markdown-content > :last-child::after {
   content: "";
   display: inline-block;
   width: 6px;
@@ -1074,13 +1074,110 @@ img.message-avatar {
   animation: action-pulse 1s ease-in-out infinite;
 }
 
-.message-bubble p {
+.markdown-content {
+  max-width: 100%;
+  color: var(--color-on-surface);
+  overflow-wrap: anywhere;
+}
+
+.markdown-content > * {
+  margin: 0;
+}
+
+.markdown-content > * + * {
+  margin-top: 10px;
+}
+
+.markdown-content p,
+.markdown-content li,
+.markdown-content blockquote,
+.markdown-content td,
+.markdown-content th {
   max-width: 100%;
   margin: 0;
   color: var(--color-on-surface);
   line-height: 1.62;
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
+}
+
+.markdown-content h3,
+.markdown-content h4,
+.markdown-content h5,
+.markdown-content h6 {
+  color: var(--color-on-surface);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.42;
+}
+
+.markdown-content ul,
+.markdown-content ol {
+  display: grid;
+  gap: 5px;
+  padding-left: 1.25rem;
+}
+
+.markdown-content blockquote {
+  border-left: 3px solid var(--border-subtle);
+  color: var(--color-on-surface-variant);
+  padding-left: 10px;
+}
+
+.markdown-content pre {
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--color-surface-container);
+  color: var(--color-on-surface);
+  padding: 10px 12px;
+  line-height: 1.5;
+}
+
+.markdown-content code {
+  border-radius: 6px;
+  background: var(--color-surface-container);
+  padding: 1px 5px;
+  color: var(--color-on-surface);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+}
+
+.markdown-content pre code {
+  background: transparent;
+  padding: 0;
+  white-space: pre;
+}
+
+.markdown-content a {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.markdown-content table {
+  width: max-content;
+  max-width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.markdown-content th,
+.markdown-content td {
+  border: 1px solid var(--border-subtle);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-content th {
+  background: var(--color-surface-container);
+  font-weight: 700;
 }
 
 .message-bubble small {
@@ -1166,6 +1263,41 @@ img.message-avatar {
   border-radius: 10px;
   background: var(--color-surface-container-lowest);
   padding: 12px;
+}
+
+.chat-task-entry {
+  grid-column: 2;
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  max-width: min(720px, calc(100% - 50px));
+  margin: 4px 0 10px;
+  border: 1px solid rgba(68, 83, 112, 0.12);
+  border-radius: 8px;
+  background: rgba(68, 83, 112, 0.06);
+  color: var(--color-on-surface-variant);
+  padding: 8px 10px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.chat-task-entry strong,
+.chat-task-entry small {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.chat-task-entry strong {
+  color: var(--color-on-surface);
+}
+
+.chat-task-entry small {
+  margin-top: 2px;
+  color: var(--color-outline);
+  font-size: 12px;
 }
 
 .execution-action-flow {
@@ -1405,6 +1537,67 @@ img.message-avatar {
   background: var(--color-surface-container-low);
 }
 
+.run-event-section {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.run-event-section h3 {
+  margin: 0;
+  color: var(--color-on-surface);
+  font-size: 14px;
+}
+
+.run-event-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.run-event-list li {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--color-surface-container-low);
+  padding: 10px;
+}
+
+.run-event-list strong,
+.run-event-list span,
+.run-event-list small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.run-event-list span,
+.run-event-list small {
+  color: var(--color-outline);
+  font-size: 12px;
+}
+
+.run-event-list details summary {
+  width: fit-content;
+  color: var(--color-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.run-event-list pre {
+  max-height: 260px;
+  margin: 6px 0 0;
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--color-surface-container-lowest);
+  padding: 10px;
+  white-space: pre-wrap;
+}
+
 @keyframes action-pulse {
   0%, 100% {
     opacity: 0.38;
@@ -1470,7 +1663,32 @@ img.message-avatar {
   gap: 8px;
 }
 
+.task-contract-block,
+.task-verification-block {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--color-surface-container-low);
+  padding: 10px;
+}
+
+.task-contract-block p,
+.task-verification-block p {
+  margin: 0;
+  color: var(--color-on-surface-variant);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.task-contract-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
 .task-card-grid div,
+.task-contract-grid div,
 .task-panel-meta span {
   min-width: 0;
   border: 1px solid var(--border-subtle);
@@ -1480,12 +1698,14 @@ img.message-avatar {
   overflow-wrap: anywhere;
 }
 
-.task-card-grid dt {
+.task-card-grid dt,
+.task-contract-grid dt {
   color: var(--color-outline);
   font-size: 11px;
 }
 
-.task-card-grid dd {
+.task-card-grid dd,
+.task-contract-grid dd {
   margin: 3px 0 0;
   color: var(--color-on-surface);
   font-size: 12px;
@@ -1584,6 +1804,21 @@ img.message-avatar {
   line-height: 1.35;
   overflow-wrap: anywhere;
   white-space: normal;
+}
+
+.task-verification-block ul {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--color-on-surface-variant);
+  font-size: 12px;
+}
+
+.task-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .insight-item small,
@@ -1739,6 +1974,35 @@ img.message-avatar {
   pointer-events: none;
 }
 
+.composer-mode-control {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-medium);
+  border-radius: 999px;
+  background: var(--color-surface-container-low);
+  pointer-events: auto;
+}
+
+.composer-mode-control button {
+  height: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-outline);
+  padding: 0 9px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.composer-mode-control button.active {
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+}
+
 .composer-model-control {
   position: relative;
   display: inline-flex;
@@ -1837,6 +2101,17 @@ img.message-avatar {
   box-shadow: none;
 }
 
+.stop-button {
+  background: var(--color-error);
+  color: var(--color-on-error);
+  font-size: 14px;
+}
+
+.stop-button:disabled {
+  background: var(--color-surface-container-highest);
+  color: var(--color-outline);
+}
+
 .notification-stack {
   position: absolute;
   z-index: 30;
@@ -1846,7 +2121,7 @@ img.message-avatar {
   gap: 10px;
   width: min(390px, calc(100% - 48px));
   pointer-events: none;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .notification-stack.chat-offset {
@@ -1952,7 +2227,7 @@ img.message-avatar {
   overflow: hidden;
   background: var(--workspace-bg);
   padding: 0;
-  --wails-draggable: drag;
+  -webkit-app-region: drag;
 }
 
 .trace-stage {
@@ -1961,7 +2236,7 @@ img.message-avatar {
   min-width: 0;
   overflow: hidden;
   background: var(--workspace-bg);
-  --wails-draggable: drag;
+  -webkit-app-region: drag;
 }
 
 .trace-stage-topbar {
@@ -1978,7 +2253,7 @@ img.message-avatar {
   color: var(--color-outline);
   font-size: 13px;
   font-weight: 600;
-  --wails-draggable: drag;
+  -webkit-app-region: drag;
 }
 
 .trace-stage-back-button {
@@ -2000,7 +2275,7 @@ img.message-avatar {
 .trace-stage-scroll .scroll-area-content {
   min-height: 100%;
   padding: calc(var(--titlebar-safe-top) + 18px) clamp(28px, 5vw, 70px) 42px;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .settings-console {
@@ -2015,7 +2290,7 @@ img.message-avatar {
   border-left: 1px solid var(--border-subtle);
   border-right: 1px solid var(--border-subtle);
   background: var(--color-surface-container-low);
-  --wails-draggable: drag;
+  -webkit-app-region: drag;
 }
 
 .settings-object-column .scroll-area-content {
@@ -2025,7 +2300,7 @@ img.message-avatar {
 .settings-object-list {
   display: grid;
   gap: 6px;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .settings-object-item {
@@ -2062,7 +2337,7 @@ img.message-avatar {
 
 .settings-detail {
   min-width: 0;
-  --wails-draggable: drag;
+  -webkit-app-region: drag;
 }
 
 .settings-detail .scroll-area-content {
@@ -2078,7 +2353,7 @@ img.message-avatar {
   margin: 0 auto 6px;
   color: var(--color-outline);
   font-size: 13px;
-  --wails-draggable: drag;
+  -webkit-app-region: drag;
 }
 
 .settings-detail-panel {
@@ -2090,7 +2365,7 @@ img.message-avatar {
   background: var(--color-surface-container-lowest);
   box-shadow: none;
   padding: 22px 22px 18px;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .detail-header {
@@ -2270,7 +2545,7 @@ img.message-avatar {
   place-items: center;
   background: rgba(27, 28, 28, 0.22);
   padding: 26px;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .settings-modal {
@@ -2571,7 +2846,7 @@ img.message-avatar {
   gap: 18px;
   max-width: 1080px;
   margin: 0 auto 24px;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .settings-content-header small {
@@ -2601,7 +2876,7 @@ img.message-avatar {
   max-width: 1080px;
   margin: 0 auto;
   gap: 16px;
-  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
 }
 
 .panel {

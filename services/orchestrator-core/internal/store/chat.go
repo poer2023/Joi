@@ -44,8 +44,19 @@ type RunRecord struct {
 	PromptAssemblies   []PromptAssemblyRecord    `json:"prompt_assemblies"`
 	ModelCalls         []ModelCallRecord         `json:"model_calls"`
 	MemoryContextPacks []MemoryContextPackRecord `json:"memory_context_packs"`
+	Events             []RunEventRecord          `json:"events"`
 	Steps              []RunStepRecord           `json:"steps"`
 	Tasks              []TaskRecord              `json:"tasks"`
+}
+
+type RunEventRecord struct {
+	ID        string         `json:"id"`
+	RunID     string         `json:"run_id"`
+	TurnID    string         `json:"turn_id,omitempty"`
+	Seq       int            `json:"seq"`
+	EventType string         `json:"event_type"`
+	Payload   map[string]any `json:"payload"`
+	CreatedAt time.Time      `json:"created_at"`
 }
 
 type RunStepRecord struct {
@@ -550,7 +561,7 @@ func listEnabledAgentsForRoute(ctx context.Context, tx *sql.Tx) (map[string]Agen
 		agents[agent.ID] = agent
 	}
 	if _, ok := agents["general_agent"]; !ok {
-		agents["general_agent"] = AgentRecord{ID: "general_agent", Capabilities: []string{"memory_search"}}
+		agents["general_agent"] = AgentRecord{ID: "general_agent", Capabilities: []string{"memory_search", "workspace_search", "file_read", "file_analyze", "apply_patch", "shell_command", "test_command", "browser_observe", "browser_navigate", "browser_click", "browser_type", "computer_observe"}}
 	}
 	return agents, rows.Err()
 }
