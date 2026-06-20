@@ -143,7 +143,30 @@ export class TelegramInboundService {
       await sendTelegramMessage(token, message.chat.id, '未授权：当前 Joi Telegram 入口只允许白名单用户使用。');
       return;
     }
+    if (isStatusCommand(text)) {
+      await sendTelegramMessage(token, message.chat.id, await this.telegramStatusReply(settings));
+      return;
+    }
     await this.runJoiAndReply(token, message, settings);
+  }
+
+  private async telegramStatusReply(settings: SettingsRecord): Promise<string> {
+    let modelCredential = 'missing';
+    try {
+      const apiKey = await resolveAPIKeyForModelEndpoint(settings, this.secrets);
+      modelCredential = apiKey.trim() ? 'available' : 'missing';
+    } catch (error) {
+      modelCredential = `failed: ${compactText(safeErrorMessage(error), 180)}`;
+    }
+    const health = this.store.systemHealth();
+    return [
+      'Joi Telegram 在线。',
+      `Telegram: ${settings.telegram_enabled ? 'enabled' : 'disabled'}`,
+      `Model: ${settings.model_provider || 'unset'} / ${settings.model_name || 'unset'}`,
+      `Model credential: ${modelCredential}`,
+      `SQLite: ${health.service_status.sqlite ? 'ok' : 'failed'}`,
+      'Remote mode: read_only',
+    ].join('\n');
   }
 
   private async runJoiAndReply(token: string, message: TelegramMessage, initialSettings: SettingsRecord): Promise<void> {
@@ -156,13 +179,13 @@ export class TelegramInboundService {
       runtime_mode: 'tool_calling',
       permission_profile: 'read_only',
     };
-    const settings = this.store.getSettings();
-    const apiKey = await resolveAPIKeyForModelEndpoint(settings, this.secrets);
-    if (!canRunRealToolCalling(settings, apiKey, req)) {
-      await sendTelegramMessage(token, message.chat.id, 'Joi Telegram 入口已收到消息，但模型未配置完整，无法生成回复。请先在 Joi Desktop 里完成模型设置。');
-      return;
-    }
     try {
+      const settings = this.store.getSettings();
+      const apiKey = await resolveAPIKeyForModelEndpoint(settings, this.secrets);
+      if (!canRunRealToolCalling(settings, apiKey, req)) {
+        await sendTelegramMessage(token, message.chat.id, 'Joi Telegram 入口已收到消息，但模型未配置完整，无法生成回复。请先在 Joi Desktop 里完成模型设置。');
+        return;
+      }
       const result = await runLiveElectronToolCallingChat(req, settings || initialSettings, apiKey, this.store, this.activeRuns, (runID) => {
         const window = this.getWindow();
         if (window && !window.isDestroyed()) emitRunEvents(window, this.store.getRunTrace(runID));
@@ -184,6 +207,10 @@ function allowedUserIDs(value = ''): Set<number> {
 function normalizeTelegramText(text: string): string {
   if (text.trim().toLowerCase() === '/joi_status') return 'Joi 自检';
   return text;
+}
+
+function isStatusCommand(text: string): boolean {
+  return text.trim().toLowerCase() === '/joi_status';
 }
 
 function telegramReply(result: ChatResponse): string {
