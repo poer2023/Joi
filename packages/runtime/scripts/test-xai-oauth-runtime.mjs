@@ -2,10 +2,15 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_XAI_OAUTH_BASE_URL,
   XAI_OAUTH_CLIENT_ID,
+  XAI_OAUTH_HERMES_SCOPES,
+  XAI_OAUTH_REDIRECT_URI,
   XAI_OAUTH_SECRET_NAME,
+  createXAIOAuthAuthorizationRequest,
+  exchangeXAIOAuthCode,
   isXAIOAuthProvider,
   normalizeXAIOAuthState,
   resolveXAIOAuthCredentials,
+  validateXAIRedirectURI,
   validateXAIInferenceBaseURL,
   validateXAIOAuthEndpoint,
   xaiAccessTokenIsExpiring,
@@ -74,9 +79,48 @@ assert.equal(xaiAccessTokenIsExpiring(expiredToken, 0), true);
 assert.equal(xaiAccessTokenIsExpiring(futureToken, 60), false);
 assert.equal(validateXAIOAuthEndpoint('https://auth.x.ai/oauth/token', 'token_endpoint'), 'https://auth.x.ai/oauth/token');
 assert.throws(() => validateXAIOAuthEndpoint('http://auth.x.ai/oauth/token', 'token_endpoint'), /HTTPS/);
+assert.equal(validateXAIRedirectURI(XAI_OAUTH_REDIRECT_URI), XAI_OAUTH_REDIRECT_URI);
+assert.throws(() => validateXAIRedirectURI('https://example.com/callback'), /127\.0\.0\.1/);
 assert.equal(validateXAIInferenceBaseURL('https://api.x.ai/v1/'), DEFAULT_XAI_OAUTH_BASE_URL);
 assert.equal(validateXAIInferenceBaseURL('http://127.0.0.1:8645/v1'), DEFAULT_XAI_OAUTH_BASE_URL);
 assert.equal(normalizeXAIOAuthState(savedState).provider, 'xai_oauth');
+
+const authRequest = await createXAIOAuthAuthorizationRequest({
+  authorizationEndpoint: 'https://auth.x.ai/oauth2/authorize',
+  tokenEndpoint: 'https://auth.x.ai/oauth2/token',
+  codeVerifier: 'verifier-123',
+  state: 'state-123',
+});
+const authURL = new URL(authRequest.url);
+assert.equal(authURL.origin + authURL.pathname, 'https://auth.x.ai/oauth2/authorize');
+assert.equal(authURL.searchParams.get('client_id'), XAI_OAUTH_CLIENT_ID);
+assert.equal(authURL.searchParams.get('redirect_uri'), XAI_OAUTH_REDIRECT_URI);
+assert.equal(authURL.searchParams.get('scope'), XAI_OAUTH_HERMES_SCOPES.join(' '));
+assert.equal(authURL.searchParams.get('state'), 'state-123');
+assert.equal(authURL.searchParams.get('code_challenge_method'), 'S256');
+assert.notEqual(authURL.searchParams.get('code_challenge'), 'verifier-123');
+assert.equal(authRequest.scopes.includes('grok-cli:access'), true);
+assert.equal(authRequest.scopes.includes('api:access'), true);
+
+const exchangeCalls = [];
+const codeState = await exchangeXAIOAuthCode({
+  code: 'code-123',
+  codeVerifier: 'verifier-123',
+  discovery: {
+    authorization_endpoint: 'https://auth.x.ai/oauth2/authorize',
+    token_endpoint: 'https://auth.x.ai/oauth2/token',
+  },
+  fetchImpl: fakeCodeExchangeFetch,
+});
+assert.equal(exchangeCalls[0].grant_type, 'authorization_code');
+assert.equal(exchangeCalls[0].client_id, XAI_OAUTH_CLIENT_ID);
+assert.equal(exchangeCalls[0].code, 'code-123');
+assert.equal(exchangeCalls[0].redirect_uri, XAI_OAUTH_REDIRECT_URI);
+assert.equal(exchangeCalls[0].code_verifier, 'verifier-123');
+assert.equal(codeState.source, 'loopback_pkce');
+assert.equal(codeState.scope, XAI_OAUTH_HERMES_SCOPES.join(' '));
+assert.equal(codeState.tokens.access_token, 'access-code');
+assert.equal(codeState.tokens.refresh_token, 'refresh-code');
 
 console.log('xai oauth runtime tests passed');
 
@@ -91,6 +135,22 @@ async function fakeFetch(url, init) {
   return new Response(JSON.stringify({
     access_token: 'access-new',
     refresh_token: 'refresh-new',
+    token_type: 'Bearer',
+    expires_in: 21600,
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+async function fakeCodeExchangeFetch(url, init) {
+  assert.equal(url, 'https://auth.x.ai/oauth2/token');
+  const body = new URLSearchParams(init.body);
+  exchangeCalls.push(Object.fromEntries(body.entries()));
+  return new Response(JSON.stringify({
+    access_token: 'access-code',
+    refresh_token: 'refresh-code',
+    id_token: 'id-code',
     token_type: 'Bearer',
     expires_in: 21600,
   }), {

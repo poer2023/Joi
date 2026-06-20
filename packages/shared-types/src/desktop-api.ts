@@ -657,6 +657,17 @@ export type ModelConnectionTestRequest = ModelConfigRequest & {
   api_key?: string;
 };
 
+export type XAIOAuthLoginResult = {
+  status: 'succeeded';
+  provider: 'xai_oauth';
+  base_url: string;
+  model_name: string;
+  last_refresh: string;
+  source: string;
+  scope: string;
+  expires_at?: string;
+};
+
 export type ModelListRequest = {
   provider?: string;
   base_url?: string;
@@ -719,6 +730,7 @@ export type DesktopBindings = {
   CompleteOnboarding(): Promise<void>;
   GetSecretStatus(): Promise<SecretStatus>;
   SaveSecret(req: { name: string; value: string }): Promise<void>;
+  LoginXAIOAuth(): Promise<XAIOAuthLoginResult>;
   TestModelConnection(req?: ModelConnectionTestRequest): Promise<ConnectionTest>;
   TestTelegramConnection(): Promise<ConnectionTest>;
   GenerateWorkerToken(): Promise<{ token: string }>;
@@ -762,6 +774,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'ListConfirmations',
   'ListConversationGroups',
   'ListConversations',
+  'LoginXAIOAuth',
   'ListMCPServers',
   'ListMemories',
   'ListNodes',

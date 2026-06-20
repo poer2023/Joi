@@ -468,6 +468,17 @@ function bindings(): DesktopBindings {
       async TestTelegramConnection() {
         return { ok: false, status: 'preview' };
       },
+      async LoginXAIOAuth() {
+        return {
+          status: 'succeeded',
+          provider: 'xai_oauth',
+          base_url: 'https://api.x.ai/v1',
+          model_name: 'grok-4.3',
+          last_refresh: new Date().toISOString(),
+          source: 'preview',
+          scope: 'openid profile email offline_access grok-cli:access api:access',
+        };
+      },
       async GenerateWorkerToken() {
         return { token: 'preview-token' };
       },
@@ -531,6 +542,7 @@ export const desktopApi = {
   completeOnboarding: () => bindings().CompleteOnboarding(),
   getSecretStatus: () => bindings().GetSecretStatus(),
   saveSecret: (req: { name: string; value: string }) => bindings().SaveSecret(req),
+  loginXAIOAuth: () => bindings().LoginXAIOAuth(),
   testModelConnection: (req?: ModelConnectionTestRequest) => bindings().TestModelConnection(req),
   testTelegramConnection: () => bindings().TestTelegramConnection(),
   generateWorkerToken: () => bindings().GenerateWorkerToken(),

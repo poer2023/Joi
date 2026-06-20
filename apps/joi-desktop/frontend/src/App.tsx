@@ -1258,8 +1258,8 @@ function EyeIcon({ open }: { open: boolean }) {
 function ModelList({ models, onConfigure }: { models: AvailableModel[]; onConfigure?: (model: AvailableModel) => void }) {
   return (
     <div className="available-model-list">
-      {models.map((model) => (
-        <article key={model.id} className="available-model-chip" title={model.owner || model.display_name || model.id}>
+      {models.map((model, index) => (
+        <article key={modelListKey(model, index)} className="available-model-chip" title={model.owner || model.display_name || model.id}>
           <div className="available-model-main">
             <strong>{model.display_name || model.id}</strong>
             {model.display_name && model.display_name !== model.id && <small>{model.id}</small>}
@@ -1270,6 +1270,10 @@ function ModelList({ models, onConfigure }: { models: AvailableModel[]; onConfig
       ))}
     </div>
   );
+}
+
+function modelListKey(model: AvailableModel, index: number) {
+  return [model.provider || '', model.base_url || '', model.id, index].join(':');
 }
 
 function modelSummary(model: AvailableModel) {
@@ -1524,6 +1528,7 @@ function SettingsConsole({
   const [modelRetryCount, setModelRetryCount] = useState('3');
   const [modelTemperature, setModelTemperature] = useState('0.7');
   const [testStatus, setTestStatus] = useState('');
+  const [xaiLoginBusy, setXAILoginBusy] = useState(false);
   const [telegramEnabled, setTelegramEnabled] = useState(settings?.telegram_enabled ?? false);
   const [telegramToken, setTelegramToken] = useState('');
   const [telegramTokenVisible, setTelegramTokenVisible] = useState(false);
@@ -1544,10 +1549,11 @@ function SettingsConsole({
 
   useEffect(() => {
     const preset = modelProviderPresets[activeObject.id] ?? modelProviderPresets.compatible;
-    const nextBaseURL = activeObject.id === 'deepseek' ? settings?.model_base_url || preset.baseURL : preset.baseURL;
+    const useSavedModelConfig = modelPresetMatchesSavedSettings(activeObject.id, preset, settings);
+    const nextBaseURL = useSavedModelConfig ? settings?.model_base_url || preset.baseURL : preset.baseURL;
     const models = savedModelsForProvider(savedModels, preset.provider, nextBaseURL);
-    const configuredDefaultModel = activeObject.id === 'deepseek' ? settings?.model_name || preset.defaultModel : preset.defaultModel;
-    const configuredReasoningModel = activeObject.id === 'deepseek' ? settings?.model_reasoning_name || preset.reasoningModel : preset.reasoningModel;
+    const configuredDefaultModel = useSavedModelConfig ? settings?.model_name || preset.defaultModel : preset.defaultModel;
+    const configuredReasoningModel = useSavedModelConfig ? settings?.model_reasoning_name || preset.reasoningModel : preset.reasoningModel;
     setProvider(preset.provider);
     setModelBaseURL(nextBaseURL);
     setModelName(models.length > 0 && !models.some((model) => model.id === configuredDefaultModel) ? preferredDefaultModel(models) : configuredDefaultModel);
@@ -1614,6 +1620,27 @@ function SettingsConsole({
     setTestStatus(message);
     setNotice(message);
     await refreshAll();
+  }
+
+  async function loginXAIOAuthDetail() {
+    setXAILoginBusy(true);
+    setTestStatus('xAI：正在等待浏览器授权');
+    try {
+      const result = await desktopApi.loginXAIOAuth();
+      setProvider(result.provider);
+      setModelBaseURL(result.base_url);
+      setModelName(result.model_name);
+      setReasoningModel(result.model_name);
+      setTestStatus(`xAI：已登录 · ${result.scope}`);
+      setNotice(`xAI OAuth 已登录并切换到 ${result.model_name}`);
+      await refreshAll();
+    } catch (error) {
+      const message = `xAI：登录失败 · ${error instanceof Error ? error.message : String(error)}`;
+      setTestStatus(message);
+      setNotice(message);
+    } finally {
+      setXAILoginBusy(false);
+    }
   }
 
   function openModelSettings(model: AvailableModel) {
@@ -1720,6 +1747,7 @@ function SettingsConsole({
   }
 
   function renderModelDetail() {
+    const visibleAvailableModels = savedModelsForProvider(availableModels, provider, modelBaseURL);
     return (
       <section className="settings-detail-panel">
         <DetailHeader title={activeObject.label} description={`配置 ${activeObject.label} API 连接与模型参数`} />
@@ -1745,18 +1773,23 @@ function SettingsConsole({
               <strong>{settings?.model_name ? '已配置' : '未配置'}</strong>
               <button type="button" onClick={testModelDetail}>测试连接</button>
               <button type="button" onClick={fetchModelList}>获取模型</button>
+              {activeObject.id === 'grok' && (
+                <button type="button" onClick={loginXAIOAuthDetail} disabled={xaiLoginBusy}>
+                  {xaiLoginBusy ? '等待 xAI 授权' : '登录 xAI'}
+                </button>
+              )}
             </div>
           </div>
-          {availableModels.length > 0 && (
+          {visibleAvailableModels.length > 0 && (
             <div className="field-row model-list-row">
               <span>可用模型</span>
-              <ModelList models={availableModels} onConfigure={openModelSettings} />
+              <ModelList models={visibleAvailableModels} onConfigure={openModelSettings} />
             </div>
           )}
           {modelSettingsDraft && (
             <ModelSettingsDialog
               draft={modelSettingsDraft}
-              model={availableModels.find((model) => model.id === modelSettingsDraft.model_id)}
+              model={visibleAvailableModels.find((model) => model.id === modelSettingsDraft.model_id)}
               onChange={setModelSettingsDraft}
               onClose={() => setModelSettingsDraft(null)}
               onSave={saveModelSettings}
@@ -2474,7 +2507,9 @@ function SettingsConsole({
   );
 }
 
-const modelProviderPresets: Record<string, { provider: string; baseURL: string; defaultModel: string; reasoningModel: string; models: string[] }> = {
+type ModelProviderPreset = { provider: string; baseURL: string; defaultModel: string; reasoningModel: string; models: string[] };
+
+const modelProviderPresets: Record<string, ModelProviderPreset> = {
   openai: {
     provider: 'openai',
     baseURL: 'https://api.openai.com/v1',
@@ -2504,11 +2539,11 @@ const modelProviderPresets: Record<string, { provider: string; baseURL: string; 
     models: ['claude-4-sonnet', 'claude-4-opus'],
   },
   grok: {
-    provider: 'xai',
+    provider: 'xai_oauth',
     baseURL: 'https://api.x.ai/v1',
-    defaultModel: 'grok-4.20-fast',
-    reasoningModel: 'grok-4',
-    models: ['grok-4.20-fast', 'grok-4'],
+    defaultModel: 'grok-4.3',
+    reasoningModel: 'grok-4.3',
+    models: ['grok-4.3'],
   },
   local: {
     provider: 'local',
@@ -2532,6 +2567,18 @@ const modelProviderPresets: Record<string, { provider: string; baseURL: string; 
     models: ['deepseek-v4-flash', 'gpt-4.1-mini', 'custom-model'],
   },
 };
+
+function modelPresetMatchesSavedSettings(activeObjectID: string, preset: ModelProviderPreset, settings: SettingsRecord | null): boolean {
+  const savedProvider = settings?.model_provider?.trim();
+  const savedBaseURL = settings?.model_base_url?.trim();
+  if (!savedProvider || !savedBaseURL) return false;
+  const providerMatches = savedProvider === preset.provider || (activeObjectID === 'grok' && ['xai', 'xai_oauth', 'xai-oauth'].includes(savedProvider));
+  return providerMatches && normalizeModelBaseURL(savedBaseURL) === normalizeModelBaseURL(preset.baseURL);
+}
+
+function normalizeModelBaseURL(value: string): string {
+  return value.trim().replace(/\/+$/, '');
+}
 
 function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[]) {
   if (category === 'models') {
@@ -4016,14 +4063,49 @@ function composerModelOptions(settings: SettingsRecord | null, selectedModelName
 }
 
 function savedModelsForProvider(models: AvailableModel[], provider?: string, baseURL?: string) {
-  const normalizedProvider = provider || '';
+  const normalizedProvider = normalizeProvider(provider || '');
   const normalizedBaseURL = normalizeBaseURL(baseURL || '');
   return models.filter((model) => {
-    if (normalizedProvider && model.provider !== normalizedProvider) return false;
+    if (normalizedProvider && !providerMatches(model.provider, normalizedProvider)) return false;
+    if (normalizedProvider && !ownerMatchesProvider(model.owner, normalizedProvider)) return false;
     if (normalizedBaseURL && normalizeBaseURL(model.base_url || '') !== normalizedBaseURL) return false;
     return Boolean(model.id);
   });
 }
+
+function normalizeProvider(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function providerAliases(provider: string): Set<string> {
+  if (['xai', 'xai_oauth', 'xai-oauth'].includes(provider)) {
+    return new Set(['xai', 'xai_oauth', 'xai-oauth']);
+  }
+  return new Set([provider]);
+}
+
+function providerMatches(modelProvider: string | undefined, provider: string) {
+  return providerAliases(provider).has(normalizeProvider(modelProvider || ''));
+}
+
+function ownerMatchesProvider(owner: string | undefined, provider: string) {
+  const normalizedOwner = normalizeProvider(owner || '');
+  if (!normalizedOwner) return true;
+  if (!knownProviderOwnerValues.has(normalizedOwner)) return true;
+  return providerAliases(provider).has(normalizedOwner);
+}
+
+const knownProviderOwnerValues = new Set([
+  'anthropic',
+  'gemini',
+  'local',
+  'openai',
+  'openai_compatible',
+  'openrouter',
+  'xai',
+  'xai-oauth',
+  'xai_oauth',
+]);
 
 function normalizeBaseURL(value: string) {
   return value.trim().replace(/\/+$/, '').replace(/\/v1$/, '');
@@ -4553,6 +4635,7 @@ function SettingsPanel({
   const [telegramAllowed, setTelegramAllowed] = useState(settings?.telegram_allowed_user_ids ?? '');
   const [telegramEnabled, setTelegramEnabled] = useState(settings?.telegram_enabled ?? false);
   const [telegramChatID, setTelegramChatID] = useState('');
+  const [xaiLoginBusy, setXAILoginBusy] = useState(false);
   const [workerGatewayEnabled, setWorkerGatewayEnabled] = useState(settings?.worker_gateway_enabled ?? true);
   const [backupDir, setBackupDir] = useState(settings?.backup_dir ?? '');
   const [autoBackupEnabled, setAutoBackupEnabled] = useState(settings?.auto_backup_enabled ?? false);
@@ -4584,6 +4667,24 @@ function SettingsPanel({
     await desktopApi.saveModelConfig({ provider, base_url: baseURL, name: modelName, timeout_seconds: 60, max_retries: 1 });
     setNotice('模型服务已保存');
     await refreshAll();
+  }
+
+  async function loginXAIOAuth() {
+    setXAILoginBusy(true);
+    setTestStatus('xAI：正在等待浏览器授权');
+    try {
+      const result = await desktopApi.loginXAIOAuth();
+      setProvider(result.provider);
+      setBaseURL(result.base_url);
+      setModelName(result.model_name);
+      setTestStatus(`xAI：已登录 · ${result.scope}`);
+      setNotice('xAI OAuth 已登录并切换到 grok-4.3');
+      await refreshAll();
+    } catch (error) {
+      setTestStatus(`xAI：登录失败 · ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setXAILoginBusy(false);
+    }
   }
 
   async function saveOperationalSettings() {
@@ -4657,6 +4758,7 @@ function SettingsPanel({
               <input value={modelName} onChange={(event) => setModelName(event.target.value)} />
             </label>
             <button type="button" onClick={saveModel}>保存模型</button>
+            <button type="button" onClick={loginXAIOAuth} disabled={xaiLoginBusy}>{xaiLoginBusy ? '等待 xAI 授权' : '登录 xAI'}</button>
           </div>
           {availableModels.length > 0 && <ModelList models={availableModels} />}
         </section>

@@ -14,7 +14,7 @@ import type {
 import type { JoiSQLiteStore, PersistedToolResult, StartedToolCallingChat, ToolCallingPromptAssembly, ToolCallingResumeRequest } from '../../../../packages/store/src/sqlite';
 import type { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
 import { fetchAvailableModels, isLoopbackModelEndpoint, LOCAL_MODEL_PROXY_API_KEY, testModelConnection } from '../../../../packages/runtime/src/model';
-import { DEFAULT_XAI_OAUTH_BASE_URL, isXAIOAuthProvider, resolveXAIOAuthCredentials, validateXAIInferenceBaseURL } from '../../../../packages/runtime/src/xai-oauth';
+import { DEFAULT_XAI_OAUTH_BASE_URL, isXAIOAuthProvider, loginWithXAIOAuthLoopback, resolveXAIOAuthCredentials, validateXAIInferenceBaseURL } from '../../../../packages/runtime/src/xai-oauth';
 import { sendTestTelegramMessage, testTelegramConnection } from '../../../../packages/runtime/src/telegram';
 import { executeFileAnalyze, executeFileRead, executeWebResearch, executeWorkspaceSearch } from '../../../../packages/runtime/src/capabilities';
 import { executeApplyPatch, executeShellCommand, executeTestCommand } from '../../../../packages/runtime/src/workspace-exec';
@@ -274,6 +274,26 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     SaveSecret(payload) {
       const req = payload as { name?: string; value?: string };
       return secrets.save(String(req.name ?? ''), String(req.value ?? ''));
+    },
+    async LoginXAIOAuth() {
+      const result = await loginWithXAIOAuthLoopback({
+        saveSecret: (name, value) => secrets.save(name, value),
+        openURL: (url) => shell.openExternal(url),
+        timeoutSeconds: 240,
+      });
+      const modelName = 'grok-4.3';
+      store.saveModelConfig({
+        provider: 'xai_oauth',
+        base_url: DEFAULT_XAI_OAUTH_BASE_URL,
+        name: modelName,
+        reasoning_name: modelName,
+        timeout_seconds: 60,
+        max_retries: 1,
+      });
+      return {
+        ...result,
+        model_name: modelName,
+      };
     },
     async GenerateWorkerToken() {
       const token = `joi_worker_${randomUUID().replace(/-/g, '')}`;
