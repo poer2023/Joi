@@ -1,7 +1,7 @@
 import type { BrowserWindow } from 'electron';
 import { app } from 'electron';
 import { spawn, execFile, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -452,6 +452,7 @@ export class IMessageInboundService {
 
   private async runJoiAndReply(spaceID: string, senderID: string, text: string): Promise<void> {
     const req: ChatRequest = {
+      conversation_id: stableInboundConversationID('imessage', `space:${spaceID || senderID}`),
       channel: 'imessage',
       user_id: senderID ? `imessage:${senderID}` : `imessage:${spaceID}`,
       message: normalizeIMessageText(text),
@@ -555,6 +556,13 @@ function allowedUsers(value: string): Set<string> {
 
 function normalizeUserID(value: string): string {
   return value.trim().replace(/[^\d+@._-]/g, '');
+}
+
+function stableInboundConversationID(channel: 'imessage', externalKey: string): string {
+  const normalized = externalKey.trim() || 'unknown';
+  const slug = normalized.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'unknown';
+  const digest = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
+  return `conv_${channel}_${slug}_${digest}`;
 }
 
 function normalizePhotonText(content?: PhotonContent): string {

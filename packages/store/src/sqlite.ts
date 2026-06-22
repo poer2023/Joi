@@ -195,6 +195,24 @@ export type StartedToolCallingChat = {
   product_task?: ProductTask;
 };
 
+type PromptConversationMessage = {
+  role: string;
+  content: string;
+  run_id?: string;
+};
+
+type PromptConversationContext = {
+  prompt: string;
+  included_count: number;
+  compressed_count: number;
+  omitted_count: number;
+};
+
+const promptConversationContextLimit = 24;
+const promptConversationVerbatimLimit = 8;
+const promptConversationSummaryLimit = 220;
+const promptConversationMessageLimit = 700;
+
 export class JoiSQLiteStore {
   private db: DatabaseSync;
   private options: JoiSQLiteStoreOptions;
@@ -430,6 +448,7 @@ export class JoiSQLiteStore {
     );
     const memoryResults = this.searchPromptMemories(req.message || '', 8);
     const memoryProfileVersion = memoryProfileVersionFor(memoryResults);
+    const conversationContext = this.buildPromptConversationContext(req.conversation_id);
     const cacheablePrefix = [
       'Joi Electron Tool Calling Runtime',
       '- You are running inside the local Electron-native Joi Desktop app.',
@@ -459,6 +478,11 @@ export class JoiSQLiteStore {
       `channel: ${req.channel || 'desktop'}`,
       `input_mode: ${req.input_mode || 'auto'}`,
       `permission_profile: ${req.permission_profile || 'read_only'}`,
+      ...(conversationContext.prompt ? [
+        '',
+        'Conversation Context',
+        conversationContext.prompt,
+      ] : []),
       '',
       'User Message',
       req.message || '',
@@ -485,6 +509,72 @@ export class JoiSQLiteStore {
       tool_schema_version: toolSchemaVersion,
       memory_results: memoryResults,
       system_message: `${cacheablePrefix}\n\n${dynamicTail}`,
+    };
+  }
+
+  private buildPromptConversationContext(conversationID?: string): PromptConversationContext {
+    const cleanConversationID = conversationID?.trim();
+    if (!cleanConversationID) {
+      return { prompt: '', included_count: 0, compressed_count: 0, omitted_count: 0 };
+    }
+    const totalRow = this.get(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id=?`, cleanConversationID);
+    const totalCount = Number(totalRow?.count ?? 0);
+    if (!Number.isFinite(totalCount) || totalCount <= 0) {
+      return { prompt: '', included_count: 0, compressed_count: 0, omitted_count: 0 };
+    }
+    const rows = this.all(
+      `SELECT role, content, COALESCE(json_extract(metadata, '$.run_id'), '') AS run_id
+       FROM (
+         SELECT role, content, metadata, created_at, rowid
+         FROM messages
+         WHERE conversation_id=?
+         ORDER BY datetime(created_at) DESC, rowid DESC
+         LIMIT ?
+       )
+       ORDER BY datetime(created_at) ASC, rowid ASC`,
+      cleanConversationID,
+      promptConversationContextLimit,
+    );
+    const messages: PromptConversationMessage[] = rows.map((row) => ({
+      role: optionalString(row.role) || 'message',
+      content: optionalString(row.content) || '',
+      run_id: optionalString(row.run_id),
+    })).filter((message) => message.content.trim());
+    if (messages.length === 0) {
+      return { prompt: '', included_count: 0, compressed_count: 0, omitted_count: Math.max(0, totalCount) };
+    }
+    const omittedCount = Math.max(0, totalCount - messages.length);
+    const compressedCount = Math.max(0, messages.length - promptConversationVerbatimLimit);
+    const compressedMessages = messages.slice(0, compressedCount);
+    const recentMessages = messages.slice(compressedCount);
+    const sections: string[] = [];
+
+    if (omittedCount > 0 || compressedMessages.length > 0) {
+      const lines = [
+        'Earlier Conversation Summary',
+        `compressed_message_count: ${omittedCount + compressedMessages.length}`,
+      ];
+      if (omittedCount > 0) {
+        lines.push(`- ${omittedCount} older message(s) are outside the compact prompt window but remain stored in this conversation.`);
+      }
+      for (const message of compressedMessages) {
+        lines.push(formatPromptConversationLine(message, promptConversationSummaryLimit));
+      }
+      sections.push(lines.join('\n'));
+    }
+
+    if (recentMessages.length > 0) {
+      sections.push([
+        'Recent Conversation',
+        ...recentMessages.map((message) => formatPromptConversationLine(message, promptConversationMessageLimit)),
+      ].join('\n'));
+    }
+
+    return {
+      prompt: sections.join('\n\n'),
+      included_count: messages.length,
+      compressed_count: omittedCount + compressedMessages.length,
+      omitted_count: omittedCount,
     };
   }
 
@@ -5373,6 +5463,18 @@ function parseStringSetting(value: string | undefined, fallback: string[]): stri
     // Fall through to comma parsing for legacy env-like values.
   }
   return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function formatPromptConversationLine(message: PromptConversationMessage, limit: number): string {
+  const role = message.role.replace(/[^A-Za-z0-9_-]/g, '') || 'message';
+  const runID = message.run_id ? ` run_id=${message.run_id}` : '';
+  return `- ${role}${runID}: ${compactPromptConversationText(message.content, limit)}`;
+}
+
+function compactPromptConversationText(value: string, limit: number): string {
+  const compact = redactSensitiveText(value).replace(/\s+/g, ' ').trim();
+  if (compact.length <= limit) return compact;
+  return `${compact.slice(0, Math.max(0, limit - 3))}...`;
 }
 
 function optionalString(value: unknown): string | undefined {

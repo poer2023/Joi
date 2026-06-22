@@ -520,6 +520,43 @@ try {
   assert.equal(liveFinishedTrace.model_calls[0].input_tokens, 5);
   assert.equal(store.getConversation(liveStarted.conversation_id).messages.at(-1).content, 'Live run finished.');
 
+  const stickyConversationID = 'conv_telegram_chat_12345_test';
+  for (let index = 1; index <= 6; index += 1) {
+    store.recordToolCallingChat({
+      conversation_id: stickyConversationID,
+      channel: 'telegram',
+      user_id: 'telegram:12345',
+      message: index === 1 ? 'Question 1 follow-up api_key=sk-test-secret-123456' : `Question ${index} follow-up`,
+      input_mode: 'auto',
+      runtime_mode: 'tool_calling',
+      model_name: 'live-tool-model',
+    }, {
+      status: 'completed',
+      provider: 'openai_compatible',
+      model_name: 'live-tool-model',
+      selected_agent_id: 'general_agent',
+      final_message: `Answer ${index}`,
+      tool_results: [],
+      usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 },
+      model_responses: [{ id: `chatcmpl_context_${index}` }],
+    });
+  }
+  const promptWithHistory = store.assembleToolCallingPrompt({
+    conversation_id: stickyConversationID,
+    channel: 'telegram',
+    user_id: 'telegram:12345',
+    message: 'What did we just discuss?',
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+    model_name: 'live-tool-model',
+  }, 'general_agent', 'live-tool-model');
+  assert.match(promptWithHistory.dynamic_tail, /Conversation Context/);
+  assert.match(promptWithHistory.dynamic_tail, /Earlier Conversation Summary/);
+  assert.match(promptWithHistory.dynamic_tail, /Recent Conversation/);
+  assert.match(promptWithHistory.dynamic_tail, /Question 6 follow-up/);
+  assert.match(promptWithHistory.dynamic_tail, /api_key=\[REDACTED\]/);
+  assert.equal(promptWithHistory.dynamic_tail.includes('sk-test-secret-123456'), false);
+
   const liveCancelled = store.beginToolCallingChat({
     message: 'Begin a live run that will be cancelled',
     input_mode: 'auto',

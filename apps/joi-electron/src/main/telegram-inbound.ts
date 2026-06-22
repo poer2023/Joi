@@ -1,4 +1,5 @@
 import type { BrowserWindow } from 'electron';
+import { createHash } from 'node:crypto';
 import type { ChatRequest, ChatResponse, SettingsRecord } from '../../../../packages/shared-types/src/desktop-api';
 import type { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
 import type { JoiSQLiteStore } from '../../../../packages/store/src/sqlite';
@@ -172,6 +173,7 @@ export class TelegramInboundService {
 
   private async runJoiAndReply(token: string, message: TelegramMessage, initialSettings: SettingsRecord): Promise<void> {
     const req: ChatRequest = {
+      conversation_id: stableInboundConversationID('telegram', `chat:${message.chat.id}`),
       channel: 'telegram',
       user_id: message.from?.id ? `telegram:${message.from.id}` : `telegram:${message.chat.id}`,
       message: normalizeTelegramText(message.text || ''),
@@ -202,6 +204,13 @@ export class TelegramInboundService {
       stopTyping();
     }
   }
+}
+
+function stableInboundConversationID(channel: 'telegram', externalKey: string): string {
+  const normalized = externalKey.trim() || 'unknown';
+  const slug = normalized.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'unknown';
+  const digest = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
+  return `conv_${channel}_${slug}_${digest}`;
 }
 
 function allowedUserIDs(value = ''): Set<number> {
