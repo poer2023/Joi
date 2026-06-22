@@ -577,11 +577,7 @@ function cleanMentionText(text: string): string {
 }
 
 function imessageReply(result: ChatResponse): string {
-  return [
-    compactText(result.response || 'Joi 已完成处理，但没有生成可见文本。', 1400),
-    '',
-    `Run: ${result.run_id}`,
-  ].join('\n');
+  return compactText(result.response || 'Joi 已完成处理，但没有生成可见文本。', 1400);
 }
 
 function compactText(value: string, maxLength: number): string {
