@@ -38,6 +38,7 @@ type TelegramAPIResponse<T = unknown> = {
 const telegramAPIBaseURL = 'https://api.telegram.org';
 const pollTimeoutSeconds = 45;
 const retryDelayMs = 3000;
+const typingPulseIntervalMs = 4000;
 
 export class TelegramInboundService {
   private readonly store: JoiSQLiteStore;
@@ -179,6 +180,7 @@ export class TelegramInboundService {
       runtime_mode: 'tool_calling',
       permission_profile: 'read_only',
     };
+    const stopTyping = startTelegramTypingLoop(token, message.chat.id, this.logger);
     try {
       const settings = this.store.getSettings();
       const apiKey = await resolveAPIKeyForModelEndpoint(settings, this.secrets);
@@ -196,6 +198,8 @@ export class TelegramInboundService {
     } catch (error) {
       this.logger.error('telegram inbound run failed', sanitizeTelegramError(error, token));
       await sendTelegramMessage(token, message.chat.id, `处理失败：${compactText(safeErrorMessage(error), 260)}`);
+    } finally {
+      stopTyping();
     }
   }
 }
@@ -227,6 +231,34 @@ async function sendTelegramMessage(token: string, chatID: number, text: string):
       chat_id: chatID,
       text: compactText(text, 3500),
       disable_web_page_preview: true,
+    }),
+  });
+}
+
+function startTelegramTypingLoop(token: string, chatID: number, logger: Pick<Console, 'warn'>): () => void {
+  let stopped = false;
+  const pulse = () => {
+    if (stopped) return;
+    void sendTelegramChatAction(token, chatID, 'typing').catch((error) => {
+      logger.warn('telegram typing action failed', sanitizeTelegramError(error, token));
+    });
+  };
+  pulse();
+  const timer = setInterval(pulse, typingPulseIntervalMs);
+  timer.unref?.();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
+async function sendTelegramChatAction(token: string, chatID: number, action: 'typing'): Promise<void> {
+  await telegramRequest(token, 'sendChatAction', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatID,
+      action,
     }),
   });
 }

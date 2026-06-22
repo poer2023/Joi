@@ -59,6 +59,7 @@ const defaultSidecarPort = 8790;
 const retryDelayMs = 3000;
 const dedupMaxSize = 4000;
 const dedupWindowMs = 48 * 3600 * 1000;
+const typingPulseIntervalMs = 4000;
 const mentionPatterns = [
   /(?<![\w@])@?joi\b[,:\-]?/i,
   /(?<![\w@])@?hermes\b[,:\-]?/i,
@@ -459,8 +460,8 @@ export class IMessageInboundService {
       runtime_mode: 'tool_calling',
       permission_profile: 'read_only',
     };
+    const stopTyping = this.startTypingLoop(spaceID);
     try {
-      await this.sidecarCall('/typing', { spaceId: spaceID, state: 'start' }).catch(() => undefined);
       const settings = this.store.getSettings();
       const apiKey = await resolveAPIKeyForModelEndpoint(settings, this.secrets);
       if (!canRunRealToolCalling(settings, apiKey, req)) {
@@ -478,8 +479,24 @@ export class IMessageInboundService {
       this.logger.error('imessage inbound run failed', error);
       await this.sidecarSend(spaceID, `处理失败：${compactText(safeErrorMessage(error), 260)}`).catch(() => undefined);
     } finally {
-      await this.sidecarCall('/typing', { spaceId: spaceID, state: 'stop' }).catch(() => undefined);
+      await stopTyping();
     }
+  }
+
+  private startTypingLoop(spaceID: string): () => Promise<void> {
+    let stopped = false;
+    const pulse = () => {
+      if (stopped) return;
+      void this.sidecarCall('/typing', { spaceId: spaceID, state: 'start' }, { timeoutMs: 10000 }).catch(() => undefined);
+    };
+    pulse();
+    const timer = setInterval(pulse, typingPulseIntervalMs);
+    timer.unref?.();
+    return async () => {
+      stopped = true;
+      clearInterval(timer);
+      await this.sidecarCall('/typing', { spaceId: spaceID, state: 'stop' }, { timeoutMs: 10000 }).catch(() => undefined);
+    };
   }
 
   private async sidecarSend(spaceID: string, text: string): Promise<void> {
