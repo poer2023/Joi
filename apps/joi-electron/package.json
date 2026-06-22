@@ -26,7 +26,14 @@
     },
     "files": [
       "dist/**",
+      "resources/**",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/photon-sidecar",
+        "to": "photon-sidecar"
+      }
     ],
     "mac": {
       "target": [

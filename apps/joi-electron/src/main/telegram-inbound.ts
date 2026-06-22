@@ -214,11 +214,9 @@ function isStatusCommand(text: string): boolean {
 }
 
 function telegramReply(result: ChatResponse): string {
-  return [
-    `结论：${compactText(result.response || 'Joi 已完成处理，但没有生成可见文本。', 1200)}`,
-    `证据：${result.selected_agent_id || 'general_agent'} / ${result.run_id}`,
-    '建议：需要更多细节时打开 Joi Desktop 查看 Run Trace。',
-  ].join('\n');
+  const response = compactText(result.response || '', 3400);
+  if (response) return response;
+  return compactText(`Joi 已完成处理，但没有生成可见文本。Run Trace: ${result.run_id}`, 3400);
 }
 
 async function sendTelegramMessage(token: string, chatID: number, text: string): Promise<void> {

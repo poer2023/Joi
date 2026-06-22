@@ -8,6 +8,7 @@ import { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
 import { startWorkerGateway, type WorkerGatewayServer } from '../../../../packages/runtime/src/worker-gateway';
 import schemaSql from '../../../../database/sqlite/001_init_schema.sql?raw';
 import { TelegramInboundService } from './telegram-inbound';
+import { IMessageInboundService } from './imessage-inbound';
 
 const mainDir = dirname(fileURLToPath(import.meta.url));
 
@@ -33,6 +34,7 @@ let mainWindow: BrowserWindow | null = null;
 let store: JoiSQLiteStore | null = null;
 let workerGateway: WorkerGatewayServer | null = null;
 let telegramInbound: TelegramInboundService | null = null;
+let imessageInbound: IMessageInboundService | null = null;
 const secrets = new KeychainSecretStore();
 
 function createMainWindow() {
@@ -68,12 +70,24 @@ function createMainWindow() {
     getWindow: () => mainWindow,
     logger: console,
   });
+  imessageInbound = new IMessageInboundService({
+    store,
+    secrets,
+    appDirs,
+    getWindow: () => mainWindow,
+    logger: console,
+  });
 
   registerIpc(mainWindow, appDirs, store, secrets, {
     onTelegramConfigChanged: () => telegramInbound?.scheduleReconfigure(),
+    onIMessageConfigChanged: () => imessageInbound?.scheduleReconfigure(),
+    getIMessageStatus: () => imessageInbound?.status(),
+    testIMessageConnection: () => imessageInbound?.testConnection(),
+    sendTestIMessageMessage: (spaceID, message) => imessageInbound?.sendTestMessage(spaceID, message),
   });
   void startConfiguredWorkerGateway(store);
   void telegramInbound.start();
+  void imessageInbound.start();
 
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
@@ -133,6 +147,8 @@ if (!hasSingleInstanceLock) {
   app.on('before-quit', () => {
     telegramInbound?.stop();
     telegramInbound = null;
+    imessageInbound?.stop();
+    imessageInbound = null;
     void workerGateway?.close();
     workerGateway = null;
     store?.close();

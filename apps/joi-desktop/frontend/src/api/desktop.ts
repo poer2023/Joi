@@ -35,6 +35,9 @@ import {
   type OnboardingStatus,
   type OpenLoop,
   type PermissionProfile,
+  type PhotonIMessageSetupRequest,
+  type PhotonIMessageSetupResult,
+  type PhotonIMessageStatus,
   type ProactiveMessage,
   type ProductTask,
   type ProductTaskDetail,
@@ -85,6 +88,9 @@ export type {
   OnboardingStatus,
   OpenLoop,
   PermissionProfile,
+  PhotonIMessageSetupRequest,
+  PhotonIMessageSetupResult,
+  PhotonIMessageStatus,
   ProactiveMessage,
   ProductTask,
   ProductTaskDetail,
@@ -359,6 +365,14 @@ function bindings(): DesktopBindings {
           model_base_url: '',
           telegram_enabled: false,
           telegram_allowed_user_ids: '',
+          imessage_enabled: false,
+          imessage_allowed_users: '',
+          imessage_require_mention: false,
+          imessage_operator_phone: '',
+          imessage_assigned_number: '',
+          imessage_project_id: '',
+          imessage_home_channel: '',
+          imessage_sidecar_port: 8790,
           worker_gateway: '',
           worker_gateway_enabled: true,
           backup_dir: 'preview/backups',
@@ -416,6 +430,37 @@ function bindings(): DesktopBindings {
       async SaveOperationalSettings() {},
       async SaveTelegramConfig() {},
       async SendTestTelegramMessage() {
+        return { ok: true, status: 'preview' };
+      },
+      async SetupPhotonIMessage() {
+        return {
+          status: 'succeeded',
+          project_id: 'preview-photon-project',
+          operator_phone: '+15551234567',
+          assigned_number: '+15557654321',
+          project_created: false,
+          user_created: false,
+        };
+      },
+      async SaveIMessageConfig() {},
+      async GetIMessageStatus() {
+        return {
+          enabled: false,
+          configured: false,
+          connected: false,
+          sidecar_running: false,
+          sidecar_port: 8790,
+          project_id: '',
+          operator_phone: '',
+          assigned_number: '',
+          allowed_users: '',
+          require_mention: false,
+        };
+      },
+      async TestIMessageConnection() {
+        return { ok: false, status: 'preview' };
+      },
+      async SendTestIMessageMessage() {
         return { ok: true, status: 'preview' };
       },
       async GetOnboardingStatus() {
@@ -535,9 +580,14 @@ export const desktopApi = {
   fetchAvailableModels: (req?: ModelConnectionTestRequest) => bindings().FetchAvailableModels(req),
   saveModelConfig: (req: ModelConfigRequest) => bindings().SaveModelConfig(req),
   saveModelSettings: (req: ModelSettingsRequest) => bindings().SaveModelSettings(req),
-  saveOperationalSettings: (req: { telegram_enabled: boolean; telegram_allowed_user_ids?: string; worker_gateway_enabled: boolean; backup_dir?: string; auto_backup_enabled: boolean }) => bindings().SaveOperationalSettings(req),
+  saveOperationalSettings: (req: { telegram_enabled: boolean; telegram_allowed_user_ids?: string; imessage_enabled?: boolean; imessage_allowed_users?: string; imessage_require_mention?: boolean; imessage_home_channel?: string; worker_gateway_enabled: boolean; backup_dir?: string; auto_backup_enabled: boolean }) => bindings().SaveOperationalSettings(req),
   saveTelegramConfig: (req: { token?: string; allowed_user_ids?: string; enabled: boolean }) => bindings().SaveTelegramConfig(req),
   sendTestTelegramMessage: (req: { chat_id?: string; message?: string }) => bindings().SendTestTelegramMessage(req),
+  setupPhotonIMessage: (req: PhotonIMessageSetupRequest) => bindings().SetupPhotonIMessage(req),
+  saveIMessageConfig: (req: { project_id?: string; project_secret?: string; dashboard_token?: string; phone_number?: string; assigned_number?: string; home_channel?: string; allowed_users?: string; require_mention?: boolean; enabled: boolean; sidecar_port?: number }) => bindings().SaveIMessageConfig(req),
+  getIMessageStatus: () => bindings().GetIMessageStatus(),
+  testIMessageConnection: () => bindings().TestIMessageConnection(),
+  sendTestIMessageMessage: (req: { space_id?: string; message?: string }) => bindings().SendTestIMessageMessage(req),
   getOnboardingStatus: () => bindings().GetOnboardingStatus(),
   completeOnboarding: () => bindings().CompleteOnboarding(),
   getSecretStatus: () => bindings().GetSecretStatus(),

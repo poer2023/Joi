@@ -5,9 +5,11 @@ import { desktopIpcMethods, type DesktopIpcMethod, type JoiInvokeRequest } from 
 import type {
   ChatRequest,
   ConversationFilter,
+  ConnectionTest,
   ModelConnectionTestRequest,
   ModelConfigRequest,
   ModelSettingsRequest,
+  PhotonIMessageStatus,
   SettingsRecord,
   WorkspaceSettings,
 } from '../../../../packages/shared-types/src/desktop-api';
@@ -16,6 +18,7 @@ import type { KeychainSecretStore } from '../../../../packages/secrets/src/keych
 import { fetchAvailableModels, isLoopbackModelEndpoint, LOCAL_MODEL_PROXY_API_KEY, testModelConnection } from '../../../../packages/runtime/src/model';
 import { DEFAULT_XAI_OAUTH_BASE_URL, isXAIOAuthProvider, loginWithXAIOAuthLoopback, resolveXAIOAuthCredentials, validateXAIInferenceBaseURL } from '../../../../packages/runtime/src/xai-oauth';
 import { sendTestTelegramMessage, testTelegramConnection } from '../../../../packages/runtime/src/telegram';
+import { PHOTON_DASHBOARD_TOKEN_SECRET, PHOTON_PROJECT_SECRET_SECRET, setupPhotonIMessage, testPhotonIMessageConnection } from '../../../../packages/runtime/src/imessage';
 import { executeFileAnalyze, executeFileRead, executeWebResearch, executeWorkspaceSearch } from '../../../../packages/runtime/src/capabilities';
 import { executeApplyPatch, executeShellCommand, executeTestCommand } from '../../../../packages/runtime/src/workspace-exec';
 import { executeBrowserClick, executeBrowserNavigate, executeBrowserObserve, executeBrowserType, executeComputerObserve } from '../../../../packages/runtime/src/browser-computer';
@@ -42,6 +45,10 @@ export type AppDirs = {
 
 export type RegisterIpcOptions = {
   onTelegramConfigChanged?: () => void;
+  onIMessageConfigChanged?: () => void;
+  getIMessageStatus?: () => PhotonIMessageStatus | undefined;
+  testIMessageConnection?: () => Promise<ConnectionTest> | ConnectionTest | undefined;
+  sendTestIMessageMessage?: (spaceID?: string, message?: string) => Promise<ConnectionTest> | ConnectionTest | undefined;
 };
 
 export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: JoiSQLiteStore, secrets: KeychainSecretStore, options: RegisterIpcOptions = {}) {
@@ -217,6 +224,7 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     SaveOperationalSettings(payload) {
       store.saveOperationalSettings(payload as Parameters<typeof store.saveOperationalSettings>[0]);
       options.onTelegramConfigChanged?.();
+      options.onIMessageConfigChanged?.();
     },
     async SaveTelegramConfig(payload) {
       const req = payload as { token?: string; allowed_user_ids?: string; enabled?: boolean };
@@ -240,6 +248,96 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
         allowedUserIDs: settings.telegram_allowed_user_ids || '',
         message: req.message,
       });
+    },
+    async SetupPhotonIMessage(payload) {
+      const req = payload as {
+        phone_number?: string;
+        project_name?: string;
+        first_name?: string;
+        last_name?: string;
+        email?: string;
+        timeout_seconds?: number;
+      };
+      const result = await setupPhotonIMessage({
+        ...req,
+        openURL: (url) => shell.openExternal(url),
+        getSecret: (name) => secrets.resolve(name),
+        saveSecret: (name, value) => secrets.save(name, value),
+        onDeviceCode: (code) => {
+          console.info(`Photon device login requested: ${code.verification_uri_complete || code.verification_uri} code=${code.user_code}`);
+        },
+      });
+      store.saveIMessageSettings({
+        enabled: true,
+        project_id: result.project_id,
+        phone_number: result.operator_phone,
+        assigned_number: result.assigned_number,
+        home_channel: result.operator_phone,
+        allowed_users: result.operator_phone,
+        require_mention: store.getSettings().imessage_require_mention ?? false,
+        sidecar_port: store.getSettings().imessage_sidecar_port,
+      });
+      options.onIMessageConfigChanged?.();
+      return result;
+    },
+    async SaveIMessageConfig(payload) {
+      const req = payload as {
+        project_id?: string;
+        project_secret?: string;
+        dashboard_token?: string;
+        phone_number?: string;
+        assigned_number?: string;
+        home_channel?: string;
+        allowed_users?: string;
+        require_mention?: boolean;
+        enabled?: boolean;
+        sidecar_port?: number;
+      };
+      if (req.project_secret?.trim()) {
+        await secrets.save(PHOTON_PROJECT_SECRET_SECRET, req.project_secret.trim());
+      }
+      if (req.dashboard_token?.trim()) {
+        await secrets.save(PHOTON_DASHBOARD_TOKEN_SECRET, req.dashboard_token.trim());
+      }
+      store.saveIMessageSettings({
+        enabled: Boolean(req.enabled),
+        project_id: req.project_id || store.getSettings().imessage_project_id,
+        phone_number: req.phone_number || store.getSettings().imessage_operator_phone,
+        assigned_number: req.assigned_number || store.getSettings().imessage_assigned_number,
+        home_channel: req.home_channel || store.getSettings().imessage_home_channel,
+        allowed_users: req.allowed_users || store.getSettings().imessage_allowed_users,
+        require_mention: req.require_mention ?? store.getSettings().imessage_require_mention ?? false,
+        sidecar_port: req.sidecar_port || store.getSettings().imessage_sidecar_port,
+      });
+      options.onIMessageConfigChanged?.();
+    },
+    GetIMessageStatus() {
+      return options.getIMessageStatus?.() || {
+        enabled: store.getSettings().imessage_enabled,
+        configured: Boolean(store.getSettings().imessage_project_id),
+        connected: false,
+        sidecar_running: false,
+        project_id: store.getSettings().imessage_project_id,
+        operator_phone: store.getSettings().imessage_operator_phone,
+        assigned_number: store.getSettings().imessage_assigned_number,
+        allowed_users: store.getSettings().imessage_allowed_users,
+        require_mention: store.getSettings().imessage_require_mention,
+      } satisfies PhotonIMessageStatus;
+    },
+    async TestIMessageConnection() {
+      const delegated = await options.testIMessageConnection?.();
+      if (delegated) return delegated;
+      const settings = store.getSettings();
+      return testPhotonIMessageConnection({
+        project_id: settings.imessage_project_id,
+        project_secret: await secrets.resolve(PHOTON_PROJECT_SECRET_SECRET),
+      });
+    },
+    async SendTestIMessageMessage(payload) {
+      const req = payload as { space_id?: string; message?: string };
+      const delegated = await options.sendTestIMessageMessage?.(req.space_id, req.message);
+      if (delegated) return delegated;
+      return { ok: false, status: 'not_running', error_summary: 'iMessage service is not running' } satisfies ConnectionTest;
     },
     GetOnboardingStatus() {
       return secrets.status().then((status) => store.getOnboardingStatus(status.secrets));

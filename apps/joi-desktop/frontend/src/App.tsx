@@ -19,6 +19,7 @@ import {
   type NodeRecord,
   type OnboardingStatus,
   type OpenLoop,
+  type PhotonIMessageStatus,
   type ProactiveMessage,
   type ProductTask,
   type ProductTaskDetail,
@@ -1534,6 +1535,21 @@ function SettingsConsole({
   const [telegramTokenVisible, setTelegramTokenVisible] = useState(false);
   const [telegramAllowed, setTelegramAllowed] = useState(settings?.telegram_allowed_user_ids ?? '');
   const [telegramChatID, setTelegramChatID] = useState('');
+  const [imessageEnabled, setIMessageEnabled] = useState(settings?.imessage_enabled ?? false);
+  const [imessageProjectID, setIMessageProjectID] = useState(settings?.imessage_project_id ?? '');
+  const [imessageProjectSecret, setIMessageProjectSecret] = useState('');
+  const [imessageProjectSecretVisible, setIMessageProjectSecretVisible] = useState(false);
+  const [imessageDashboardToken, setIMessageDashboardToken] = useState('');
+  const [imessageDashboardTokenVisible, setIMessageDashboardTokenVisible] = useState(false);
+  const [imessagePhone, setIMessagePhone] = useState(settings?.imessage_operator_phone ?? '');
+  const [imessageAssignedNumber, setIMessageAssignedNumber] = useState(settings?.imessage_assigned_number ?? '');
+  const [imessageHomeChannel, setIMessageHomeChannel] = useState(settings?.imessage_home_channel ?? '');
+  const [imessageAllowed, setIMessageAllowed] = useState(settings?.imessage_allowed_users ?? '');
+  const [imessageRequireMention, setIMessageRequireMention] = useState(settings?.imessage_require_mention ?? false);
+  const [imessageSidecarPort, setIMessageSidecarPort] = useState(String(settings?.imessage_sidecar_port ?? 8790));
+  const [imessageTestSpaceID, setIMessageTestSpaceID] = useState('');
+  const [imessageStatus, setIMessageStatus] = useState<PhotonIMessageStatus | null>(null);
+  const [imessageSetupBusy, setIMessageSetupBusy] = useState(false);
   const [secretName, setSecretName] = useState('MODEL_API_KEY');
   const [secretValue, setSecretValue] = useState('');
   const [secretValueVisible, setSecretValueVisible] = useState(false);
@@ -1565,8 +1581,16 @@ function SettingsConsole({
   useEffect(() => {
     setTelegramEnabled(settings?.telegram_enabled ?? false);
     setTelegramAllowed(settings?.telegram_allowed_user_ids ?? '');
+    setIMessageEnabled(settings?.imessage_enabled ?? false);
+    setIMessageProjectID(settings?.imessage_project_id ?? '');
+    setIMessagePhone(settings?.imessage_operator_phone ?? '');
+    setIMessageAssignedNumber(settings?.imessage_assigned_number ?? '');
+    setIMessageHomeChannel(settings?.imessage_home_channel ?? '');
+    setIMessageAllowed(settings?.imessage_allowed_users ?? '');
+    setIMessageRequireMention(settings?.imessage_require_mention ?? false);
+    setIMessageSidecarPort(String(settings?.imessage_sidecar_port ?? 8790));
     setWorkerGatewayEnabled(settings?.worker_gateway_enabled ?? true);
-  }, [settings?.telegram_allowed_user_ids, settings?.telegram_enabled, settings?.worker_gateway_enabled]);
+  }, [settings?.imessage_allowed_users, settings?.imessage_assigned_number, settings?.imessage_enabled, settings?.imessage_home_channel, settings?.imessage_operator_phone, settings?.imessage_project_id, settings?.imessage_require_mention, settings?.imessage_sidecar_port, settings?.telegram_allowed_user_ids, settings?.telegram_enabled, settings?.worker_gateway_enabled]);
 
   async function saveModelDetail() {
     await desktopApi.saveModelConfig({
@@ -1721,10 +1745,83 @@ function SettingsConsole({
     setTestStatus(`Telegram 消息：${formatStatus(result.status)}${result.error_summary ? ` · ${result.error_summary}` : ''}`);
   }
 
+  async function setupIMessageDetail() {
+    if (!imessagePhone.trim()) {
+      setTestStatus('iMessage：请先填写你的 E.164 手机号，例如 +15551234567');
+      return;
+    }
+    setIMessageSetupBusy(true);
+    setTestStatus('iMessage：等待 Photon 浏览器授权');
+    try {
+      const result = await desktopApi.setupPhotonIMessage({
+        phone_number: imessagePhone.trim(),
+        project_name: 'Joi',
+        timeout_seconds: 600,
+      });
+      setIMessageEnabled(true);
+      setIMessageProjectID(result.project_id);
+      setIMessagePhone(result.operator_phone || imessagePhone);
+      setIMessageAssignedNumber(result.assigned_number || '');
+      setIMessageHomeChannel(result.operator_phone || imessagePhone);
+      setIMessageAllowed(result.operator_phone || imessagePhone);
+      setTestStatus(`iMessage：Photon 已配置 · ${result.assigned_number || '等待分配号码'}`);
+      setNotice('iMessage 已通过 Photon 配置完成');
+      await refreshAll();
+      await refreshIMessageStatus();
+    } catch (error) {
+      const message = `iMessage：配置失败 · ${error instanceof Error ? error.message : String(error)}`;
+      setTestStatus(message);
+      setNotice(message);
+    } finally {
+      setIMessageSetupBusy(false);
+    }
+  }
+
+  async function saveIMessageDetail() {
+    await desktopApi.saveIMessageConfig({
+      project_id: imessageProjectID,
+      project_secret: imessageProjectSecret,
+      dashboard_token: imessageDashboardToken,
+      phone_number: imessagePhone,
+      assigned_number: imessageAssignedNumber,
+      home_channel: imessageHomeChannel,
+      allowed_users: imessageAllowed,
+      require_mention: imessageRequireMention,
+      enabled: imessageEnabled,
+      sidecar_port: Number(imessageSidecarPort) || 8790,
+    });
+    setIMessageProjectSecret('');
+    setIMessageDashboardToken('');
+    setNotice('iMessage 设置已保存');
+    await refreshAll();
+    await refreshIMessageStatus();
+  }
+
+  async function refreshIMessageStatus() {
+    const status = await desktopApi.getIMessageStatus();
+    setIMessageStatus(status);
+    return status;
+  }
+
+  async function testIMessageDetail() {
+    const result = await desktopApi.testIMessageConnection();
+    const status = await refreshIMessageStatus();
+    setTestStatus(`iMessage：${formatStatus(result.status)}${result.error_summary ? ` · ${result.error_summary}` : status.connected ? ' · sidecar connected' : ''}`);
+  }
+
+  async function sendIMessageTest() {
+    const result = await desktopApi.sendTestIMessageMessage({ space_id: imessageTestSpaceID, message: 'Joi 桌面端 iMessage 测试' });
+    setTestStatus(`iMessage 消息：${formatStatus(result.status)}${result.error_summary ? ` · ${result.error_summary}` : ''}`);
+  }
+
   async function saveWorkerGateway() {
     await desktopApi.saveOperationalSettings({
       telegram_enabled: settings?.telegram_enabled ?? false,
       telegram_allowed_user_ids: settings?.telegram_allowed_user_ids ?? '',
+      imessage_enabled: settings?.imessage_enabled ?? false,
+      imessage_allowed_users: settings?.imessage_allowed_users ?? '',
+      imessage_require_mention: settings?.imessage_require_mention ?? false,
+      imessage_home_channel: settings?.imessage_home_channel ?? '',
       worker_gateway_enabled: workerGatewayEnabled,
       backup_dir: settings?.backup_dir ?? '',
       auto_backup_enabled: settings?.auto_backup_enabled ?? false,
@@ -1830,6 +1927,109 @@ function SettingsConsole({
   }
 
   function renderChatEntranceDetail() {
+    if (activeObject.id === 'imessage') {
+      const connected = imessageStatus?.connected ?? false;
+      const sidecarRunning = imessageStatus?.sidecar_running ?? false;
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="iMessage" description="通过 Photon 托管线路接入 iMessage" />
+          <div className="settings-form">
+            <label className="field-row">
+              <span>启用入口</span>
+              <input checked={imessageEnabled} type="checkbox" onChange={(event) => setIMessageEnabled(event.target.checked)} />
+            </label>
+            <label className="field-row">
+              <span>我的手机号</span>
+              <input placeholder="+15551234567" value={imessagePhone} onChange={(event) => setIMessagePhone(event.target.value)} />
+            </label>
+            <div className="field-row">
+              <span>Photon Setup</span>
+              <div className="connection-status">
+                <button type="button" onClick={setupIMessageDetail} disabled={imessageSetupBusy}>
+                  {imessageSetupBusy ? '等待授权' : '登录并配置 Photon'}
+                </button>
+                <small>会打开 Photon 授权页，完成 project、secret、手机号注册。</small>
+              </div>
+            </div>
+            <label className="field-row">
+              <span>Project ID</span>
+              <input value={imessageProjectID} onChange={(event) => setIMessageProjectID(event.target.value)} />
+            </label>
+            <label className="field-row">
+              <span>Project Secret</span>
+              <SecretInput
+                placeholder="留空表示使用已保存密钥"
+                value={imessageProjectSecret}
+                visible={imessageProjectSecretVisible}
+                onChange={setIMessageProjectSecret}
+                onToggleVisible={() => setIMessageProjectSecretVisible((value) => !value)}
+              />
+            </label>
+            <label className="field-row">
+              <span>Dashboard Token</span>
+              <SecretInput
+                placeholder="可选；一键 setup 后会自动保存"
+                value={imessageDashboardToken}
+                visible={imessageDashboardTokenVisible}
+                onChange={setIMessageDashboardToken}
+                onToggleVisible={() => setIMessageDashboardTokenVisible((value) => !value)}
+              />
+            </label>
+            <label className="field-row">
+              <span>分配号码</span>
+              <input value={imessageAssignedNumber} onChange={(event) => setIMessageAssignedNumber(event.target.value)} />
+            </label>
+            <label className="field-row">
+              <span>默认会话</span>
+              <input placeholder="E.164 手机号或 Photon space id" value={imessageHomeChannel} onChange={(event) => setIMessageHomeChannel(event.target.value)} />
+            </label>
+            <label className="field-row">
+              <span>允许用户</span>
+              <input placeholder="+15551234567,+15557654321" value={imessageAllowed} onChange={(event) => setIMessageAllowed(event.target.value)} />
+            </label>
+            <label className="field-row">
+              <span>群聊唤醒</span>
+              <input checked={imessageRequireMention} type="checkbox" onChange={(event) => setIMessageRequireMention(event.target.checked)} />
+            </label>
+            <label className="field-row">
+              <span>Sidecar 端口</span>
+              <input inputMode="numeric" value={imessageSidecarPort} onChange={(event) => setIMessageSidecarPort(event.target.value)} />
+            </label>
+            <label className="field-row">
+              <span>测试会话</span>
+              <input placeholder="留空使用默认会话" value={imessageTestSpaceID} onChange={(event) => setIMessageTestSpaceID(event.target.value)} />
+            </label>
+            <div className="field-row">
+              <span>连接状态</span>
+              <div className="connection-status">
+                <span className={`live-dot ${connected ? 'on' : ''}`} />
+                <strong>{connected ? '已连接' : imessageEnabled ? '未连接' : '未启用'}</strong>
+                <small>{testStatus || (sidecarRunning ? 'Photon sidecar running' : 'Photon sidecar idle')}</small>
+                <button type="button" onClick={testIMessageDetail}>测试连接</button>
+                <button type="button" onClick={sendIMessageTest}>发送测试消息</button>
+              </div>
+            </div>
+            <div className="detail-actions">
+              <button className="secondary-button" type="button" onClick={() => {
+                setIMessageProjectSecret('');
+                setIMessageDashboardToken('');
+              }}>清空密钥输入</button>
+              <button type="button" onClick={saveIMessageDetail}>保存</button>
+            </div>
+            <CollapsedData label="高级详情" value={{
+              enabled: imessageEnabled,
+              project_id: imessageProjectID,
+              assigned_number: imessageAssignedNumber,
+              allowed_users: imessageAllowed,
+              require_mention: imessageRequireMention,
+              sidecar_port: imessageSidecarPort,
+              status: imessageStatus,
+            }} />
+          </div>
+        </section>
+      );
+    }
+
     if (activeObject.id !== 'telegram') {
       return (
         <section className="settings-detail-panel">
@@ -2596,6 +2796,7 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[]) {
   if (category === 'chatEntrances') {
     return [
       { id: 'telegram', label: 'Telegram', description: 'Telegram Bot 入口' },
+      { id: 'imessage', label: 'iMessage', description: 'Photon 托管 iMessage 入口' },
       { id: 'wechat-claw', label: '微信 Claw', description: '微信入口与桥接配置' },
       { id: 'desktop-notify', label: '桌面通知', description: '本机通知入口' },
       { id: 'cli', label: 'CLI', description: '命令行入口' },
@@ -4739,6 +4940,7 @@ function SettingsPanel({
         <KV label="模型服务商" value={settings?.model_provider ?? ''} />
         <KV label="模型" value={settings?.model_name ?? ''} />
         <KV label="Telegram" value={settings?.telegram_enabled ? '已配置' : '未配置'} />
+        <KV label="iMessage" value={settings?.imessage_enabled ? '已启用' : '未配置'} />
         <KV label="工作节点网关" value={settings?.worker_gateway ?? ''} />
       </dl>
       <div className="settings-grid">
@@ -4814,6 +5016,8 @@ function SettingsPanel({
               <select value={secretName} onChange={(event) => setSecretName(event.target.value)}>
                 <option value="MODEL_API_KEY">MODEL_API_KEY</option>
                 <option value="TELEGRAM_BOT_TOKEN">TELEGRAM_BOT_TOKEN</option>
+                <option value="PHOTON_PROJECT_SECRET">PHOTON_PROJECT_SECRET</option>
+                <option value="PHOTON_DASHBOARD_TOKEN">PHOTON_DASHBOARD_TOKEN</option>
                 <option value="WORKER_TOKEN">WORKER_TOKEN</option>
                 <option value="NODE_SECRET">NODE_SECRET</option>
                 <option value="ADMIN_TOKEN">ADMIN_TOKEN</option>

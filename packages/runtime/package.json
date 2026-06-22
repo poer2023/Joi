@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "test": "node --experimental-strip-types scripts/test-model-runtime.mjs && node --experimental-strip-types scripts/test-xai-oauth-runtime.mjs && node --experimental-strip-types scripts/test-worker-gateway-runtime.mjs && node --experimental-strip-types scripts/test-capabilities-runtime.mjs && node --experimental-strip-types scripts/test-workspace-exec-runtime.mjs && node --experimental-strip-types scripts/test-browser-computer-runtime.mjs && node --experimental-strip-types scripts/test-desktop-apps-runtime.mjs && node --experimental-strip-types scripts/test-diagnostics-runtime.mjs && node --experimental-strip-types scripts/test-tool-calling-runtime.mjs && node --experimental-strip-types scripts/test-capability-compiler-runtime.mjs"
+    "test": "node --experimental-strip-types scripts/test-model-runtime.mjs && node --experimental-strip-types scripts/test-xai-oauth-runtime.mjs && node --experimental-strip-types scripts/test-imessage-runtime.mjs && node --experimental-strip-types scripts/test-worker-gateway-runtime.mjs && node --experimental-strip-types scripts/test-capabilities-runtime.mjs && node --experimental-strip-types scripts/test-workspace-exec-runtime.mjs && node --experimental-strip-types scripts/test-browser-computer-runtime.mjs && node --experimental-strip-types scripts/test-desktop-apps-runtime.mjs && node --experimental-strip-types scripts/test-diagnostics-runtime.mjs && node --experimental-strip-types scripts/test-tool-calling-runtime.mjs && node --experimental-strip-types scripts/test-capability-compiler-runtime.mjs"
   },
   "exports": {
     ".": "./src/index.ts"

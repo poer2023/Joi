@@ -79,12 +79,31 @@ try {
   store.saveOperationalSettings({
     telegram_enabled: true,
     telegram_allowed_user_ids: '123',
+    imessage_enabled: true,
+    imessage_allowed_users: '+15551234567',
+    imessage_require_mention: true,
+    imessage_home_channel: '+15551234567',
     worker_gateway_enabled: false,
     backup_dir: join(tempDir, 'custom-backups'),
     auto_backup_enabled: true,
   });
   assert.equal(store.getSettings().telegram_enabled, true);
   assert.equal(store.getSettings().telegram_allowed_user_ids, '123');
+  assert.equal(store.getSettings().imessage_enabled, true);
+  assert.equal(store.getSettings().imessage_allowed_users, '+15551234567');
+  assert.equal(store.getSettings().imessage_require_mention, true);
+  store.saveIMessageSettings({
+    enabled: true,
+    project_id: 'photon_project_test',
+    phone_number: '+15551234567',
+    assigned_number: '+15557654321',
+    allowed_users: '+15551234567',
+    require_mention: false,
+    sidecar_port: 8790,
+  });
+  assert.equal(store.getSettings().imessage_project_id, 'photon_project_test');
+  assert.equal(store.getSettings().imessage_assigned_number, '+15557654321');
+  assert.equal(store.getSettings().imessage_sidecar_port, 8790);
   assert.equal(store.getSettings().worker_gateway_enabled, false);
   assert.equal(store.getSettings().auto_backup_enabled, true);
 

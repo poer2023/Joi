@@ -9,3 +9,4 @@ export * from './diagnostics';
 export * from './tool-calling';
 export * from './capability-compiler';
 export * from './xai-oauth';
+export * from './imessage';

@@ -1528,6 +1528,14 @@ export class JoiSQLiteStore {
       model_base_url: settings['model.base_url'] || '',
       telegram_enabled: settings['telegram.enabled'] === 'true',
       telegram_allowed_user_ids: settings['telegram.allowed_user_ids'] || '',
+      imessage_enabled: settings['imessage.enabled'] === 'true',
+      imessage_allowed_users: settings['imessage.allowed_users'] || '',
+      imessage_require_mention: settings['imessage.require_mention'] === 'true',
+      imessage_operator_phone: settings['imessage.operator_phone'] || '',
+      imessage_assigned_number: settings['imessage.assigned_number'] || '',
+      imessage_project_id: settings['imessage.photon_project_id'] || '',
+      imessage_home_channel: settings['imessage.home_channel'] || settings['imessage.operator_phone'] || '',
+      imessage_sidecar_port: Number(settings['imessage.sidecar_port'] || 0) || undefined,
       worker_gateway: settings['worker_gateway.url'] || settings['worker.gateway_url'] || (workerGatewayAddr.startsWith('http') ? workerGatewayAddr : `http://${workerGatewayAddr}`),
       worker_gateway_enabled: workerGatewaySetting === undefined ? true : workerGatewaySetting === 'true',
       backup_dir: settings['backup.dir'] || this.options.backupDir,
@@ -2583,7 +2591,14 @@ export class JoiSQLiteStore {
       ['recent_errors.json', this.diagnosticRows(`SELECT 'run' AS source, id, COALESCE(error_code,'') AS error_code, COALESCE(error_message,'') AS error_message, created_at FROM runs WHERE error_code IS NOT NULL OR error_message IS NOT NULL ORDER BY created_at DESC LIMIT 50`)],
       ['worker_status.json', this.listNodes()],
       ['model_provider_status.json', { provider: settings.model_provider, model: settings.model_name, base_url: settings.model_base_url, usage: this.getModelUsage() }],
-      ['telegram_status.json', { configured: false, allowed_user_ids_configured: Boolean(settings.telegram_allowed_user_ids?.trim()) }],
+      ['telegram_status.json', { configured: settings.telegram_enabled, allowed_user_ids_configured: Boolean(settings.telegram_allowed_user_ids?.trim()) }],
+      ['imessage_status.json', {
+        configured: settings.imessage_enabled,
+        project_id_configured: Boolean(settings.imessage_project_id?.trim()),
+        assigned_number_configured: Boolean(settings.imessage_assigned_number?.trim()),
+        allowed_users_configured: Boolean(settings.imessage_allowed_users?.trim()),
+        require_mention: Boolean(settings.imessage_require_mention),
+      }],
       ['backup_status.json', this.listBackups()],
       ['last_100_run_steps.json', this.diagnosticRows(`SELECT id, run_id, step_type, title, status, input, output, COALESCE(error,'') AS error, started_at, finished_at, created_at FROM run_steps ORDER BY created_at DESC LIMIT 100`)],
       ['last_100_tool_runs.json', this.diagnosticRows(`SELECT id, COALESCE(run_id,'') AS run_id, COALESCE(task_id,'') AS task_id, capability_id, workflow_name, tool_name, node_id, assignment_reason, risk_level, status, input, output, COALESCE(error,'') AS error, started_at, finished_at, created_at FROM tool_runs ORDER BY created_at DESC LIMIT 100`)],
@@ -2661,18 +2676,50 @@ export class JoiSQLiteStore {
   saveOperationalSettings(req: {
     telegram_enabled?: boolean;
     telegram_allowed_user_ids?: string;
+    imessage_enabled?: boolean;
+    imessage_allowed_users?: string;
+    imessage_require_mention?: boolean;
+    imessage_home_channel?: string;
     worker_gateway_enabled?: boolean;
     backup_dir?: string;
     auto_backup_enabled?: boolean;
   }): void {
-    const values: Record<string, string> = {
-      'telegram.enabled': boolString(Boolean(req.telegram_enabled)),
-      'telegram.allowed_user_ids': req.telegram_allowed_user_ids?.trim() || '',
-      'worker_gateway.enabled': boolString(Boolean(req.worker_gateway_enabled)),
-      'backup.auto_enabled': boolString(Boolean(req.auto_backup_enabled)),
-    };
+    const values: Record<string, string> = {};
+    if (req.telegram_enabled !== undefined) values['telegram.enabled'] = boolString(Boolean(req.telegram_enabled));
+    if (req.telegram_allowed_user_ids !== undefined) values['telegram.allowed_user_ids'] = req.telegram_allowed_user_ids.trim();
+    if (req.imessage_enabled !== undefined) values['imessage.enabled'] = boolString(Boolean(req.imessage_enabled));
+    if (req.imessage_allowed_users !== undefined) values['imessage.allowed_users'] = req.imessage_allowed_users.trim();
+    if (req.imessage_require_mention !== undefined) values['imessage.require_mention'] = boolString(Boolean(req.imessage_require_mention));
+    if (req.imessage_home_channel !== undefined) values['imessage.home_channel'] = req.imessage_home_channel.trim();
+    if (req.worker_gateway_enabled !== undefined) values['worker_gateway.enabled'] = boolString(Boolean(req.worker_gateway_enabled));
+    if (req.auto_backup_enabled !== undefined) values['backup.auto_enabled'] = boolString(Boolean(req.auto_backup_enabled));
     if (req.backup_dir?.trim()) {
       values['backup.dir'] = resolve(req.backup_dir.trim());
+    }
+    this.setDesktopSettings(values);
+  }
+
+  saveIMessageSettings(req: {
+    enabled?: boolean;
+    project_id?: string;
+    phone_number?: string;
+    assigned_number?: string;
+    home_channel?: string;
+    allowed_users?: string;
+    require_mention?: boolean;
+    sidecar_port?: number;
+  }): void {
+    const values: Record<string, string> = {
+      'imessage.enabled': boolString(Boolean(req.enabled)),
+      'imessage.photon_project_id': req.project_id?.trim() || '',
+      'imessage.operator_phone': req.phone_number?.trim() || '',
+      'imessage.assigned_number': req.assigned_number?.trim() || '',
+      'imessage.home_channel': req.home_channel?.trim() || req.phone_number?.trim() || '',
+      'imessage.allowed_users': req.allowed_users?.trim() || req.phone_number?.trim() || '',
+      'imessage.require_mention': boolString(Boolean(req.require_mention)),
+    };
+    if (req.sidecar_port && req.sidecar_port > 0) {
+      values['imessage.sidecar_port'] = String(Math.trunc(req.sidecar_port));
     }
     this.setDesktopSettings(values);
   }

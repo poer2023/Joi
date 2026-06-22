@@ -576,6 +576,14 @@ export type SettingsRecord = {
   model_base_url: string;
   telegram_enabled: boolean;
   telegram_allowed_user_ids?: string;
+  imessage_enabled: boolean;
+  imessage_allowed_users?: string;
+  imessage_require_mention?: boolean;
+  imessage_operator_phone?: string;
+  imessage_assigned_number?: string;
+  imessage_project_id?: string;
+  imessage_home_channel?: string;
+  imessage_sidecar_port?: number;
   worker_gateway: string;
   worker_gateway_enabled?: boolean;
   backup_dir: string;
@@ -668,6 +676,38 @@ export type XAIOAuthLoginResult = {
   expires_at?: string;
 };
 
+export type PhotonIMessageSetupRequest = {
+  phone_number?: string;
+  project_name?: string;
+  first_name?: string;
+  last_name?: string;
+  email?: string;
+  timeout_seconds?: number;
+};
+
+export type PhotonIMessageSetupResult = {
+  status: 'succeeded';
+  project_id: string;
+  operator_phone?: string;
+  assigned_number?: string;
+  project_created: boolean;
+  user_created: boolean;
+};
+
+export type PhotonIMessageStatus = {
+  enabled: boolean;
+  configured: boolean;
+  connected: boolean;
+  sidecar_running: boolean;
+  sidecar_port?: number;
+  project_id?: string;
+  operator_phone?: string;
+  assigned_number?: string;
+  allowed_users?: string;
+  require_mention?: boolean;
+  last_error?: string;
+};
+
 export type ModelListRequest = {
   provider?: string;
   base_url?: string;
@@ -723,9 +763,14 @@ export type DesktopBindings = {
   FetchAvailableModels(req?: ModelConnectionTestRequest): Promise<ConnectionTest>;
   SaveModelConfig(req: ModelConfigRequest): Promise<void>;
   SaveModelSettings(req: ModelSettingsRequest): Promise<void>;
-  SaveOperationalSettings(req: { telegram_enabled: boolean; telegram_allowed_user_ids?: string; worker_gateway_enabled: boolean; backup_dir?: string; auto_backup_enabled: boolean }): Promise<void>;
+  SaveOperationalSettings(req: { telegram_enabled: boolean; telegram_allowed_user_ids?: string; imessage_enabled?: boolean; imessage_allowed_users?: string; imessage_require_mention?: boolean; imessage_home_channel?: string; worker_gateway_enabled: boolean; backup_dir?: string; auto_backup_enabled: boolean }): Promise<void>;
   SaveTelegramConfig(req: { token?: string; allowed_user_ids?: string; enabled: boolean }): Promise<void>;
   SendTestTelegramMessage(req: { chat_id?: string; message?: string }): Promise<ConnectionTest>;
+  SetupPhotonIMessage(req: PhotonIMessageSetupRequest): Promise<PhotonIMessageSetupResult>;
+  SaveIMessageConfig(req: { project_id?: string; project_secret?: string; dashboard_token?: string; phone_number?: string; assigned_number?: string; home_channel?: string; allowed_users?: string; require_mention?: boolean; enabled: boolean; sidecar_port?: number }): Promise<void>;
+  GetIMessageStatus(): Promise<PhotonIMessageStatus>;
+  TestIMessageConnection(): Promise<ConnectionTest>;
+  SendTestIMessageMessage(req: { space_id?: string; message?: string }): Promise<ConnectionTest>;
   GetOnboardingStatus(): Promise<OnboardingStatus>;
   CompleteOnboarding(): Promise<void>;
   GetSecretStatus(): Promise<SecretStatus>;
@@ -764,6 +809,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'GetProductTask',
   'GetRunTrace',
   'GetSecretStatus',
+  'GetIMessageStatus',
   'GetSettings',
   'GetSystemHealth',
   'GetWorkspaceSettings',
@@ -793,14 +839,18 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'SaveConversationGroup',
   'SaveModelConfig',
   'SaveModelSettings',
+  'SaveIMessageConfig',
   'SaveOperationalSettings',
   'SaveSecret',
   'SaveTelegramConfig',
   'SaveWorkspaceSettings',
   'SendChat',
+  'SendTestIMessageMessage',
   'SendTestTelegramMessage',
   'SetToolWorkflowEnabled',
+  'SetupPhotonIMessage',
   'SyncMCPServer',
+  'TestIMessageConnection',
   'TestModelConnection',
   'TestTelegramConnection',
   'TrashConversation',
