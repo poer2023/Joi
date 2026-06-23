@@ -21,6 +21,24 @@ export type ToolResult = {
 
 export type ToolExecutor = (call: ToolCall, options?: { signal?: AbortSignal }) => Promise<ToolResult> | ToolResult;
 
+export type ToolCallingCallbacks = {
+  onModelStarted?: (event: { step: number; model: string; streaming: boolean }) => void;
+  onModelDelta?: (event: { step: number; payload: Record<string, unknown> }) => void;
+  onModelCompleted?: (event: { step: number; finish_reason?: string; usage_status: UsageStatus }) => void;
+  onAssistantDelta?: (event: { step: number; text: string; index: number }) => void;
+  onAssistantCompleted?: (event: { step: number; text: string; finish_reason?: string; usage_status: UsageStatus }) => void;
+  onToolCallRequested?: (event: { step: number; call: ToolCall }) => void;
+  onToolStarted?: (event: { step: number; call: ToolCall }) => void;
+  onToolOutputDelta?: (event: { step: number; call: ToolCall; output: Record<string, unknown> }) => void;
+  onToolCompleted?: (event: { step: number; call: ToolCall; result: ToolResult }) => void;
+  onToolFailed?: (event: { step: number; call: ToolCall; result?: ToolResult; error?: Error }) => void;
+  onApprovalRequired?: (event: { step: number; call: ToolCall; result: ToolResult }) => void;
+  onUsage?: (event: { step: number; usage: ToolCallingTurnResult['usage']; usage_status: UsageStatus }) => void;
+  onError?: (event: { step: number; error: Error }) => void;
+};
+
+export type UsageStatus = 'recorded' | 'provider_missing' | 'estimated' | 'failed';
+
 export type ToolCallingTurnRequest = {
   base_url: string;
   api_key: string;
@@ -32,6 +50,7 @@ export type ToolCallingTurnRequest = {
   max_steps?: number;
   stream?: boolean;
   signal?: AbortSignal;
+  callbacks?: ToolCallingCallbacks;
 };
 
 export type ToolCallingTurnResult = {
@@ -43,6 +62,8 @@ export type ToolCallingTurnResult = {
     output_tokens: number;
     cached_input_tokens: number;
   };
+  usage_status: UsageStatus;
+  finish_reason?: string;
   model_responses: Array<Record<string, unknown>>;
 };
 
@@ -60,8 +81,11 @@ export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): P
   const toolResults: ToolResult[] = [];
   const modelResponses: Array<Record<string, unknown>> = [];
   const usage = { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 };
+  let usageStatus: UsageStatus = 'provider_missing';
+  let finishReason = '';
   for (let step = 0; step < maxSteps; step++) {
     throwIfAborted(req.signal);
+    req.callbacks?.onModelStarted?.({ step, model: req.model, streaming: Boolean(req.stream) });
     const payload = {
       model: req.model,
       messages,
@@ -78,19 +102,35 @@ export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): P
       },
       body: JSON.stringify(payload),
     }, positiveInteger(req.timeout_seconds, 30), req.signal);
-    const body = await response.text();
-    if (!response.ok) throw new Error(`chat completion returned ${response.status} ${response.statusText}: ${body.slice(0, 2000)}`);
-    const parsed = req.stream ? parseChatCompletionsSSE(body) : JSON.parse(body) as Record<string, unknown>;
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`chat completion returned ${response.status} ${response.statusText}: ${body.slice(0, 2000)}`);
+    }
+    const parsed = req.stream
+      ? await parseChatCompletionsSSEResponse(response, req.callbacks, step, req.signal)
+      : JSON.parse(await response.text()) as Record<string, unknown>;
     modelResponses.push(parsed);
-    addUsage(usage, parsed.usage);
+    const stepUsageStatus = addUsage(usage, parsed.usage);
+    usageStatus = mergeUsageStatus(usageStatus, stepUsageStatus);
+    finishReason = finishReasonFromPayload(parsed) || finishReason;
+    req.callbacks?.onUsage?.({ step, usage: { ...usage }, usage_status: stepUsageStatus });
+    req.callbacks?.onModelCompleted?.({ step, finish_reason: finishReason || undefined, usage_status: stepUsageStatus });
     const message = firstChoiceMessage(parsed);
     const toolCalls = parseToolCalls(message.tool_calls);
     if (toolCalls.length === 0) {
+      req.callbacks?.onAssistantCompleted?.({
+        step,
+        text: stringValue(message.content),
+        finish_reason: finishReason || undefined,
+        usage_status: stepUsageStatus,
+      });
       return {
         status: 'completed',
         final_message: stringValue(message.content),
         tool_results: toolResults,
         usage,
+        usage_status: usageStatus,
+        finish_reason: finishReason || undefined,
         model_responses: modelResponses,
       };
     }
@@ -105,8 +145,18 @@ export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): P
     });
     for (const call of toolCalls) {
       throwIfAborted(req.signal);
-      const result = await req.executeTool(call, { signal: req.signal });
+      req.callbacks?.onToolCallRequested?.({ step, call });
+      req.callbacks?.onToolStarted?.({ step, call });
+      let result: ToolResult;
+      try {
+        result = await req.executeTool(call, { signal: req.signal });
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        req.callbacks?.onToolFailed?.({ step, call, error: err });
+        throw err;
+      }
       toolResults.push(result);
+      req.callbacks?.onToolOutputDelta?.({ step, call, output: result.output });
       messages.push({
         role: 'tool',
         tool_call_id: call.id,
@@ -114,13 +164,21 @@ export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): P
         content: JSON.stringify(result.output),
       });
       if (result.output?.status === 'waiting_confirmation') {
+        req.callbacks?.onApprovalRequired?.({ step, call, result });
         return {
           status: 'waiting_confirmation',
           final_message: stringValue(result.output.message) || 'confirmation_required: tool execution requires approval before it can continue.',
           tool_results: toolResults,
           usage,
+          usage_status: usageStatus,
+          finish_reason: finishReason || undefined,
           model_responses: modelResponses,
         };
+      }
+      if (toolResultFailed(result)) {
+        req.callbacks?.onToolFailed?.({ step, call, result });
+      } else {
+        req.callbacks?.onToolCompleted?.({ step, call, result });
       }
     }
   }
@@ -129,25 +187,35 @@ export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): P
     final_message: '',
     tool_results: toolResults,
     usage,
+    usage_status: usageStatus,
+    finish_reason: finishReason || undefined,
     model_responses: modelResponses,
   };
 }
 
-export function parseChatCompletionsSSE(raw: string): Record<string, unknown> {
+export function parseChatCompletionsSSE(raw: string, callbacks?: ToolCallingCallbacks, step = 0): Record<string, unknown> {
   let content = '';
   const toolCalls = new Map<number, { id: string; name: string; arguments: string; type: string }>();
   let usage: unknown = undefined;
+  let finishReason = '';
+  let deltaIndex = 0;
   for (const item of sseDataItems(raw)) {
     if (item === '[DONE]') break;
     const payload = JSON.parse(item) as Record<string, unknown>;
+    callbacks?.onModelDelta?.({ step, payload });
     if (payload.usage) usage = payload.usage;
     const choices = Array.isArray(payload.choices) ? payload.choices : [];
     for (const choice of choices) {
       if (!choice || typeof choice !== 'object') continue;
+      finishReason = stringValue((choice as Record<string, unknown>).finish_reason) || finishReason;
       const delta = (choice as Record<string, unknown>).delta;
       if (!delta || typeof delta !== 'object') continue;
       const object = delta as Record<string, unknown>;
-      content += stringValue(object.content);
+      const text = stringValue(object.content);
+      if (text) {
+        content += text;
+        callbacks?.onAssistantDelta?.({ step, text, index: deltaIndex++ });
+      }
       const deltaToolCalls = Array.isArray(object.tool_calls) ? object.tool_calls : [];
       for (const call of deltaToolCalls) {
         if (!call || typeof call !== 'object') continue;
@@ -182,10 +250,68 @@ export function parseChatCompletionsSSE(raw: string): Record<string, unknown> {
         content,
         tool_calls: messageToolCalls,
       },
+      finish_reason: finishReason || undefined,
     }],
     usage: usage || {},
     stream: true,
   };
+}
+
+async function parseChatCompletionsSSEResponse(
+  response: Response,
+  callbacks: ToolCallingCallbacks | undefined,
+  step: number,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  if (!response.body) {
+    return parseChatCompletionsSSE(await response.text(), callbacks, step);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let buffer = '';
+  try {
+    while (true) {
+      throwIfAborted(signal);
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      raw += lines.map((line) => `${line}\n`).join('');
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const item = line.slice('data:'.length).trim();
+        if (!item || item === '[DONE]') continue;
+        callbacks && emitSSECallbacks(item, callbacks, step);
+      }
+    }
+    if (buffer) {
+      raw += buffer;
+      for (const line of buffer.split(/\r?\n/)) {
+        if (!line.startsWith('data:')) continue;
+        const item = line.slice('data:'.length).trim();
+        if (!item || item === '[DONE]') continue;
+        callbacks && emitSSECallbacks(item, callbacks, step);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return parseChatCompletionsSSE(raw);
+}
+
+function emitSSECallbacks(item: string, callbacks: ToolCallingCallbacks, step: number): void {
+  const payload = JSON.parse(item) as Record<string, unknown>;
+  callbacks.onModelDelta?.({ step, payload });
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  for (const choice of choices) {
+    if (!choice || typeof choice !== 'object') continue;
+    const delta = (choice as Record<string, unknown>).delta;
+    if (!delta || typeof delta !== 'object') continue;
+    const text = stringValue((delta as Record<string, unknown>).content);
+    if (text) callbacks.onAssistantDelta?.({ step, text, index: 0 });
+  }
 }
 
 function sseDataItems(raw: string): string[] {
@@ -233,12 +359,38 @@ function parseArguments(value: unknown): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-function addUsage(total: ToolCallingTurnResult['usage'], value: unknown): void {
-  if (!value || typeof value !== 'object') return;
+function addUsage(total: ToolCallingTurnResult['usage'], value: unknown): UsageStatus {
+  if (!value || typeof value !== 'object') return 'provider_missing';
   const usage = value as Record<string, unknown>;
-  total.input_tokens += numberValue(usage.prompt_tokens) || numberValue(usage.input_tokens);
-  total.output_tokens += numberValue(usage.completion_tokens) || numberValue(usage.output_tokens);
-  total.cached_input_tokens += numberValue(usage.cached_tokens) || numberValue(usage.cached_input_tokens);
+  const inputTokens = numberValue(usage.prompt_tokens) || numberValue(usage.input_tokens);
+  const outputTokens = numberValue(usage.completion_tokens) || numberValue(usage.output_tokens);
+  const cachedInputTokens = numberValue(usage.cached_tokens) || numberValue(usage.cached_input_tokens);
+  total.input_tokens += inputTokens;
+  total.output_tokens += outputTokens;
+  total.cached_input_tokens += cachedInputTokens;
+  return inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0 ? 'recorded' : 'provider_missing';
+}
+
+function mergeUsageStatus(current: UsageStatus, next: UsageStatus): UsageStatus {
+  if (current === 'recorded' || next === 'recorded') return 'recorded';
+  if (current === 'estimated' || next === 'estimated') return 'estimated';
+  if (current === 'failed' || next === 'failed') return 'failed';
+  return 'provider_missing';
+}
+
+function finishReasonFromPayload(payload: Record<string, unknown>): string {
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  for (const choice of choices) {
+    if (!choice || typeof choice !== 'object') continue;
+    const finishReason = stringValue((choice as Record<string, unknown>).finish_reason);
+    if (finishReason) return finishReason;
+  }
+  return '';
+}
+
+function toolResultFailed(result: ToolResult): boolean {
+  const status = stringValue(result.output?.status).toLowerCase();
+  return ['failed', 'error', 'policy_blocked', 'blocked', 'cancelled', 'canceled'].includes(status);
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutSeconds: number, signal?: AbortSignal): Promise<Response> {

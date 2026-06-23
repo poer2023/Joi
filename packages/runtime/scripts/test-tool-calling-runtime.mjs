@@ -150,6 +150,7 @@ try {
   assert.equal(result.usage.cached_input_tokens, 4);
   assert.equal(requests.length, 2);
 
+  const streamCallbackEvents = [];
   const streamed = await runChatCompletionsToolTurn({
     base_url: `http://127.0.0.1:${port}/v1`,
     api_key: 'sk-test',
@@ -171,14 +172,42 @@ try {
         output: { status: 'completed', summary: 'streamed tool output' },
       };
     },
+    callbacks: {
+      onModelStarted(event) {
+        streamCallbackEvents.push(['model.started', event.step, event.streaming]);
+      },
+      onModelDelta(event) {
+        streamCallbackEvents.push(['model.delta', event.step, Boolean(event.payload)]);
+      },
+      onAssistantDelta(event) {
+        streamCallbackEvents.push(['assistant.delta', event.text]);
+      },
+      onToolCallRequested(event) {
+        streamCallbackEvents.push(['tool.call_requested', event.call.name]);
+      },
+      onToolCompleted(event) {
+        streamCallbackEvents.push(['tool.completed', event.result.output.status]);
+      },
+      onUsage(event) {
+        streamCallbackEvents.push(['usage.recorded', event.usage_status]);
+      },
+      onAssistantCompleted(event) {
+        streamCallbackEvents.push(['assistant.completed', event.text]);
+      },
+    },
   });
   assert.equal(streamed.status, 'completed');
   assert.equal(streamed.final_message, 'Streamed answer.');
+  assert.equal(streamed.usage_status, 'recorded');
   assert.equal(streamed.tool_results.length, 1);
   assert.equal(streamed.usage.input_tokens, 21);
   assert.equal(streamed.usage.output_tokens, 9);
   assert.equal(streamed.usage.cached_input_tokens, 2);
   assert.equal(streamRequests.length, 2);
+  assert.ok(streamCallbackEvents.some((event) => event[0] === 'tool.call_requested' && event[1] === 'workspace_search'));
+  assert.ok(streamCallbackEvents.some((event) => event[0] === 'assistant.delta' && event[1] === 'Streamed '));
+  assert.ok(streamCallbackEvents.some((event) => event[0] === 'assistant.completed' && event[1] === 'Streamed answer.'));
+  assert.ok(streamCallbackEvents.some((event) => event[0] === 'usage.recorded' && event[1] === 'recorded'));
 
   const waiting = await runChatCompletionsToolTurn({
     base_url: `http://127.0.0.1:${port}/v1`,

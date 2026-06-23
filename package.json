@@ -1,7 +1,7 @@
 {
   "name": "joi-workspace",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packageManager": "pnpm@10.14.0",
   "scripts": {
     "dev:electron": "pnpm --filter @joi/electron dev",
@@ -13,6 +13,19 @@
     "test:runtime": "pnpm --filter @joi/runtime test",
     "test:secrets": "pnpm --filter @joi/secrets test",
     "test:store": "pnpm --filter @joi/store test",
+    "test:conversation-flow": "bash scripts/conversation_flow_completion_gate.sh",
+    "test:conversation-flow:full": "JOI_REQUIRE_EXTERNAL=1 bash scripts/conversation_flow_completion_gate.sh",
+    "test:conversation-flow:live": "JOI_REQUIRE_EXTERNAL=1 JOI_REQUIRE_LIVE_EXTERNAL=1 bash scripts/conversation_flow_completion_gate.sh",
+    "test:conversation-flow:live:audit": "node --experimental-strip-types scripts/desktop_live_external_handoff_audit.mjs --require-live --include-readiness",
+    "test:conversation-flow:live:wait": "node --experimental-strip-types scripts/desktop_live_external_handoff_wait.mjs",
+    "test:conversation-flow:live:guided": "node --experimental-strip-types scripts/desktop_live_external_handoff_wait.mjs --require-new --out=.e2e/live-external-handoff-guided/latest.json",
+    "test:conversation-flow:live:token": "JOI_REQUIRE_EXTERNAL=1 JOI_REQUIRE_LIVE_EXTERNAL=1 bash scripts/conversation_flow_completion_gate.sh",
+    "test:conversation-flow:dod:audit": "node --experimental-strip-types scripts/conversation_flow_dod_audit.mjs",
+    "test:conversation-flow:manual:init": "node --experimental-strip-types scripts/conversation_flow_manual_e2e_audit.mjs --init",
+    "test:conversation-flow:manual:collect": "node --experimental-strip-types scripts/conversation_flow_manual_e2e_collect.mjs",
+    "test:conversation-flow:manual:audit": "node --experimental-strip-types scripts/conversation_flow_manual_e2e_audit.mjs",
+    "joi:prod-schema:check": "node --experimental-strip-types scripts/desktop_production_schema_migration.mjs",
+    "joi:prod-schema:migrate": "node --experimental-strip-types scripts/desktop_production_schema_migration.mjs --apply",
     "eval:desktop:ts": "node --experimental-strip-types packages/runtime/scripts/desktop-evals.mjs evals/desktop_cases.json"
   }
 }

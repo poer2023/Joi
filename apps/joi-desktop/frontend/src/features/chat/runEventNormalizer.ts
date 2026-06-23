@@ -5,7 +5,15 @@ export function normalizeStatus(status: string): NormalizedStatus {
     case 'succeeded':
     case 'success':
     case 'completed':
+    case 'approved':
+    case 'delivered':
+    case 'responded':
+    case 'closed':
       return 'completed';
+    case 'authorized':
+    case 'scheduled':
+    case 'snoozed':
+      return 'queued';
     case 'running':
     case 'in_progress':
       return 'running';
@@ -19,14 +27,21 @@ export function normalizeStatus(status: string): NormalizedStatus {
       return 'waiting_approval';
     case 'failed':
     case 'error':
+    case 'rejected':
+    case 'denied':
       return 'failed';
     case 'cancelled':
     case 'canceled':
     case 'aborted':
       return 'cancelled';
+    case 'redirected':
+      return 'redirected';
     case 'blocked':
       return 'blocked';
     case 'skipped':
+    case 'expired':
+    case 'suppressed':
+    case 'dismissed':
       return 'skipped';
     default:
       return 'running';
@@ -35,7 +50,7 @@ export function normalizeStatus(status: string): NormalizedStatus {
 
 export function normalizeRunEvent(raw: unknown): NormalizedRunEvent {
   const source = asObject(raw);
-  const payload = asObject(source.payload);
+  const payload = { ...asObject(source.payload), ...asObject(source.payload_json) };
   const read = (...keys: string[]) => firstDefined(source, payload, keys);
   const type = stringValue(read('type', 'event_type', 'event'));
   const runId = stringValue(read('run_id', 'runID', 'runId'));
@@ -73,19 +88,72 @@ export function normalizeRunEvent(raw: unknown): NormalizedRunEvent {
     runId,
     seq,
     type,
+    schemaVersion: numberValue(read('schema_version', 'schemaVersion')) || 1,
     itemId,
     itemType,
     status,
     parentItemId: stringValue(read('parent_item_id', 'parentItemID', 'parentItemId')) || undefined,
+    visibility: stringValue(read('visibility')) || undefined,
+    source: stringValue(read('source')) || undefined,
+    terminal: booleanValue(read('terminal')),
     title: stringValue(read('title')) || undefined,
     summary: stringValue(read('summary', 'message')) || undefined,
     snapshot,
     delta,
-    error: stringValue(read('error')) || undefined,
+    usage: asObject(read('usage', 'usage_json')),
+    error: errorValue(read('error'), read('error_json')),
     metadata,
     createdAt,
     raw: source,
   };
+}
+
+export function normalizeRunEvents(rawEvents: unknown[]): NormalizedRunEvent[] {
+  const normalized = rawEvents.map((event) => normalizeRunEvent(event));
+  const hasAssistantV2 = new Set(
+    normalized
+      .filter((event) => event.type === 'assistant.delta' || event.type === 'assistant.completed')
+      .map((event) => event.runId),
+  );
+  const expanded: NormalizedRunEvent[] = [];
+  for (const event of normalized) {
+    if (event.type !== 'message.delta') {
+      expanded.push(event);
+      continue;
+    }
+    if (hasAssistantV2.has(event.runId)) {
+      expanded.push(event);
+      continue;
+    }
+    const text = stringValue(event.delta.text) || stringValue(event.delta) || stringValue(event.snapshot.delta);
+    if (!text) {
+      expanded.push(event);
+      continue;
+    }
+    const assistantBase = {
+      ...event,
+      itemType: 'assistant_message',
+      itemId: event.itemId || `${event.runId}:assistant`,
+      visibility: 'chat',
+      source: event.source || 'legacy',
+      delta: { text, stream_source: 'legacy_message_delta' },
+    };
+    expanded.push({
+      ...assistantBase,
+      id: `${event.id}:assistant-delta`,
+      type: 'assistant.delta',
+      status: event.status === 'waiting_approval' ? 'waiting_approval' : 'completed',
+    });
+    expanded.push({
+      ...assistantBase,
+      id: `${event.id}:assistant-completed`,
+      seq: event.seq + 0.001,
+      type: 'assistant.completed',
+      status: event.status === 'waiting_approval' ? 'waiting_approval' : 'completed',
+      terminal: event.status !== 'waiting_approval',
+    });
+  }
+  return expanded;
 }
 
 export function asObject(value: unknown): Record<string, unknown> {
@@ -154,6 +222,28 @@ function numberValue(value: unknown): number {
   return 0;
 }
 
+function booleanValue(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true' || normalized === '1') return true;
+    if (normalized === 'false' || normalized === '0') return false;
+  }
+  return undefined;
+}
+
+function errorValue(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const direct = stringValue(value);
+    if (direct) return direct;
+    const object = asObject(value);
+    const message = stringValue(object.message || object.error);
+    if (message) return message;
+  }
+  return undefined;
+}
+
 function inferItemType(type: string, payload: Record<string, unknown>): string {
   const lower = type.toLowerCase();
   if (lower.startsWith('assistant.')) return 'assistant_message';
@@ -162,6 +252,10 @@ function inferItemType(type: string, payload: Record<string, unknown>): string {
   if (lower.startsWith('artifact.')) return 'artifact';
   if (lower.startsWith('worker.')) return 'worker';
   if (lower.startsWith('task.')) return 'task';
+  if (lower.startsWith('open_loop.')) return 'open_loop';
+  if (lower.startsWith('proactive.')) return 'proactive';
+  if (lower.startsWith('handoff.') || lower.startsWith('notification.')) return 'handoff';
+  if (lower === 'run.mode_resolved') return 'mode_resolution';
   if (lower.startsWith('reflection.') || stringValue(payload.item_type) === 'reflection') return 'reflection';
   if (lower.startsWith('policy.')) return 'policy';
   if (lower.startsWith('workflow.')) return 'workflow';
@@ -182,11 +276,23 @@ function inferItemId(
   if (itemType === 'approval') return stringValue(payload.confirmation_id || payload.call_id);
   if (itemType === 'artifact') return stringValue(payload.artifact_id || payload.id);
   if (itemType === 'task' || itemType === 'worker') return stringValue(payload.task_id || payload.worker_task_id || payload.id);
+  if (itemType === 'memory') return stringValue(payload.memory_id || payload.item_id || payload.id);
+  if (itemType === 'open_loop') return stringValue(payload.open_loop_id || payload.item_id || payload.id);
+  if (itemType === 'proactive') return stringValue(payload.proactive_message_id || payload.item_id || payload.id);
+  if (itemType === 'handoff') return stringValue(payload.notification_id || payload.channel_identity_id || payload.item_id || payload.id);
+  if (itemType === 'mode_resolution') return stringValue(payload.mode_resolution_id || payload.item_id || payload.id);
   return `${itemType || 'event'}:${type}`;
 }
 
 function statusFromEventType(type: string): string {
   if (type.endsWith('.failed')) return 'failed';
+  if (type.endsWith('.denied') || type.endsWith('.rejected')) return 'rejected';
+  if (type.endsWith('.cancelled') || type.endsWith('.canceled')) return 'cancelled';
+  if (type === 'run.redirected' || type.endsWith('.redirected')) return 'redirected';
+  if (type === 'run.recovery_required') return 'waiting_approval';
+  if (type.endsWith('.expired') || type.endsWith('.suppressed') || type.endsWith('.dismissed')) return 'skipped';
+  if (type.endsWith('.authorized') || type.endsWith('.scheduled') || type.endsWith('.snoozed')) return 'queued';
+  if (type.endsWith('.delivered') || type.endsWith('.responded') || type.endsWith('.closed')) return 'completed';
   if (type.endsWith('.completed') || type.endsWith('.finished') || type === 'run.completed') return 'completed';
   if (type.endsWith('.skipped')) return 'skipped';
   if (type.endsWith('.queued')) return 'queued';

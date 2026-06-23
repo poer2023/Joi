@@ -1,5 +1,13 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
+import { Terminal } from '@xterm/xterm';
+import { Component, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import type {
+  CSSProperties,
+  ErrorInfo,
+  KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+} from 'react';
 import {
   desktopApi,
   type ArtifactDetail,
@@ -11,6 +19,7 @@ import {
   type ConversationMessage,
   type ConversationSummary,
   type ConfirmationRecord,
+  type ExternalHandoffAudit,
   type InputMode,
   type MemoryRecord,
   type MemorySearchResult,
@@ -23,11 +32,14 @@ import {
   type ProactiveMessage,
   type ProductTask,
   type ProductTaskDetail,
+  type RunClosureReport,
   type RunTrace,
   type SecretStatus,
   type SettingsRecord,
   type SkillRecord,
   type SystemHealth,
+  type TerminalSessionEvent,
+  type TerminalSessionInfo,
   type ToolRunRecord,
   type ToolWorkflowRecord,
   type WorkerGatewayAuditRecord,
@@ -37,11 +49,12 @@ import { eventsOn, windowSetMinSize } from './api/runtime';
 import { permissionProfileForPrompt } from './permissionProfile';
 import joiAvatar from './assets/joi-avatar-circle.png';
 import { ScrollArea } from './components/ScrollArea';
-import { buildConversationRenderItems, sortBySeq } from './features/chat/conversationProjector';
+import { buildConversationRenderItems, getMessageRunId, sortBySeq } from './features/chat/conversationProjector';
 import { MessageList } from './features/chat/components/MessageList';
 import { TraceDrawer } from './features/chat/components/TraceDrawer';
-import { normalizeRunEvent } from './features/chat/runEventNormalizer';
+import { normalizeRunEvent, normalizeRunEvents } from './features/chat/runEventNormalizer';
 import type { NormalizedRunEvent } from './features/chat/types';
+import { visibleRecentTasksForHandoff } from './productTasks';
 import {
   createOptimisticExecutionActions,
   getExecutionDisplayMode,
@@ -54,11 +67,13 @@ import {
   type ExecutionActionKind,
   type ExecutionActionStatus,
 } from './executionActions';
+import '@xterm/xterm/css/xterm.css';
 
 type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
 type SettingsTab = Exclude<Tab, 'chat'>;
 type SettingsCategory = 'models' | 'chatEntrances' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
 type ExecutionTarget = 'main-node' | 'auto' | 'local-worker-1' | 'vps-la-1';
+type RightInspectorTab = 'terminal' | 'memory';
 type StreamingAssistantMessage = ConversationMessage & {
   role: 'assistant';
   complete?: boolean;
@@ -143,9 +158,15 @@ const DEFAULT_SIDEBAR_WIDTH = 224;
 const MIN_SIDEBAR_WIDTH = 192;
 const MAX_SIDEBAR_WIDTH = 560;
 const CHAT_MAIN_MIN_WIDTH = 560;
+const COMPANION_MAIN_MIN_WIDTH = 420;
+const DEFAULT_RIGHT_PANEL_WIDTH = 520;
 const RIGHT_PANEL_MIN_WIDTH = 260;
+const RIGHT_PANEL_MAX_WIDTH = 960;
 const MIN_APP_WIDTH = CHAT_MAIN_MIN_WIDTH;
 const MIN_APP_HEIGHT = 720;
+const RIGHT_INSPECTOR_TERMINAL_ID = 'joi-right-inspector-terminal';
+const TERMINAL_APPROX_CHAR_WIDTH = 7.2;
+const TERMINAL_APPROX_ROW_HEIGHT = 17;
 const executionTargetOptions: Array<{ value: ExecutionTarget; label: string; preferredNode: string; allowWorker: boolean }> = [
   { value: 'main-node', label: '本机', preferredNode: 'main-node', allowWorker: false },
   { value: 'auto', label: '自动', preferredNode: 'auto', allowWorker: true },
@@ -180,6 +201,18 @@ function mergeRunEvents(
   };
 }
 
+function pickRunEvents(
+  eventsByRunId: Record<string, NormalizedRunEvent[]>,
+  runIds: Iterable<string | undefined>,
+): Record<string, NormalizedRunEvent[]> {
+  const picked: Record<string, NormalizedRunEvent[]> = {};
+  for (const runId of runIds) {
+    if (!runId) continue;
+    if (eventsByRunId[runId]) picked[runId] = eventsByRunId[runId];
+  }
+  return picked;
+}
+
 function latestActiveRunId(eventsByRunId: Record<string, NormalizedRunEvent[]>): string {
   let latest = '';
   let latestSeq = -1;
@@ -210,9 +243,52 @@ function latestActiveRunId(eventsByRunId: Record<string, NormalizedRunEvent[]>):
 }
 
 function normalizeTraceEvents(trace: RunTrace | null): NormalizedRunEvent[] {
-  return (trace?.events ?? [])
-    .map((event) => normalizeRunEvent(event))
+  return normalizeRunEvents(trace?.events ?? [])
     .filter((event) => Boolean(event.runId));
+}
+
+type RenderCrashBoundaryProps = {
+  children: ReactNode;
+  onRecover?: () => void;
+  resetKey: string;
+  surface: string;
+};
+
+type RenderCrashBoundaryState = {
+  errorMessage: string;
+};
+
+class RenderCrashBoundary extends Component<RenderCrashBoundaryProps, RenderCrashBoundaryState> {
+  state: RenderCrashBoundaryState = { errorMessage: '' };
+
+  static getDerivedStateFromError(error: unknown): RenderCrashBoundaryState {
+    return { errorMessage: error instanceof Error ? error.message : String(error) };
+  }
+
+  componentDidCatch(error: unknown, errorInfo: ErrorInfo) {
+    console.error('joi render surface failed', {
+      surface: this.props.surface,
+      error,
+      componentStack: errorInfo.componentStack,
+    });
+  }
+
+  componentDidUpdate(previousProps: RenderCrashBoundaryProps) {
+    if (previousProps.resetKey !== this.props.resetKey && this.state.errorMessage) {
+      this.setState({ errorMessage: '' });
+    }
+  }
+
+  render() {
+    if (!this.state.errorMessage) return this.props.children;
+    return (
+      <section className="render-crash-panel">
+        <strong>聊天页渲染失败</strong>
+        <p>{this.state.errorMessage}</p>
+        {this.props.onRecover ? <button type="button" onClick={this.props.onRecover}>返回空对话</button> : null}
+      </section>
+    );
+  }
 }
 
 export default function App() {
@@ -242,6 +318,8 @@ export default function App() {
   const [toolRuns, setToolRuns] = useState<ToolRunRecord[]>([]);
   const [workspaceSettings, setWorkspaceSettings] = useState<WorkspaceSettings | null>(null);
   const [health, setHealth] = useState<SystemHealth | null>(null);
+  const [closureReport, setClosureReport] = useState<RunClosureReport | null>(null);
+  const [externalHandoffAudit, setExternalHandoffAudit] = useState<ExternalHandoffAudit | null>(null);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
   const [productTasks, setProductTasks] = useState<ProductTask[]>([]);
   const [activeProductTaskID, setActiveProductTaskID] = useState('');
@@ -264,6 +342,7 @@ export default function App() {
   const [settingsObjectByCategory, setSettingsObjectByCategory] = useState<Record<SettingsCategory, string>>(defaultSettingsObjectByCategory);
   const [manualSidebarCollapsed, setManualSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+  const [rightPanelWidth, setRightPanelWidth] = useState(DEFAULT_RIGHT_PANEL_WIDTH);
   const [windowWidth, setWindowWidth] = useState(() => (typeof window === 'undefined' ? 1280 : window.innerWidth));
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -276,6 +355,7 @@ export default function App() {
   const receivedAssistantDeltaRunIDRef = useRef('');
   const assistantCompletedRunIDsRef = useRef<Set<string>>(new Set());
   const runCompletedFallbackTimersRef = useRef<Record<string, number>>({});
+  const loadConversationRequestRef = useRef(0);
 
   const stepCount = useMemo(() => trace?.steps?.length ?? 0, [trace]);
   const firstModelCall = trace?.model_calls?.[0] ?? chat?.model_calls?.[0];
@@ -283,11 +363,18 @@ export default function App() {
   const autoSidebarCollapsed = !manualSidebarCollapsed && windowWidth < sidebarWidth + CHAT_MAIN_MIN_WIDTH;
   const sidebarCollapsed = manualSidebarCollapsed || autoSidebarCollapsed;
   const activeSidebarWidth = sidebarCollapsed ? 0 : sidebarWidth;
+  const maxRightPanelWidth = Math.max(
+    RIGHT_PANEL_MIN_WIDTH,
+    Math.min(RIGHT_PANEL_MAX_WIDTH, windowWidth - activeSidebarWidth - COMPANION_MAIN_MIN_WIDTH),
+  );
+  const activeRightPanelWidth = Math.min(rightPanelWidth, maxRightPanelWidth);
   const autoRightPanelCollapsed = windowWidth < activeSidebarWidth + CHAT_MAIN_MIN_WIDTH + RIGHT_PANEL_MIN_WIDTH;
   const shellStyle = {
     '--sidebar-width': `${activeSidebarWidth}px`,
     '--chat-main-min-width': `${CHAT_MAIN_MIN_WIDTH}px`,
+    '--companion-main-min-width': `${COMPANION_MAIN_MIN_WIDTH}px`,
     '--right-panel-min-width': `${RIGHT_PANEL_MIN_WIDTH}px`,
+    '--right-panel-width': `${activeRightPanelWidth}px`,
   } as CSSProperties;
 
   useEffect(() => {
@@ -437,19 +524,19 @@ export default function App() {
       return;
     }
 
-    if (eventType === 'tool.started' || eventType === 'tool.call.started') {
+    if (eventType === 'tool.started' || eventType === 'tool.call.started' || eventType === 'tool.call_requested') {
       setActiveExecutionStatus('running');
       setActiveExecutionActions((current) => upsertExecutionAction(current, toolEventToExecutionAction(event), 'running'));
       return;
     }
 
-    if (eventType === 'tool.finished') {
+    if (eventType === 'tool.finished' || eventType === 'tool.completed') {
       const status = String(event.status || '').toLowerCase() === 'failed' ? 'failed' : 'completed';
       setActiveExecutionActions((current) => upsertExecutionAction(current, toolEventToExecutionAction(event), status));
       return;
     }
 
-    if (eventType === 'tool.failed') {
+    if (eventType === 'tool.failed' || eventType === 'tool.policy_blocked') {
       setActiveExecutionActions((current) => upsertExecutionAction(current, toolEventToExecutionAction(event), 'failed'));
       return;
     }
@@ -460,9 +547,9 @@ export default function App() {
       return;
     }
 
-    if (eventType === 'approval.resolved') {
+    if (eventType === 'approval.resolved' || eventType === 'approval.approved' || eventType === 'approval.denied') {
       const confirmationID = String(event.confirmation_id || event.action_id || '');
-      const approved = event.approved !== false && String(event.status || '').toLowerCase() !== 'rejected';
+      const approved = eventType === 'approval.approved' || (event.approved !== false && String(event.status || '').toLowerCase() !== 'rejected');
       setActiveExecutionActions((current) => current.map((action) => (
         action.id === confirmationID || (action.kind === 'confirmation' && confirmationID === '')
           ? { ...action, status: approved ? 'completed' : 'failed', summary: approved ? '已批准' : '已拒绝' }
@@ -474,7 +561,7 @@ export default function App() {
       return;
     }
 
-    if (eventType === 'turn.aborted') {
+    if (eventType === 'turn.aborted' || eventType === 'run.cancelled' || eventType === 'run.redirected' || eventType === 'run.recovery_required') {
       setActiveExecutionStatus('failed');
       setActiveExecutionActions((current) => current.map((action) => (
         action.status === 'running' || action.status === 'queued'
@@ -488,7 +575,7 @@ export default function App() {
       const text = String(normalized.delta.text ?? event.text ?? event.delta ?? '');
       if (!text) return;
       const runID = normalized.runId || event.run_id || event.runID || '';
-      const messageID = String(normalized.metadata.message_id || normalized.snapshot.assistant_message_id || event.message_id || pendingAssistantIDRef.current || `streaming-${runID || Date.now()}`);
+      const messageID = String(normalized.itemId || normalized.metadata.message_id || normalized.snapshot.assistant_message_id || event.message_id || pendingAssistantIDRef.current || `streaming-${runID || Date.now()}`);
       const conversationID = pendingConversationIDRef.current || currentConversationID || 'pending-conversation';
       receivedAssistantDeltaRef.current = true;
       receivedAssistantDeltaRunIDRef.current = runID;
@@ -566,6 +653,8 @@ export default function App() {
         toolRunList,
         workspaceConfig,
         systemHealth,
+        runClosureReport,
+        handoffAudit,
         memoryList,
         taskList,
         artifactList,
@@ -591,6 +680,8 @@ export default function App() {
         desktopApi.listToolRuns(),
         desktopApi.getWorkspaceSettings(),
         desktopApi.getSystemHealth(),
+        desktopApi.getRecentRunClosureReport({ limit: 50 }),
+        desktopApi.getExternalHandoffAudit(),
         desktopApi.listMemories({ query: memoryQuery, limit: 50 }),
         desktopApi.listProductTasks({ status: '', limit: 50 }),
         desktopApi.listArtifacts({ limit: 50 }),
@@ -616,6 +707,8 @@ export default function App() {
       setToolRuns(toolRunList.tool_runs ?? []);
       setWorkspaceSettings(workspaceConfig);
       setHealth(systemHealth);
+      setClosureReport(runClosureReport);
+      setExternalHandoffAudit(handoffAudit);
       setMemories(memoryList.memories ?? []);
       setProductTasks(taskList.tasks ?? []);
       setArtifacts(artifactList.artifacts ?? []);
@@ -798,15 +891,29 @@ export default function App() {
   }
 
   async function loadConversation(conversationID: string) {
+    const requestID = loadConversationRequestRef.current + 1;
+    loadConversationRequestRef.current = requestID;
     setError('');
     setNotice('');
+    setCurrentConversationID(conversationID);
+    setConversationMessages([]);
+    setChat(null);
+    setTrace(null);
+    setPendingUserMessage(null);
+    setStreamingAssistantMessage(null);
+    setActiveExecutionActions([]);
+    setActiveExecutionStatus('pending');
+    pendingAssistantIDRef.current = '';
+    pendingConversationIDRef.current = '';
     try {
       const detail = await desktopApi.getConversation(conversationID);
+      if (loadConversationRequestRef.current !== requestID) return;
       setCurrentConversationID(detail.conversation.id);
       setConversationMessages(detail.messages ?? []);
       setChat(null);
       if (detail.conversation.latest_run_id) {
         const runTrace = await desktopApi.getRunTrace(detail.conversation.latest_run_id);
+        if (loadConversationRequestRef.current !== requestID) return;
         setTrace(runTrace);
         setRunEventsByRunId((current) => mergeRunEvents(current, detail.conversation.latest_run_id || '', normalizeTraceEvents(runTrace)));
       } else {
@@ -860,7 +967,7 @@ export default function App() {
   }
 
   async function updateMemory(id: string, action: string, extra: Partial<MemoryRecord> = {}) {
-    await desktopApi.updateMemory({ id, action, reason: 'desktop_ui', content: extra.content, summary: extra.summary });
+    await desktopApi.updateMemory({ id, action, reason: 'desktop_ui', content: extra.content, summary: extra.summary, run_id: trace?.id });
     await refreshAll();
   }
 
@@ -915,7 +1022,18 @@ export default function App() {
     setActiveProductTaskID(task.id);
     setInputMode(task.mode === 'background_task' ? 'background_task' : 'serious_task');
     setMessage(`继续任务：${task.title}\n\n请根据已有任务契约继续执行未完成步骤，更新交付物，并在完成前写入验证结果。`);
+    setActiveTab('chat');
     showNotice(`已准备继续任务：${task.title}`);
+  }
+
+  async function continueProductTaskByID(id: string) {
+    if (!id) return;
+    try {
+      const detail = await desktopApi.getProductTask(id);
+      await continueProductTask(detail.task);
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function setNodeDisabled(nodeID: string, disabled: boolean) {
@@ -948,16 +1066,26 @@ export default function App() {
   }
 
   function startNewChat() {
+    loadConversationRequestRef.current += 1;
+    Object.keys(runCompletedFallbackTimersRef.current).forEach(clearRunCompletedFallback);
     setActiveTab('chat');
     setChat(null);
     setTrace(null);
     setCurrentConversationID('');
     setConversationMessages([]);
+    setPendingUserMessage(null);
+    setStreamingAssistantMessage(null);
+    setActiveExecutionActions([]);
+    setActiveExecutionStatus('pending');
     setActiveProductTaskID('');
     setActiveProductTaskDetail(null);
     setArtifactViewer(null);
     setLastPrompt('');
     setMessage('');
+    pendingAssistantIDRef.current = '';
+    pendingConversationIDRef.current = '';
+    receivedAssistantDeltaRef.current = false;
+    receivedAssistantDeltaRunIDRef.current = '';
   }
 
   function toggleSidebarCollapsed() {
@@ -1004,6 +1132,60 @@ export default function App() {
       document.body.style.cursor = previousCursor;
       document.body.style.userSelect = previousUserSelect;
       setSidebarWidth(nextWidth);
+      window.removeEventListener('pointermove', resize);
+      window.removeEventListener('pointerup', stopResize);
+      window.removeEventListener('pointercancel', stopResize);
+    }
+
+    window.addEventListener('pointermove', resize);
+    window.addEventListener('pointerup', stopResize);
+    window.addEventListener('pointercancel', stopResize);
+  }
+
+  function startRightPanelResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (autoRightPanelCollapsed) return;
+
+    event.preventDefault();
+    const shell = shellRef.current;
+    const startX = event.clientX;
+    const startWidth = activeRightPanelWidth;
+    const maxWidth = Math.max(
+      RIGHT_PANEL_MIN_WIDTH,
+      Math.min(RIGHT_PANEL_MAX_WIDTH, windowWidth - activeSidebarWidth - COMPANION_MAIN_MIN_WIDTH),
+    );
+    let nextWidth = startWidth;
+    let animationFrame = 0;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    shell?.classList.add('right-panel-resizing');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    function applyWidth() {
+      animationFrame = 0;
+      shell?.style.setProperty('--right-panel-width', `${nextWidth}px`);
+    }
+
+    function scheduleWidth(width: number) {
+      nextWidth = Math.min(maxWidth, Math.max(RIGHT_PANEL_MIN_WIDTH, width));
+      if (animationFrame) return;
+      animationFrame = window.requestAnimationFrame(applyWidth);
+    }
+
+    function resize(moveEvent: PointerEvent) {
+      scheduleWidth(startWidth + startX - moveEvent.clientX);
+    }
+
+    function stopResize() {
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame);
+        animationFrame = 0;
+      }
+      shell?.style.setProperty('--right-panel-width', `${nextWidth}px`);
+      shell?.classList.remove('right-panel-resizing');
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      setRightPanelWidth(nextWidth);
       window.removeEventListener('pointermove', resize);
       window.removeEventListener('pointerup', stopResize);
       window.removeEventListener('pointercancel', stopResize);
@@ -1063,43 +1245,50 @@ export default function App() {
         {onboarding?.required && <OnboardingPanel createBackup={createBackup} refreshAll={refreshAll} setError={showError} setNotice={showNotice} status={onboarding} />}
 
         {!onboarding?.required && activeTab === 'chat' && (
-          <ChatHome
-            activeProductTask={activeProductTaskDetail}
-            artifacts={artifacts}
-            activeExecutionActions={activeExecutionActions}
-            autoRightPanelCollapsed={autoRightPanelCollapsed}
-            chat={chat}
-            conversationMessages={conversationMessages}
-            cancelRun={cancelRun}
-            continueProductTask={continueProductTask}
-            decideProactiveMessage={decideProactiveMessage}
-            executionTarget={executionTarget}
-            health={health}
-            inputMode={inputMode}
-            isSubmitting={isSubmitting}
-            memories={memories}
-            openArtifact={openArtifact}
-            openLoops={openLoops}
-            lastPrompt={lastPrompt}
-            message={message}
-            pendingUserMessage={pendingUserMessage}
-            streamingAssistantMessage={streamingAssistantMessage}
-            proactiveMessages={proactiveMessages}
-            productTasks={productTasks}
-            runEventsByRunId={runEventsByRunId}
-            savedModels={savedModels}
-            selectProductTask={selectProductTask}
-            selectedModelName={selectedModelName || settings?.model_name || 'deepseek-v4-flash'}
-            setActiveTab={setActiveTab}
-            setExecutionTarget={setExecutionTarget}
-            setInputMode={setInputMode}
-            setMessage={setMessage}
-            setSelectedModelName={setSelectedModelName}
-            settings={settings}
-            updateMemory={updateMemory}
-            submit={submit}
-            trace={trace}
-          />
+          <RenderCrashBoundary
+            onRecover={startNewChat}
+            resetKey={`chat:${currentConversationID || chat?.conversation_id || 'new'}:${conversationMessages.length}:${chat?.run_id || trace?.id || ''}`}
+            surface="chat"
+          >
+            <ChatHome
+              activeProductTask={activeProductTaskDetail}
+              artifacts={artifacts}
+              activeExecutionActions={activeExecutionActions}
+              autoRightPanelCollapsed={autoRightPanelCollapsed}
+              chat={chat}
+              conversationMessages={conversationMessages}
+              cancelRun={cancelRun}
+              continueProductTask={continueProductTask}
+              decideProactiveMessage={decideProactiveMessage}
+              executionTarget={executionTarget}
+              health={health}
+              inputMode={inputMode}
+              isSubmitting={isSubmitting}
+              memories={memories}
+              openArtifact={openArtifact}
+              openLoops={openLoops}
+              lastPrompt={lastPrompt}
+              message={message}
+              pendingUserMessage={pendingUserMessage}
+              streamingAssistantMessage={streamingAssistantMessage}
+              proactiveMessages={proactiveMessages}
+              productTasks={productTasks}
+              runEventsByRunId={runEventsByRunId}
+              savedModels={savedModels}
+              selectProductTask={selectProductTask}
+              selectedModelName={selectedModelName || settings?.model_name || 'deepseek-v4-flash'}
+              setActiveTab={setActiveTab}
+              setExecutionTarget={setExecutionTarget}
+              setInputMode={setInputMode}
+              setMessage={setMessage}
+              setSelectedModelName={setSelectedModelName}
+              settings={settings}
+              startRightPanelResize={startRightPanelResize}
+              updateMemory={updateMemory}
+              submit={submit}
+              trace={trace}
+            />
+          </RenderCrashBoundary>
         )}
         {artifactViewer && activeTab === 'chat' && (
           <ArtifactViewer artifact={artifactViewer} close={() => setArtifactViewer(null)} />
@@ -1125,6 +1314,9 @@ export default function App() {
               capabilities={capabilities}
               calls={trace?.model_calls ?? []}
               confirmations={confirmations}
+              closureReport={closureReport}
+              continueProductTaskByID={continueProductTaskByID}
+              externalHandoffAudit={externalHandoffAudit}
               createBackup={createBackup}
               decideConfirmation={decideConfirmation}
               firstModelCall={firstModelCall}
@@ -1437,6 +1629,9 @@ function SettingsConsole({
   capabilities,
   calls,
   confirmations,
+  closureReport,
+  continueProductTaskByID,
+  externalHandoffAudit,
   createBackup,
   decideConfirmation,
   firstModelCall,
@@ -1479,6 +1674,9 @@ function SettingsConsole({
   capabilities: CapabilityRecord[];
   calls: ModelCall[];
   confirmations: ConfirmationRecord[];
+  closureReport: RunClosureReport | null;
+  continueProductTaskByID: (id: string) => Promise<void>;
+  externalHandoffAudit: ExternalHandoffAudit | null;
   createBackup: () => Promise<void>;
   decideConfirmation: (id: string, approve: boolean) => Promise<void>;
   firstModelCall?: ModelCall;
@@ -2596,6 +2794,11 @@ function SettingsConsole({
               setNotice(`诊断信息已导出：${result.path}`);
             }}>导出诊断</button>
           </div>
+          <ClosureReportPanel
+            continueProductTaskByID={continueProductTaskByID}
+            externalHandoffAudit={externalHandoffAudit}
+            report={closureReport}
+          />
         </section>
       );
     }
@@ -2607,6 +2810,7 @@ function SettingsConsole({
           <CollapsedData label="运行设置" value={settings ?? {}} />
           <CollapsedData label="节点数据" value={nodes} />
           <CollapsedData label="用量数据" value={{ usage, calls }} />
+          <CollapsedData label="闭环报告" value={closureReport ?? {}} />
         </section>
       );
     }
@@ -3063,6 +3267,37 @@ function RailSectionTitle({ label }: { label: string }) {
   return <div className="rail-section-title">{label}</div>;
 }
 
+function handleTopControlPointerAction(
+  event: ReactPointerEvent<HTMLButtonElement>,
+  action: () => void,
+  suppressClickRef: { current: boolean },
+) {
+  if (event.button !== 0) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  suppressClickRef.current = true;
+  window.setTimeout(() => {
+    suppressClickRef.current = false;
+  }, 350);
+  action();
+}
+
+function handleTopControlClickAction(
+  event: ReactMouseEvent<HTMLButtonElement>,
+  action: () => void,
+  suppressClickRef: { current: boolean },
+) {
+  event.preventDefault();
+  event.stopPropagation();
+  if (suppressClickRef.current) {
+    suppressClickRef.current = false;
+    return;
+  }
+  action();
+}
+
 function SidebarTopControls({
   collapsed,
   setActiveTab,
@@ -3074,15 +3309,41 @@ function SidebarTopControls({
   startNewChat: () => void;
   toggleCollapsed: () => void;
 }) {
+  const suppressNewClickRef = useRef(false);
+  const suppressSearchClickRef = useRef(false);
+  const suppressToggleClickRef = useRef(false);
+  const openSearch = () => setActiveTab('memory');
+
   return (
     <div className="sidebar-top-controls">
-      <button className="round-icon-button" title="新建对话" type="button" onClick={startNewChat}>
+      <button
+        aria-label="新建对话"
+        className="round-icon-button"
+        title="新建对话"
+        type="button"
+        onClick={(event) => handleTopControlClickAction(event, startNewChat, suppressNewClickRef)}
+        onPointerDown={(event) => handleTopControlPointerAction(event, startNewChat, suppressNewClickRef)}
+      >
         <SidebarIcon name="plus" />
       </button>
-      <button className="round-icon-button" title="搜索" type="button" onClick={() => setActiveTab('memory')}>
+      <button
+        aria-label="搜索"
+        className="round-icon-button"
+        title="搜索"
+        type="button"
+        onClick={(event) => handleTopControlClickAction(event, openSearch, suppressSearchClickRef)}
+        onPointerDown={(event) => handleTopControlPointerAction(event, openSearch, suppressSearchClickRef)}
+      >
         <SidebarIcon name="search" />
       </button>
-      <button className="round-icon-button collapse-sidebar-button" title={collapsed ? '展开侧边栏' : '折叠侧边栏'} type="button" onClick={toggleCollapsed}>
+      <button
+        aria-label={collapsed ? '展开侧边栏' : '折叠侧边栏'}
+        className="round-icon-button collapse-sidebar-button"
+        title={collapsed ? '展开侧边栏' : '折叠侧边栏'}
+        type="button"
+        onClick={(event) => handleTopControlClickAction(event, toggleCollapsed, suppressToggleClickRef)}
+        onPointerDown={(event) => handleTopControlPointerAction(event, toggleCollapsed, suppressToggleClickRef)}
+      >
         <SidebarIcon name={collapsed ? 'expand' : 'collapse'} />
       </button>
     </div>
@@ -3098,12 +3359,31 @@ function SettingsTopControls({
   goBack: () => void;
   toggleCollapsed: () => void;
 }) {
+  const suppressBackClickRef = useRef(false);
+  const suppressToggleClickRef = useRef(false);
+
+  const toggleLabel = collapsed ? '展开设置菜单' : '折叠设置菜单';
+
   return (
     <div className="sidebar-top-controls settings-top-controls">
-      <button className="round-icon-button" title="返回对话" type="button" onClick={goBack}>
+      <button
+        aria-label="返回对话"
+        className="round-icon-button"
+        title="返回对话"
+        type="button"
+        onClick={(event) => handleTopControlClickAction(event, goBack, suppressBackClickRef)}
+        onPointerDown={(event) => handleTopControlPointerAction(event, goBack, suppressBackClickRef)}
+      >
         <SidebarIcon name="back" />
       </button>
-      <button className="round-icon-button collapse-sidebar-button" title={collapsed ? '展开设置菜单' : '折叠设置菜单'} type="button" onClick={toggleCollapsed}>
+      <button
+        aria-label={toggleLabel}
+        className="round-icon-button collapse-sidebar-button"
+        title={toggleLabel}
+        type="button"
+        onClick={(event) => handleTopControlClickAction(event, toggleCollapsed, suppressToggleClickRef)}
+        onPointerDown={(event) => handleTopControlPointerAction(event, toggleCollapsed, suppressToggleClickRef)}
+      >
         <SidebarIcon name={collapsed ? 'expand' : 'collapse'} />
       </button>
     </div>
@@ -3177,6 +3457,7 @@ function ChatHome({
   setMessage,
   setSelectedModelName,
   settings,
+  startRightPanelResize,
   updateMemory,
   submit,
   trace,
@@ -3213,6 +3494,7 @@ function ChatHome({
   setMessage: (value: string) => void;
   setSelectedModelName: (value: string) => void;
   settings: SettingsRecord | null;
+  startRightPanelResize: (event: ReactPointerEvent<HTMLDivElement>) => void;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
   submit: (event?: FormEvent) => Promise<void>;
   trace: RunTrace | null;
@@ -3222,19 +3504,30 @@ function ChatHome({
     : chat
       ? [
         { id: chat.user_message_id, conversation_id: chat.conversation_id, role: 'user', content: lastPrompt },
-        { id: chat.assistant_message_id, conversation_id: chat.conversation_id, role: 'assistant', content: chat.response, run_id: chat.run_id },
+        ...(streamingAssistantMessage ? [] : [{ id: chat.assistant_message_id, conversation_id: chat.conversation_id, role: 'assistant' as const, content: chat.response, run_id: chat.run_id }]),
       ]
       : [];
-  const liveRunId = latestActiveRunId(runEventsByRunId);
-  const activeRunId = streamingAssistantMessage?.run_id || chat?.run_id || trace?.id || liveRunId;
+  const candidateRunIds = new Set<string>();
+  for (const message of settledMessages) {
+    const runId = getMessageRunId(message);
+    if (runId) candidateRunIds.add(runId);
+  }
+  const streamingRunId = streamingAssistantMessage ? getMessageRunId(streamingAssistantMessage) : '';
+  if (streamingRunId) candidateRunIds.add(streamingRunId);
+  if (chat?.run_id) candidateRunIds.add(chat.run_id);
+  if (trace?.id) candidateRunIds.add(trace.id);
+  const pendingLiveRunId = (isSubmitting || pendingUserMessage) ? latestActiveRunId(runEventsByRunId) : '';
+  const activeRunId = streamingRunId || chat?.run_id || trace?.id || pendingLiveRunId;
+  if (activeRunId) candidateRunIds.add(activeRunId);
+  const threadRunEventsByRunId = pickRunEvents(runEventsByRunId, candidateRunIds);
   const conversationProjection = useMemo(() => buildConversationRenderItems({
     messages: settledMessages,
     pendingUserMessage,
     streamingAssistant: streamingAssistantMessage,
-    runEventsByRunId,
+    runEventsByRunId: threadRunEventsByRunId,
     activeRunId,
     mode: inputMode,
-  }), [activeRunId, inputMode, pendingUserMessage, runEventsByRunId, settledMessages, streamingAssistantMessage]);
+  }), [activeRunId, inputMode, pendingUserMessage, threadRunEventsByRunId, settledMessages, streamingAssistantMessage]);
   const renderItems = conversationProjection.items;
   const hasThread = renderItems.length > 0;
   const activeTaskBelongsToCurrentRun = Boolean(activeProductTask?.task.latest_run_id && activeProductTask.task.latest_run_id === (chat?.run_id || trace?.id));
@@ -3242,10 +3535,9 @@ function ChatHome({
   const executionActions = useMemo(() => projectRunTraceToActions(trace), [trace]);
   const visibleTraceActions = useMemo(() => visibleExecutionActions(executionActions), [executionActions]);
   const liveExecutionActions = activeExecutionActions.length > 0 ? activeExecutionActions : visibleTraceActions;
-  const showRunDetails = shouldShowInlineRunDetails(chat, trace, latestTask, liveExecutionActions);
-  const hasProjectedTaskEntry = renderItems.some((item) => item.type === 'task_entry' || item.type === 'compact_run_card');
-  const showInlineTaskCard = Boolean(latestTask && showRunDetails && inputMode !== 'background_task' && !hasProjectedTaskEntry);
+  const showInlineTaskCard = false;
   const [manualRightPanelCollapsed, setManualRightPanelCollapsed] = useState(true);
+  const [rightInspectorTab, setRightInspectorTab] = useState<RightInspectorTab>('terminal');
   const [executionTargetOpen, setExecutionTargetOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const modelControlRef = useRef<HTMLDivElement | null>(null);
@@ -3362,7 +3654,11 @@ function ChatHome({
           </button>
         </header>
 
-        <ScrollArea className={hasThread ? 'chat-thread' : 'chat-empty-state'}>
+        <ScrollArea
+          className={hasThread ? 'chat-thread' : 'chat-empty-state'}
+          stickToBottom={hasThread}
+          stickToBottomKey={hasThread ? conversationMessages[0]?.conversation_id || chat?.conversation_id || activeRunId || 'thread' : undefined}
+        >
           {hasThread ? (
             <>
               <MessageList
@@ -3485,30 +3781,31 @@ function ChatHome({
         </form>
       </section>
       {!rightPanelCollapsed && (
-        <ScrollArea
-          as="aside"
-          className="companion-right-panel"
-          contentClassName="companion-right-panel-content"
-          aria-label="Joi 右侧内容"
-        >
-          <>
-            {latestTask ? (
-              <TaskExecutionPanel detail={latestTask} cancelRun={cancelRun} continueProductTask={continueProductTask} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />
-            ) : (
-              <CompanionInsightPanel
-                memories={memories}
-                openLoops={openLoops}
-                proactiveMessages={proactiveMessages}
-                trace={trace}
-                updateMemory={updateMemory}
-                decideProactiveMessage={decideProactiveMessage}
-              />
-            )}
-            <ProactiveQueuePanel messages={proactiveMessages} decide={decideProactiveMessage} />
-            <RecentArtifactsPanel artifacts={artifacts} openArtifact={openArtifact} />
-            <TaskMiniList tasks={productTasks} />
-          </>
-        </ScrollArea>
+        <>
+          <div
+            aria-label="调整右侧栏宽度"
+            className="right-panel-resizer"
+            role="separator"
+            onPointerDown={startRightPanelResize}
+          />
+          <ScrollArea
+            as="aside"
+            className="companion-right-panel"
+            contentClassName="companion-right-panel-content"
+            aria-label="Joi 右侧检查器"
+          >
+            <CompanionInspectorPanel
+              activeTab={rightInspectorTab}
+              decideProactiveMessage={decideProactiveMessage}
+              memories={memories}
+              openLoops={openLoops}
+              proactiveMessages={proactiveMessages}
+              setActiveTab={setRightInspectorTab}
+              trace={trace}
+              updateMemory={updateMemory}
+            />
+          </ScrollArea>
+        </>
       )}
     </section>
   );
@@ -3553,6 +3850,274 @@ function dedupeConversationMessages(messages: ConversationMessage[]) {
   });
 }
 
+function CompanionInspectorPanel({
+  activeTab,
+  decideProactiveMessage,
+  memories,
+  openLoops,
+  proactiveMessages,
+  setActiveTab,
+  trace,
+  updateMemory,
+}: {
+  activeTab: RightInspectorTab;
+  decideProactiveMessage: (id: string, action: string, feedback?: string) => Promise<void>;
+  memories: MemoryRecord[];
+  openLoops: OpenLoop[];
+  proactiveMessages: ProactiveMessage[];
+  setActiveTab: (tab: RightInspectorTab) => void;
+  trace: RunTrace | null;
+  updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
+}) {
+  return (
+    <section className="right-inspector-shell">
+      <header className="right-inspector-header">
+        <div className="right-inspector-tabs" role="tablist" aria-label="右侧栏视图">
+          <button
+            id="right-inspector-tab-terminal"
+            aria-controls="right-inspector-terminal"
+            aria-selected={activeTab === 'terminal'}
+            className={activeTab === 'terminal' ? 'active' : ''}
+            role="tab"
+            type="button"
+            onClick={() => setActiveTab('terminal')}
+          >
+            <span>Terminal</span>
+          </button>
+          <button
+            id="right-inspector-tab-memory"
+            aria-controls="right-inspector-memory"
+            aria-selected={activeTab === 'memory'}
+            className={activeTab === 'memory' ? 'active' : ''}
+            role="tab"
+            type="button"
+            onClick={() => setActiveTab('memory')}
+          >
+            <span>Memory</span>
+          </button>
+        </div>
+        <div className="right-inspector-header-drag-spacer" aria-hidden="true" />
+      </header>
+      {activeTab === 'terminal' ? (
+        <CompanionTerminalPanel />
+      ) : (
+        <CompanionInsightPanel
+          decideProactiveMessage={decideProactiveMessage}
+          memories={memories}
+          openLoops={openLoops}
+          proactiveMessages={proactiveMessages}
+          trace={trace}
+          updateMemory={updateMemory}
+        />
+      )}
+    </section>
+  );
+}
+
+function CompanionTerminalPanel() {
+  return (
+    <div
+      id="right-inspector-terminal"
+      className="right-inspector-tab-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-terminal"
+    >
+      <InteractiveTerminalPanel />
+    </div>
+  );
+}
+
+function readCssVariable(name: string, fallback: string) {
+  if (typeof window === 'undefined') return fallback;
+  const value = window.getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
+function InteractiveTerminalPanel() {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const [session, setSession] = useState<TerminalSessionInfo | null>(null);
+  const [error, setError] = useState('');
+  const shellLabel = session?.shell ? terminalShellLabel(session.shell) : 'ZSH';
+
+  useEffect(() => {
+    const api = window.joi?.terminal;
+    const container = containerRef.current;
+    if (!api || !container) {
+      setSession(null);
+      setError('Terminal requires the Joi desktop app.');
+      return;
+    }
+    const terminalApi = api;
+
+    let disposed = false;
+    setError('');
+    const terminalBackground = readCssVariable('--joi-terminal-background', '#fcf9f8');
+    const terminalForeground = readCssVariable('--joi-terminal-foreground', '#1b1c1c');
+    const terminalCursor = readCssVariable('--joi-terminal-cursor', '#445370');
+    const terminalSelection = readCssVariable('--joi-terminal-selection', 'rgba(68, 71, 77, 0.18)');
+    const terminal = new Terminal({
+      cursorBlink: true,
+      cursorStyle: 'block',
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+      fontSize: 12,
+      lineHeight: 1.24,
+      scrollback: 5000,
+      theme: {
+        background: terminalBackground,
+        foreground: terminalForeground,
+        cursor: terminalCursor,
+        selectionBackground: terminalSelection,
+        black: '#31343a',
+        blue: '#315c9f',
+        cyan: '#286a70',
+        green: '#3d6c40',
+        magenta: '#6f4f8f',
+        red: '#9b3530',
+        white: '#f8fbff',
+        yellow: '#775f24',
+      },
+    });
+    terminalRef.current = terminal;
+    terminal.open(container);
+
+    const syncSize = () => {
+      const size = estimateTerminalSize(container);
+      terminal.resize(size.cols, size.rows);
+      void terminalApi.resize({ id: RIGHT_INSPECTOR_TERMINAL_ID, cols: size.cols, rows: size.rows });
+      return size;
+    };
+    const dataDisposable = terminal.onData((data) => {
+      void terminalApi.input({ id: RIGHT_INSPECTOR_TERMINAL_ID, data });
+    });
+    const unsubscribe = terminalApi.onEvent((event: TerminalSessionEvent) => {
+      if (event.id !== RIGHT_INSPECTOR_TERMINAL_ID) return;
+      if (event.type === 'output' && event.data) {
+        terminal.write(event.data);
+      }
+      if (event.session) {
+        setSession(event.session);
+      }
+      if (event.type === 'error') {
+        setError(event.error || event.session?.error || 'Terminal failed.');
+      }
+    });
+    const resizeObserver = new ResizeObserver(syncSize);
+    resizeObserver.observe(container);
+
+    async function boot() {
+      try {
+        const snapshot = await terminalApi.getStatus(RIGHT_INSPECTOR_TERMINAL_ID);
+        if (disposed) return;
+        if (snapshot.output) {
+          terminal.write(snapshot.output);
+        }
+        if (snapshot.session) {
+          setSession(snapshot.session);
+        }
+        const size = syncSize();
+        if (!snapshot.session || snapshot.session.status === 'exited' || snapshot.session.status === 'failed') {
+          const started = await terminalApi.start({ id: RIGHT_INSPECTOR_TERMINAL_ID, cols: size.cols, rows: size.rows });
+          if (disposed) return;
+          setSession(started);
+          if (started.status === 'failed') {
+            setError(started.error || 'Terminal failed.');
+          }
+        }
+        requestAnimationFrame(() => {
+          if (!disposed) terminal.focus();
+        });
+      } catch (terminalError) {
+        if (!disposed) {
+          const message = safeErrorText(terminalError);
+          setError(message);
+          terminal.writeln(`\r\n${message}`);
+        }
+      }
+    }
+
+    void boot();
+    return () => {
+      disposed = true;
+      unsubscribe();
+      dataDisposable.dispose();
+      resizeObserver.disconnect();
+      terminal.dispose();
+      terminalRef.current = null;
+    };
+  }, []);
+
+  return (
+    <section className="right-panel-section interactive-terminal-panel">
+      <header>
+        <span className="terminal-shell-label">{shellLabel}</span>
+      </header>
+      <div className="interactive-terminal-frame" onMouseDown={() => terminalRef.current?.focus()}>
+        <div ref={containerRef} className="interactive-terminal-surface" />
+      </div>
+      {error && <p className="terminal-error">{error}</p>}
+    </section>
+  );
+}
+
+function TerminalRunPanel({
+  actions,
+  openTrace,
+  trace,
+}: {
+  actions: ExecutionAction[];
+  openTrace: () => void;
+  trace: RunTrace | null;
+}) {
+  const visibleActions = visibleExecutionActions(actions);
+  const events = sortBySeq(normalizeTraceEvents(trace)).slice(-8);
+  const latestModelCall = trace?.model_calls?.[0];
+  return (
+    <section className="right-panel-section terminal-run-panel">
+      <header>
+        <small>Terminal</small>
+        <h2>{trace ? '最近运行' : '等待运行'}</h2>
+      </header>
+      <dl className="terminal-summary-grid">
+        <KV label="状态" value={trace ? formatStatus(trace.status) : '空闲'} />
+        <KV label="动作" value={`${visibleActions.length} 个`} />
+        <KV label="事件" value={`${events.length} 条`} />
+        <KV label="模型" value={latestModelCall?.model_name || '无'} />
+      </dl>
+      {visibleActions.length > 0 ? (
+        <ExecutionActionFlow actions={visibleActions} mode="detail" runStatus={trace?.status ?? 'completed'} />
+      ) : (
+        <p className="empty">当前没有可见执行动作。</p>
+      )}
+      <TerminalEventStream events={events} />
+      <button className="trace-link-button terminal-trace-button" type="button" onClick={openTrace}>打开完整执行过程</button>
+    </section>
+  );
+}
+
+function TerminalEventStream({ events }: { events: NormalizedRunEvent[] }) {
+  if (events.length === 0) return null;
+  return (
+    <section className="terminal-event-stream" aria-label="Terminal event stream">
+      <h3>Event Stream</h3>
+      <ol>
+        {events.map((event) => (
+          <li key={event.id}>
+            <span className={`status-dot ${event.status === 'running' ? 'running' : event.status === 'failed' ? 'failed' : 'done'}`} />
+            <div>
+              <strong>{event.type}</strong>
+              <small>
+                #{event.seq || '-'} · {formatStatus(event.status || 'completed')}
+                {event.title || event.summary || event.error ? ` · ${[event.title, event.summary, event.error].filter(Boolean).join(' · ')}` : ''}
+              </small>
+            </div>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 function CompanionInsightPanel({
   decideProactiveMessage,
   memories,
@@ -3579,10 +4144,15 @@ function CompanionInsightPanel({
   }
 
   return (
-    <section className="right-panel-section">
+    <section
+      id="right-inspector-memory"
+      className="right-panel-section memory-inspector-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-memory"
+    >
       <header>
-        <small>Joi 对你的理解</small>
-        <h2>最近记住</h2>
+        <small>Memory</small>
+        <h2>记忆</h2>
       </header>
       <h3>本次使用了这些记忆</h3>
       <InsightList empty="本轮没有召回 confirmed memory。">
@@ -3753,16 +4323,30 @@ function RecentArtifactsPanel({ artifacts, openArtifact }: { artifacts: Artifact
   );
 }
 
-function TaskMiniList({ tasks }: { tasks: ProductTask[] }) {
-  const active = tasks.filter((task) => ['planning', 'running', 'waiting_confirmation', 'paused', 'verifying', 'blocked'].includes(task.status)).slice(0, 3);
-  if (active.length === 0) return null;
+function TaskMiniList({
+  continueProductTask,
+  selectProductTask,
+  tasks,
+}: {
+  continueProductTask: (task: ProductTask) => Promise<void>;
+  selectProductTask: (id: string) => Promise<void>;
+  tasks: ProductTask[];
+}) {
+  const visible = visibleRecentTasksForHandoff(tasks);
+  if (visible.length === 0) return null;
   return (
     <section className="right-panel-section compact-section">
-      <h3>进行中的任务</h3>
-      {active.map((task) => (
+      <h3>最近任务</h3>
+      {visible.map((task) => (
         <div key={task.id} className="task-mini-row">
-          <strong>{task.title}</strong>
-          <small>{formatStatus(task.status)} · {task.progress_percent}%</small>
+          <button className="task-mini-title" type="button" onClick={() => void selectProductTask(task.id)}>
+            <strong>{task.title}</strong>
+            <small>{formatStatus(task.status)} · {task.progress_percent}% · {formatChannelLabel(task.source_channel)}</small>
+          </button>
+          <div className="task-mini-actions">
+            <button className="trace-link-button" type="button" onClick={() => void selectProductTask(task.id)}>打开</button>
+            <button type="button" onClick={() => void continueProductTask(task)}>继续</button>
+          </div>
         </div>
       ))}
     </section>
@@ -4616,6 +5200,132 @@ function SystemPanel({ health }: { health: SystemHealth | null }) {
   );
 }
 
+function ClosureReportPanel({
+  continueProductTaskByID,
+  externalHandoffAudit,
+  report,
+}: {
+  continueProductTaskByID: (id: string) => Promise<void>;
+  externalHandoffAudit: ExternalHandoffAudit | null;
+  report: RunClosureReport | null;
+}) {
+  const metrics = report?.metrics ?? {
+    total_runs: 0,
+    terminal_event_runs: 0,
+    execution_runs: 0,
+    execution_runs_with_task_or_refusal: 0,
+    completed_tasks: 0,
+    completed_tasks_with_evidence: 0,
+    runs_with_tool_evidence: 0,
+    runs_with_memory_events: 0,
+    runs_with_proactive_events: 0,
+    runs_with_handoff_events: 0,
+    recoverable_runs: 0,
+  };
+  const items = report?.items ?? [];
+  const handoffStatus = externalHandoffAudit?.status || 'unknown';
+  const handoffReadiness = externalHandoffAudit?.readiness;
+  const pendingExternalHandoffs = externalHandoffAudit?.pending_external_handoffs ?? [];
+
+  return (
+    <section className="settings-data-panel closure-report-panel">
+      <h3>最近运行闭环报告</h3>
+      <article className="row-card compact closure-run-card">
+        <strong>外部入口 Handoff</strong>
+        <small>
+          状态：{formatExternalHandoffStatus(handoffStatus)}
+          {handoffReadiness?.checked ? ` · 连接：${handoffReadiness.ok ? 'ready' : 'not ready'}` : ''}
+        </small>
+        <div className="closure-report-signals">
+          <span>外部运行：{externalHandoffAudit?.metrics.external_runs ?? 0}</span>
+          <span>Desktop 运行：{externalHandoffAudit?.metrics.desktop_runs ?? 0}</span>
+          <span>已链接任务：{externalHandoffAudit?.metrics.linked_external_desktop_tasks ?? 0}</span>
+          <span>入口：{externalHandoffAudit?.external_channels_seen.length ? externalHandoffAudit.external_channels_seen.join(', ') : '暂无'}</span>
+        </div>
+        {pendingExternalHandoffs.length ? (
+          <div className="closure-report-signals">
+            {pendingExternalHandoffs.slice(0, 3).map((handoff) => (
+              <span className="closure-report-action-signal" key={handoff.external_run_id}>
+                <span>
+                  待接续：{formatChannelLabel(handoff.external_channel)} · {compactIdentifier(handoff.product_task_id)}
+                  {handoff.latest_task_status ? ` · ${formatStatus(handoff.latest_task_status)}` : ''}
+                </span>
+                <button type="button" onClick={() => void continueProductTaskByID(handoff.product_task_id)}>继续</button>
+              </span>
+            ))}
+            {pendingExternalHandoffs.length > 3 ? <span>另 {pendingExternalHandoffs.length - 3} 条待接续</span> : null}
+          </div>
+        ) : null}
+        {externalHandoffAudit?.next_action ? <p>{externalHandoffAudit.next_action}</p> : null}
+        {handoffReadiness?.checked ? (
+          <div className="closure-report-signals">
+            {Object.entries(handoffReadiness.credentials).map(([name, credential]) => (
+              <span key={name}>{name}：{credential.present ? credential.source : 'missing'}</span>
+            ))}
+            {Object.entries(handoffReadiness.checks).map(([name, check]) => (
+              <span key={name}>{name}：{check.ok ? 'passed' : check.status}</span>
+            ))}
+            {Object.entries(handoffReadiness.services).map(([name, service]) => (
+              <span key={`service-${name}`}>{service.label || name}：{formatExternalServiceStatus(service)}</span>
+            ))}
+          </div>
+        ) : null}
+      </article>
+      <dl className="metrics closure-report-metrics">
+        <KV label="最近运行" value={`${metrics.total_runs} 条`} />
+        <KV label="终态事件" value={`${metrics.terminal_event_runs} 条`} />
+        <KV label="任务覆盖" value={`${metrics.execution_runs_with_task_or_refusal}/${metrics.execution_runs}`} />
+        <KV label="任务证据" value={`${metrics.completed_tasks_with_evidence}/${metrics.completed_tasks}`} />
+        <KV label="工具证据" value={`${metrics.runs_with_tool_evidence} 条`} />
+        <KV label="记忆使用" value={`${metrics.runs_with_memory_events} 条`} />
+        <KV label="主动闭环" value={`${metrics.runs_with_proactive_events} 条`} />
+        <KV label="Handoff" value={`${metrics.runs_with_handoff_events} 条`} />
+        <KV label="需恢复" value={`${metrics.recoverable_runs} 条`} />
+      </dl>
+      <RecordList
+        emptyText="暂无运行闭环报告。"
+        items={items.slice(0, 12)}
+        renderItem={(item) => {
+          const terminalLabel = item.terminal_event_present
+            ? (item.terminal_event_type || item.terminal_status || '已记录')
+            : '缺失';
+          const updatedAt = formatShortTime(item.updated_at || item.created_at) || '未知时间';
+          return (
+            <article key={item.run_id} className="row-card compact closure-run-card">
+              <strong>{compactIdentifier(item.run_id) || '未知运行'}</strong>
+              <small>
+                状态：{formatStatus(item.status)}
+                {item.terminal_status ? ` · 终态：${formatStatus(item.terminal_status)}` : ''}
+                {item.task_id ? ` · 任务：${compactIdentifier(item.task_id)}` : ''}
+              </small>
+              <div className="closure-report-signals">
+                <span>终态事件：{terminalLabel}</span>
+                <span>任务证据：{item.has_task_evidence ? '有' : '无'}</span>
+                <span>工具：{item.tool_run_count} 次</span>
+                <span>终态工具：{item.terminal_tool_event_count}</span>
+                <span>记忆：{item.memory_event_count}</span>
+                <span>主动：{item.proactive_event_count}</span>
+                <span>Handoff：{item.handoff_event_count}</span>
+                <span>恢复：{item.recovery_required ? '需要' : '无需'}</span>
+              </div>
+              {item.task_status || item.terminal_reason ? (
+                <small>
+                  {item.task_status ? `任务状态：${formatStatus(item.task_status)}` : ''}
+                  {item.task_status && item.terminal_reason ? ' · ' : ''}
+                  {item.terminal_reason ? `原因：${item.terminal_reason}` : ''}
+                </small>
+              ) : null}
+              {item.task_evidence_summary ? <p>{item.task_evidence_summary}</p> : null}
+              <small>更新：{updatedAt}</small>
+            </article>
+          );
+        }}
+      />
+      <CollapsedData label="闭环报告 JSON" value={report ?? {}} />
+    </section>
+  );
+}
+
 function MemoryPanel({
   memories,
   memoryQuery,
@@ -4932,7 +5642,7 @@ function SettingsPanel({
     <section className="panel wide">
       <h2>常规设置</h2>
       <dl className="metrics">
-        <KV label="版本" value={settings?.version ?? '0.1.0-rc0'} />
+        <KV label="版本" value={settings?.version ?? '0.1.1'} />
         <KV label="应用模式" value={formatAppMode(settings?.app_mode)} />
         <KV label="数据存储" value={settings?.data_store ?? 'sqlite'} />
         <KV label="任务队列" value={settings?.task_queue ?? 'sqlite'} />
@@ -5222,6 +5932,26 @@ function formatAppMode(mode?: string) {
   return labels[mode ?? ''] ?? (mode || '未设置');
 }
 
+function estimateTerminalSize(element: HTMLElement): { cols: number; rows: number } {
+  const rect = element.getBoundingClientRect();
+  const cols = Math.floor(Math.max(320, rect.width) / TERMINAL_APPROX_CHAR_WIDTH);
+  const rows = Math.floor(Math.max(180, rect.height) / TERMINAL_APPROX_ROW_HEIGHT);
+  return {
+    cols: Math.max(40, Math.min(160, cols)),
+    rows: Math.max(10, Math.min(48, rows)),
+  };
+}
+
+function terminalShellLabel(shell: string) {
+  const parts = shell.split('/').filter(Boolean);
+  const label = parts[parts.length - 1] || 'zsh';
+  return label.toUpperCase();
+}
+
+function safeErrorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error || 'Unknown error');
+}
+
 function formatStatus(status: string) {
   const labels: Record<string, string> = {
     succeeded: '成功',
@@ -5247,6 +5977,43 @@ function formatStatus(status: string) {
     unknown: '未知',
   };
   return labels[status] ?? status;
+}
+
+function formatChannelLabel(channel?: string) {
+  const labels: Record<string, string> = {
+    desktop: 'Desktop',
+    telegram: 'Telegram',
+    imessage: 'iMessage',
+  };
+  return labels[channel ?? ''] ?? (channel || '未知入口');
+}
+
+function formatExternalHandoffStatus(status: string) {
+  const labels: Record<string, string> = {
+    sqlite_missing: '数据库缺失',
+    schema_missing: 'Schema 缺失',
+    external_not_ready: '外部入口未就绪',
+    awaiting_external_input: '等待外部消息',
+    awaiting_desktop_continuation: '等待 Desktop 继续',
+    live_handoff_linked: '已链接',
+    unknown: '未知',
+  };
+  return labels[status] ?? status;
+}
+
+function formatExternalServiceStatus(service: ExternalHandoffAudit['readiness']['services'][string]) {
+  if (service.ready) return 'ready';
+  if (!service.enabled) return 'disabled';
+  if (!service.configured) return 'not configured';
+  if (!service.running) return 'not running';
+  if (service.last_error) return `failed: ${compactInlineText(service.last_error, 80)}`;
+  return 'not ready';
+}
+
+function compactInlineText(value: string, maxLength: number) {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (compact.length <= maxLength) return compact;
+  return `${compact.slice(0, maxLength - 3)}...`;
 }
 
 function formatStepType(type: string) {

@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS skill_runs (
 
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
+  principal_id TEXT,
   channel TEXT NOT NULL,
   user_id TEXT NOT NULL DEFAULT 'default_user',
   title TEXT,
@@ -213,11 +214,23 @@ CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
   conversation_id TEXT REFERENCES conversations(id),
   user_message_id TEXT REFERENCES messages(id),
+  principal_id TEXT,
+  entry_channel TEXT NOT NULL DEFAULT 'desktop',
+  requested_mode TEXT NOT NULL DEFAULT 'auto',
+  resolved_mode TEXT NOT NULL DEFAULT 'chat_assist',
+  mode_source TEXT NOT NULL DEFAULT 'automatic',
   status TEXT NOT NULL DEFAULT 'pending',
+  terminal_status TEXT,
+  terminal_reason TEXT,
   selected_agent_id TEXT REFERENCES agents(id),
   selected_model_id TEXT REFERENCES models(id),
   selected_node_id TEXT,
   route_result TEXT NOT NULL DEFAULT '{}',
+  resume_token TEXT,
+  parent_run_id TEXT,
+  redirected_from_run_id TEXT,
+  cancel_requested_at TEXT,
+  resumed_at TEXT,
   started_at TEXT NOT NULL DEFAULT (datetime('now')),
   finished_at TEXT,
   duration_ms INTEGER,
@@ -247,10 +260,15 @@ CREATE TABLE IF NOT EXISTS turns (
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   turn_index INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'running',
+  mode_resolution_id TEXT,
+  user_intent_summary TEXT,
+  assistant_message_id TEXT,
+  stream_status TEXT NOT NULL DEFAULT 'created',
   active_model_call_id TEXT,
   cancellation_key TEXT,
   started_at TEXT NOT NULL DEFAULT (datetime('now')),
   finished_at TEXT,
+  completed_at TEXT,
   metadata TEXT NOT NULL DEFAULT '{}',
   UNIQUE(run_id, turn_index)
 );
@@ -279,9 +297,21 @@ CREATE TABLE IF NOT EXISTS run_events (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+  schema_version INTEGER NOT NULL DEFAULT 1,
+  conversation_id TEXT,
   seq INTEGER NOT NULL,
   event_type TEXT NOT NULL,
+  item_type TEXT,
+  item_id TEXT,
+  parent_item_id TEXT,
+  phase TEXT,
+  visibility TEXT,
+  source TEXT,
+  terminal INTEGER NOT NULL DEFAULT 0,
   payload TEXT NOT NULL DEFAULT '{}',
+  payload_json TEXT,
+  error_json TEXT,
+  usage_json TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(run_id, seq)
 );
@@ -354,9 +384,15 @@ CREATE TABLE IF NOT EXISTS model_calls (
   cost_estimate REAL,
   latency_ms INTEGER,
   status TEXT NOT NULL DEFAULT 'pending',
+  streaming_enabled INTEGER NOT NULL DEFAULT 0,
+  first_delta_at TEXT,
+  completed_at TEXT,
+  finish_reason TEXT,
+  usage_status TEXT NOT NULL DEFAULT 'provider_missing',
   error_code TEXT,
   error_message TEXT,
   raw_response TEXT NOT NULL DEFAULT '{}',
+  raw_finish_json TEXT NOT NULL DEFAULT '{}',
   metadata TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -449,26 +485,38 @@ CREATE TABLE IF NOT EXISTS worker_gateway_audit_logs (
 CREATE TABLE IF NOT EXISTS tool_runs (
   id TEXT PRIMARY KEY,
   run_id TEXT REFERENCES runs(id),
+  turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
   task_id TEXT REFERENCES tasks(id),
+  tool_call_id TEXT,
   capability_id TEXT REFERENCES capabilities(id),
   workflow_name TEXT,
   tool_id TEXT REFERENCES tools(id),
   tool_name TEXT NOT NULL,
+  purpose TEXT NOT NULL DEFAULT '',
+  approval_request_id TEXT,
   node_id TEXT REFERENCES nodes(id),
   assignment_reason TEXT,
   risk_level TEXT NOT NULL DEFAULT 'read_only',
+  side_effect_level TEXT NOT NULL DEFAULT 'none',
+  idempotency_key TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   input TEXT NOT NULL DEFAULT '{}',
   output TEXT NOT NULL DEFAULT '{}',
+  output_summary TEXT,
+  artifact_id TEXT REFERENCES artifacts(id),
   error TEXT,
+  error_code TEXT,
+  error_message TEXT,
   started_at TEXT NOT NULL DEFAULT (datetime('now')),
   finished_at TEXT,
+  completed_at TEXT,
   duration_ms INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS product_tasks (
   id TEXT PRIMARY KEY,
+  principal_id TEXT,
   title TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'planning',
@@ -483,6 +531,15 @@ CREATE TABLE IF NOT EXISTS product_tasks (
   progress_percent INTEGER NOT NULL DEFAULT 0,
   current_step_id TEXT,
   summary TEXT NOT NULL DEFAULT '',
+  source_conversation_id TEXT,
+  source_run_id TEXT,
+  source_turn_id TEXT,
+  mode_resolution_id TEXT,
+  terminal_status TEXT,
+  terminal_reason TEXT,
+  evidence_summary TEXT,
+  verification_status TEXT NOT NULL DEFAULT 'pending',
+  last_projected_at TEXT,
   metadata TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -583,6 +640,77 @@ CREATE TABLE IF NOT EXISTS proactive_feedback (
   action TEXT NOT NULL,
   feedback TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS principals (
+  id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS channel_identities (
+  id TEXT PRIMARY KEY,
+  principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+  channel TEXT NOT NULL,
+  external_user_id TEXT NOT NULL,
+  external_thread_id TEXT NOT NULL DEFAULT '',
+  display_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'linked',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(channel, external_user_id, external_thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_entry_links (
+  id TEXT PRIMARY KEY,
+  principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+  channel_identity_id TEXT NOT NULL REFERENCES channel_identities(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  channel TEXT NOT NULL,
+  external_thread_id TEXT NOT NULL DEFAULT '',
+  external_message_id TEXT NOT NULL DEFAULT '',
+  selection_reason TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(channel_identity_id, conversation_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_entry_links (
+  id TEXT PRIMARY KEY,
+  principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+  channel_identity_id TEXT NOT NULL REFERENCES channel_identities(id) ON DELETE CASCADE,
+  product_task_id TEXT NOT NULL REFERENCES product_tasks(id) ON DELETE CASCADE,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  external_task_ref TEXT NOT NULL DEFAULT '',
+  selection_reason TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(channel_identity_id, product_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+  id TEXT PRIMARY KEY,
+  principal_id TEXT REFERENCES principals(id) ON DELETE SET NULL,
+  channel_identity_id TEXT REFERENCES channel_identities(id) ON DELETE SET NULL,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  product_task_id TEXT REFERENCES product_tasks(id) ON DELETE SET NULL,
+  open_loop_id TEXT REFERENCES open_loops(id) ON DELETE SET NULL,
+  proactive_message_id TEXT REFERENCES proactive_messages(id) ON DELETE SET NULL,
+  channel TEXT NOT NULL DEFAULT 'desktop',
+  status TEXT NOT NULL DEFAULT 'pending',
+  deep_link_target TEXT NOT NULL DEFAULT '',
+  external_delivery_id TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  sent_at TEXT,
+  opened_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS memories (
@@ -701,6 +829,9 @@ CREATE INDEX IF NOT EXISTS idx_turns_run_id ON turns(run_id, turn_index);
 CREATE INDEX IF NOT EXISTS idx_turn_items_run_id ON turn_items(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_turn_items_call_id ON turn_items(call_id);
 CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_run_events_conversation_created ON run_events(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_run_events_type ON run_events(run_id, event_type);
+CREATE INDEX IF NOT EXISTS idx_run_events_item ON run_events(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_confirmation_requests_call_id ON confirmation_requests(call_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_lifecycle ON conversations(lifecycle_status, pinned DESC, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_group ON conversations(group_id, lifecycle_status, updated_at DESC);
@@ -747,6 +878,11 @@ CREATE INDEX IF NOT EXISTS idx_memory_usage_run_id ON memory_usage_logs(run_id);
 CREATE INDEX IF NOT EXISTS idx_memory_usage_memory_id ON memory_usage_logs(memory_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_feedback_memory_id ON memory_feedback(memory_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_confirmation_requests_status ON confirmation_requests(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_principals_status ON principals(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_channel_identities_principal ON channel_identities(principal_id, channel);
+CREATE INDEX IF NOT EXISTS idx_conversation_entry_links_conversation ON conversation_entry_links(conversation_id, channel);
+CREATE INDEX IF NOT EXISTS idx_task_entry_links_task ON task_entry_links(product_task_id, principal_id);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_target ON notification_deliveries(conversation_id, product_task_id, status);
 
 INSERT INTO schema_migrations (version) VALUES ('001_init_schema')
 ON CONFLICT(version) DO NOTHING;

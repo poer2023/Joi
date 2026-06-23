@@ -2,12 +2,15 @@ export type ChatRequest = {
   conversation_id?: string;
   channel?: string;
   user_id?: string;
+  principal_id?: string;
   message: string;
   preferred_node?: string;
   allow_worker?: boolean;
   model_name?: string;
   input_mode?: InputMode;
   product_task_id?: string;
+  parent_run_id?: string;
+  redirected_from_run_id?: string;
   runtime_mode?: RuntimeMode;
   permission_profile?: PermissionProfile;
 };
@@ -69,6 +72,166 @@ export type InterruptRunRequest = {
   scope?: 'run' | 'task';
 };
 
+export type RedirectRunRequest = {
+  run_id: string;
+  message?: string;
+  reason?: string;
+  requested_mode?: InputMode;
+  product_task_id?: string;
+};
+
+export type RedirectRunResponse = {
+  redirected_run: RunTrace;
+  new_run?: ChatResponse;
+};
+
+export type ApprovalDecisionRequest = {
+  run_id: string;
+  approval_request_id: string;
+  decision: 'approve' | 'approved' | 'deny' | 'denied' | 'reject' | 'rejected' | string;
+  decided_by: string;
+  decided_at?: string;
+  reason?: string;
+  edited_parameters?: Record<string, unknown>;
+};
+
+export type ApprovalDecisionResponse = {
+  confirmation?: ConfirmationRecord;
+};
+
+export type ApprovalResumeRunRequest = {
+  run_id: string;
+  approval_request_id: string;
+};
+
+export type ApprovalResumeRunResponse = {
+  resumed: boolean;
+  trace?: RunTrace;
+};
+
+export type RecoverableRunRecord = {
+  run_id: string;
+  conversation_id?: string;
+  status: string;
+  recovery_status: 'needs_user_decision' | 'runtime_lost' | 'recoverable' | string;
+  reason: string;
+  latest_event?: RunEvent;
+  trace?: RunTrace;
+};
+
+export type RunClosureReportItem = {
+  run_id: string;
+  conversation_id?: string;
+  status: string;
+  terminal_status?: string;
+  terminal_reason?: string;
+  terminal_event_present: boolean;
+  terminal_event_type?: string;
+  task_id?: string;
+  task_status?: string;
+  task_evidence_summary?: string;
+  has_task_evidence: boolean;
+  tool_run_count: number;
+  terminal_tool_event_count: number;
+  memory_event_count: number;
+  proactive_event_count: number;
+  handoff_event_count: number;
+  recovery_required: boolean;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type RunClosureReport = {
+  items: RunClosureReportItem[];
+  metrics: {
+    total_runs: number;
+    terminal_event_runs: number;
+    execution_runs: number;
+    execution_runs_with_task_or_refusal: number;
+    completed_tasks: number;
+    completed_tasks_with_evidence: number;
+    runs_with_tool_evidence: number;
+    runs_with_memory_events: number;
+    runs_with_proactive_events: number;
+    runs_with_handoff_events: number;
+    recoverable_runs: number;
+  };
+};
+
+export type ExternalHandoffLink = {
+  external_channel: string;
+  external_run_id: string;
+  desktop_run_id: string;
+  product_task_id: string;
+  principal_id?: string;
+  conversation_id?: string;
+  external_status?: string;
+  desktop_status?: string;
+  external_created_at?: string;
+  desktop_created_at?: string;
+};
+
+export type PendingExternalHandoff = {
+  external_channel: string;
+  external_run_id: string;
+  product_task_id: string;
+  principal_id?: string;
+  conversation_id?: string;
+  external_status?: string;
+  external_created_at?: string;
+  latest_task_status?: string;
+  latest_task_title?: string;
+};
+
+export type ExternalHandoffServiceStatus = {
+  enabled: boolean;
+  configured: boolean;
+  running: boolean;
+  ready: boolean;
+  label?: string;
+  last_poll_at?: string;
+  last_event_at?: string;
+  last_update_id?: number;
+  last_error?: string;
+  details?: Record<string, string | number | boolean | null>;
+};
+
+export type ExternalHandoffReadiness = {
+  checked: boolean;
+  ok: boolean;
+  credentials: Record<string, { present: boolean; source: string }>;
+  checks: Record<string, ConnectionTest>;
+  services: Record<string, ExternalHandoffServiceStatus>;
+  missing?: string[];
+  failed_checks?: string[];
+  failed_services?: string[];
+  error?: string;
+};
+
+export type ExternalHandoffAudit = {
+  ok: boolean;
+  schema_current: boolean;
+  missing_schema: string[];
+  external_channels_seen: string[];
+  linked_live_handoffs: ExternalHandoffLink[];
+  pending_external_handoffs: PendingExternalHandoff[];
+  metrics: {
+    external_runs: number;
+    desktop_runs: number;
+    linked_external_desktop_tasks: number;
+  };
+  readiness: ExternalHandoffReadiness;
+  status: 'sqlite_missing' | 'schema_missing' | 'external_not_ready' | 'awaiting_external_input' | 'awaiting_desktop_continuation' | 'live_handoff_linked' | 'unknown';
+  next_action: string;
+  error?: string;
+};
+
+export type RecordNotificationOpenedRequest = {
+  id: string;
+  actor?: string;
+  external_delivery_id?: string;
+};
+
 export type ModelCall = {
   id: string;
   provider: string;
@@ -90,6 +253,15 @@ export type RunTrace = {
   id: string;
   conversation_id?: string;
   user_message_id?: string;
+  principal_id?: string;
+  entry_channel?: string;
+  requested_mode?: string;
+  resolved_mode?: string;
+  mode_source?: string;
+  terminal_status?: string;
+  terminal_reason?: string;
+  parent_run_id?: string;
+  redirected_from_run_id?: string;
   status: string;
   selected_agent_id: string;
   route_result?: Record<string, unknown>;
@@ -118,17 +290,25 @@ export type RunEvent = {
   id: string;
   run_id: string;
   turn_id?: string;
+  schema_version?: number;
+  conversation_id?: string;
   seq: number;
   event_type: string;
   type?: string;
   item_id?: string;
   item_type?: string;
+  parent_item_id?: string;
   status?: string;
+  phase?: string;
+  visibility?: string;
+  source?: string;
+  terminal?: boolean;
   title?: string;
   summary?: string;
   payload?: Record<string, unknown>;
   snapshot?: Record<string, unknown>;
   delta?: Record<string, unknown> | string;
+  usage?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   error?: string;
   created_at?: string;
@@ -136,6 +316,7 @@ export type RunEvent = {
 
 export type ConversationSummary = {
   id: string;
+  principal_id?: string;
   channel: string;
   user_id: string;
   title: string;
@@ -389,8 +570,40 @@ export type MemorySearchResult = {
   reason: string;
 };
 
+export type MemoryCandidateFilter = {
+  status?: string;
+  limit?: number;
+};
+
+export type MemoryCandidateDecisionRequest = {
+  id: string;
+  decision: 'confirm' | 'correct' | 'reject' | 'delete' | string;
+  run_id?: string;
+  comment?: string;
+  reason?: string;
+  content?: string;
+  summary?: string;
+};
+
+export type MemoryCorrectionRequest = {
+  id: string;
+  content: string;
+  summary?: string;
+  run_id?: string;
+  comment?: string;
+  reason?: string;
+};
+
+export type MemoryDeleteRequest = {
+  id: string;
+  run_id?: string;
+  reason?: string;
+  comment?: string;
+};
+
 export type ProductTask = {
   id: string;
+  principal_id?: string;
   title: string;
   description: string;
   status: string;
@@ -405,6 +618,15 @@ export type ProductTask = {
   progress_percent: number;
   current_step_id?: string;
   summary?: string;
+  source_conversation_id?: string;
+  source_run_id?: string;
+  source_turn_id?: string;
+  mode_resolution_id?: string;
+  terminal_status?: string;
+  terminal_reason?: string;
+  evidence_summary?: string;
+  verification_status?: string;
+  last_projected_at?: string;
   metadata?: Record<string, unknown>;
   task_contract?: TaskContract;
   verification?: TaskVerification;
@@ -439,6 +661,29 @@ export type ProductTaskDetail = {
   task: ProductTask;
   steps: ProductTaskStep[];
   deliverables: ArtifactSummary[];
+};
+
+export type ProductTaskFilter = {
+  status?: string;
+  limit?: number;
+  conversation_id?: string;
+  principal_id?: string;
+  channel?: string;
+};
+
+export type ProductTaskCloseRequest = {
+  id: string;
+  outcome?: 'completed' | 'completed_with_limitations' | 'blocked' | 'failed' | 'cancelled' | string;
+  reason?: string;
+  actor?: string;
+  run_id?: string;
+};
+
+export type ProductTaskReopenRequest = {
+  id: string;
+  reason?: string;
+  actor?: string;
+  run_id?: string;
 };
 
 export type ArtifactSummary = {
@@ -708,6 +953,70 @@ export type PhotonIMessageStatus = {
   last_error?: string;
 };
 
+export type TelegramInboundStatus = {
+  enabled: boolean;
+  configured: boolean;
+  polling: boolean;
+  allowed_user_ids_configured: boolean;
+  active_runs: number;
+  last_poll_at?: string;
+  last_update_id?: number;
+  last_error?: string;
+};
+
+export type TerminalSessionStatus = 'starting' | 'running' | 'exited' | 'failed';
+
+export type TerminalSessionInfo = {
+  id: string;
+  shell: string;
+  cwd: string;
+  status: TerminalSessionStatus;
+  pid?: number;
+  cols: number;
+  rows: number;
+  started_at?: string;
+  exited_at?: string;
+  exit_code?: number;
+  signal?: number;
+  error?: string;
+};
+
+export type TerminalSessionSnapshot = {
+  session?: TerminalSessionInfo;
+  output: string;
+};
+
+export type TerminalSessionStartRequest = {
+  id?: string;
+  shell?: string;
+  cwd?: string;
+  cols?: number;
+  rows?: number;
+};
+
+export type TerminalSessionInputRequest = {
+  id: string;
+  data: string;
+};
+
+export type TerminalSessionResizeRequest = {
+  id: string;
+  cols: number;
+  rows: number;
+};
+
+export type TerminalSessionKillRequest = {
+  id: string;
+};
+
+export type TerminalSessionEvent = {
+  id: string;
+  type: 'output' | 'status' | 'exit' | 'error';
+  data?: string;
+  session?: TerminalSessionInfo;
+  error?: string;
+};
+
 export type ModelListRequest = {
   provider?: string;
   base_url?: string;
@@ -737,13 +1046,26 @@ export type DesktopBindings = {
   GetSystemHealth(): Promise<SystemHealth>;
   ListMemories(filter: { query?: string; limit?: number }): Promise<{ memories: MemoryRecord[] }>;
   UpdateMemory(req: { id: string; action: string; feedback?: string; comment?: string; target_id?: string; reason?: string; content?: string; summary?: string; scope_type?: string; run_id?: string }): Promise<void>;
-  ListProductTasks(filter: { status?: string; limit?: number }): Promise<{ tasks: ProductTask[] }>;
+  ListMemoriesUsedForRun(runID: string): Promise<{ memories: MemorySearchResult[] }>;
+  ListMemoryCandidates(filter: MemoryCandidateFilter): Promise<{ memories: MemoryRecord[] }>;
+  DecideMemoryCandidate(req: MemoryCandidateDecisionRequest): Promise<void>;
+  CorrectMemory(req: MemoryCorrectionRequest): Promise<void>;
+  DeleteMemory(req: MemoryDeleteRequest): Promise<void>;
+  ListUserStates(filter?: { limit?: number }): Promise<{ memories: MemoryRecord[] }>;
+  ListRelationshipStates(filter?: { limit?: number }): Promise<{ memories: MemoryRecord[] }>;
+  ListProductTasks(filter: ProductTaskFilter): Promise<{ tasks: ProductTask[] }>;
+  ListProductTasksByConversation(conversationID: string): Promise<{ tasks: ProductTask[] }>;
+  ListProductTasksByPrincipal(principalID: string): Promise<{ tasks: ProductTask[] }>;
   GetProductTask(id: string): Promise<ProductTaskDetail>;
+  CloseProductTask(req: ProductTaskCloseRequest): Promise<ProductTaskDetail>;
+  ReopenProductTask(req: ProductTaskReopenRequest): Promise<ProductTaskDetail>;
   ListArtifacts(filter: { product_task_id?: string; type?: string; limit?: number }): Promise<{ artifacts: ArtifactSummary[] }>;
   GetArtifact(id: string): Promise<ArtifactDetail>;
   ListOpenLoops(filter: { status?: string; limit?: number }): Promise<{ open_loops: OpenLoop[] }>;
+  DecideOpenLoop(req: { id: string; action: string; feedback?: string; due_at?: string }): Promise<void>;
   ListProactiveMessages(filter: { status?: string; limit?: number }): Promise<{ messages: ProactiveMessage[] }>;
   DecideProactiveMessage(req: { id: string; action: string; feedback?: string }): Promise<void>;
+  RecordNotificationOpened(req: RecordNotificationOpenedRequest): Promise<void>;
   ListNodes(): Promise<{ nodes: NodeRecord[] }>;
   DisableNode(nodeID: string): Promise<void>;
   EnableNode(nodeID: string): Promise<void>;
@@ -751,7 +1073,14 @@ export type DesktopBindings = {
   GetModelUsage(): Promise<{ items: Record<string, unknown>[] }>;
   ListConfirmations(): Promise<{ items: ConfirmationRecord[] }>;
   DecideConfirmation(req: { id: string; approve: boolean; actor?: string; reason?: string }): Promise<void>;
+  ListPendingApprovals(): Promise<{ items: ConfirmationRecord[] }>;
+  DecideApproval(req: ApprovalDecisionRequest): Promise<ApprovalDecisionResponse>;
+  ResumeApprovalRun(req: ApprovalResumeRunRequest): Promise<ApprovalResumeRunResponse>;
   InterruptRun(req: InterruptRunRequest): Promise<void>;
+  RedirectRun(req: RedirectRunRequest): Promise<RedirectRunResponse>;
+  ListRecoverableRuns(req?: { limit?: number }): Promise<{ runs: RecoverableRunRecord[] }>;
+  GetRecentRunClosureReport(req?: { limit?: number }): Promise<RunClosureReport>;
+  GetExternalHandoffAudit(): Promise<ExternalHandoffAudit>;
   ListBackups(): Promise<{ backups: BackupRecord[] }>;
   CreateBackup(): Promise<{ path: string }>;
   RestoreBackup(path: string): Promise<void>;
@@ -784,6 +1113,14 @@ export type DesktopBindings = {
 export type JoiPreloadApi = {
   invoke<T = unknown>(method: keyof DesktopBindings, payload?: unknown): Promise<T>;
   onRunEvent(callback: (event: unknown) => void): () => void;
+  terminal: {
+    start(req?: TerminalSessionStartRequest): Promise<TerminalSessionInfo>;
+    input(req: TerminalSessionInputRequest): Promise<void>;
+    resize(req: TerminalSessionResizeRequest): Promise<void>;
+    kill(req: TerminalSessionKillRequest): Promise<void>;
+    getStatus(id: string): Promise<TerminalSessionSnapshot>;
+    onEvent(callback: (event: TerminalSessionEvent) => void): () => void;
+  };
   app: {
     getVersion(): Promise<string>;
     openExternal(url: string): Promise<void>;
@@ -792,11 +1129,17 @@ export type JoiPreloadApi = {
 
 export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'ArchiveConversation',
+  'CloseProductTask',
   'CompleteOnboarding',
+  'CorrectMemory',
   'CreateBackup',
   'DecideConfirmation',
+  'DecideApproval',
+  'DecideMemoryCandidate',
+  'DecideOpenLoop',
   'DecideProactiveMessage',
   'DeleteConversationGroup',
+  'DeleteMemory',
   'DisableNode',
   'EnableNode',
   'ExportDiagnostics',
@@ -804,9 +1147,11 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'GenerateWorkerToken',
   'GetArtifact',
   'GetConversation',
+  'GetExternalHandoffAudit',
   'GetModelUsage',
   'GetOnboardingStatus',
   'GetProductTask',
+  'GetRecentRunClosureReport',
   'GetRunTrace',
   'GetSecretStatus',
   'GetIMessageStatus',
@@ -814,6 +1159,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'GetSystemHealth',
   'GetWorkspaceSettings',
   'InterruptRun',
+  'ListRecoverableRuns',
   'ListArtifacts',
   'ListBackups',
   'ListCapabilities',
@@ -823,19 +1169,30 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'LoginXAIOAuth',
   'ListMCPServers',
   'ListMemories',
+  'ListMemoriesUsedForRun',
+  'ListMemoryCandidates',
   'ListNodes',
   'ListOpenLoops',
+  'ListPendingApprovals',
   'ListProductTasks',
+  'ListProductTasksByConversation',
+  'ListProductTasksByPrincipal',
   'ListProactiveMessages',
+  'ListRelationshipStates',
   'ListSavedModels',
   'ListSkills',
   'ListToolRuns',
   'ListToolWorkflows',
   'ListWorkerGatewayAuditLogs',
+  'ListUserStates',
   'MoveConversationToGroup',
   'PurgeConversation',
+  'RecordNotificationOpened',
+  'ReopenProductTask',
   'RestoreBackup',
   'RestoreConversation',
+  'RedirectRun',
+  'ResumeApprovalRun',
   'SaveConversationGroup',
   'SaveModelConfig',
   'SaveModelSettings',

@@ -22,7 +22,8 @@ function extractDesktopMethods(source) {
 
 function extractSqliteHandlers(source) {
   const start = source.indexOf('const sqliteApi: Record<DesktopIpcMethod, Handler> = {');
-  const end = source.indexOf('\n  };\n\n  ipcMain.handle', start);
+  const endRelative = start >= 0 ? source.slice(start).search(/\n  };\n\n  ipcMain\.(?:removeHandler|handle)/) : -1;
+  const end = endRelative >= 0 ? start + endRelative : -1;
   if (start < 0 || end < 0) {
     throw new Error('Could not find SQLite DesktopApi handlers');
   }
@@ -33,6 +34,7 @@ function extractSqliteHandlers(source) {
 const desktopApiContract = read('packages/shared-types/src/desktop-api.ts');
 const preload = read('apps/joi-electron/src/preload/index.ts');
 const ipc = read('apps/joi-electron/src/main/ipc.ts');
+const imessageInbound = read('apps/joi-electron/src/main/imessage-inbound.ts');
 const desktopFrontend = read('apps/joi-desktop/frontend/src/App.tsx');
 const desktopBridge = read('apps/joi-desktop/frontend/src/api/desktop.ts');
 const rendererRuntime = read('apps/joi-desktop/frontend/src/api/runtime.ts');
@@ -50,13 +52,13 @@ if (extraHandlers.length > 0) {
   fail(`Electron SQLite DesktopApi has handlers outside the shared contract: ${extraHandlers.join(', ')}`);
 }
 
-for (const required of ['contextBridge.exposeInMainWorld', 'invoke<T = unknown>', 'onRunEvent', 'getVersion', 'openExternal']) {
+for (const required of ['contextBridge.exposeInMainWorld', 'invoke<T = unknown>', 'onRunEvent', 'terminal:', 'joi:terminal:start', 'joi:terminal:event', 'getVersion', 'openExternal']) {
   if (!preload.includes(required)) {
     fail(`preload API is missing required surface: ${required}`);
   }
 }
 
-for (const required of ['z.enum(desktopIpcMethods)', "ipcMain.handle('joi:invoke'", "ipcMain.handle('joi:app:getVersion'", "ipcMain.handle('joi:app:openExternal'"]) {
+for (const required of ['z.enum(desktopIpcMethods)', 'TerminalSessionManager', "ipcMain.handle('joi:invoke'", "ipcMain.handle('joi:terminal:start'", "ipcMain.handle('joi:terminal:input'", "ipcMain.handle('joi:terminal:resize'", "ipcMain.handle('joi:terminal:kill'", "ipcMain.handle('joi:terminal:getStatus'", "ipcMain.handle('joi:app:getVersion'", "ipcMain.handle('joi:app:openExternal'"]) {
   if (!ipc.includes(required)) {
     fail(`main IPC router is missing required guard: ${required}`);
   }
@@ -90,6 +92,16 @@ for (const required of ['startWorkerGateway(', 'resolveToken: () => secrets.reso
   if (!read('apps/joi-electron/src/main/index.ts').includes(required)) {
     fail(`Electron main lifecycle is missing Worker Gateway integration: ${required}`);
   }
+}
+
+for (const required of ['sidecarNodeRuntime(', 'process.execPath', 'ELECTRON_RUN_AS_NODE', "this.sidecar?.once('error'"]) {
+  if (!imessageInbound.includes(required)) {
+    fail(`iMessage Photon sidecar spawn is missing packaged Electron guard: ${required}`);
+  }
+}
+
+if (imessageInbound.includes("PHOTON_NODE_BIN || 'node'") || imessageInbound.includes('PHOTON_NODE_BIN || "node"')) {
+  fail('iMessage Photon sidecar must not fall back to a bare node binary in the packaged app');
 }
 
 for (const required of ['store.restoreBackup(', 'store.listProductTasks(', 'store.getProductTask(', 'store.listArtifacts(', 'store.getArtifact(', 'store.listOpenLoops(', 'store.listProactiveMessages(', 'store.decideProactiveMessage(']) {

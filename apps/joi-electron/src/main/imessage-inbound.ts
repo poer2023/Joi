@@ -60,6 +60,7 @@ const retryDelayMs = 3000;
 const dedupMaxSize = 4000;
 const dedupWindowMs = 48 * 3600 * 1000;
 const typingPulseIntervalMs = 4000;
+const localOwnerPrincipalID = 'principal_local_owner';
 const mentionPatterns = [
   /(?<![\w@])@?joi\b[,:\-]?/i,
   /(?<![\w@])@?hermes\b[,:\-]?/i,
@@ -229,8 +230,7 @@ export class IMessageInboundService {
     const sidecarDir = await this.ensureSidecarInstalled();
     if (signal.aborted) return;
     this.sidecarToken = randomBytes(24).toString('hex');
-    const nodeBin = process.env.PHOTON_NODE_BIN || 'node';
-    const env = {
+    const baseEnv = {
       ...process.env,
       PHOTON_PROJECT_ID: config.projectID,
       PHOTON_PROJECT_SECRET: config.projectSecret,
@@ -239,11 +239,22 @@ export class IMessageInboundService {
       PHOTON_SIDECAR_TOKEN: this.sidecarToken,
       PHOTON_SIDECAR_WATCH_STDIN: '1',
     };
-    this.sidecar = spawn(nodeBin, ['index.mjs'], {
+    const nodeRuntime = sidecarNodeRuntime(baseEnv);
+    this.sidecar = spawn(nodeRuntime.command, nodeRuntime.args, {
       cwd: sidecarDir,
-      env,
+      env: nodeRuntime.env,
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
+    });
+    const spawnError = new Promise<never>((_, reject) => {
+      this.sidecar?.once('error', (error) => {
+        if (!this.controller?.signal.aborted) {
+          this.connected = false;
+          this.lastError = `sidecar spawn failed: ${safeErrorMessage(error)}`;
+          this.logger.warn('imessage sidecar spawn failed', this.lastError);
+        }
+        reject(error);
+      });
     });
     this.sidecar.stdout.on('data', (chunk: Buffer) => {
       this.logger.info(`[imessage-sidecar] ${chunk.toString('utf8').trim()}`);
@@ -258,7 +269,7 @@ export class IMessageInboundService {
         this.logger.warn('imessage sidecar exited', this.lastError);
       }
     });
-    await this.waitForHealth(config.port, signal);
+    await Promise.race([this.waitForHealth(config.port, signal), spawnError]);
   }
 
   private async stopSidecar(): Promise<void> {
@@ -346,6 +357,8 @@ export class IMessageInboundService {
         });
         if (!response.ok || !response.body) throw new Error(`/inbound returned ${response.status}`);
         backoff = 1;
+        this.connected = true;
+        this.lastError = '';
         await this.consumeInboundStream(response.body, config, signal);
       } catch (error) {
         if (!signal.aborted) {
@@ -415,6 +428,7 @@ export class IMessageInboundService {
       this.logger.info(`imessage ignored unauthorized sender ${senderID || 'unknown'}`);
       return;
     }
+    const principalID = config.allowedUsers.size > 0 ? localOwnerPrincipalID : undefined;
     const chatType = event.space?.type === 'group' ? 'group' : 'dm';
     const text = normalizePhotonText(event.content);
     if (!text) return;
@@ -427,7 +441,7 @@ export class IMessageInboundService {
       if (!mentionPatterns.some((pattern) => pattern.test(messageText))) return;
       messageText = cleanMentionText(messageText);
     }
-    await this.runJoiAndReply(spaceID, senderID || spaceID, messageText);
+    await this.runJoiAndReply(spaceID, senderID || spaceID, messageText, principalID);
   }
 
   private async imessageStatusReply(): Promise<string> {
@@ -450,11 +464,12 @@ export class IMessageInboundService {
     ].join('\n');
   }
 
-  private async runJoiAndReply(spaceID: string, senderID: string, text: string): Promise<void> {
+  private async runJoiAndReply(spaceID: string, senderID: string, text: string, principalID?: string): Promise<void> {
     const req: ChatRequest = {
       conversation_id: stableInboundConversationID('imessage', `space:${spaceID || senderID}`),
       channel: 'imessage',
       user_id: senderID ? `imessage:${senderID}` : `imessage:${spaceID}`,
+      principal_id: principalID,
       message: normalizeIMessageText(text),
       preferred_node: 'main-node',
       allow_worker: false,
@@ -544,6 +559,21 @@ function resolveSidecarSourceDir(): string {
     }
   }
   throw new Error(`Photon sidecar resources not found. Checked: ${candidates.join(', ')}`);
+}
+
+function sidecarNodeRuntime(baseEnv: NodeJS.ProcessEnv): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
+  const override = process.env.PHOTON_NODE_BIN?.trim();
+  if (override) {
+    return { command: override, args: ['index.mjs'], env: baseEnv };
+  }
+  return {
+    command: process.execPath,
+    args: ['index.mjs'],
+    env: {
+      ...baseEnv,
+      ELECTRON_RUN_AS_NODE: '1',
+    },
+  };
 }
 
 function sidecarHeaders(token: string): HeadersInit {

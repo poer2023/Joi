@@ -2,6 +2,8 @@
 
 Date: 2026-05-23
 
+Current installed package note, updated 2026-06-23: the latest local Electron package installed during launch repair is `dist/desktop/Joi-0.1.0-20260623.1115-macos-arm64.zip`. The original dogfood evidence below is historical and still refers to the package that was actually tested on 2026-05-23.
+
 Package under test:
 
 ```text

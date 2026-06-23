@@ -1,17 +1,18 @@
 {
   "name": "@joi/electron",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "main": "dist/main/index.js",
   "scripts": {
-    "dev": "electron-vite dev --host 127.0.0.1",
+    "dev": "electron-vite dev",
     "build": "tsc --noEmit && electron-vite build",
     "package:mac": "pnpm build && electron-builder --mac dir --arm64 --config.mac.identity=null",
     "test:contract": "node scripts/test-preload-contract.mjs"
   },
   "dependencies": {
     "@joi/shared-types": "workspace:*",
+    "node-pty": "^1.1.0",
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "react-router-dom": "7.9.6",
@@ -21,6 +22,9 @@
     "appId": "com.hao.joi.desktop",
     "productName": "Joi",
     "asar": true,
+    "asarUnpack": [
+      "node_modules/node-pty/**"
+    ],
     "directories": {
       "output": "release"
     },
@@ -39,6 +43,7 @@
       "target": [
         "zip"
       ],
+      "icon": "assets/icon.icns",
       "category": "public.app-category.productivity"
     }
   },

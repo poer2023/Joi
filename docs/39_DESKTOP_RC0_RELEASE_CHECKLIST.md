@@ -1,8 +1,10 @@
-# Desktop RC0 Release Checklist
+# Desktop Release Checklist
 
-Version: `0.1.0-rc0`
+Current local installed package: `0.1.0-20260623.1115`
 
-Historical note: the original RC0 checklist was written for the Wails desktop bundle. The current desktop release path is Electron-native; use `docs/36_DESKTOP_INSTALLATION.md` and `docs/53_ELECTRON_NATIVE_REFACTOR.md` for current build/package commands.
+Historical RC0 package: `0.1.0-rc0`
+
+Historical note: the original RC0 checklist was written for the Wails desktop bundle. The current desktop release path is Electron-native; use `docs/36_DESKTOP_INSTALLATION.md`, `docs/53_ELECTRON_NATIVE_REFACTOR.md`, and `docs/54_LOCAL_REPO_AND_APP_STATE.md` for current build/package commands and installed-app state.
 
 ## Required Checks
 
@@ -25,8 +27,8 @@ Confirmation flow: available in Desktop Confirmations page
 Security eval: required before release
 Desktop eval: required before release
 Backup restore: temporary data drill passed; UI first backup created
-Package: dist/desktop/Joi-0.1.0-rc0-macos-arm64.zip
-Package manifest: dist/desktop/Joi-0.1.0-rc0-macos-arm64.manifest.json
+Package: dist/desktop/Joi-0.1.0-20260623.1115-macos-arm64.zip
+Package manifest: dist/desktop/Joi-0.1.0-20260623.1115-macos-arm64.manifest.json
 Crash/restart recovery: scripts/desktop_crash_recovery_check.sh passed
 SQLite migration/upgrade: scripts/sqlite_migration_check.sh passed
 Package install dogfood: /Applications/Joi.app opened from Finder and completed first-run flow
@@ -42,7 +44,8 @@ NATS dependency: none in Desktop Mode
 ## Package Verification
 
 ```text
-App version: 0.1.0-rc0
+App package version: 0.1.0-20260623.1115
+Bundle version metadata: 0.1.0
 Bundle name: Joi
 Bundle path: apps/joi-electron/release-desktop/mac-arm64/Joi.app
 Executable: apps/joi-electron/release-desktop/mac-arm64/Joi.app/Contents/MacOS/Joi
@@ -83,7 +86,8 @@ first_run_onboarding_verified=true
 desktop_backup_restore_verified=true
 desktop_rc0_validation_commit=2634854
 desktop_rc0_validation_tag=desktop-rc0-validation
-app_version=0.1.0-rc0
+app_version=0.1.0-20260623.1115
+desktop_single_instance_reopen_verified=true
 desktop_diagnostics_export_verified=true
 worker_gateway_security_verified=true
 desktop_rc0_hardened_commit=43143d9

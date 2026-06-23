@@ -1,144 +1,144 @@
 # 02 系统架构设计
 
+当前默认形态是 Desktop Mode。Server Mode 保留为高级部署形态，但不是本机日常入口。当前本机状态见 `docs/54_LOCAL_REPO_AND_APP_STATE.md`，模式边界见 `docs/40_MODE_MATRIX.md`。
+
 ## 1. 总体架构
 
 ```text
-Web / Telegram / 后续微信 / CLI
+Desktop UI / Telegram / iMessage / optional Web Console
           ↓
-Gateway Layer
-          ↓
-Orchestrator Core
+Electron Main + Controlled Preload IPC
           ↓
 ┌─────────────────────────────────────────────┐
-│ Control Plane                               │
-│ - Session Manager                           │
-│ - Intent Router                             │
-│ - Agent Registry                            │
-│ - Model Router                              │
-│ - Policy Engine                             │
-│ - Memory Orchestrator                       │
-│ - Capability Manager                        │
-│ - Tool Compiler                             │
-│ - Node Scheduler                            │
-│ - Run Trace Logger                          │
+│ Local Desktop Runtime                       │
+│ - SQLite Store                              │
+│ - Settings / Keychain adapter               │
+│ - Tool-calling turn loop                    │
+│ - Prompt / Memory assembly                  │
+│ - Capability executors                      │
+│ - Policy / confirmation handling            │
+│ - Run Trace / events                        │
+│ - Telegram / iMessage inbound services      │
+│ - Worker Gateway                            │
 └─────────────────────────────────────────────┘
-          ↓
-Runtime Layer
           ↓
 ┌─────────────────────────────────────────────┐
-│ - Agent Runtime                             │
-│ - Tool Runtime                              │
-│ - Memory Extractor                          │
-│ - Embedding Service                         │
-│ - Model Provider Adapter                    │
+│ Optional Remote Worker Pool                 │
+│ - worker-runtime / sidecars                 │
+│ - minimal task payloads                     │
+│ - no full memory database                   │
 └─────────────────────────────────────────────┘
-          ↓
-NATS JetStream
-          ↓
-Node Pool
           ↓
 ┌─────────────────────────────────────────────┐
-│ main-node                                   │
-│ node-vps-la                                 │
-│ node-vps-hk                                 │
-│ other-worker                                │
+│ Storage                                     │
+│ - Desktop: local SQLite                     │
+│ - Secrets: macOS Keychain                   │
+│ - Server Mode: optional Postgres/NATS       │
 └─────────────────────────────────────────────┘
-          ↓
-Storage
-          ↓
-PostgreSQL + pgvector / 后续 Qdrant
 ```
 
-## 2. 服务拆分
+## 2. 主要模块
 
-### apps/console-web
+### apps/joi-electron
 
-Next.js 前端。包含 Chat Workbench、Run Trace、Memory Studio、Agent Registry、Node Console、Capability Console、Model Routing Console、Settings。
+Electron-native 桌面壳。负责 main/preload/renderer、窗口生命周期、单实例恢复、受控 IPC、Keychain 加载、外部入口服务和 Worker Gateway。
 
-### apps/telegram-gateway
+### apps/joi-desktop/frontend
 
-Telegram 入口，负责接收消息、转换为内部事件、调用 Orchestrator、发送回复。
+共享 React renderer。当前嵌入 Electron Desktop，也可作为浏览器预览/Server Mode UI 的基础。
 
-### services/orchestrator-core
+### packages/store
 
-Go 实现。系统控制平面，负责 run、router、policy、memory、agent、capability、node、trace 的编排。
+TypeScript SQLite store。负责 conversation、message、run、run events、settings、memories、product tasks、artifacts、open loops、diagnostics、backup/restore 和 schema 初始化。
 
-### services/agent-runtime
+### packages/runtime
 
-Python 实现。负责加载 Agent Card、构造 prompt、调用 model provider、解析 final_answer 或 capability_request。
+TypeScript runtime。负责 model provider、tool-calling turn loop、capability executors、workspace/file/web/exec/browser/computer/desktop-app/diagnostics capability，以及 Worker Gateway。
 
-### services/memory-service
+### packages/secrets
 
-Python 实现。负责 memory search、memory extraction、context pack、embedding、conflict、feedback。
+本机 secret adapter。macOS 默认使用 Keychain，环境变量只作为开发 fallback。
 
-### services/worker-runtime
+### Server Mode / Historical Services
 
-Go + Python tools。负责节点注册、心跳、任务消费、工具执行、结果回传。
+以下服务属于 Server Mode 或历史 Go-first 架构，不是 Desktop Mode 启动前提：
 
-### services/model-gateway
-
-MVP 可内嵌在 agent-runtime，后续独立。负责 provider adapter、fallback、成本记录、超时和重试。
+- `apps/console-web`：Server Mode Web Console。
+- `apps/telegram-gateway`：历史独立 Telegram gateway；当前 Desktop 也有本机 Telegram inbound。
+- `services/orchestrator-core`：Go control plane / historical server path。
+- `services/worker-runtime`：独立 Worker 执行节点。
 
 ## 3. 核心流程
 
 ### 普通聊天
 
 ```text
-Message → create run → resolve session → router → memory search → agent runtime → response → trace
+Desktop message
+  ↓
+SQLite conversation / message / run
+  ↓
+Prompt + Memory assembly
+  ↓
+Tool-calling runtime
+  ↓
+Model response and optional tool calls
+  ↓
+Capability executor
+  ↓
+Tool result回灌模型
+  ↓
+Final response + Run Trace
 ```
 
 ### 工具调用
 
 ```text
-Agent capability_request
+Model tool call
   ↓
 validate schema
   ↓
-policy check
+permission / confirmation check
   ↓
-tool compiler
-  ↓
-workflow
-  ↓
-node scheduler
-  ↓
-tool runtime
+capability executor
   ↓
 result normalize
   ↓
-agent interpret
+persist tool_runs / run events
+  ↓
+feed tool result back to model
 ```
 
 ### 记忆写入
 
 ```text
-raw event → extractor → candidate → normalize → conflict check → policy check → pending/confirmed
+raw event → candidate → normalize → conflict check → policy check → pending/confirmed
 ```
 
-### 节点派发
+### 可选 Worker 派发
 
 ```text
-workflow → scheduler → task → NATS → worker → result → trace
+Desktop Worker Gateway → worker register/heartbeat → claim → execute minimal task → ack/fail → trace
 ```
 
 ## 4. 技术选型
 
-| 层 | 技术 |
-|---|---|
-| 前端 | Next.js + React + TanStack Query + Tailwind |
-| 控制平面 | Go |
-| AI 运行层 | Python |
-| 数据库 | PostgreSQL |
-| 向量 | MVP pgvector，后续 Qdrant |
-| 队列 | NATS JetStream |
-| 部署 | Docker Compose |
-| 节点网络 | 公网 SSH 反向隧道；PostgreSQL / NATS 不公网裸露 |
+| 层 | Desktop Mode 技术 | Server Mode / 历史技术 |
+|---|---|---|
+| 前端 | Electron + React renderer | Web Console / Next.js |
+| 控制平面 | Electron main + TypeScript runtime/store | Go orchestrator-core |
+| AI 运行层 | TypeScript tool-calling runtime | Python/Go historical services |
+| 数据库 | SQLite WAL | PostgreSQL |
+| 检索 | SQLite FTS / local memory search | pgvector/Qdrant optional |
+| 队列 | SQLiteTaskQueue / Worker Gateway | NATS JetStream optional |
+| 部署 | `/Applications/Joi.app` | Docker Compose optional |
+| 节点网络 | Worker Gateway；Worker 不直连 SQLite | SSH tunnel / server queue |
 
 ## 5. 关键边界
 
 - Router 不生成最终回复。
-- Tool Compiler 不调用 LLM。
+- Capability executor 不调用 LLM，除非它本身被建模为受控 model capability。
 - Policy Engine 只处理结构化决策。
-- Memory Service 不做通用聊天。
-- Worker 不保存主库。
-- Agent Runtime 不直接执行工具。
+- Memory OS 不做通用聊天。
+- Worker 不保存主库，不接收完整长期记忆。
+- 模型不能绕过 runtime 直接执行 shell、文件写入或浏览器操作。
+- Desktop Mode 不要求 Docker、Postgres、NATS 或 localhost Web Console 才能启动。

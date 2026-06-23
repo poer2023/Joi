@@ -1,6 +1,6 @@
 import type { BrowserWindow } from 'electron';
 import { createHash } from 'node:crypto';
-import type { ChatRequest, ChatResponse, SettingsRecord } from '../../../../packages/shared-types/src/desktop-api';
+import type { ChatRequest, ChatResponse, SettingsRecord, TelegramInboundStatus } from '../../../../packages/shared-types/src/desktop-api';
 import type { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
 import type { JoiSQLiteStore } from '../../../../packages/store/src/sqlite';
 import { canRunRealToolCalling, emitRunEvents, resolveAPIKeyForModelEndpoint, runLiveElectronToolCallingChat } from './ipc';
@@ -40,6 +40,7 @@ const telegramAPIBaseURL = 'https://api.telegram.org';
 const pollTimeoutSeconds = 45;
 const retryDelayMs = 3000;
 const typingPulseIntervalMs = 4000;
+const localOwnerPrincipalID = 'principal_local_owner';
 
 export class TelegramInboundService {
   private readonly store: JoiSQLiteStore;
@@ -49,6 +50,11 @@ export class TelegramInboundService {
   private controller: AbortController | null = null;
   private reconfigureTimer: NodeJS.Timeout | null = null;
   private activeRuns = new Map<string, AbortController>();
+  private tokenConfigured = false;
+  private polling = false;
+  private lastPollAt = '';
+  private lastUpdateID: number | null = null;
+  private lastError = '';
 
   constructor(options: TelegramInboundOptions) {
     this.store = options.store;
@@ -72,6 +78,7 @@ export class TelegramInboundService {
   async reconfigure(): Promise<void> {
     const settings = this.store.getSettings();
     const token = await this.secrets.resolve('TELEGRAM_BOT_TOKEN');
+    this.tokenConfigured = Boolean(token.trim());
     if (!settings.telegram_enabled || !token.trim()) {
       this.stop();
       return;
@@ -90,31 +97,57 @@ export class TelegramInboundService {
       this.controller.abort();
     }
     this.controller = null;
+    this.polling = false;
     for (const controller of this.activeRuns.values()) {
       if (!controller.signal.aborted) controller.abort();
     }
     this.activeRuns.clear();
   }
 
+  status(): TelegramInboundStatus {
+    const settings = this.store.getSettings();
+    const controllerRunning = Boolean(this.controller && !this.controller.signal.aborted);
+    return {
+      enabled: Boolean(settings.telegram_enabled),
+      configured: this.tokenConfigured,
+      polling: controllerRunning && this.polling,
+      allowed_user_ids_configured: Boolean(settings.telegram_allowed_user_ids?.trim()),
+      active_runs: this.activeRuns.size,
+      last_poll_at: this.lastPollAt || undefined,
+      last_update_id: this.lastUpdateID ?? undefined,
+      last_error: this.lastError || undefined,
+    };
+  }
+
   private async pollLoop(token: string, signal: AbortSignal): Promise<void> {
     let offset = 0;
+    this.polling = true;
+    this.lastError = '';
     this.logger.info('telegram inbound started');
-    while (!signal.aborted) {
-      try {
-        const updates = await this.getUpdates(token, offset, signal);
-        for (const update of updates) {
-          if (signal.aborted) break;
-          await this.handleUpdate(token, update);
-          offset = Math.max(offset, update.update_id + 1);
-        }
-      } catch (error) {
-        if (!signal.aborted) {
-          this.logger.warn('telegram inbound poll failed', sanitizeTelegramError(error, token));
-          await sleep(retryDelayMs, signal);
+    try {
+      while (!signal.aborted) {
+        try {
+          const updates = await this.getUpdates(token, offset, signal);
+          this.lastPollAt = new Date().toISOString();
+          this.lastError = '';
+          for (const update of updates) {
+            if (signal.aborted) break;
+            await this.handleUpdate(token, update);
+            offset = Math.max(offset, update.update_id + 1);
+            this.lastUpdateID = update.update_id;
+          }
+        } catch (error) {
+          if (!signal.aborted) {
+            this.lastError = sanitizeTelegramError(error, token);
+            this.logger.warn('telegram inbound poll failed', this.lastError);
+            await sleep(retryDelayMs, signal);
+          }
         }
       }
+    } finally {
+      this.polling = false;
+      this.logger.info('telegram inbound stopped');
     }
-    this.logger.info('telegram inbound stopped');
   }
 
   private async getUpdates(token: string, offset: number, signal: AbortSignal): Promise<TelegramUpdate[]> {
@@ -145,11 +178,12 @@ export class TelegramInboundService {
       await sendTelegramMessage(token, message.chat.id, '未授权：当前 Joi Telegram 入口只允许白名单用户使用。');
       return;
     }
+    const principalID = allowed.size > 0 ? localOwnerPrincipalID : undefined;
     if (isStatusCommand(text)) {
       await sendTelegramMessage(token, message.chat.id, await this.telegramStatusReply(settings));
       return;
     }
-    await this.runJoiAndReply(token, message, settings);
+    await this.runJoiAndReply(token, message, settings, principalID);
   }
 
   private async telegramStatusReply(settings: SettingsRecord): Promise<string> {
@@ -171,11 +205,12 @@ export class TelegramInboundService {
     ].join('\n');
   }
 
-  private async runJoiAndReply(token: string, message: TelegramMessage, initialSettings: SettingsRecord): Promise<void> {
+  private async runJoiAndReply(token: string, message: TelegramMessage, initialSettings: SettingsRecord, principalID?: string): Promise<void> {
     const req: ChatRequest = {
       conversation_id: stableInboundConversationID('telegram', `chat:${message.chat.id}`),
       channel: 'telegram',
       user_id: message.from?.id ? `telegram:${message.from.id}` : `telegram:${message.chat.id}`,
+      principal_id: principalID,
       message: normalizeTelegramText(message.text || ''),
       preferred_node: 'main-node',
       allow_worker: false,

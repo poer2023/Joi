@@ -37,10 +37,65 @@ try {
   const trace = store.getRunTrace(response.run_id);
   assert.equal(trace.status, 'completed');
   assert.equal(trace.selected_agent_id, 'general_agent');
-  assert.equal(trace.events?.length, 4);
-  assert.equal(trace.events?.[1]?.delta, response.response);
+  assert.equal(trace.requested_mode, 'auto');
+  assert.equal(trace.resolved_mode, 'chat_assist');
+  assert.equal(trace.mode_source, 'automatic');
+  assert.equal(trace.events?.length, 5);
+  assert.equal(trace.events?.[1]?.event_type, 'run.mode_resolved');
+  assert.equal(trace.events?.[1]?.schema_version, 2);
+  assert.equal(trace.events?.[1]?.payload?.requested_mode, 'auto');
+  assert.equal(trace.events?.[1]?.payload?.resolved_mode, 'chat_assist');
+  assert.equal(trace.events?.[1]?.payload?.mode_source, 'automatic');
+  assert.equal(trace.events?.[1]?.payload?.mode_locked_by_user, false);
+  assert.equal(trace.events?.[2]?.delta, response.response);
+  assert.equal(trace.events?.at(-1)?.terminal, true);
   assert.equal(trace.model_calls?.[0]?.model_name, 'deepseek-v4-flash');
   assert.equal(trace.model_calls?.[0]?.provider, 'deterministic_provider');
+
+  const chatOnlyResponse = await store.sendDeterministicChat({
+    message: '今天只做一个纯聊天检查：用一句话回复我，不要创建任务。',
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+  });
+  const chatOnlyTrace = store.getRunTrace(chatOnlyResponse.run_id);
+  assert.equal(chatOnlyTrace.resolved_mode, 'chat_assist');
+  assert.equal(chatOnlyResponse.product_task, undefined);
+  assert.equal(store.listProductTasks({ conversation_id: chatOnlyResponse.conversation_id, limit: 10 }).tasks.length, 0);
+
+  const explicitChatResponse = await store.sendDeterministicChat({
+    message: '请帮我分析和实现这个功能，但这次我明确选择普通聊天，不创建任务。',
+    input_mode: 'chat_assist',
+    runtime_mode: 'tool_calling',
+  });
+  const explicitChatTrace = store.getRunTrace(explicitChatResponse.run_id);
+  const explicitChatModeEvent = explicitChatTrace.events.find((event) => event.event_type === 'run.mode_resolved');
+  assert.equal(explicitChatTrace.requested_mode, 'chat_assist');
+  assert.equal(explicitChatTrace.resolved_mode, 'chat_assist');
+  assert.equal(explicitChatTrace.mode_source, 'explicit');
+  assert.equal(explicitChatModeEvent?.payload?.mode_locked_by_user, true);
+  assert.equal(explicitChatModeEvent?.payload?.reason, 'User selected chat_assist.');
+  assert.equal(store.listProductTasks({ conversation_id: explicitChatResponse.conversation_id, limit: 10 }).tasks.length, 0);
+
+  const telegramBuildTask = await store.sendDeterministicChat({
+    channel: 'telegram',
+    user_id: 'telegram:7991996397',
+    message: '为 joi 构建一个简单的 loading page',
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+  });
+  const telegramBuildTrace = store.getRunTrace(telegramBuildTask.run_id);
+  assert.equal(telegramBuildTrace.entry_channel, 'telegram');
+  assert.equal(telegramBuildTrace.requested_mode, 'auto');
+  assert.equal(telegramBuildTrace.resolved_mode, 'serious_task');
+  assert.equal(telegramBuildTrace.mode_source, 'automatic');
+  const telegramBuildProductTask = store.listProductTasks({ conversation_id: telegramBuildTask.conversation_id, limit: 10 })
+    .tasks.find((task) => task.source_run_id === telegramBuildTask.run_id);
+  assert.ok(telegramBuildProductTask);
+  assert.equal(telegramBuildProductTask.mode, 'serious_task');
+  assert.equal(telegramBuildProductTask.source_channel, 'telegram');
+  assert.equal(telegramBuildProductTask.source_run_id, telegramBuildTask.run_id);
+  assert.equal(telegramBuildProductTask.principal_id, telegramBuildTrace.principal_id);
+  assert.equal(store['get'](`SELECT product_task_id FROM task_entry_links WHERE principal_id=?`, telegramBuildTrace.principal_id).product_task_id, telegramBuildProductTask.id);
 
   const models = store.listSavedModels().models.map((model) => model.id);
   assert.ok(models.includes('deepseek-v4-flash'));
@@ -157,8 +212,67 @@ try {
   assert.equal(store.listMemories({ limit: 10 }).memories[0].pinned, true);
   store.updateMemory({ id: 'mem_test', action: 'feedback_positive', comment: 'useful' });
   assert.equal(store.listMemories({ limit: 10 }).memories[0].positive_feedback, 1);
-  store.updateMemory({ id: 'mem_test', action: 'edit_confirm', content: 'Prefer direct status updates.', summary: 'Direct status preference' });
-  assert.equal(store.listMemories({ query: 'direct', limit: 10 }).memories[0].summary, 'Direct status preference');
+  store.updateMemory({ id: 'mem_test', action: 'edit_confirm', content: 'Prefer direct status updates.', summary: 'Direct status preference', run_id: response.run_id });
+  const correctedMemory = store.listMemories({ query: 'direct', limit: 10 }).memories[0];
+  assert.equal(correctedMemory.summary, 'Direct status preference');
+  assert.notEqual(correctedMemory.id, 'mem_test');
+  assert.equal(store['get'](`SELECT status FROM memories WHERE id='mem_test'`).status, 'superseded');
+  assert.equal(store['get'](`SELECT merged_into_memory_id FROM memories WHERE id='mem_test'`).merged_into_memory_id, correctedMemory.id);
+  assert.ok(store.getRunTrace(response.run_id).events.some((event) => event.event_type === 'memory.corrected' && event.item_id === correctedMemory.id && event.payload.previous_memory_id === 'mem_test'));
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata)
+     VALUES ('mem_candidate_api', 'preference', 'Candidate API memory.', 'Candidate API memory', 'global', 'internal', 0.7, 'pending', '[]', '[]', '{}')`,
+  );
+  assert.equal(store.listMemoryCandidates({ limit: 10 }).memories[0].id, 'mem_candidate_api');
+  store.decideMemoryCandidate({ id: 'mem_candidate_api', decision: 'confirm', run_id: response.run_id, comment: 'confirm via direct API' });
+  assert.equal(store['get'](`SELECT status FROM memories WHERE id='mem_candidate_api'`).status, 'confirmed');
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata)
+     VALUES ('mem_correct_api', 'preference', 'Temporary API memory.', 'Temporary API memory', 'global', 'internal', 0.7, 'confirmed', '[]', '[]', '{}')`,
+  );
+  store.correctMemory({ id: 'mem_correct_api', content: 'Corrected API memory.', summary: 'Corrected API memory', run_id: response.run_id });
+  assert.equal(store['get'](`SELECT status FROM memories WHERE id='mem_correct_api'`).status, 'superseded');
+  assert.equal(store.listMemories({ query: 'Corrected API', limit: 10 }).memories[0].summary, 'Corrected API memory');
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata)
+     VALUES ('mem_delete_api', 'preference', 'Delete API memory.', 'Delete API memory', 'global', 'internal', 0.7, 'confirmed', '[]', '[]', '{}')`,
+  );
+  store.deleteMemory({ id: 'mem_delete_api', run_id: response.run_id, reason: 'delete via direct API' });
+  assert.equal(store['get'](`SELECT status FROM memories WHERE id='mem_delete_api'`).status, 'deleted');
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata)
+     VALUES ('mem_user_state_api', 'current_state', 'Currently validating memory APIs.', 'Memory API validation state', 'global', 'internal', 0.8, 'confirmed', '[]', '[]', '{}')`,
+  );
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, pinned, metadata)
+     VALUES ('mem_current_state_expired', 'current_state', 'Expired TTL project focus should never be recalled.', 'Expired TTL state', 'global', 'internal', 1.0, 'confirmed', '[]', '[]', 1, ?)`,
+    JSON.stringify({ ttl_until: '2000-01-01T00:00:00Z' }),
+  );
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata)
+     VALUES ('mem_current_state_active', 'current_state', 'Active TTL project focus should be recalled.', 'Active TTL state', 'global', 'internal', 0.7, 'confirmed', '[]', '[]', ?)`,
+    JSON.stringify({ ttl_until: '2999-01-01T00:00:00Z' }),
+  );
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata)
+     VALUES ('mem_relationship_api', 'relationship_state', 'Use direct factual tone.', 'Direct relationship tone', 'global', 'internal', 0.8, 'confirmed', '[]', '[]', '{}')`,
+  );
+  const userStates = store.listUserStates({ limit: 10 }).memories;
+  assert.ok(userStates.some((memory) => memory.id === 'mem_user_state_api'));
+  assert.ok(userStates.some((memory) => memory.id === 'mem_current_state_active'));
+  assert.ok(!userStates.some((memory) => memory.id === 'mem_current_state_expired'));
+  const ttlPrompt = store.assembleToolCallingPrompt({
+    message: 'TTL project focus active expired',
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, 'general_agent', 'real-tool-model');
+  const ttlMemoryIDs = ttlPrompt.memory_results.map((result) => result.memory.id);
+  assert.ok(ttlMemoryIDs.includes('mem_current_state_active'));
+  assert.ok(!ttlMemoryIDs.includes('mem_current_state_expired'));
+  assert.match(ttlPrompt.dynamic_tail, /Active TTL project focus/);
+  assert.equal(ttlPrompt.dynamic_tail.includes('Expired TTL project focus'), false);
+  assert.equal(store.listRelationshipStates({ limit: 10 }).memories[0].id, 'mem_relationship_api');
 
   store['exec'](
     `INSERT INTO product_tasks (id, title, description, status, mode, priority, risk_level, progress_percent, summary, metadata)
@@ -201,9 +315,13 @@ try {
   assert.equal(store.listConfirmations().items[0].status, 'approved');
 
   store.interruptRun({ run_id: response.run_id, reason: 'test interrupt' });
+  store.interruptRun({ run_id: response.run_id, reason: 'duplicate interrupt' });
   const interruptedTrace = store.getRunTrace(response.run_id);
   assert.equal(interruptedTrace.status, 'cancelled');
   assert.equal(interruptedTrace.events?.at(-1)?.event_type, 'run.interrupted');
+  assert.equal(interruptedTrace.events.filter((event) => event.event_type === 'run.cancel_requested').length, 1);
+  assert.equal(interruptedTrace.events.filter((event) => event.event_type === 'run.cancelled').length, 1);
+  assert.equal(interruptedTrace.events.filter((event) => event.event_type === 'run.interrupted').length, 1);
 
   const capabilityChat = await store.sendDeterministicChat({
     message: '在当前项目里找 Run Trace 的设计文档',
@@ -254,12 +372,18 @@ try {
     model_responses: [{ id: 'chatcmpl_fixture', choices: [{ message: { content: 'Run Trace evidence found by model tool call.' } }] }],
   });
   assert.equal(toolCallingChat.response, 'Run Trace evidence found by model tool call.');
-  assert.ok(toolCallingChat.used_memories.some((result) => result.memory.id === 'mem_test'));
+  assert.ok(toolCallingChat.used_memories.some((result) => result.memory.id === correctedMemory.id));
+  assert.ok(!toolCallingChat.used_memories.some((result) => result.memory.id === 'mem_test'));
   const toolCallingTrace = store.getRunTrace(toolCallingChat.run_id);
   assert.equal(toolCallingTrace.status, 'completed');
+  assert.ok(toolCallingTrace.events.some((event) => event.event_type === 'memory.recalled' && event.item_id === correctedMemory.id));
+  assert.ok(!toolCallingTrace.events.some((event) => event.event_type === 'memory.recalled' && event.item_id === 'mem_test'));
+  const memoriesUsedForToolRun = store.listMemoriesUsedForRun(toolCallingChat.run_id).memories;
+  assert.ok(memoriesUsedForToolRun.some((result) => result.memory.id === correctedMemory.id && result.reason));
   assert.equal(toolCallingTrace.model_calls[0].provider, 'openai_compatible');
   assert.equal(toolCallingTrace.model_calls[0].input_tokens, 31);
   assert.equal(toolCallingTrace.model_calls[0].cached_input_tokens, 7);
+  assert.equal(JSON.parse(store['get'](`SELECT metadata FROM model_calls WHERE run_id=?`, toolCallingChat.run_id).metadata).tool_run_count, 1);
   assert.equal(toolCallingTrace.steps.find((step) => step.step_type === 'tool_finished')?.output?.mode, 'workspace_search_v1_model_tool_test');
   const turnItemCount = Number(store['get'](`SELECT COUNT(*) AS count FROM turn_items WHERE run_id=?`, toolCallingChat.run_id)?.count || 0);
   assert.equal(turnItemCount, 4);
@@ -274,7 +398,9 @@ try {
   assert.ok(promptRow.cacheable_prefix.includes('Do not claim to be Claude'));
   assert.ok(promptRow.dynamic_tail.includes('Prefer direct status updates.'));
   const memoryPackRow = store['get'](`SELECT dynamic_retrieval FROM memory_context_packs WHERE run_id=?`, toolCallingChat.run_id);
-  assert.equal(JSON.parse(memoryPackRow.dynamic_retrieval)[0].memory.id, 'mem_test');
+  const dynamicMemoryIDs = JSON.parse(memoryPackRow.dynamic_retrieval).map((result) => result.memory.id);
+  assert.ok(dynamicMemoryIDs.includes(correctedMemory.id));
+  assert.ok(!dynamicMemoryIDs.includes('mem_test'));
 
   const seriousTaskChat = store.recordToolCallingChat({
     message: '帮我分析 Joi Task OS 并给出报告',
@@ -299,8 +425,115 @@ try {
   const seriousTaskDetail = store.getProductTask(seriousTaskChat.product_task.id);
   assert.equal(seriousTaskDetail.deliverables[0].id, seriousTaskChat.artifacts[0].id);
   const seriousTaskTrace = store.getRunTrace(seriousTaskChat.run_id);
+  const seriousTaskModeEvent = seriousTaskTrace.events.find((event) => event.event_type === 'run.mode_resolved');
+  assert.equal(seriousTaskTrace.requested_mode, 'serious_task');
+  assert.equal(seriousTaskTrace.resolved_mode, 'serious_task');
+  assert.equal(seriousTaskTrace.mode_source, 'explicit');
+  assert.equal(seriousTaskModeEvent?.payload?.mode_locked_by_user, true);
+  assert.equal(seriousTaskModeEvent?.payload?.contract_mode, 'execution');
   assert.ok(seriousTaskTrace.steps.some((step) => step.step_type === 'artifact_created'));
   assert.ok(seriousTaskTrace.steps.some((step) => step.step_type === 'task_verification_finished'));
+
+  const telegramTaskChat = store.recordToolCallingChat({
+    conversation_id: 'conv_tg_handoff_test',
+    channel: 'telegram',
+    user_id: 'telegram:4242',
+    message: '从 Telegram 开始一个 Joi 跨入口任务',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'Telegram task is ready in Desktop.',
+    tool_results: [],
+    usage: { input_tokens: 6, output_tokens: 5 },
+    model_responses: [{ id: 'chatcmpl_tg_handoff', choices: [{ message: { content: 'Telegram task is ready in Desktop.' } }] }],
+  });
+  const telegramTrace = store.getRunTrace(telegramTaskChat.run_id);
+  assert.equal(telegramTrace.entry_channel, 'telegram');
+  assert.ok(telegramTrace.principal_id?.startsWith('principal_'));
+  assert.equal(telegramTaskChat.product_task.principal_id, telegramTrace.principal_id);
+  assert.ok(telegramTrace.events.some((event) => event.event_type === 'handoff.linked' && event.item_type === 'handoff'));
+  assert.equal(store['get'](`SELECT channel FROM channel_identities WHERE principal_id=?`, telegramTrace.principal_id).channel, 'telegram');
+  assert.equal(store['get'](`SELECT conversation_id FROM conversation_entry_links WHERE principal_id=?`, telegramTrace.principal_id).conversation_id, telegramTaskChat.conversation_id);
+  assert.equal(store['get'](`SELECT product_task_id FROM task_entry_links WHERE principal_id=?`, telegramTrace.principal_id).product_task_id, telegramTaskChat.product_task.id);
+
+  const desktopContinuation = store.recordToolCallingChat({
+    conversation_id: telegramTaskChat.conversation_id,
+    channel: 'desktop',
+    user_id: 'desktop_user',
+    principal_id: telegramTrace.principal_id,
+    product_task_id: telegramTaskChat.product_task.id,
+    message: '在桌面继续刚才 Telegram 的任务',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'Desktop continued the same task.',
+    tool_results: [],
+    usage: { input_tokens: 4, output_tokens: 4 },
+    model_responses: [{ id: 'chatcmpl_desktop_handoff', choices: [{ message: { content: 'Desktop continued the same task.' } }] }],
+  });
+  assert.equal(desktopContinuation.product_task.id, telegramTaskChat.product_task.id);
+  const desktopContinuationTrace = store.getRunTrace(desktopContinuation.run_id);
+  assert.equal(desktopContinuationTrace.principal_id, telegramTrace.principal_id);
+  assert.ok(desktopContinuationTrace.events.some((event) => event.event_type === 'handoff.linked'));
+  assert.ok(store.listProductTasks({ principal_id: telegramTrace.principal_id, limit: 20 }).tasks.some((task) => task.id === telegramTaskChat.product_task.id));
+  assert.ok(store.listProductTasks({ conversation_id: telegramTaskChat.conversation_id, limit: 20 }).tasks.some((task) => task.id === telegramTaskChat.product_task.id));
+  assert.ok(store.listProductTasks({ channel: 'telegram', limit: 20 }).tasks.some((task) => task.id === telegramTaskChat.product_task.id));
+  assert.ok(store.listProductTasks({ channel: 'desktop', limit: 20 }).tasks.some((task) => task.id === telegramTaskChat.product_task.id));
+  const imessageContinuation = store.recordToolCallingChat({
+    conversation_id: 'conv_imessage_handoff_test',
+    channel: 'imessage',
+    user_id: 'imessage:+15551234567',
+    principal_id: telegramTrace.principal_id,
+    message: '从 iMessage 查询刚才同一个跨入口任务的进展',
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'iMessage continued the same task.',
+    tool_results: [],
+    usage: { input_tokens: 4, output_tokens: 4 },
+    model_responses: [{ id: 'chatcmpl_imessage_handoff', choices: [{ message: { content: 'iMessage continued the same task.' } }] }],
+  });
+  assert.equal(imessageContinuation.product_task.id, telegramTaskChat.product_task.id);
+  const imessageContinuationTrace = store.getRunTrace(imessageContinuation.run_id);
+  assert.equal(imessageContinuationTrace.principal_id, telegramTrace.principal_id);
+  assert.equal(imessageContinuationTrace.resolved_mode, 'chat_assist');
+  assert.ok(imessageContinuationTrace.events.some((event) => event.event_type === 'handoff.linked'));
+  assert.ok(store.listProductTasks({ channel: 'imessage', limit: 20 }).tasks.some((task) => task.id === telegramTaskChat.product_task.id));
+  const closedHandoffTask = store.closeProductTask({
+    id: telegramTaskChat.product_task.id,
+    outcome: 'blocked',
+    reason: 'manual test closure for handoff task',
+    actor: 'store-test',
+  });
+  assert.equal(closedHandoffTask.task.terminal_status, 'blocked');
+  assert.equal(closedHandoffTask.task.terminal_reason, 'manual test closure for handoff task');
+  assert.equal(closedHandoffTask.task.metadata.manual_close.reason, 'manual test closure for handoff task');
+  const closedHandoffTrace = store.getRunTrace(closedHandoffTask.task.latest_run_id);
+  assert.ok(closedHandoffTrace.events.some((event) => event.event_type === 'task.blocked' && event.item_id === telegramTaskChat.product_task.id));
+  const reopenedHandoffTask = store.reopenProductTask({
+    id: telegramTaskChat.product_task.id,
+    reason: 'resume handoff task in test',
+    actor: 'store-test',
+  });
+  assert.equal(reopenedHandoffTask.task.status, 'planning');
+  assert.equal(reopenedHandoffTask.task.terminal_status, undefined);
+  const reopenedHandoffTrace = store.getRunTrace(reopenedHandoffTask.task.latest_run_id);
+  assert.ok(reopenedHandoffTrace.events.some((event) => event.event_type === 'task.planned' && event.item_id === telegramTaskChat.product_task.id && event.payload.reopened));
 
   const backgroundTaskChat = store.recordToolCallingChat({
     message: '后台跟进 Joi 每日状态并生成提醒',
@@ -322,8 +555,111 @@ try {
   assert.ok(store.listOpenLoops({ status: 'open' }).open_loops.some((loop) => loop.source_product_task_id === backgroundTaskChat.product_task.id));
   assert.ok(store.listProactiveMessages({ status: 'draft' }).messages.some((item) => item.source_product_task_id === backgroundTaskChat.product_task.id));
   const backgroundTrace = store.getRunTrace(backgroundTaskChat.run_id);
+  const backgroundModeEvent = backgroundTrace.events.find((event) => event.event_type === 'run.mode_resolved');
+  assert.equal(backgroundTrace.requested_mode, 'background_task');
+  assert.equal(backgroundTrace.resolved_mode, 'background_task');
+  assert.equal(backgroundTrace.mode_source, 'explicit');
+  assert.equal(backgroundModeEvent?.payload?.mode_locked_by_user, true);
+  assert.equal(backgroundModeEvent?.payload?.contract_mode, 'background');
   assert.ok(backgroundTrace.steps.some((step) => step.step_type === 'open_loop_created'));
   assert.ok(backgroundTrace.steps.some((step) => step.step_type === 'proactive_candidate_created'));
+  assert.ok(backgroundTrace.events.some((event) => event.event_type === 'open_loop.created'));
+  assert.ok(backgroundTrace.events.some((event) => event.event_type === 'proactive.candidate_created'));
+  const backgroundProactive = store.listProactiveMessages({ status: 'draft' }).messages.find((item) => item.source_product_task_id === backgroundTaskChat.product_task.id);
+  assert.ok(backgroundProactive);
+  const backgroundOpenLoop = store.listOpenLoops({ status: 'open' }).open_loops.find((loop) => loop.source_product_task_id === backgroundTaskChat.product_task.id);
+  assert.ok(backgroundOpenLoop);
+  const futureDueAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  store.decideOpenLoop({ id: backgroundOpenLoop.id, action: 'schedule', due_at: futureDueAt, feedback: 'scheduled in test' });
+  assert.equal(store.listOpenLoops({ status: 'scheduled' }).open_loops.find((loop) => loop.id === backgroundOpenLoop.id).status, 'scheduled');
+  store.decideOpenLoop({ id: backgroundOpenLoop.id, action: 'snooze', due_at: futureDueAt, feedback: 'snoozed in test' });
+  assert.equal(store.listOpenLoops({ status: 'snoozed' }).open_loops.find((loop) => loop.id === backgroundOpenLoop.id).status, 'snoozed');
+  const scheduledOpenLoopTrace = store.getRunTrace(backgroundTaskChat.run_id);
+  assert.ok(scheduledOpenLoopTrace.events.some((event) => event.event_type === 'open_loop.scheduled' && event.item_id === backgroundOpenLoop.id));
+  assert.ok(scheduledOpenLoopTrace.events.some((event) => event.event_type === 'open_loop.snoozed' && event.item_id === backgroundOpenLoop.id));
+  store['exec'](
+    `INSERT INTO proactive_messages (id, type, title, body, reason, source_open_loop_id, source_product_task_id, score, status, channel, metadata)
+     VALUES ('pmsg_transition_test', 'followup', 'Transition coverage', 'Transition coverage body', 'state machine coverage', ?, ?, 0.9, 'draft', 'desktop', '{}')`,
+    backgroundOpenLoop.id,
+    backgroundTaskChat.product_task.id,
+  );
+  store.decideProactiveMessage({ id: 'pmsg_transition_test', action: 'approve', feedback: 'authorized in test' });
+  assert.equal(store.listProactiveMessages({ status: 'authorized' }).messages.find((item) => item.id === 'pmsg_transition_test').status, 'authorized');
+  store.decideProactiveMessage({ id: 'pmsg_transition_test', action: 'queue', feedback: 'scheduled in test' });
+  assert.equal(store.listProactiveMessages({ status: 'scheduled' }).messages.find((item) => item.id === 'pmsg_transition_test').status, 'scheduled');
+  store.decideProactiveMessage({ id: 'pmsg_transition_test', action: 'sent', feedback: 'delivered in test' });
+  assert.equal(store.listProactiveMessages({ status: 'delivered' }).messages.find((item) => item.id === 'pmsg_transition_test').status, 'delivered');
+  assert.equal(store['get'](`SELECT status FROM notification_deliveries WHERE proactive_message_id='pmsg_transition_test'`).status, 'delivered');
+  store.decideProactiveMessage({ id: 'pmsg_transition_test', action: 'useful', feedback: 'responded in test' });
+  assert.equal(store.listProactiveMessages({ status: 'responded' }).messages.find((item) => item.id === 'pmsg_transition_test').status, 'responded');
+  const proactiveTransitionTrace = store.getRunTrace(backgroundTaskChat.run_id);
+  assert.ok(proactiveTransitionTrace.events.some((event) => event.event_type === 'proactive.authorized' && event.item_id === 'pmsg_transition_test'));
+  assert.ok(proactiveTransitionTrace.events.some((event) => event.event_type === 'proactive.scheduled' && event.item_id === 'pmsg_transition_test'));
+  assert.ok(proactiveTransitionTrace.events.some((event) => event.event_type === 'proactive.delivered' && event.item_id === 'pmsg_transition_test'));
+  assert.ok(proactiveTransitionTrace.events.some((event) => event.event_type === 'proactive.responded' && event.item_id === 'pmsg_transition_test'));
+  store.decideProactiveMessage({ id: backgroundProactive.id, action: 'sent', feedback: 'delivered in test' });
+  assert.equal(store.listProactiveMessages({ status: 'delivered' }).messages.find((item) => item.id === backgroundProactive.id).status, 'delivered');
+  const backgroundNotification = store['get'](`SELECT id, status FROM notification_deliveries WHERE proactive_message_id=?`, backgroundProactive.id);
+  assert.equal(backgroundNotification.status, 'delivered');
+  const deliveredBackgroundTrace = store.getRunTrace(backgroundTaskChat.run_id);
+  assert.ok(deliveredBackgroundTrace.events.some((event) => event.event_type === 'proactive.delivered' && event.item_id === backgroundProactive.id));
+  assert.ok(deliveredBackgroundTrace.events.some((event) => event.event_type === 'notification.sent' && event.payload.proactive_message_id === backgroundProactive.id));
+  store.recordNotificationOpened({ id: backgroundNotification.id, actor: 'desktop-test', external_delivery_id: 'delivery_test' });
+  const openedNotification = store['get'](`SELECT status, external_delivery_id, opened_at FROM notification_deliveries WHERE id=?`, backgroundNotification.id);
+  assert.equal(openedNotification.status, 'opened');
+  assert.equal(openedNotification.external_delivery_id, 'delivery_test');
+  assert.ok(openedNotification.opened_at);
+  store.recordNotificationOpened({ id: backgroundNotification.id, actor: 'duplicate-test' });
+  const openedBackgroundTrace = store.getRunTrace(backgroundTaskChat.run_id);
+  assert.equal(openedBackgroundTrace.events.filter((event) => event.event_type === 'notification.opened' && event.item_id === backgroundNotification.id).length, 1);
+  assert.equal(openedBackgroundTrace.events.filter((event) => event.event_type === 'notification.resumed' && event.item_id === backgroundNotification.id).length, 1);
+  assert.ok(openedBackgroundTrace.events.some((event) => event.event_type === 'notification.resumed' && event.payload.deep_link_target?.startsWith('joi://conversation/')));
+  for (const [id, score] of [['pmsg_ignore_1', 0.9], ['pmsg_ignore_2', 0.8], ['pmsg_ignore_3', 0.7]]) {
+    store['exec'](
+      `INSERT INTO proactive_messages (id, type, title, body, reason, source_open_loop_id, source_product_task_id, score, status, channel, metadata)
+       VALUES (?, 'followup', ?, 'Ignore feedback body', 'downrank regression', ?, ?, ?, 'draft', 'desktop', '{}')`,
+      id,
+      id,
+      backgroundOpenLoop.id,
+      backgroundTaskChat.product_task.id,
+      score,
+    );
+  }
+  store.decideProactiveMessage({ id: 'pmsg_ignore_1', action: 'ignore', feedback: 'not useful now' });
+  assert.ok(Number(store['get'](`SELECT score FROM proactive_messages WHERE id='pmsg_ignore_2'`).score) < 0.8);
+  store.decideProactiveMessage({ id: 'pmsg_ignore_2', action: 'dismiss', feedback: 'still not useful' });
+  store.decideProactiveMessage({ id: 'pmsg_ignore_3', action: 'ignore', feedback: 'third ignore' });
+  const suppressedByDownrank = store['get'](`SELECT status, metadata FROM proactive_messages WHERE id='pmsg_ignore_3'`);
+  assert.equal(suppressedByDownrank.status, 'suppressed');
+  assert.equal(JSON.parse(suppressedByDownrank.metadata).downranking.negative_feedback_count, 3);
+  const downrankTrace = store.getRunTrace(backgroundTaskChat.run_id);
+  assert.ok(downrankTrace.events.some((event) => event.event_type === 'proactive.suppressed' && event.item_id === 'pmsg_ignore_3'));
+  store.decideProactiveMessage({ id: backgroundProactive.id, action: 'suppress', feedback: 'test suppression' });
+  const suppressedBackgroundTrace = store.getRunTrace(backgroundTaskChat.run_id);
+  assert.ok(suppressedBackgroundTrace.events.some((event) => event.event_type === 'proactive.suppressed' && event.item_id === backgroundProactive.id));
+  store.decideOpenLoop({ id: backgroundOpenLoop.id, action: 'close', feedback: 'closed in test' });
+  assert.equal(store.listOpenLoops({ status: 'closed' }).open_loops.find((loop) => loop.id === backgroundOpenLoop.id).status, 'closed');
+  const closedBackgroundTrace = store.getRunTrace(backgroundTaskChat.run_id);
+  assert.ok(closedBackgroundTrace.events.some((event) => event.event_type === 'open_loop.closed' && event.item_id === backgroundOpenLoop.id));
+  store['exec'](
+    `INSERT INTO open_loops (id, topic, description, status, source_conversation_id, source_run_id, source_product_task_id,
+                             suggested_followup, priority, due_at, metadata)
+     VALUES ('oloop_expired_test', 'Expired loop', 'Should be classified automatically', 'open', ?, ?, ?,
+             'Expired follow-up', 'normal', '2000-01-01T00:00:00Z', '{}')`,
+    backgroundTaskChat.conversation_id,
+    backgroundTaskChat.run_id,
+    backgroundTaskChat.product_task.id,
+  );
+  store['exec'](
+    `INSERT INTO proactive_messages (id, type, title, body, reason, source_open_loop_id, source_product_task_id, score, status, channel, metadata)
+     VALUES ('pmsg_expired_test', 'followup', 'Expired proactive', 'Expired body', 'expired loop', 'oloop_expired_test', ?, 0.9, 'draft', 'desktop', '{}')`,
+    backgroundTaskChat.product_task.id,
+  );
+  assert.ok(!store.listOpenLoops({ status: 'open', limit: 100 }).open_loops.some((loop) => loop.id === 'oloop_expired_test'));
+  assert.equal(store.listOpenLoops({ status: 'expired', limit: 100 }).open_loops.find((loop) => loop.id === 'oloop_expired_test').status, 'expired');
+  assert.equal(store.listProactiveMessages({ status: 'expired', limit: 100 }).messages.find((item) => item.id === 'pmsg_expired_test').status, 'expired');
+  const expiredBackgroundTrace = store.getRunTrace(backgroundTaskChat.run_id);
+  assert.ok(expiredBackgroundTrace.events.some((event) => event.event_type === 'open_loop.expired' && event.item_id === 'oloop_expired_test'));
 
   const waitingToolCallingChat = store.recordToolCallingChat({
     message: 'Use a model-generated patch that requires approval',
@@ -369,6 +705,8 @@ try {
   assert.equal(waitingOutput.status, 'waiting_confirmation');
   assert.equal(JSON.parse(waitingOutput.output).confirmation_id, waitingConfirmation.id);
   assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM tool_runs WHERE run_id=?`, waitingToolCallingChat.run_id).count), 0);
+  assert.equal(JSON.parse(store['get'](`SELECT metadata FROM model_calls WHERE run_id=?`, waitingToolCallingChat.run_id).metadata).tool_run_count, 0);
+  assert.equal(store.getRunTrace(waitingToolCallingChat.run_id).steps.find((step) => step.step_type === 'model_call_finished')?.output?.tool_run_count, 0);
   store.decideConfirmation({ id: waitingConfirmation.id, approve: false, actor: 'test', reason: 'reject test' });
   const rejectedTrace = store.getRunTrace(waitingToolCallingChat.run_id);
   assert.equal(rejectedTrace.status, 'failed');
@@ -402,10 +740,22 @@ try {
     model_responses: [{ id: 'chatcmpl_resumable', choices: [{ message: { tool_calls: [] } }] }],
   });
   const resumableConfirmation = store.listConfirmations().items.find((item) => item.run_id === resumableChat.run_id);
-  store.decideConfirmation({ id: resumableConfirmation.id, approve: true, actor: 'test', reason: 'approve test' });
+  assert.ok(store.listPendingApprovals().items.some((item) => item.id === resumableConfirmation.id));
+  store.decideApproval({
+    run_id: resumableChat.run_id,
+    approval_request_id: resumableConfirmation.id,
+    decision: 'approve',
+    decided_by: 'test',
+    decided_at: '2026-06-22T00:00:00Z',
+    reason: 'approve test',
+    edited_parameters: { reason: 'edited resume approval', dry_run: true },
+  });
+  assert.equal(store.listConfirmations().items.find((item) => item.id === resumableConfirmation.id).approved_by, 'test');
+  assert.equal(store.listConfirmations().items.find((item) => item.id === resumableConfirmation.id).decided_at, '2026-06-22T00:00:00Z');
   const resumeRequest = store.loadApprovedToolCallingResume(resumableConfirmation.id);
   assert.equal(resumeRequest.call_id, 'call_apply_patch_resume');
-  assert.equal(resumeRequest.input.reason, 'resume approval');
+  assert.equal(resumeRequest.input.reason, 'edited resume approval');
+  assert.equal(resumeRequest.input.dry_run, true);
   const resumed = store.completeApprovedToolCallingResume(resumableConfirmation.id, {
     provider: 'openai_compatible',
     model_name: 'real-tool-model',
@@ -425,12 +775,40 @@ try {
   assert.equal(resumed.artifacts.length, 1);
   const resumedTrace = store.getRunTrace(resumableChat.run_id);
   assert.equal(resumedTrace.status, 'succeeded');
-  assert.ok(resumedTrace.events.some((event) => event.event_type === 'approval.resolved'));
+  assert.ok(resumedTrace.events.some((event) => event.event_type === 'approval.resolved' && event.payload.approval_request_id === resumableConfirmation.id && event.payload.decided_by === 'test'));
+  assert.ok(resumedTrace.events.some((event) => event.event_type === 'approval.approved' && event.payload.edited_parameters?.reason === 'edited resume approval'));
+  assert.equal(resumedTrace.events.filter((event) => event.event_type === 'approval.resumed' && event.item_id === resumableConfirmation.id).length, 1);
+  assert.equal(resumedTrace.events.filter((event) => event.event_type === 'run.resumed' && event.payload.resumed_from_confirmation_id === resumableConfirmation.id).length, 1);
   assert.ok(resumedTrace.events.some((event) => event.event_type === 'tool.finished'));
   assert.ok(resumedTrace.events.some((event) => event.event_type === 'run.completed'));
   assert.equal(store.getConversation(resumableChat.conversation_id).messages.at(-1).content, 'Patch resumed final answer.');
   assert.equal(JSON.parse(store['get'](`SELECT output FROM tool_runs WHERE run_id=?`, resumableChat.run_id).output).summary, 'patch applied by approval resume');
   assert.ok(store.listConfirmations().items.find((item) => item.id === resumableConfirmation.id).resumed_at);
+  const duplicateResume = store.completeApprovedToolCallingResume(resumableConfirmation.id, {
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    final_message: 'duplicate resume should not run',
+    tool_result: {
+      call_id: 'call_apply_patch_resume',
+      name: 'apply_patch',
+      arguments: resumeRequest.input,
+      output: { status: 'completed', summary: 'duplicate resume output' },
+    },
+    usage: { input_tokens: 99, output_tokens: 99, cached_input_tokens: 99 },
+    model_responses: [{ id: 'chatcmpl_duplicate_resume' }],
+  });
+  assert.equal(duplicateResume, undefined);
+  const afterDuplicateResumeTrace = store.getRunTrace(resumableChat.run_id);
+  assert.equal(afterDuplicateResumeTrace.events.filter((event) => event.event_type === 'approval.resumed' && event.item_id === resumableConfirmation.id).length, 1);
+  assert.equal(afterDuplicateResumeTrace.events.filter((event) => event.event_type === 'run.resumed' && event.payload.resumed_from_confirmation_id === resumableConfirmation.id).length, 1);
+  assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM tool_runs WHERE run_id=? AND tool_call_id='call_apply_patch_resume'`, resumableChat.run_id).count), 1);
+  const resumedModelMetadata = JSON.parse(store['get'](
+    `SELECT metadata FROM model_calls WHERE run_id=? AND json_extract(metadata, '$.resumed_from_confirmation_id')=?`,
+    resumableChat.run_id,
+    resumableConfirmation.id,
+  ).metadata);
+  assert.equal(resumedModelMetadata.tool_run_count, 1);
+  assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM messages WHERE json_extract(metadata, '$.run_id')=? AND role='assistant'`, resumableChat.run_id).count), 2);
 
   const failingResumeChat = store.recordToolCallingChat({
     message: 'Use a model-generated patch whose final resume model call fails',
@@ -520,6 +898,127 @@ try {
   assert.equal(liveFinishedTrace.model_calls[0].input_tokens, 5);
   assert.equal(store.getConversation(liveStarted.conversation_id).messages.at(-1).content, 'Live run finished.');
 
+  const streamStarted = store.beginToolCallingChat({
+    message: 'Begin a streaming provider run with tool events',
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+    model_name: 'live-tool-model',
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'live-tool-model',
+    selected_agent_id: 'general_agent',
+  });
+  const emittedEventTypes = [];
+  const streamCallbacks = store.createToolCallingEventCallbacks(streamStarted, () => {
+    emittedEventTypes.push(store.getRunTrace(streamStarted.run_id).events.at(-1).event_type);
+  });
+  const streamToolCall = {
+    id: 'call_stream_workspace_search',
+    name: 'workspace_search',
+    arguments: { query: 'Run Trace', root: '.', max_results: 3 },
+  };
+  const streamToolResult = {
+    call_id: streamToolCall.id,
+    name: streamToolCall.name,
+    arguments: streamToolCall.arguments,
+    output: {
+      status: 'completed',
+      mode: 'streaming_persistence_test',
+      summary: 'streaming persistence evidence',
+    },
+  };
+  streamCallbacks.onModelStarted({ step: 0, model: 'live-tool-model', streaming: true });
+  streamCallbacks.onModelDelta({ step: 0, payload: { choices: [{ delta: { content: 'Streamed ' } }] } });
+  streamCallbacks.onAssistantDelta({ step: 0, text: 'Streamed ', index: 0 });
+  streamCallbacks.onToolCallRequested({ step: 0, call: streamToolCall });
+  streamCallbacks.onToolStarted({ step: 0, call: streamToolCall });
+  streamCallbacks.onToolOutputDelta({ step: 0, call: streamToolCall, output: { summary: 'partial stream evidence' } });
+  streamCallbacks.onToolCompleted({ step: 0, call: streamToolCall, result: streamToolResult });
+  streamCallbacks.onUsage({
+    step: 0,
+    usage: { input_tokens: 9, output_tokens: 4, cached_input_tokens: 2 },
+    usage_status: 'recorded',
+  });
+  streamCallbacks.onAssistantDelta({ step: 1, text: 'answer.', index: 1 });
+  streamCallbacks.onAssistantCompleted({ step: 1, text: 'Streamed answer.', finish_reason: 'stop', usage_status: 'recorded' });
+  streamCallbacks.onModelCompleted({ step: 1, finish_reason: 'stop', usage_status: 'recorded' });
+  const streamFinished = store.finishToolCallingChat(streamStarted, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'live-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'Streamed answer.',
+    tool_results: [streamToolResult],
+    usage: { input_tokens: 9, output_tokens: 4, cached_input_tokens: 2 },
+    usage_status: 'recorded',
+    finish_reason: 'stop',
+    model_responses: [{ id: 'chatcmpl_stream_finished' }],
+  });
+  assert.equal(streamFinished.response, 'Streamed answer.');
+  assert.ok(emittedEventTypes.includes('assistant.delta'));
+  assert.ok(emittedEventTypes.includes('tool.completed'));
+  const streamTrace = store.getRunTrace(streamStarted.run_id);
+  const streamEventTypes = streamTrace.events.map((event) => event.event_type);
+  assert.deepEqual(streamEventTypes.slice(0, 3), ['run.started', 'run.mode_resolved', 'turn.started']);
+  assert.ok(streamEventTypes.indexOf('assistant.delta') < streamEventTypes.indexOf('tool.call_requested'));
+  assert.ok(streamEventTypes.indexOf('tool.call_requested') < streamEventTypes.indexOf('tool.completed'));
+  assert.ok(streamEventTypes.indexOf('tool.completed') < streamEventTypes.indexOf('assistant.completed'));
+  assert.ok(streamEventTypes.indexOf('assistant.completed') < streamEventTypes.indexOf('turn.completed'));
+  assert.ok(streamEventTypes.indexOf('turn.completed') < streamEventTypes.indexOf('run.completed'));
+  const providerDeltas = streamTrace.events.filter((event) => event.event_type === 'assistant.delta' && event.delta?.stream_source === 'provider_stream');
+  assert.equal(providerDeltas.length, 2);
+  assert.equal(providerDeltas.map((event) => event.delta.text).join(''), 'Streamed answer.');
+  assert.equal(streamTrace.events.some((event) => event.event_type === 'assistant.delta' && event.delta?.stream_source === 'fallback_final_chunk'), false);
+  assert.equal(streamTrace.events.filter((event) => event.event_type === 'assistant.completed').length, 1);
+  assert.equal(streamTrace.events.filter((event) => event.event_type === 'tool.call_requested' && event.item_id === streamToolCall.id).length, 1);
+  assert.equal(streamTrace.events.filter((event) => event.event_type === 'tool.started' && event.item_id === streamToolCall.id).length, 1);
+  assert.equal(streamTrace.events.filter((event) => event.event_type === 'tool.completed' && event.item_id === streamToolCall.id).length, 1);
+  assert.equal(streamTrace.events.filter((event) => event.event_type === 'usage.recorded' && event.item_id === streamStarted.model_call_id).length, 1);
+  assert.equal(streamTrace.model_calls[0].input_tokens, 9);
+  assert.equal(streamTrace.model_calls[0].cached_input_tokens, 2);
+  const streamModelCallRow = store['get'](
+    `SELECT streaming_enabled, first_delta_at FROM model_calls WHERE id=?`,
+    streamStarted.model_call_id,
+  );
+  assert.equal(Number(streamModelCallRow.streaming_enabled), 1);
+  assert.ok(streamModelCallRow.first_delta_at);
+  const streamToolRun = store['get'](`SELECT output FROM tool_runs WHERE run_id=? AND tool_call_id=?`, streamStarted.run_id, streamToolCall.id);
+  assert.equal(JSON.parse(streamToolRun.output).mode, 'streaming_persistence_test');
+
+  const redirectStarted = store.beginToolCallingChat({
+    conversation_id: liveStarted.conversation_id,
+    message: 'Begin a run that will be redirected',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'live-tool-model',
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'live-tool-model',
+    selected_agent_id: 'general_agent',
+  });
+  const redirectedTrace = store.redirectRun({ run_id: redirectStarted.run_id, reason: 'test redirect' });
+  assert.equal(redirectedTrace.status, 'redirected');
+  assert.equal(redirectedTrace.terminal_status, 'redirected');
+  assert.ok(redirectedTrace.events.some((event) => event.event_type === 'run.redirected'));
+  assert.equal(redirectedTrace.model_calls[0].status, 'cancelled');
+  const redirectChild = store.beginToolCallingChat({
+    conversation_id: liveStarted.conversation_id,
+    message: 'Continue redirected run',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'live-tool-model',
+    parent_run_id: redirectStarted.run_id,
+    redirected_from_run_id: redirectStarted.run_id,
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'live-tool-model',
+    selected_agent_id: 'general_agent',
+  });
+  const redirectChildTrace = store.getRunTrace(redirectChild.run_id);
+  assert.equal(redirectChildTrace.parent_run_id, redirectStarted.run_id);
+  assert.equal(redirectChildTrace.redirected_from_run_id, redirectStarted.run_id);
+  store.failToolCallingChat(redirectChild, new Error('redirect child cleanup'), 'cancelled');
+
   const stickyConversationID = 'conv_telegram_chat_12345_test';
   for (let index = 1; index <= 6; index += 1) {
     store.recordToolCallingChat({
@@ -601,11 +1100,94 @@ try {
   });
   const cancellableConfirmation = store.listConfirmations().items.find((item) => item.run_id === cancellableChat.run_id);
   store.interruptRun({ run_id: cancellableChat.run_id, reason: 'cancel waiting approval' });
+  store.interruptRun({ run_id: cancellableChat.run_id, reason: 'duplicate cancel waiting approval' });
   const cancelledTrace = store.getRunTrace(cancellableChat.run_id);
   assert.equal(cancelledTrace.status, 'cancelled');
+  assert.equal(cancelledTrace.events.filter((event) => event.event_type === 'run.cancel_requested').length, 1);
+  assert.equal(cancelledTrace.events.filter((event) => event.event_type === 'run.cancelled').length, 1);
+  assert.equal(cancelledTrace.events.filter((event) => event.event_type === 'run.interrupted').length, 1);
   assert.equal(store['get'](`SELECT status FROM turns WHERE run_id=?`, cancellableChat.run_id).status, 'cancelled');
   assert.equal(store.listConfirmations().items.find((item) => item.id === cancellableConfirmation.id).status, 'rejected');
   assert.equal(store.getProductTask(cancellableChat.product_task.id).task.status, 'paused');
+
+  {
+    const recoveryDbPath = join(tempDir, 'recovery-classification.db');
+    const recoveryStore = new JoiSQLiteStore({
+      dbPath: recoveryDbPath,
+      schemaSql: readFileSync(join(root, 'database/sqlite/001_init_schema.sql'), 'utf8'),
+      logDir: join(tempDir, 'recovery-logs'),
+      backupDir: join(tempDir, 'recovery-backups'),
+      version: 'test',
+    });
+    const staleRun = recoveryStore.beginToolCallingChat({
+      message: 'This live run will be orphaned by restart',
+      input_mode: 'auto',
+      runtime_mode: 'tool_calling',
+      model_name: 'live-tool-model',
+    }, {
+      provider: 'openai_compatible',
+      model_name: 'live-tool-model',
+      selected_agent_id: 'general_agent',
+    });
+    const waitingRecovery = recoveryStore.recordToolCallingChat({
+      message: 'This approval should survive restart',
+      input_mode: 'serious_task',
+      runtime_mode: 'tool_calling',
+      model_name: 'real-tool-model',
+    }, {
+      status: 'waiting_confirmation',
+      provider: 'openai_compatible',
+      model_name: 'real-tool-model',
+      selected_agent_id: 'general_agent',
+      final_message: 'confirmation_required: workspace write requires approval before execution',
+      tool_results: [{
+        call_id: 'call_apply_patch_recovery',
+        name: 'apply_patch',
+        arguments: { patch: '*** Begin Patch\n*** End Patch\n', reason: 'restart recovery approval' },
+        output: {
+          status: 'waiting_confirmation',
+          message: 'confirmation_required: workspace write requires approval before execution',
+          capability: 'apply_patch',
+          risk: 'workspace_write',
+        },
+      }],
+      usage: { input_tokens: 8, output_tokens: 2 },
+      model_responses: [{ id: 'chatcmpl_recovery_waiting', choices: [{ message: { tool_calls: [] } }] }],
+    });
+    recoveryStore.close();
+    const reopenedRecoveryStore = new JoiSQLiteStore({
+      dbPath: recoveryDbPath,
+      schemaSql: readFileSync(join(root, 'database/sqlite/001_init_schema.sql'), 'utf8'),
+      logDir: join(tempDir, 'recovery-logs'),
+      backupDir: join(tempDir, 'recovery-backups'),
+      version: 'test',
+    });
+    const staleTrace = reopenedRecoveryStore.getRunTrace(staleRun.run_id);
+    assert.equal(staleTrace.status, 'failed');
+    assert.equal(staleTrace.terminal_reason, 'runtime state was lost after app restart');
+    assert.ok(staleTrace.events.some((event) => event.event_type === 'run.recovery_required'));
+    assert.ok(staleTrace.events.some((event) => event.event_type === 'run.failed'));
+    const waitingRecoveryTrace = reopenedRecoveryStore.getRunTrace(waitingRecovery.run_id);
+    assert.equal(waitingRecoveryTrace.status, 'waiting_confirmation');
+    assert.ok(waitingRecoveryTrace.events.some((event) => event.event_type === 'run.recovery_required'));
+    const recoverableRuns = reopenedRecoveryStore.listRecoverableRuns({ limit: 10 }).runs;
+    assert.ok(recoverableRuns.some((item) => item.run_id === staleRun.run_id && item.recovery_status === 'runtime_lost'));
+    assert.ok(recoverableRuns.some((item) => item.run_id === waitingRecovery.run_id && item.recovery_status === 'needs_user_decision'));
+    reopenedRecoveryStore.close();
+  }
+
+  const closureReport = store.getRecentRunClosureReport({ limit: 100 });
+  assert.ok(closureReport.metrics.total_runs > 0);
+  assert.ok(closureReport.metrics.terminal_event_runs > 0);
+  assert.ok(closureReport.metrics.completed_tasks_with_evidence > 0);
+  assert.ok(closureReport.metrics.runs_with_tool_evidence > 0);
+  assert.ok(closureReport.metrics.runs_with_memory_events > 0);
+  assert.ok(closureReport.metrics.runs_with_proactive_events > 0);
+  assert.ok(closureReport.metrics.runs_with_handoff_events > 0);
+  assert.ok(closureReport.items.some((item) => item.run_id === telegramTaskChat.run_id && item.handoff_event_count > 0));
+  assert.ok(closureReport.items.some((item) => item.run_id === backgroundTaskChat.run_id && item.proactive_event_count > 0));
+  assert.ok(closureReport.items.some((item) => item.run_id === backgroundTaskChat.run_id && item.handoff_event_count > 0));
+  assertConversationFlowClosureInvariants(store);
 
   const backup = store.createBackup();
   assert.ok(existsSync(backup.path));
@@ -669,4 +1251,94 @@ try {
   console.log('sqlite store tests passed');
 } finally {
   rmSync(tempDir, { recursive: true, force: true });
+}
+
+function assertNoRows(rows, message) {
+  assert.deepEqual(rows, [], `${message}: ${JSON.stringify(rows.slice(0, 5))}`);
+}
+
+function assertConversationFlowClosureInvariants(store) {
+  assertNoRows(store['all'](
+    `SELECT run_id, seq, COUNT(*) AS count
+     FROM run_events
+     GROUP BY run_id, seq
+     HAVING COUNT(*) > 1`,
+  ), 'run_events must keep unique (run_id, seq) ordering');
+
+  assertNoRows(store['all'](
+    `SELECT r.id, r.status, r.terminal_status
+     FROM runs r
+     WHERE NOT EXISTS (
+       SELECT 1 FROM run_events e
+       WHERE e.run_id=r.id AND e.terminal=1
+     )
+       AND NOT EXISTS (
+         SELECT 1 FROM run_events e
+         WHERE e.run_id=r.id AND e.event_type='run.recovery_required'
+       )`,
+  ), 'every run must have a terminal event or explicit recovery classification');
+
+  assertNoRows(store['all'](
+    `SELECT r.id, r.resolved_mode, r.status, m.content AS user_message, r.metadata
+     FROM runs r
+     LEFT JOIN messages m ON m.id=r.user_message_id
+     WHERE r.resolved_mode IN ('serious_task', 'background_task')
+       AND NOT EXISTS (
+         SELECT 1 FROM product_tasks pt
+         WHERE pt.latest_run_id=r.id
+            OR pt.source_run_id=r.id
+            OR pt.id=json_extract(r.metadata, '$.product_task_id')
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM run_events e
+         WHERE e.run_id=r.id
+           AND (
+             e.item_type='refusal'
+             OR e.event_type IN ('task.refused', 'task.declined', 'policy.blocked')
+           )
+       )`,
+  ), 'every execution/background run must have a Product Task or refusal event');
+
+  assertNoRows(store['all'](
+    `SELECT id, status, terminal_status, evidence_summary
+     FROM product_tasks
+     WHERE (status='completed' OR terminal_status='completed')
+       AND COALESCE(NULLIF(evidence_summary, ''), '')=''`,
+  ), 'completed product tasks must have evidence summaries');
+
+  assertNoRows(store['all'](
+    `WITH requested AS (
+       SELECT run_id, item_id, seq
+       FROM run_events
+       WHERE event_type='tool.call_requested'
+     )
+     SELECT requested.run_id, requested.item_id, requested.seq
+     FROM requested
+     WHERE COALESCE(requested.item_id, '') <> ''
+       AND NOT EXISTS (
+         SELECT 1 FROM run_events e
+         WHERE e.run_id=requested.run_id
+           AND e.item_id=requested.item_id
+           AND e.event_type IN ('tool.completed', 'tool.failed', 'tool.policy_blocked', 'tool.finished', 'tool.cancelled')
+       )`,
+  ), 'every requested tool call must have a terminal tool event');
+
+  assertNoRows(store['all'](
+    `SELECT p.id, p.status
+     FROM proactive_messages p
+     WHERE p.status IN ('delivered', 'responded', 'closed')
+       AND NOT EXISTS (
+         SELECT 1 FROM notification_deliveries nd
+         WHERE nd.proactive_message_id=p.id
+           AND nd.status IN ('delivered', 'sent', 'opened', 'responded')
+       )`,
+  ), 'delivered proactive messages must have delivery state');
+
+  assertNoRows(store['all'](
+    `SELECT DISTINCT m.id, m.status
+     FROM memories m
+     JOIN memory_usage_logs mul ON mul.memory_id=m.id
+     WHERE m.status IN ('superseded', 'deleted', 'rejected')
+        OR m.disabled_at IS NOT NULL`,
+  ), 'superseded or disabled memories must not be recalled');
 }

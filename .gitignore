@@ -14,7 +14,9 @@ blind-test-runs/
 services/orchestrator-core/blind-test-runs/
 JoiBlindTestWorkspace/
 .local/
+.e2e/
 apps/joi-electron/release-*/
+reference/openai-codex/
 
 .DS_Store
 *.log

@@ -39,6 +39,36 @@ const toolLabelMap: Record<string, { running: string; completed: string; failed:
 };
 
 export function summarizeExecutionEvent(event: NormalizedRunEvent): string {
+  if (event.type === 'run.mode_resolved') {
+    return modeResolutionLabel(event);
+  }
+  if (event.type === 'run.redirected') {
+    return event.summary || stringValue(event.snapshot.reason) || stringValue(event.delta.reason) || '任务已转向';
+  }
+  if (event.type === 'run.resumed') {
+    return event.summary || '已恢复执行';
+  }
+  if (event.type === 'run.cancel_requested') {
+    return event.summary || stringValue(event.snapshot.reason) || stringValue(event.delta.reason) || '已请求取消';
+  }
+  if (event.type === 'run.cancelled') {
+    return event.summary || stringValue(event.snapshot.reason) || stringValue(event.delta.reason) || '运行已取消';
+  }
+  if (event.type === 'run.failed') {
+    return event.summary || event.error || stringValue(event.snapshot.reason) || stringValue(event.delta.reason) || '运行失败';
+  }
+  if (event.type === 'run.recovery_required') {
+    return event.summary || '需要恢复处理';
+  }
+  if (event.itemType === 'memory') {
+    return event.summary || '已使用记忆';
+  }
+  if (event.itemType === 'open_loop' || event.itemType === 'proactive') {
+    return event.summary || '后续跟进已记录';
+  }
+  if (event.itemType === 'handoff') {
+    return event.summary || '跨入口继续任务';
+  }
   const toolName = toolNameFromEvent(event);
   const labels = toolLabelMap[toolName] ?? inferToolLabels(toolName);
 
@@ -58,9 +88,26 @@ export function summarizeExecutionEvent(event: NormalizedRunEvent): string {
 }
 
 export function detailForExecutionEvent(event: NormalizedRunEvent): string | undefined {
+  if (event.type === 'run.mode_resolved') {
+    return stringValue(event.snapshot.reason) || stringValue(event.delta.reason);
+  }
+  if (event.type === 'run.redirected' || event.type === 'run.recovery_required' || event.type === 'run.cancel_requested' || event.type === 'run.cancelled' || event.type === 'run.failed') {
+    return stringValue(event.snapshot.reason) || stringValue(event.delta.reason);
+  }
+  if (event.type === 'run.resumed') {
+    return stringValue(event.snapshot.resumed_from_confirmation_id) || stringValue(event.delta.resumed_from_confirmation_id);
+  }
   const source = sourceLabelFromEvent(event);
   if (source) return source;
   return event.title && event.title !== summarizeExecutionEvent(event) ? event.title : undefined;
+}
+
+function modeResolutionLabel(event: NormalizedRunEvent): string {
+  const resolvedMode = stringValue(event.snapshot.resolved_mode) || stringValue(event.delta.resolved_mode);
+  const source = stringValue(event.snapshot.mode_source) || stringValue(event.delta.mode_source);
+  if (resolvedMode === 'serious_task') return source === 'explicit' ? '执行模式已锁定' : '已进入执行模式';
+  if (resolvedMode === 'background_task') return source === 'explicit' ? '后台模式已锁定' : '已进入后台模式';
+  return source === 'explicit' ? '聊天模式已锁定' : '普通聊天';
 }
 
 export function sourceLabelFromEvent(event: NormalizedRunEvent): string {

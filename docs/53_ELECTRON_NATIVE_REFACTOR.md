@@ -2,7 +2,9 @@
 
 ## Current Target
 
-The active target repo is `/Users/hao/project/Joi`. The older `/Users/hao/Documents/Joi` tree is not used for new Electron work.
+The active target repo is `/Users/hao/project/Joi`.
+
+The older `/Users/hao/Documents/Joi` tree is not used for new Electron work. On this Mac it is a stale residual path and current terminal access to it is blocked by macOS with `Operation not permitted`; see `docs/54_LOCAL_REPO_AND_APP_STATE.md`.
 
 The cutover has moved the default desktop app to Electron-native:
 
@@ -38,6 +40,7 @@ The Electron shell currently provides:
 - Electron main/preload/renderer app under `apps/joi-electron`.
 - `contextIsolation=true` and `nodeIntegration=false`.
 - Single-instance lock.
+- Single-instance reopen recovery: if the last window was closed while the Electron main process remained alive, `second-instance` and macOS `activate` recreate/show the main window instead of leaving the app apparently unopened.
 - macOS hidden-inset title bar.
 - Joi data/log/backup directories under `~/Library/Application Support/Joi`.
 - Controlled preload API: `window.joi.invoke`, `window.joi.onRunEvent`, `window.joi.app.getVersion`, and `window.joi.app.openExternal`.
@@ -88,6 +91,6 @@ npm run test:execution-actions --prefix apps/joi-desktop/frontend
 npm run build --prefix apps/joi-desktop/frontend
 ```
 
-The current package output is `dist/desktop/Joi-0.1.0-rc0-macos-arm64.zip`, with installed app path `/Applications/Joi.app` and source app path `apps/joi-electron/release-desktop/mac-arm64/Joi.app`.
+The current package output is `dist/desktop/Joi-0.1.0-20260623.1115-macos-arm64.zip`, with installed app path `/Applications/Joi.app` and source app path `apps/joi-electron/release-desktop/mac-arm64/Joi.app`.
 
 Manual Electron verification should target `/Applications/Joi.app` or the running `Electron` dev runtime, not a static browser preview.

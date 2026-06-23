@@ -2,22 +2,61 @@ import type { ChatInputMode, NormalizedRunEvent } from './types';
 
 export type EventVisibility =
   | 'chat'
+  | 'transcript'
   | 'inline'
   | 'compact'
   | 'task'
   | 'approval'
   | 'artifact'
+  | 'memory'
+  | 'proactive'
+  | 'handoff'
   | 'trace_only'
   | 'hidden';
 
 export function getEventVisibility(event: NormalizedRunEvent, mode: ChatInputMode): EventVisibility {
   const type = event.type;
   const itemType = event.itemType;
+  const declared = normalizeDeclaredVisibility(event.visibility);
+
+  if (declared === 'hidden') {
+    return 'hidden';
+  }
+
+  if (isExecutionProcessEvent(event)) {
+    return 'transcript';
+  }
+
+  if (declared === 'trace_only' || declared === 'chat') {
+    return declared;
+  }
+  if (declared === 'transcript') return 'transcript';
+  if (declared === 'approval') return 'transcript';
+  if (declared === 'artifact') return 'trace_only';
+  if (declared === 'task') {
+    return 'trace_only';
+  }
+  if (declared === 'tool') {
+    return 'transcript';
+  }
+  if (declared === 'memory' || declared === 'proactive' || declared === 'handoff') {
+    return 'trace_only';
+  }
+  if (declared === 'inline_status') {
+    if (type === 'run.mode_resolved' || itemType === 'model' || itemType === 'mode_resolution') return 'trace_only';
+    return 'transcript';
+  }
 
   if (type === 'assistant.delta' || type === 'assistant.completed') return 'chat';
-  if (type === 'approval.required' || type === 'approval.requested') return 'approval';
-  if (type === 'artifact.created') return 'artifact';
+  if (type === 'approval.required' || type === 'approval.requested') return 'transcript';
+  if (type === 'artifact.created' || type.startsWith('verification.')) return 'trace_only';
+  if (type === 'run.mode_resolved') return 'trace_only';
+  if (type === 'run.resumed' || type === 'run.redirected' || type === 'run.recovery_required' || type === 'run.cancel_requested' || type === 'run.cancelled' || type === 'run.failed') return 'transcript';
 
+  if (itemType === 'memory') return 'trace_only';
+  if (itemType === 'open_loop' || itemType === 'proactive') return 'trace_only';
+  if (itemType === 'handoff') return 'trace_only';
+  if (itemType === 'artifact') return 'trace_only';
   if (itemType === 'reflection') return 'trace_only';
   if (itemType === 'policy' || itemType === 'workflow' || itemType === 'memory' || itemType === 'model') return 'trace_only';
 
@@ -32,24 +71,67 @@ export function getEventVisibility(event: NormalizedRunEvent, mode: ChatInputMod
     return 'hidden';
   }
 
-  if (itemType === 'worker') {
-    if (mode === 'background_task') return 'task';
-    if (mode === 'serious_task') return 'compact';
-    if (mode === 'chat_assist') return 'trace_only';
-    return 'inline';
-  }
+  if (itemType === 'worker') return 'trace_only';
 
   if (itemType === 'task') {
-    if (mode === 'chat_assist') return 'trace_only';
-    return mode === 'background_task' ? 'task' : 'compact';
+    return 'trace_only';
   }
 
   if (itemType === 'tool' || itemType === 'capability' || itemType === 'node') {
-    if (mode === 'chat_assist') return 'trace_only';
-    if (mode === 'serious_task') return 'compact';
-    if (mode === 'background_task') return 'task';
-    return 'inline';
+    return 'transcript';
   }
 
   return 'trace_only';
+}
+
+function isExecutionProcessEvent(event: NormalizedRunEvent): boolean {
+  const type = event.type.toLowerCase();
+  const itemType = event.itemType.toLowerCase();
+  if (
+    type.startsWith('model.')
+    || type.startsWith('tool.')
+    || type.startsWith('approval.')
+    || type.startsWith('artifact.')
+    || type.startsWith('verification.')
+  ) {
+    return true;
+  }
+  if (
+    type === 'run.resumed'
+    || type === 'run.redirected'
+    || type === 'run.recovery_required'
+    || type === 'run.cancel_requested'
+    || type === 'run.cancelled'
+    || type === 'run.failed'
+    || type === 'run.interrupted'
+  ) {
+    return true;
+  }
+  return (
+    itemType === 'tool'
+    || itemType === 'tool_run'
+    || itemType === 'capability'
+    || itemType === 'node'
+    || itemType === 'approval'
+    || itemType === 'artifact'
+    || itemType === 'task'
+    || itemType === 'worker'
+    || itemType === 'memory'
+    || itemType === 'open_loop'
+    || itemType === 'proactive'
+    || itemType === 'handoff'
+  );
+}
+
+function normalizeDeclaredVisibility(value: string | undefined): string {
+  const visibility = (value || '').trim();
+  if (visibility === 'inline_status') return 'inline_status';
+  if (visibility === 'tool') return 'tool';
+  if (visibility === 'memory') return 'memory';
+  if (visibility === 'proactive') return 'proactive';
+  if (visibility === 'handoff') return 'handoff';
+  if (visibility === 'chat' || visibility === 'transcript' || visibility === 'task' || visibility === 'approval' || visibility === 'artifact' || visibility === 'trace_only' || visibility === 'hidden') {
+    return visibility;
+  }
+  return '';
 }

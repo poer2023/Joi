@@ -30,6 +30,7 @@ import type {
   ConversationGroupRequest,
   ConversationMessage,
   ConversationSummary,
+  ExternalHandoffAudit,
   InputMode,
   MCPServerRecord,
   MCPWrapToolRequest,
@@ -45,6 +46,8 @@ import type {
   ProductTask,
   ProductTaskDetail,
   ProductTaskStep,
+  RecoverableRunRecord,
+  RunClosureReport,
   RunEvent,
   RunTrace,
   SettingsRecord,
@@ -130,6 +133,8 @@ export type PersistedToolCallingTurn = {
     output_tokens?: number;
     cached_input_tokens?: number;
   };
+  usage_status?: 'recorded' | 'provider_missing' | 'estimated' | 'failed' | string;
+  finish_reason?: string;
   model_responses?: Array<Record<string, unknown>>;
   prompt_assembly?: ToolCallingPromptAssembly;
 };
@@ -163,6 +168,8 @@ export type PersistedToolCallingResume = {
     output_tokens?: number;
     cached_input_tokens?: number;
   };
+  usage_status?: 'recorded' | 'provider_missing' | 'estimated' | 'failed' | string;
+  finish_reason?: string;
   model_responses?: Array<Record<string, unknown>>;
 };
 
@@ -195,6 +202,84 @@ export type StartedToolCallingChat = {
   product_task?: ProductTask;
 };
 
+export type RunEventV2Input = {
+  id?: string;
+  schema_version?: number;
+  conversation_id?: string;
+  run_id: string;
+  turn_id?: string;
+  seq?: number;
+  event_type: string;
+  item_type?: string;
+  item_id?: string;
+  parent_item_id?: string;
+  status?: string;
+  phase?: string;
+  source?: string;
+  visibility?: string;
+  created_at?: string;
+  delta?: unknown;
+  snapshot?: unknown;
+  payload?: Record<string, unknown>;
+  error?: unknown;
+  usage?: unknown;
+  terminal?: boolean;
+};
+
+type ToolCallingCallbackToolCall = {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+};
+
+type ToolCallingCallbackToolResult = {
+  call_id: string;
+  name: string;
+  arguments?: Record<string, unknown>;
+  output: Record<string, unknown>;
+};
+
+type ToolCallingCallbackUsage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  cached_input_tokens?: number;
+};
+
+export type ToolCallingEventCallbacks = {
+  onModelStarted?: (event: { step: number; model: string; streaming: boolean }) => void;
+  onModelDelta?: (event: { step: number; payload: Record<string, unknown> }) => void;
+  onModelCompleted?: (event: { step: number; finish_reason?: string; usage_status: string }) => void;
+  onAssistantDelta?: (event: { step: number; text: string; index: number }) => void;
+  onAssistantCompleted?: (event: { step: number; text: string; finish_reason?: string; usage_status: string }) => void;
+  onToolCallRequested?: (event: { step: number; call: ToolCallingCallbackToolCall }) => void;
+  onToolStarted?: (event: { step: number; call: ToolCallingCallbackToolCall }) => void;
+  onToolOutputDelta?: (event: { step: number; call: ToolCallingCallbackToolCall; output: Record<string, unknown> }) => void;
+  onToolCompleted?: (event: { step: number; call: ToolCallingCallbackToolCall; result: ToolCallingCallbackToolResult }) => void;
+  onToolFailed?: (event: { step: number; call: ToolCallingCallbackToolCall; result?: ToolCallingCallbackToolResult; error?: Error }) => void;
+  onApprovalRequired?: (event: { step: number; call: ToolCallingCallbackToolCall; result: ToolCallingCallbackToolResult }) => void;
+  onUsage?: (event: { step: number; usage: ToolCallingCallbackUsage; usage_status: string }) => void;
+  onError?: (event: { step: number; error: Error }) => void;
+};
+
+type ModeResolutionRecord = {
+  id: string;
+  requested_mode: InputMode;
+  resolved_mode: InputMode;
+  mode_source: 'explicit' | 'automatic' | 'inherited';
+  mode_locked_by_user: boolean;
+  reason: string;
+  confidence: number;
+};
+
+type EntryIdentityResolution = {
+  principal_id: string;
+  channel_identity_id: string;
+  channel: string;
+  external_user_id: string;
+  external_thread_id: string;
+  selection_reason: string;
+};
+
 type PromptConversationMessage = {
   role: string;
   content: string;
@@ -223,11 +308,256 @@ export class JoiSQLiteStore {
     this.db = new DatabaseSync(options.dbPath);
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
     this.db.exec(options.schemaSql);
+    this.ensureConversationClosureSchema();
     this.seedDefaults();
+    this.classifyRecoverableRunsOnStartup();
   }
 
   close(): void {
     this.db.close();
+  }
+
+  appendRunEventV2(input: RunEventV2Input): RunEvent {
+    const eventType = input.event_type.trim();
+    if (!input.run_id.trim()) throw new Error('run_id is required for RunEventV2');
+    if (!eventType) throw new Error('event_type is required for RunEventV2');
+    const runID = input.run_id.trim();
+    const conversationID = input.conversation_id?.trim() || optionalString(this.get(`SELECT conversation_id FROM runs WHERE id=?`, runID)?.conversation_id);
+    const seq = input.seq && input.seq > 0 ? input.seq : this.nextRunEventSeq(runID);
+    const schemaVersion = input.schema_version || 2;
+    const status = input.status || statusForRunEventType(eventType);
+    const payload = pruneUndefined({
+      ...(input.payload || {}),
+      schema_version: schemaVersion,
+      run_id: runID,
+      turn_id: input.turn_id || undefined,
+      conversation_id: conversationID || undefined,
+      seq,
+      event_type: eventType,
+      type: eventType,
+      item_type: input.item_type,
+      item_id: input.item_id,
+      parent_item_id: input.parent_item_id,
+      status,
+      phase: input.phase,
+      source: input.source || 'runtime',
+      visibility: input.visibility || visibilityForRunEventType(eventType, input.item_type),
+      terminal: input.terminal || terminalRunEventType(eventType) || undefined,
+      delta: input.delta,
+      snapshot: input.snapshot,
+      error: errorSummary(input.error),
+      usage: input.usage,
+    });
+    this.exec(
+      `INSERT INTO run_events (id, run_id, turn_id, schema_version, conversation_id, seq, event_type,
+                               item_type, item_id, parent_item_id, phase, visibility, source, terminal,
+                               payload, payload_json, error_json, usage_json, created_at)
+       VALUES (?, ?, NULLIF(?, ''), ?, NULLIF(?, ''), ?, ?, NULLIF(?, ''), NULLIF(?, ''),
+               NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?,
+               COALESCE(?, datetime('now')))`,
+      input.id || `evt_${newID()}`,
+      runID,
+      input.turn_id || '',
+      schemaVersion,
+      conversationID || '',
+      seq,
+      eventType,
+      input.item_type || '',
+      input.item_id || '',
+      input.parent_item_id || '',
+      input.phase || '',
+      payload.visibility ? String(payload.visibility) : '',
+      payload.source ? String(payload.source) : '',
+      payload.terminal ? 1 : 0,
+      json(payload),
+      json(payload),
+      json(input.error || {}),
+      json(input.usage || {}),
+      input.created_at || '',
+    );
+    return rowToRunEvent(this.get(`SELECT * FROM run_events WHERE run_id=? AND seq=?`, runID, seq)!);
+  }
+
+  listRunEventsV2(runID: string): { events: RunEvent[] } {
+    return { events: this.getRunTrace(runID).events || [] };
+  }
+
+  markModelCallFirstDelta(modelCallID: string): void {
+    if (!modelCallID.trim()) return;
+    this.exec(
+      `UPDATE model_calls
+       SET streaming_enabled=1, first_delta_at=COALESCE(first_delta_at, datetime('now'))
+       WHERE id=?`,
+      modelCallID,
+    );
+  }
+
+  createToolCallingEventCallbacks(started: StartedToolCallingChat, emit?: () => void): ToolCallingEventCallbacks {
+    const append = (input: Omit<RunEventV2Input, 'run_id'> & { run_id?: string }) => {
+      this.appendRunEventV2({
+        ...input,
+        conversation_id: input.conversation_id || started.conversation_id,
+        run_id: input.run_id || started.run_id,
+        turn_id: input.turn_id || started.turn_id,
+      });
+      emit?.();
+    };
+    return {
+      onModelStarted: (event) => {
+        append({
+          event_type: 'model.started',
+          item_type: 'model_call',
+          item_id: started.model_call_id,
+          status: 'running',
+          source: 'model_provider',
+          visibility: 'trace_only',
+          payload: { model: event.model, streaming: event.streaming, step: event.step },
+        });
+      },
+      onModelDelta: (event) => {
+        append({
+          event_type: 'model.delta',
+          item_type: 'model_call',
+          item_id: started.model_call_id,
+          status: 'running',
+          source: 'model_provider',
+          visibility: 'trace_only',
+          delta: event.payload,
+          payload: { step: event.step },
+        });
+      },
+      onModelCompleted: (event) => {
+        append({
+          event_type: 'model.completed',
+          item_type: 'model_call',
+          item_id: started.model_call_id,
+          status: 'completed',
+          source: 'model_provider',
+          visibility: 'trace_only',
+          payload: { step: event.step, finish_reason: event.finish_reason, usage_status: event.usage_status },
+        });
+      },
+      onAssistantDelta: (event) => {
+        this.markModelCallFirstDelta(started.model_call_id);
+        append({
+          event_type: 'assistant.delta',
+          item_type: 'assistant_message',
+          item_id: started.assistant_message_id,
+          status: 'running',
+          source: 'model_provider',
+          visibility: 'chat',
+          delta: { text: event.text, index: event.index, stream_source: 'provider_stream' },
+        });
+      },
+      onAssistantCompleted: (event) => {
+        append({
+          event_type: 'assistant.completed',
+          item_type: 'assistant_message',
+          item_id: started.assistant_message_id,
+          status: 'completed',
+          source: 'model_provider',
+          visibility: 'chat',
+          delta: { text: event.text },
+          payload: { finish_reason: event.finish_reason, usage_status: event.usage_status },
+        });
+      },
+      onToolCallRequested: (event) => {
+        append({
+          event_type: 'tool.call_requested',
+          item_type: 'tool_run',
+          item_id: event.call.id,
+          status: 'requested',
+          source: 'model_provider',
+          visibility: 'tool',
+          payload: { call_id: event.call.id, tool_name: event.call.name, input: event.call.arguments, step: event.step },
+        });
+      },
+      onToolStarted: (event) => {
+        append({
+          event_type: 'tool.started',
+          item_type: 'tool_run',
+          item_id: event.call.id,
+          status: 'running',
+          source: 'tool',
+          visibility: 'tool',
+          payload: { call_id: event.call.id, tool_name: event.call.name, input: event.call.arguments, step: event.step },
+        });
+      },
+      onToolOutputDelta: (event) => {
+        append({
+          event_type: 'tool.output_delta',
+          item_type: 'tool_run',
+          item_id: event.call.id,
+          status: 'running',
+          source: 'tool',
+          visibility: 'tool',
+          delta: event.output,
+          payload: { call_id: event.call.id, tool_name: event.call.name, step: event.step },
+        });
+      },
+      onToolCompleted: (event) => {
+        append({
+          event_type: 'tool.completed',
+          item_type: 'tool_run',
+          item_id: event.call.id,
+          status: 'completed',
+          source: 'tool',
+          visibility: 'tool',
+          snapshot: event.result.output,
+          payload: { call_id: event.call.id, tool_name: event.call.name, step: event.step },
+        });
+      },
+      onToolFailed: (event) => {
+        append({
+          event_type: 'tool.failed',
+          item_type: 'tool_run',
+          item_id: event.call.id,
+          status: 'failed',
+          source: 'tool',
+          visibility: 'tool',
+          error: event.error || event.result?.output,
+          snapshot: event.result?.output,
+          payload: { call_id: event.call.id, tool_name: event.call.name, step: event.step },
+        });
+      },
+      onApprovalRequired: (event) => {
+        append({
+          event_type: 'tool.approval_required',
+          item_type: 'tool_run',
+          item_id: event.call.id,
+          status: 'waiting_confirmation',
+          source: 'tool',
+          visibility: 'approval',
+          snapshot: event.result.output,
+          payload: { call_id: event.call.id, tool_name: event.call.name, step: event.step },
+        });
+      },
+      onUsage: (event) => {
+        append({
+          event_type: 'usage.recorded',
+          item_type: 'model',
+          item_id: started.model_call_id,
+          status: event.usage_status,
+          source: 'model_provider',
+          visibility: 'trace_only',
+          usage: event.usage,
+          payload: { step: event.step, usage_status: event.usage_status },
+        });
+      },
+      onError: (event) => {
+        append({
+          event_type: 'run.failed',
+          item_type: 'run',
+          item_id: started.run_id,
+          status: 'failed',
+          source: 'runtime',
+          visibility: 'inline_status',
+          terminal: true,
+          error: event.error,
+          payload: { step: event.step },
+        });
+      },
+    };
   }
 
   async sendDeterministicChat(req: ChatRequest, options: SendChatOptions = {}): Promise<ChatResponse> {
@@ -248,19 +578,23 @@ export class JoiSQLiteStore {
     const prefixHash = hashText('joi-electron-deterministic-prefix');
     const dynamicTailHash = hashText(message);
     const promptCacheKey = `${modelName}:${prefixHash}:${dynamicTailHash}`;
+    const modeResolution = modeResolutionForRequest(req, message);
+    const entryIdentity = entryIdentityForRequest(req, conversationID);
 
     this.transaction(() => {
       this.exec(
-        `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, lifecycle_status, metadata, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, datetime('now'), datetime('now'))
-         ON CONFLICT(id) DO UPDATE SET title=COALESCE(conversations.title, excluded.title), updated_at=datetime('now')`,
+        `INSERT INTO conversations (id, principal_id, channel, user_id, title, active_agent_id, lifecycle_status, metadata, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, datetime('now'), datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET principal_id=COALESCE(conversations.principal_id, excluded.principal_id), title=COALESCE(conversations.title, excluded.title), updated_at=datetime('now')`,
         conversationID,
+        entryIdentity.principal_id,
         req.channel || 'desktop',
         req.user_id || 'desktop_user',
         title,
         plan.agentID,
         json({ electron_native: true }),
       );
+      this.linkChannelIdentity(entryIdentity, conversationID);
 
       this.exec(
         `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
@@ -282,16 +616,27 @@ export class JoiSQLiteStore {
       );
 
       this.exec(
-        `INSERT INTO runs (id, conversation_id, user_message_id, status, selected_agent_id, selected_model_id, selected_node_id, route_result, started_at, finished_at, duration_ms, metadata, created_at)
-         VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, datetime('now'), datetime('now'), 0, ?, datetime('now'))`,
+        `INSERT INTO runs (id, conversation_id, user_message_id, entry_channel, requested_mode, resolved_mode,
+                           mode_source, principal_id, status, terminal_status, terminal_reason, selected_agent_id,
+                           selected_model_id, selected_node_id, route_result, parent_run_id, redirected_from_run_id,
+                           started_at, finished_at, duration_ms, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', 'completed', 'deterministic response completed',
+                 ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), datetime('now'), datetime('now'), 0, ?, datetime('now'))`,
         runID,
         conversationID,
         userMessageID,
+        req.channel || 'desktop',
+        modeResolution.requested_mode,
+        modeResolution.resolved_mode,
+        modeResolution.mode_source,
+        entryIdentity.principal_id,
         plan.agentID,
         modelName,
         plan.selectedNodeID,
         json(plan.routeResult),
-        json({ runtime_mode: req.runtime_mode || 'tool_calling', input_mode: req.input_mode || 'auto' }),
+        req.parent_run_id || '',
+        req.redirected_from_run_id || '',
+        json({ runtime_mode: req.runtime_mode || 'tool_calling', input_mode: req.input_mode || 'auto', mode_resolution: modeResolution }),
       );
 
       this.exec(
@@ -303,19 +648,22 @@ export class JoiSQLiteStore {
         json({ run_id: runID, source: 'electron_sqlite_store' }),
       );
 
-      const events = this.deterministicRunEvents(runID, response, createdAt);
+      const events = this.deterministicRunEvents(runID, response, createdAt, modeResolution);
       for (const event of events) {
-        this.exec(
-          `INSERT INTO run_events (id, run_id, seq, event_type, payload, created_at)
-           VALUES (?, ?, ?, ?, ?, datetime('now'))`,
-          event.id,
-          runID,
-          event.seq,
-          event.event_type,
-          json(event.payload ?? {}),
-        );
+        this.appendRunEventV2({
+          id: event.id,
+          run_id: runID,
+          seq: event.seq,
+          event_type: event.event_type,
+          status: event.status,
+          source: 'store',
+          visibility: optionalString(event.payload?.visibility),
+          delta: event.delta,
+          payload: event.payload || {},
+          created_at: event.created_at,
+          terminal: event.terminal,
+        });
       }
-
       this.exec(
         `INSERT INTO memory_context_packs (id, run_id, agent_id, memory_profile_version, profile, project_facts, relevant_episodes, heuristics, anti_patterns, open_issues, dynamic_retrieval, metadata)
          VALUES (?, ?, ?, 'electron_deterministic_v1', '[]', '[]', '[]', '[]', '[]', '[]', '[]', ?)`,
@@ -418,7 +766,9 @@ export class JoiSQLiteStore {
           json({ source: 'electron_sqlite_deterministic', turn: index + 1 }),
         );
       }
-      this.applyDeterministicRuntimeArtifacts(plan, runID, conversationID, userMessageID, modelName, capabilityExecution?.output);
+      const productTaskID = this.applyDeterministicRuntimeArtifacts(plan, runID, conversationID, userMessageID, modelName, modeResolution.resolved_mode, response, entryIdentity, req, capabilityExecution?.output);
+      this.linkTaskEntryIfNeeded(entryIdentity, conversationID, productTaskID, handoffReasonForRequest(req, entryIdentity));
+      this.appendCrossEntryHandoffEvent(runID, '', entryIdentity, req, productTaskID || undefined);
     });
 
     return {
@@ -598,20 +948,24 @@ export class JoiSQLiteStore {
     const provider = params.provider.trim() || 'openai_compatible';
     const modelName = req.model_name?.trim() || params.model_name.trim() || 'model';
     const prompt = params.prompt_assembly || this.assembleToolCallingPrompt(req, agentID, modelName);
+    const modeResolution = modeResolutionForRequest(req, message);
+    const entryIdentity = entryIdentityForRequest(req, conversationID);
     let productTask: ProductTask | undefined;
 
     this.transaction(() => {
       this.exec(
-        `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, lifecycle_status, metadata, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, datetime('now'), datetime('now'))
-         ON CONFLICT(id) DO UPDATE SET active_agent_id=excluded.active_agent_id, updated_at=datetime('now')`,
+        `INSERT INTO conversations (id, principal_id, channel, user_id, title, active_agent_id, lifecycle_status, metadata, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, datetime('now'), datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET principal_id=COALESCE(conversations.principal_id, excluded.principal_id), active_agent_id=excluded.active_agent_id, updated_at=datetime('now')`,
         conversationID,
+        entryIdentity.principal_id,
         req.channel || 'desktop',
         req.user_id || 'desktop_user',
         title,
         agentID,
         json({ electron_native: true, runtime: 'ts_tool_calling' }),
       );
+      this.linkChannelIdentity(entryIdentity, conversationID);
       this.exec(
         `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
          VALUES (?, ?, 'user', ?, '[]', ?, datetime('now'))`,
@@ -631,33 +985,69 @@ export class JoiSQLiteStore {
         json({ electron_native: true, observed_from_tool_calling: true }),
       );
       this.exec(
-        `INSERT INTO runs (id, conversation_id, user_message_id, status, selected_agent_id, selected_model_id, selected_node_id, route_result, started_at, metadata, created_at)
-         VALUES (?, ?, ?, 'running', ?, ?, 'main-node', ?, datetime('now'), ?, datetime('now'))`,
+        `INSERT INTO runs (id, conversation_id, user_message_id, entry_channel, requested_mode, resolved_mode, mode_source,
+                           principal_id, status, selected_agent_id, selected_model_id, selected_node_id, route_result,
+                           parent_run_id, redirected_from_run_id, started_at, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, 'main-node', ?, NULLIF(?, ''), NULLIF(?, ''), datetime('now'), ?, datetime('now'))`,
         runID,
         conversationID,
         userMessageID,
+        req.channel || 'desktop',
+        modeResolution.requested_mode,
+        modeResolution.resolved_mode,
+        modeResolution.mode_source,
+        entryIdentity.principal_id,
         agentID,
         modelName,
         json({ route: 'electron_ts_tool_calling', agent_id: agentID, model: modelName, provider }),
-        json({ runtime_mode: 'tool_calling', input_mode: req.input_mode || 'auto', source: 'electron_ts_tool_calling', live_cancellable: true }),
+        req.parent_run_id || '',
+        req.redirected_from_run_id || '',
+        json({ runtime_mode: 'tool_calling', input_mode: req.input_mode || 'auto', mode_resolution: modeResolution, source: 'electron_ts_tool_calling', live_cancellable: true }),
       );
+      this.exec(
+        `INSERT INTO turns (id, run_id, turn_index, status, mode_resolution_id, user_intent_summary, assistant_message_id,
+                            stream_status, active_model_call_id, cancellation_key, started_at, metadata)
+         VALUES (?, ?, 1, 'running', ?, ?, ?, 'mode_resolved', ?, ?, datetime('now'), ?)`,
+        turnID,
+        runID,
+        modeResolution.id,
+        message.slice(0, 500),
+        assistantMessageID,
+        modelCallID,
+        `cancel_${runID}`,
+        json({ runtime: 'electron_ts_tool_calling', mode_resolution: modeResolution, live_cancellable: true }),
+      );
+      this.insertRunEvent(runID, turnID, 1, 'run.started', { run_id: runID, conversation_id: conversationID, status: 'running', source: 'store', type: 'run.started' });
+      this.insertRunEvent(runID, turnID, 2, 'run.mode_resolved', {
+        run_id: runID,
+        turn_id: turnID,
+        conversation_id: conversationID,
+        item_type: 'mode_resolution',
+        item_id: modeResolution.id,
+        status: 'completed',
+        visibility: 'inline_status',
+        source: 'store',
+        requested_mode: modeResolution.requested_mode,
+        resolved_mode: modeResolution.resolved_mode,
+        contract_mode: contractMode(modeResolution.resolved_mode),
+        mode_source: modeResolution.mode_source,
+        mode_locked_by_user: modeResolution.mode_locked_by_user,
+        reason: modeResolution.reason,
+        confidence: modeResolution.confidence,
+        type: 'run.mode_resolved',
+      });
+      this.insertRunEvent(runID, turnID, 3, 'turn.started', { run_id: runID, turn_id: turnID, status: 'running', source: 'store', type: 'turn.started' });
       productTask = this.ensureProductTaskForRun(req, {
         conversation_id: conversationID,
         user_message_id: userMessageID,
         run_id: runID,
+        turn_id: turnID,
+        mode_resolution_id: modeResolution.id,
+        mode_resolution: modeResolution,
         message,
       });
-      this.exec(
-        `INSERT INTO turns (id, run_id, turn_index, status, active_model_call_id, cancellation_key, started_at, metadata)
-         VALUES (?, ?, 1, 'running', ?, ?, datetime('now'), ?)`,
-        turnID,
-        runID,
-        modelCallID,
-        `cancel_${runID}`,
-        json({ runtime: 'electron_ts_tool_calling', live_cancellable: true }),
-      );
-      this.insertRunEvent(runID, turnID, 1, 'run.started', { run_id: runID, conversation_id: conversationID, status: 'running', type: 'run.started' });
-      this.insertRunEvent(runID, turnID, 2, 'turn.started', { run_id: runID, turn_id: turnID, status: 'running', type: 'turn.started' });
+      this.linkTaskEntryIfNeeded(entryIdentity, conversationID, productTask?.id, handoffReasonForRequest(req, entryIdentity));
+      this.appendCrossEntryHandoffEvent(runID, turnID, entryIdentity, req, productTask?.id);
       this.exec(
         `INSERT INTO memory_context_packs (id, run_id, agent_id, memory_profile_version, profile, project_facts, relevant_episodes, heuristics, anti_patterns, open_issues, dynamic_retrieval, metadata)
          VALUES (?, ?, ?, ?, '[]', '[]', '[]', '[]', '[]', '[]', ?, ?)`,
@@ -668,6 +1058,7 @@ export class JoiSQLiteStore {
         json(prompt.memory_results || []),
         json({ source: 'electron_ts_tool_calling', memory_result_count: prompt.memory_results?.length || 0 }),
       );
+      this.appendMemoryRecalledEvents(runID, turnID, memoryPackID, prompt.memory_results || []);
       this.exec(
         `INSERT INTO prompt_assemblies (id, run_id, agent_id, model_id, memory_context_pack_id, cacheable_prefix, dynamic_tail, prefix_hash, dynamic_tail_hash, prompt_cache_key, memory_profile_version, tool_schema_version, metadata)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -690,8 +1081,10 @@ export class JoiSQLiteStore {
       this.insertRunStep(runID, 'prompt_assembled', 'Prompt assembly finished', { run_id: runID, agent_id: agentID }, { prompt_assembly_id: promptAssemblyID, prefix_hash: prompt.prefix_hash, dynamic_tail_hash: prompt.dynamic_tail_hash, prompt_cache_key: prompt.prompt_cache_key, memory_profile_version: prompt.memory_profile_version, tool_schema_version: prompt.tool_schema_version, memory_result_count: prompt.memory_results?.length || 0 });
       this.insertTurnItem(runID, turnID, 1, 'message', 'user', '', '', {}, message, {}, 'completed', { source: 'desktop_user' });
       this.exec(
-        `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name, prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens, cached_input_tokens, latency_ms, status, raw_response, metadata, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'running', '{}', ?, datetime('now'))`,
+        `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
+                                  prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens,
+                                  cached_input_tokens, latency_ms, status, streaming_enabled, usage_status, raw_response, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'running', 1, 'provider_missing', '{}', ?, datetime('now'))`,
         modelCallID,
         runID,
         agentID,
@@ -742,6 +1135,9 @@ export class JoiSQLiteStore {
         json({ run_id: started.run_id, source: 'electron_ts_tool_calling' }),
       );
       let itemSeq = this.nextTurnItemSeq(started.run_id);
+      const hasRunEvent = (eventType: string, itemID?: string): boolean => Boolean(itemID
+        ? this.get(`SELECT id FROM run_events WHERE run_id=? AND event_type=? AND item_id=? LIMIT 1`, started.run_id, eventType, itemID)
+        : this.get(`SELECT id FROM run_events WHERE run_id=? AND event_type=? LIMIT 1`, started.run_id, eventType));
       for (const result of toolResults) {
         const capability = canonicalCapabilityName(result.name);
         const workflowName = workflowNameForGateway(capability);
@@ -751,6 +1147,22 @@ export class JoiSQLiteStore {
         const resultWaiting = isWaitingConfirmationToolResult(result);
         const operationID = operationIDForTool(started.product_task_id, capability, args, result.call_id);
         this.insertRunStep(started.run_id, 'capability_requested', 'Model requested capability tool', { agent_id: started.selected_agent_id, call_id: result.call_id, tool_name: result.name }, { capability, goal: requestedAction, inputs: args, risk, source: 'tool_calling', operation_id: operationID });
+        if (!hasRunEvent('tool.call_requested', result.call_id)) {
+          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'tool.call_requested', {
+            item_type: 'tool_run',
+            item_id: result.call_id,
+            call_id: result.call_id,
+            capability,
+            tool_name: result.name,
+            purpose: requestedAction,
+            status: 'requested',
+            visibility: 'tool',
+            source: 'model_provider',
+            input: args,
+            risk,
+            operation_id: operationID,
+          });
+        }
         this.insertTurnItem(started.run_id, started.turn_id, itemSeq++, 'tool_call', 'assistant', result.call_id, result.name, args, '', {}, resultWaiting ? 'waiting_confirmation' : 'completed', { capability });
         if (resultWaiting) {
           const confirmationID = `confirm_${newID()}`;
@@ -788,6 +1200,22 @@ export class JoiSQLiteStore {
             approvalKey,
           );
           this.insertRunStep(started.run_id, 'approval_requested', 'Tool execution waiting for confirmation', { agent_id: started.selected_agent_id, call_id: result.call_id, capability }, approvalPayload, 'waiting_confirmation');
+          if (!hasRunEvent('tool.approval_required', result.call_id)) {
+            this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'tool.approval_required', {
+              item_type: 'tool_run',
+              item_id: result.call_id,
+              call_id: result.call_id,
+              confirmation_id: confirmationID,
+              capability,
+              tool_name: result.name,
+              status: 'waiting_confirmation',
+              visibility: 'approval',
+              source: 'store',
+              purpose: requestedAction,
+              risk,
+              operation_id: confirmationInput.operation_id,
+            });
+          }
           this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'approval.requested', approvalPayload);
           this.insertTurnItem(started.run_id, started.turn_id, itemSeq++, 'tool_output', 'tool', result.call_id, result.name, {}, JSON.stringify(approvalPayload), approvalPayload, 'waiting_confirmation', { confirmation_id: confirmationID, capability });
           this.recordProductTaskToolCheckpoint(started.product_task_id, {
@@ -802,19 +1230,65 @@ export class JoiSQLiteStore {
           continue;
         }
         const toolRunID = `toolrun_${newID()}`;
+        const toolStatus = toolRunStatusForOutput(result.output);
+        const toolSummary = summaryForToolOutput(result.output, toolStatus);
+        if (!hasRunEvent('tool.started', result.call_id)) {
+          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'tool.started', {
+            item_type: 'tool_run',
+            item_id: result.call_id,
+            tool_run_id: toolRunID,
+            call_id: result.call_id,
+            capability,
+            tool_name: result.name,
+            purpose: requestedAction,
+            status: 'running',
+            visibility: 'tool',
+            source: 'tool',
+            operation_id: operationID,
+          });
+        }
         this.exec(
-          `INSERT INTO tool_runs (id, run_id, capability_id, workflow_name, tool_name, node_id, assignment_reason, risk_level, status, input, output, finished_at, duration_ms)
-           VALUES (?, ?, ?, ?, ?, 'main-node', 'model_tool_call', ?, 'succeeded', ?, ?, datetime('now'), 0)`,
+          `INSERT INTO tool_runs (id, run_id, turn_id, tool_call_id, capability_id, workflow_name, tool_name, purpose,
+                                  node_id, assignment_reason, risk_level, side_effect_level, idempotency_key,
+                                  status, input, output, output_summary, error_code, error_message, finished_at, completed_at, duration_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'main-node', 'model_tool_call', ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), datetime('now'), datetime('now'), 0)`,
           toolRunID,
           started.run_id,
+          started.turn_id,
+          result.call_id,
           capability,
           workflowName,
-          workflowName,
+          result.name,
+          requestedAction,
           risk,
+          sideEffectLevelForCapability(capability),
+          operationID,
+          toolStatus,
           json(args),
           json(result.output),
+          toolSummary,
+          toolStatus === 'failed' || toolStatus === 'policy_blocked' ? toolStatus : '',
+          optionalString(result.output?.error) || '',
         );
         this.insertRunStep(started.run_id, 'tool_finished', 'Tool runtime finished', { workflow_name: workflowName, tool_run_id: toolRunID, call_id: result.call_id }, result.output);
+        const toolTerminalEventType = toolStatus === 'failed' ? 'tool.failed' : toolStatus === 'policy_blocked' ? 'tool.policy_blocked' : 'tool.completed';
+        if (!hasRunEvent(toolTerminalEventType, result.call_id)) {
+          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), toolTerminalEventType, {
+            item_type: 'tool_run',
+            item_id: result.call_id,
+            tool_run_id: toolRunID,
+            call_id: result.call_id,
+            capability,
+            tool_name: result.name,
+            purpose: requestedAction,
+            status: toolStatus,
+            visibility: 'tool',
+            source: 'tool',
+            summary: toolSummary,
+            operation_id: operationID,
+            output: result.output,
+          });
+        }
         this.insertTurnItem(started.run_id, started.turn_id, itemSeq++, 'tool_output', 'tool', result.call_id, result.name, {}, JSON.stringify(result.output), result.output, 'completed', { tool_run_id: toolRunID, capability });
         this.recordProductTaskToolCheckpoint(started.product_task_id, {
           run_id: started.run_id,
@@ -822,7 +1296,7 @@ export class JoiSQLiteStore {
           requested_action: requestedAction,
           input: args,
           output: { ...result.output, operation_id: operationID },
-          status: String(result.output?.status || '') === 'failed' ? 'failed' : 'done',
+          status: toolStatus === 'failed' || toolStatus === 'policy_blocked' ? 'failed' : 'done',
           tool_run_id: toolRunID,
           operation_id: operationID,
         });
@@ -838,46 +1312,76 @@ export class JoiSQLiteStore {
       if (started.product_task_id) {
         productTask = this.getProductTask(started.product_task_id).task;
       }
-      this.insertRunStep(started.run_id, 'model_call_finished', 'Model call finished', { agent_id: started.selected_agent_id, model_id: started.model_name, prompt_assembly_id: started.prompt_assembly_id }, { provider: started.provider, model: started.model_name, real_model: started.provider !== 'mock_provider', fallback_to_mock: false, input_tokens: positiveNumber(usage.input_tokens), output_tokens: positiveNumber(usage.output_tokens), cached_input_tokens: positiveNumber(usage.cached_input_tokens), tool_run_count: toolResults.length });
+      const persistedToolRunCount = this.persistedToolRunCountForRun(started.run_id);
+      this.insertRunStep(started.run_id, 'model_call_finished', 'Model call finished', { agent_id: started.selected_agent_id, model_id: started.model_name, prompt_assembly_id: started.prompt_assembly_id }, { provider: started.provider, model: started.model_name, real_model: started.provider !== 'mock_provider', fallback_to_mock: false, input_tokens: positiveNumber(usage.input_tokens), output_tokens: positiveNumber(usage.output_tokens), cached_input_tokens: positiveNumber(usage.cached_input_tokens), tool_run_count: persistedToolRunCount });
       this.insertRunStep(started.run_id, 'agent_output_parsed', 'Agent output parsed', { turn: 1 }, { repaired: false, output_type: 'final_answer' });
       this.insertRunStep(started.run_id, 'response_generated', waitingConfirmation ? 'Confirmation response generated' : 'Response generated', {}, { response }, waitingConfirmation ? 'waiting_confirmation' : 'succeeded');
       this.insertTurnItem(started.run_id, started.turn_id, itemSeq++, 'message', 'assistant', '', '', {}, response, {}, waitingConfirmation ? 'waiting_confirmation' : 'completed', { final_answer: !waitingConfirmation, waiting_confirmation: waitingConfirmation });
+      const usageStatus = turn.usage_status || usageStatusForUsage(usage);
       this.exec(
         `UPDATE model_calls
-         SET input_tokens=?, output_tokens=?, cached_input_tokens=?, latency_ms=0, status='succeeded', raw_response=?, metadata=json_set(COALESCE(metadata, '{}'), '$.tool_run_count', ?)
+         SET input_tokens=?, output_tokens=?, cached_input_tokens=?, latency_ms=0, status='succeeded',
+             completed_at=datetime('now'), finish_reason=?, usage_status=?, raw_response=?, raw_finish_json=?,
+             metadata=json_set(COALESCE(metadata, '{}'), '$.tool_run_count', ?, '$.usage_status', ?)
          WHERE id=?`,
         positiveNumber(usage.input_tokens),
         positiveNumber(usage.output_tokens),
         positiveNumber(usage.cached_input_tokens),
+        turn.status || 'completed',
+        usageStatus,
         json({ responses: turn.model_responses || [] }),
-        toolResults.length,
+        json({ status: turn.status || 'completed', usage_status: usageStatus }),
+        persistedToolRunCount,
+        usageStatus,
         started.model_call_id,
       );
       this.exec(
         `UPDATE runs
-         SET status=?, finished_at=CASE WHEN ? THEN NULL ELSE datetime('now') END,
+         SET status=?, terminal_status=CASE WHEN ? THEN NULL ELSE ? END,
+             terminal_reason=CASE WHEN ? THEN NULL ELSE ? END,
+             finished_at=CASE WHEN ? THEN NULL ELSE datetime('now') END,
              duration_ms=CASE WHEN ? THEN NULL ELSE CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER) END
          WHERE id=?`,
         waitingConfirmation ? 'waiting_confirmation' : 'completed',
+        waitingConfirmation ? 1 : 0,
+        waitingConfirmation ? 'waiting_approval' : 'completed',
+        waitingConfirmation ? 1 : 0,
+        waitingConfirmation ? 'waiting approval' : 'assistant response completed',
         waitingConfirmation ? 1 : 0,
         waitingConfirmation ? 1 : 0,
         started.run_id,
       );
       this.exec(
         `UPDATE turns
-         SET status=?, finished_at=CASE WHEN ? THEN NULL ELSE datetime('now') END
+         SET status=?, stream_status=?, finished_at=CASE WHEN ? THEN NULL ELSE datetime('now') END,
+             completed_at=CASE WHEN ? THEN NULL ELSE datetime('now') END
          WHERE id=?`,
         waitingConfirmation ? 'waiting_confirmation' : 'completed',
+        waitingConfirmation ? 'waiting_approval' : 'completed',
+        waitingConfirmation ? 1 : 0,
         waitingConfirmation ? 1 : 0,
         started.turn_id,
       );
       if (waitingConfirmation) {
-        this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'message.delta', { run_id: started.run_id, turn_id: started.turn_id, delta: response, status: 'waiting_confirmation', type: 'message.delta' });
+        if (!hasRunEvent('assistant.completed', started.assistant_message_id)) {
+          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'assistant.completed', { run_id: started.run_id, turn_id: started.turn_id, item_type: 'assistant_message', item_id: started.assistant_message_id, delta: { text: response }, status: 'waiting_confirmation', visibility: 'chat', source: 'store', type: 'assistant.completed' });
+        }
+        this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'message.delta', { run_id: started.run_id, turn_id: started.turn_id, delta: response, status: 'waiting_confirmation', visibility: 'trace_only', source: 'store', type: 'message.delta' });
         this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'run.waiting_confirmation', { run_id: started.run_id, turn_id: started.turn_id, status: 'waiting_confirmation', message: response, type: 'run.waiting_confirmation' });
       } else {
-        this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'message.delta', { run_id: started.run_id, turn_id: started.turn_id, delta: response, status: 'completed', type: 'message.delta' });
+        const hasAssistantDelta = Boolean(this.get(`SELECT id FROM run_events WHERE run_id=? AND event_type='assistant.delta' LIMIT 1`, started.run_id));
+        if (!hasAssistantDelta) {
+          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'assistant.delta', { run_id: started.run_id, turn_id: started.turn_id, item_type: 'assistant_message', item_id: started.assistant_message_id, delta: { text: response, stream_source: 'fallback_final_chunk' }, status: 'completed', visibility: 'chat', source: 'store', type: 'assistant.delta' });
+        }
+        if (!hasRunEvent('assistant.completed', started.assistant_message_id)) {
+          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'assistant.completed', { run_id: started.run_id, turn_id: started.turn_id, item_type: 'assistant_message', item_id: started.assistant_message_id, delta: { text: response }, status: 'completed', visibility: 'chat', source: 'store', type: 'assistant.completed' });
+        }
+        if (!hasRunEvent('usage.recorded', started.model_call_id)) {
+          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'usage.recorded', { run_id: started.run_id, turn_id: started.turn_id, item_type: 'model', item_id: started.model_call_id, status: usageStatus, visibility: 'trace_only', source: 'store', usage, usage_status: usageStatus, type: 'usage.recorded' });
+        }
+        this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'message.delta', { run_id: started.run_id, turn_id: started.turn_id, delta: response, status: 'completed', visibility: 'trace_only', source: 'store', type: 'message.delta' });
         this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'turn.completed', { run_id: started.run_id, turn_id: started.turn_id, status: 'completed', type: 'turn.completed' });
-        this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'run.completed', { run_id: started.run_id, status: 'succeeded', type: 'run.completed' });
+        this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'run.completed', { run_id: started.run_id, status: 'succeeded', terminal: true, type: 'run.completed' });
       }
     });
 
@@ -917,32 +1421,43 @@ export class JoiSQLiteStore {
       }
       this.exec(
         `UPDATE runs
-         SET status=?, error_code=?, error_message=?, finished_at=datetime('now'),
+         SET status=?, terminal_status=?, terminal_reason=?, error_code=?, error_message=?, finished_at=datetime('now'),
              duration_ms=CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)
          WHERE id=?`,
         status,
+        status,
+        error.message,
         status === 'cancelled' ? 'interrupted' : 'tool_calling_runtime_failed',
         error.message,
         started.run_id,
       );
       this.exec(
-        `UPDATE turns SET status=?, finished_at=datetime('now') WHERE id=?`,
+        `UPDATE turns SET status=?, stream_status=?, finished_at=datetime('now'), completed_at=datetime('now') WHERE id=?`,
+        status,
         status,
         started.turn_id,
       );
       this.exec(
         `UPDATE model_calls
-         SET status=?, error_code=?, error_message=?, raw_response=?, metadata=json_set(COALESCE(metadata, '{}'), '$.error', ?)
+         SET status=?, completed_at=datetime('now'), finish_reason=?, usage_status='failed',
+             error_code=?, error_message=?, raw_response=?, raw_finish_json=?,
+             metadata=json_set(COALESCE(metadata, '{}'), '$.error', ?)
          WHERE id=?`,
+        status,
         status,
         status === 'cancelled' ? 'interrupted' : 'tool_calling_runtime_failed',
         error.message,
         json({ error: error.message }),
+        json({ status, error: error.message }),
         error.message,
         started.model_call_id,
       );
       this.markProductTaskFailed(started.product_task_id, started.run_id, error, status);
-      this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), status === 'cancelled' ? 'run.interrupted' : 'run.failed', { run_id: started.run_id, turn_id: started.turn_id, status, error: error.message, message: response });
+      this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'assistant.completed', { run_id: started.run_id, turn_id: started.turn_id, item_type: 'assistant_message', item_id: started.assistant_message_id, delta: { text: response }, status, visibility: 'chat', source: 'store', terminal: true, error: error.message, type: 'assistant.completed' });
+      this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), status === 'cancelled' ? 'run.cancelled' : 'run.failed', { run_id: started.run_id, turn_id: started.turn_id, status, terminal: true, error: error.message, message: response, type: status === 'cancelled' ? 'run.cancelled' : 'run.failed' });
+      if (status === 'cancelled') {
+        this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'run.interrupted', { run_id: started.run_id, turn_id: started.turn_id, status, error: error.message, message: response, visibility: 'trace_only', type: 'run.interrupted' });
+      }
     });
     return {
       conversation_id: started.conversation_id,
@@ -989,21 +1504,25 @@ export class JoiSQLiteStore {
     const waitingConfirmation = turn.status === 'waiting_confirmation' || Boolean(waitingResult);
     const runStatus = waitingConfirmation ? 'waiting_confirmation' : 'completed';
     const turnStatus = waitingConfirmation ? 'waiting_confirmation' : 'completed';
+    const modeResolution = modeResolutionForRequest(req, message);
+    const entryIdentity = entryIdentityForRequest(req, conversationID);
     let productTask: ProductTask | undefined;
     let artifacts: ArtifactSummary[] = [];
 
     this.transaction(() => {
       this.exec(
-        `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, lifecycle_status, metadata, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, datetime('now'), datetime('now'))
-         ON CONFLICT(id) DO UPDATE SET active_agent_id=excluded.active_agent_id, updated_at=datetime('now')`,
+        `INSERT INTO conversations (id, principal_id, channel, user_id, title, active_agent_id, lifecycle_status, metadata, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, datetime('now'), datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET principal_id=COALESCE(conversations.principal_id, excluded.principal_id), active_agent_id=excluded.active_agent_id, updated_at=datetime('now')`,
         conversationID,
+        entryIdentity.principal_id,
         req.channel || 'desktop',
         req.user_id || 'desktop_user',
         title,
         agentID,
         json({ electron_native: true, runtime: 'ts_tool_calling' }),
       );
+      this.linkChannelIdentity(entryIdentity, conversationID);
 
       this.exec(
         `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
@@ -1026,25 +1545,34 @@ export class JoiSQLiteStore {
       );
 
       this.exec(
-        `INSERT INTO runs (id, conversation_id, user_message_id, status, selected_agent_id, selected_model_id, selected_node_id, route_result, started_at, finished_at, duration_ms, metadata, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'main-node', ?, datetime('now'), CASE WHEN ? THEN NULL ELSE datetime('now') END, CASE WHEN ? THEN NULL ELSE 0 END, ?, datetime('now'))`,
+        `INSERT INTO runs (id, conversation_id, user_message_id, entry_channel, requested_mode, resolved_mode,
+                           mode_source, principal_id, status, terminal_status, terminal_reason, selected_agent_id,
+                           selected_model_id, selected_node_id, route_result, parent_run_id, redirected_from_run_id,
+                           started_at, finished_at, duration_ms, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? THEN NULL ELSE 'completed' END,
+                 CASE WHEN ? THEN NULL ELSE 'assistant response completed' END, ?, ?, 'main-node', ?,
+                 NULLIF(?, ''), NULLIF(?, ''), datetime('now'), CASE WHEN ? THEN NULL ELSE datetime('now') END,
+                 CASE WHEN ? THEN NULL ELSE 0 END, ?, datetime('now'))`,
         runID,
         conversationID,
         userMessageID,
+        req.channel || 'desktop',
+        modeResolution.requested_mode,
+        modeResolution.resolved_mode,
+        modeResolution.mode_source,
+        entryIdentity.principal_id,
         runStatus,
+        waitingConfirmation ? 1 : 0,
+        waitingConfirmation ? 1 : 0,
         agentID,
         modelName,
         json({ route: 'electron_ts_tool_calling', agent_id: agentID, model: modelName, provider }),
+        req.parent_run_id || '',
+        req.redirected_from_run_id || '',
         waitingConfirmation ? 1 : 0,
         waitingConfirmation ? 1 : 0,
-        json({ runtime_mode: 'tool_calling', input_mode: req.input_mode || 'auto', source: 'electron_ts_tool_calling' }),
+        json({ runtime_mode: 'tool_calling', input_mode: req.input_mode || 'auto', mode_resolution: modeResolution, source: 'electron_ts_tool_calling' }),
       );
-      productTask = this.ensureProductTaskForRun(req, {
-        conversation_id: conversationID,
-        user_message_id: userMessageID,
-        run_id: runID,
-        message,
-      });
 
       this.exec(
         `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
@@ -1056,19 +1584,57 @@ export class JoiSQLiteStore {
       );
 
       this.exec(
-        `INSERT INTO turns (id, run_id, turn_index, status, active_model_call_id, cancellation_key, started_at, finished_at, metadata)
-         VALUES (?, ?, 1, ?, ?, ?, datetime('now'), CASE WHEN ? THEN NULL ELSE datetime('now') END, ?)`,
+        `INSERT INTO turns (id, run_id, turn_index, status, mode_resolution_id, user_intent_summary,
+                            assistant_message_id, stream_status, active_model_call_id, cancellation_key,
+                            started_at, finished_at, completed_at, metadata)
+         VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, datetime('now'),
+                 CASE WHEN ? THEN NULL ELSE datetime('now') END,
+                 CASE WHEN ? THEN NULL ELSE datetime('now') END, ?)`,
         turnID,
         runID,
         turnStatus,
+        modeResolution.id,
+        message.slice(0, 500),
+        assistantMessageID,
+        waitingConfirmation ? 'waiting_approval' : 'completed',
         modelCallID,
         `cancel_${runID}`,
         waitingConfirmation ? 1 : 0,
-        json({ runtime: 'electron_ts_tool_calling' }),
+        waitingConfirmation ? 1 : 0,
+        json({ runtime: 'electron_ts_tool_calling', mode_resolution: modeResolution }),
       );
 
-      this.insertRunEvent(runID, turnID, 1, 'run.started', { run_id: runID, conversation_id: conversationID, status: 'running', type: 'run.started' });
-      this.insertRunEvent(runID, turnID, 2, 'turn.started', { run_id: runID, turn_id: turnID, status: 'running', type: 'turn.started' });
+      this.insertRunEvent(runID, turnID, 1, 'run.started', { run_id: runID, conversation_id: conversationID, status: 'running', source: 'store', type: 'run.started' });
+      this.insertRunEvent(runID, turnID, 2, 'run.mode_resolved', {
+        run_id: runID,
+        turn_id: turnID,
+        conversation_id: conversationID,
+        item_type: 'mode_resolution',
+        item_id: modeResolution.id,
+        status: 'completed',
+        visibility: 'inline_status',
+        source: 'store',
+        requested_mode: modeResolution.requested_mode,
+        resolved_mode: modeResolution.resolved_mode,
+        contract_mode: contractMode(modeResolution.resolved_mode),
+        mode_source: modeResolution.mode_source,
+        mode_locked_by_user: modeResolution.mode_locked_by_user,
+        reason: modeResolution.reason,
+        confidence: modeResolution.confidence,
+        type: 'run.mode_resolved',
+      });
+      this.insertRunEvent(runID, turnID, 3, 'turn.started', { run_id: runID, turn_id: turnID, status: 'running', source: 'store', type: 'turn.started' });
+      productTask = this.ensureProductTaskForRun(req, {
+        conversation_id: conversationID,
+        user_message_id: userMessageID,
+        run_id: runID,
+        turn_id: turnID,
+        mode_resolution_id: modeResolution.id,
+        mode_resolution: modeResolution,
+        message,
+      });
+      this.linkTaskEntryIfNeeded(entryIdentity, conversationID, productTask?.id, handoffReasonForRequest(req, entryIdentity));
+      this.appendCrossEntryHandoffEvent(runID, turnID, entryIdentity, req, productTask?.id);
 
       this.exec(
         `INSERT INTO memory_context_packs (id, run_id, agent_id, memory_profile_version, profile, project_facts, relevant_episodes, heuristics, anti_patterns, open_issues, dynamic_retrieval, metadata)
@@ -1080,6 +1646,7 @@ export class JoiSQLiteStore {
         json(prompt.memory_results || []),
         json({ source: 'electron_ts_tool_calling', memory_result_count: prompt.memory_results?.length || 0 }),
       );
+      this.appendMemoryRecalledEvents(runID, turnID, memoryPackID, prompt.memory_results || []);
 
       this.exec(
         `INSERT INTO prompt_assemblies (id, run_id, agent_id, model_id, memory_context_pack_id, cacheable_prefix, dynamic_tail, prefix_hash, dynamic_tail_hash, prompt_cache_key, memory_profile_version, tool_schema_version, metadata)
@@ -1120,6 +1687,20 @@ export class JoiSQLiteStore {
         const resultWaiting = isWaitingConfirmationToolResult(result);
         const operationID = operationIDForTool(productTask?.id, capability, args, result.call_id);
         this.insertRunStep(runID, 'capability_requested', 'Model requested capability tool', { agent_id: agentID, call_id: result.call_id, tool_name: result.name }, { capability, goal: requestedAction, inputs: args, risk, source: 'tool_calling', operation_id: operationID });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'tool.call_requested', {
+          item_type: 'tool_run',
+          item_id: result.call_id,
+          call_id: result.call_id,
+          capability,
+          tool_name: result.name,
+          purpose: requestedAction,
+          status: 'requested',
+          visibility: 'tool',
+          source: 'model_provider',
+          input: args,
+          risk,
+          operation_id: operationID,
+        });
         this.insertTurnItem(runID, turnID, itemSeq++, 'tool_call', 'assistant', result.call_id, result.name, args, '', {}, resultWaiting ? 'waiting_confirmation' : 'completed', { capability });
         if (resultWaiting) {
           const confirmationID = `confirm_${newID()}`;
@@ -1157,7 +1738,21 @@ export class JoiSQLiteStore {
             approvalKey,
           );
           this.insertRunStep(runID, 'approval_requested', 'Tool execution waiting for confirmation', { agent_id: agentID, call_id: result.call_id, capability }, approvalPayload, 'waiting_confirmation');
-          this.insertRunEvent(runID, turnID, 3, 'approval.requested', approvalPayload);
+          this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'tool.approval_required', {
+            item_type: 'tool_run',
+            item_id: result.call_id,
+            call_id: result.call_id,
+            confirmation_id: confirmationID,
+            capability,
+            tool_name: result.name,
+            status: 'waiting_confirmation',
+            visibility: 'approval',
+            source: 'store',
+            purpose: requestedAction,
+            risk,
+            operation_id: confirmationInput.operation_id,
+          });
+          this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'approval.requested', approvalPayload);
           this.insertTurnItem(runID, turnID, itemSeq++, 'tool_output', 'tool', result.call_id, result.name, {}, JSON.stringify(approvalPayload), approvalPayload, 'waiting_confirmation', { confirmation_id: confirmationID, capability });
           this.recordProductTaskToolCheckpoint(productTask?.id, {
             run_id: runID,
@@ -1171,19 +1766,60 @@ export class JoiSQLiteStore {
           continue;
         }
         const toolRunID = `toolrun_${newID()}`;
+        const toolStatus = toolRunStatusForOutput(result.output);
+        const toolSummary = summaryForToolOutput(result.output, toolStatus);
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'tool.started', {
+          item_type: 'tool_run',
+          item_id: result.call_id,
+          tool_run_id: toolRunID,
+          call_id: result.call_id,
+          capability,
+          tool_name: result.name,
+          purpose: requestedAction,
+          status: 'running',
+          visibility: 'tool',
+          source: 'tool',
+          operation_id: operationID,
+        });
         this.exec(
-          `INSERT INTO tool_runs (id, run_id, capability_id, workflow_name, tool_name, node_id, assignment_reason, risk_level, status, input, output, finished_at, duration_ms)
-           VALUES (?, ?, ?, ?, ?, 'main-node', 'model_tool_call', ?, 'succeeded', ?, ?, datetime('now'), 0)`,
+          `INSERT INTO tool_runs (id, run_id, turn_id, tool_call_id, capability_id, workflow_name, tool_name, purpose,
+                                  node_id, assignment_reason, risk_level, side_effect_level, idempotency_key,
+                                  status, input, output, output_summary, error_code, error_message, finished_at, completed_at, duration_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'main-node', 'model_tool_call', ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), datetime('now'), datetime('now'), 0)`,
           toolRunID,
           runID,
+          turnID,
+          result.call_id,
           capability,
           workflowName,
-          workflowName,
+          result.name,
+          requestedAction,
           risk,
+          sideEffectLevelForCapability(capability),
+          operationID,
+          toolStatus,
           json(args),
           json(result.output),
+          toolSummary,
+          toolStatus === 'failed' || toolStatus === 'policy_blocked' ? toolStatus : '',
+          optionalString(result.output?.error) || '',
         );
         this.insertRunStep(runID, 'tool_finished', 'Tool runtime finished', { workflow_name: workflowName, tool_run_id: toolRunID, call_id: result.call_id }, result.output);
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), toolStatus === 'failed' ? 'tool.failed' : toolStatus === 'policy_blocked' ? 'tool.policy_blocked' : 'tool.completed', {
+          item_type: 'tool_run',
+          item_id: result.call_id,
+          tool_run_id: toolRunID,
+          call_id: result.call_id,
+          capability,
+          tool_name: result.name,
+          purpose: requestedAction,
+          status: toolStatus,
+          visibility: 'tool',
+          source: 'tool',
+          summary: toolSummary,
+          operation_id: operationID,
+          output: result.output,
+        });
         this.insertTurnItem(runID, turnID, itemSeq++, 'tool_output', 'tool', result.call_id, result.name, {}, JSON.stringify(result.output), result.output, 'completed', { tool_run_id: toolRunID, capability });
         this.recordProductTaskToolCheckpoint(productTask?.id, {
           run_id: runID,
@@ -1191,7 +1827,7 @@ export class JoiSQLiteStore {
           requested_action: requestedAction,
           input: args,
           output: { ...result.output, operation_id: operationID },
-          status: String(result.output?.status || '') === 'failed' ? 'failed' : 'done',
+          status: toolStatus === 'failed' || toolStatus === 'policy_blocked' ? 'failed' : 'done',
           tool_run_id: toolRunID,
           operation_id: operationID,
         });
@@ -1208,14 +1844,19 @@ export class JoiSQLiteStore {
         productTask = this.getProductTask(productTask.id).task;
       }
 
-      this.insertRunStep(runID, 'model_call_finished', 'Model call finished', { agent_id: agentID, model_id: modelName, prompt_assembly_id: promptAssemblyID }, { provider, model: modelName, real_model: provider !== 'mock_provider', fallback_to_mock: false, input_tokens: positiveNumber(usage.input_tokens), output_tokens: positiveNumber(usage.output_tokens), cached_input_tokens: positiveNumber(usage.cached_input_tokens), tool_run_count: toolResults.length });
+      const persistedToolRunCount = this.persistedToolRunCountForRun(runID);
+      this.insertRunStep(runID, 'model_call_finished', 'Model call finished', { agent_id: agentID, model_id: modelName, prompt_assembly_id: promptAssemblyID }, { provider, model: modelName, real_model: provider !== 'mock_provider', fallback_to_mock: false, input_tokens: positiveNumber(usage.input_tokens), output_tokens: positiveNumber(usage.output_tokens), cached_input_tokens: positiveNumber(usage.cached_input_tokens), tool_run_count: persistedToolRunCount });
       this.insertRunStep(runID, 'agent_output_parsed', 'Agent output parsed', { turn: 1 }, { repaired: false, output_type: 'final_answer' });
       this.insertRunStep(runID, 'response_generated', waitingConfirmation ? 'Confirmation response generated' : 'Response generated', {}, { response }, waitingConfirmation ? 'waiting_confirmation' : 'succeeded');
       this.insertTurnItem(runID, turnID, itemSeq++, 'message', 'assistant', '', '', {}, response, {}, waitingConfirmation ? 'waiting_confirmation' : 'completed', { final_answer: !waitingConfirmation, waiting_confirmation: waitingConfirmation });
 
+      const usageStatus = turn.usage_status || usageStatusForUsage(usage);
       this.exec(
-        `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name, prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens, cached_input_tokens, latency_ms, status, raw_response, metadata, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'succeeded', ?, ?, datetime('now'))`,
+        `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
+                                  prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens,
+                                  cached_input_tokens, latency_ms, status, streaming_enabled, completed_at,
+                                  finish_reason, usage_status, raw_response, raw_finish_json, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'succeeded', ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))`,
         modelCallID,
         runID,
         agentID,
@@ -1229,17 +1870,25 @@ export class JoiSQLiteStore {
         positiveNumber(usage.input_tokens),
         positiveNumber(usage.output_tokens),
         positiveNumber(usage.cached_input_tokens),
+        1,
+        turn.status || 'completed',
+        usageStatus,
         json({ responses: turn.model_responses || [] }),
-        json({ source: 'electron_ts_tool_calling', real_model: provider !== 'mock_provider', fallback_to_mock: false, tool_run_count: toolResults.length }),
+        json({ status: turn.status || 'completed', usage_status: usageStatus }),
+        json({ source: 'electron_ts_tool_calling', real_model: provider !== 'mock_provider', fallback_to_mock: false, tool_run_count: persistedToolRunCount, usage_status: usageStatus }),
       );
 
       if (waitingConfirmation) {
-        this.insertRunEvent(runID, turnID, 4, 'message.delta', { run_id: runID, turn_id: turnID, delta: response, status: 'waiting_confirmation', type: 'message.delta' });
-        this.insertRunEvent(runID, turnID, 5, 'run.waiting_confirmation', { run_id: runID, turn_id: turnID, status: 'waiting_confirmation', message: response, type: 'run.waiting_confirmation' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'assistant.completed', { run_id: runID, turn_id: turnID, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response }, status: 'waiting_confirmation', visibility: 'chat', source: 'store', type: 'assistant.completed' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'message.delta', { run_id: runID, turn_id: turnID, delta: response, status: 'waiting_confirmation', visibility: 'trace_only', source: 'store', type: 'message.delta' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'run.waiting_confirmation', { run_id: runID, turn_id: turnID, status: 'waiting_confirmation', message: response, type: 'run.waiting_confirmation' });
       } else {
-        this.insertRunEvent(runID, turnID, 3, 'message.delta', { run_id: runID, turn_id: turnID, delta: response, status: 'completed', type: 'message.delta' });
-        this.insertRunEvent(runID, turnID, 4, 'turn.completed', { run_id: runID, turn_id: turnID, status: 'completed', type: 'turn.completed' });
-        this.insertRunEvent(runID, turnID, 5, 'run.completed', { run_id: runID, status: 'succeeded', type: 'run.completed' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'assistant.delta', { run_id: runID, turn_id: turnID, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response, stream_source: 'fallback_final_chunk' }, status: 'completed', visibility: 'chat', source: 'store', type: 'assistant.delta' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'assistant.completed', { run_id: runID, turn_id: turnID, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response }, status: 'completed', visibility: 'chat', source: 'store', terminal: true, type: 'assistant.completed' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'usage.recorded', { run_id: runID, turn_id: turnID, item_type: 'model', item_id: modelCallID, status: usageStatus, visibility: 'trace_only', source: 'store', usage, usage_status: usageStatus, type: 'usage.recorded' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'message.delta', { run_id: runID, turn_id: turnID, delta: response, status: 'completed', visibility: 'trace_only', source: 'store', type: 'message.delta' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'turn.completed', { run_id: runID, turn_id: turnID, status: 'completed', type: 'turn.completed' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'run.completed', { run_id: runID, status: 'succeeded', terminal: true, type: 'run.completed' });
       }
     });
 
@@ -1430,7 +2079,7 @@ export class JoiSQLiteStore {
       };
     }
     const events = this.all(
-      `SELECT id, run_id, turn_id, seq, event_type, payload, created_at
+      `SELECT *
        FROM run_events
        WHERE run_id = ?
        ORDER BY seq`,
@@ -1490,6 +2139,15 @@ export class JoiSQLiteStore {
       id: String(run.id),
       conversation_id: optionalString(run.conversation_id),
       user_message_id: optionalString(run.user_message_id),
+      principal_id: optionalString(run.principal_id),
+      entry_channel: optionalString(run.entry_channel),
+      requested_mode: optionalString(run.requested_mode),
+      resolved_mode: optionalString(run.resolved_mode),
+      mode_source: optionalString(run.mode_source),
+      terminal_status: optionalString(run.terminal_status),
+      terminal_reason: optionalString(run.terminal_reason),
+      parent_run_id: optionalString(run.parent_run_id),
+      redirected_from_run_id: optionalString(run.redirected_from_run_id),
       status: String(run.status),
       selected_agent_id: optionalString(run.selected_agent_id) || 'general_agent',
       route_result: parseObject(run.route_result),
@@ -1877,6 +2535,145 @@ export class JoiSQLiteStore {
     return { memories: rows.map(rowToMemory) };
   }
 
+  listMemoriesUsedForRun(runID: string): { memories: MemorySearchResult[] } {
+    const id = runID.trim();
+    if (!id) throw new Error('run_id is required');
+    const rows = this.all(
+      `SELECT m.id, m.type, m.content, COALESCE(m.summary, '') AS summary, m.scope_type, COALESCE(m.scope_id, '') AS scope_id,
+              m.privacy_level, m.confidence, m.status, m.source_event_ids, m.entities, m.success_count, m.failure_count,
+              m.usage_count, m.positive_feedback, m.negative_feedback, m.pinned, m.disabled_at,
+              COALESCE(m.merged_into_memory_id, '') AS merged_into_memory_id,
+              COALESCE(m.conflict_group_id, '') AS conflict_group_id,
+              COALESCE(m.conflict_reason, '') AS conflict_reason,
+              m.metadata, m.created_at, m.updated_at, m.last_used_at,
+              re.payload_json AS event_payload
+       FROM run_events re
+       JOIN memories m ON m.id = COALESCE(
+         NULLIF(re.item_id, ''),
+         json_extract(re.payload_json, '$.memory_id'),
+         json_extract(re.payload, '$.memory_id')
+       )
+       WHERE re.run_id=? AND re.event_type='memory.recalled'
+       ORDER BY re.seq ASC`,
+      id,
+    );
+    return {
+      memories: rows.map((row) => {
+        const payload = parseObject(row.event_payload);
+        return {
+          memory: rowToMemory(row),
+          score: optionalNumber(payload.score) || 0,
+          reason: optionalString(payload.reason) || 'memory.recalled',
+        };
+      }),
+    };
+  }
+
+  listMemoryCandidates(filter: { status?: string; limit?: number } = {}): { memories: MemoryRecord[] } {
+    const status = filter.status?.trim();
+    const where = [`status <> 'deleted'`];
+    const params: SQLiteValue[] = [];
+    if (status && status !== 'all') {
+      where.push('status = ?');
+      params.push(status);
+    } else if (!status) {
+      where.push(`status IN ('pending', 'candidate', 'conflicted')`);
+    }
+    const rows = this.all(
+      `SELECT id, type, content, COALESCE(summary, '') AS summary, scope_type, COALESCE(scope_id, '') AS scope_id,
+              privacy_level, confidence, status, source_event_ids, entities, success_count, failure_count,
+              usage_count, positive_feedback, negative_feedback, pinned, disabled_at,
+              COALESCE(merged_into_memory_id, '') AS merged_into_memory_id,
+              COALESCE(conflict_group_id, '') AS conflict_group_id,
+              COALESCE(conflict_reason, '') AS conflict_reason,
+              metadata, created_at, updated_at, last_used_at
+       FROM memories
+       WHERE ${where.join(' AND ')}
+       ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
+       LIMIT ?`,
+      ...params,
+      clampLimit(filter.limit, 50),
+    );
+    return { memories: rows.map(rowToMemory) };
+  }
+
+  decideMemoryCandidate(req: {
+    id?: string;
+    decision?: string;
+    run_id?: string;
+    comment?: string;
+    reason?: string;
+    content?: string;
+    summary?: string;
+  }): void {
+    const decision = req.decision?.trim();
+    if (!decision) throw new Error('memory candidate decision is required');
+    const action = memoryCandidateDecisionAction(decision);
+    this.updateMemory({
+      id: req.id,
+      action,
+      run_id: req.run_id,
+      comment: req.comment,
+      reason: req.reason,
+      content: req.content,
+      summary: req.summary,
+    });
+  }
+
+  correctMemory(req: { id?: string; content?: string; summary?: string; run_id?: string; comment?: string; reason?: string }): void {
+    this.updateMemory({
+      id: req.id,
+      action: 'edit_confirm',
+      content: req.content,
+      summary: req.summary,
+      run_id: req.run_id,
+      comment: req.comment,
+      reason: req.reason,
+    });
+  }
+
+  deleteMemory(req: { id?: string; run_id?: string; reason?: string; comment?: string }): void {
+    this.updateMemory({
+      id: req.id,
+      action: 'delete',
+      run_id: req.run_id,
+      reason: req.reason,
+      comment: req.comment,
+    });
+  }
+
+  listUserStates(filter: { limit?: number } = {}): { memories: MemoryRecord[] } {
+    return { memories: this.listMemoryRecordsByTypes(['current_state', 'user_state'], filter.limit) };
+  }
+
+  listRelationshipStates(filter: { limit?: number } = {}): { memories: MemoryRecord[] } {
+    return { memories: this.listMemoryRecordsByTypes(['relationship_state'], filter.limit) };
+  }
+
+  private listMemoryRecordsByTypes(types: string[], limit = 50): MemoryRecord[] {
+    const placeholders = types.map(() => '?').join(', ');
+    const rows = this.all(
+      `SELECT id, type, content, COALESCE(summary, '') AS summary, scope_type, COALESCE(scope_id, '') AS scope_id,
+              privacy_level, confidence, status, source_event_ids, entities, success_count, failure_count,
+              usage_count, positive_feedback, negative_feedback, pinned, disabled_at,
+              COALESCE(merged_into_memory_id, '') AS merged_into_memory_id,
+              COALESCE(conflict_group_id, '') AS conflict_group_id,
+              COALESCE(conflict_reason, '') AS conflict_reason,
+              metadata, created_at, updated_at, last_used_at
+       FROM memories
+       WHERE type IN (${placeholders})
+         AND status='confirmed'
+         AND disabled_at IS NULL
+         AND merged_into_memory_id IS NULL
+         AND ${activeMemoryTTLWhereClause('memories')}
+       ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
+       LIMIT ?`,
+      ...types,
+      clampLimit(limit, 50),
+    );
+    return rows.map(rowToMemory);
+  }
+
   updateMemory(req: {
     id?: string;
     action?: string;
@@ -1912,30 +2709,66 @@ export class JoiSQLiteStore {
         if (!content) throw new Error('edit_confirm requires content');
         const summary = req.summary?.trim() || titleFromMessage(content);
         this.transaction(() => {
-          this.exec(
-            `UPDATE memories
-             SET content=?, summary=?, status='confirmed', disabled_at=NULL,
-                 metadata=json_set(COALESCE(metadata, '{}'), '$.edited_by', 'desktop_ui', '$.edited_at', datetime('now')),
-                 updated_at=datetime('now')
+          const existing = this.get(
+            `SELECT type, scope_type, scope_id, privacy_level, confidence, source_event_ids, entities, metadata
+             FROM memories
              WHERE id=?`,
-            content,
-            summary,
             id,
           );
-          this.insertMemoryFeedback(id, req.run_id, 'edit', req.comment || req.reason || '');
+          if (!existing) throw new Error(`memory not found: ${id}`);
+          const replacementID = `mem_${newID()}`;
+          const sourceEventIDs = parseArray(existing.source_event_ids).map(String);
+          if (req.run_id) sourceEventIDs.push(req.run_id);
+          const metadata = {
+            ...parseObject(existing.metadata),
+            corrected_from_memory_id: id,
+            corrected_by: 'desktop_ui',
+            corrected_at: nowIso(),
+            correction_reason: req.reason || req.comment || '',
+          };
+          this.exec(
+            `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence,
+                                  status, source_event_ids, entities, metadata)
+             VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, 'confirmed', ?, ?, ?)`,
+            replacementID,
+            optionalString(existing.type) || 'preference',
+            content,
+            summary,
+            optionalString(existing.scope_type) || 'global',
+            optionalString(existing.scope_id) || '',
+            optionalString(existing.privacy_level) || 'internal',
+            optionalNumber(existing.confidence) || 0.7,
+            json([...new Set(sourceEventIDs)]),
+            json(parseArray(existing.entities)),
+            json(metadata),
+          );
+          this.exec(
+            `UPDATE memories
+             SET status='superseded', merged_into_memory_id=?, disabled_at=datetime('now'),
+                 metadata=json_set(COALESCE(metadata, '{}'), '$.edited_by', 'desktop_ui', '$.edited_at', datetime('now'), '$.superseded_by', ?),
+                 updated_at=datetime('now')
+             WHERE id=?`,
+            replacementID,
+            replacementID,
+            id,
+          );
+          this.insertMemoryFeedback(id, req.run_id, 'edit', req.comment || req.reason || '', replacementID);
         });
         return;
       }
       case 'reject':
-        this.exec(
-          `UPDATE memories
-           SET status='rejected', disabled_at=datetime('now'),
-               metadata=json_set(COALESCE(metadata, '{}'), '$.rejected_by', 'desktop_ui', '$.reject_reason', ?, '$.rejected_at', datetime('now')),
-               updated_at=datetime('now')
-           WHERE id=?`,
-          req.reason || 'desktop_ui',
-          id,
-        );
+        this.transaction(() => {
+          this.exec(
+            `UPDATE memories
+             SET status='rejected', disabled_at=datetime('now'),
+                 metadata=json_set(COALESCE(metadata, '{}'), '$.rejected_by', 'desktop_ui', '$.reject_reason', ?, '$.rejected_at', datetime('now')),
+                 updated_at=datetime('now')
+             WHERE id=?`,
+            req.reason || 'desktop_ui',
+            id,
+          );
+          this.insertMemoryFeedback(id, req.run_id, 'reject', req.comment || req.reason || '');
+        });
         return;
       case 'delete':
         this.transaction(() => {
@@ -2234,60 +3067,139 @@ export class JoiSQLiteStore {
     return { items: rows.map(rowToConfirmation) };
   }
 
+  listPendingApprovals(): { items: ConfirmationRecord[] } {
+    const rows = this.all(
+      `SELECT id, COALESCE(run_id, '') AS run_id, COALESCE(capability_id, '') AS capability_id,
+              requested_action, risk_level, status, input, COALESCE(call_id, '') AS call_id,
+              COALESCE(turn_id, '') AS turn_id, COALESCE(approval_scope, 'once') AS approval_scope,
+              COALESCE(approval_key, '') AS approval_key, COALESCE(approved_by, '') AS approved_by,
+              COALESCE(rejected_by, '') AS rejected_by, COALESCE(decision_reason, '') AS decision_reason,
+              created_at, decided_at, resumed_at
+       FROM confirmation_requests
+       WHERE status='pending'
+       ORDER BY datetime(created_at) DESC
+       LIMIT 100`,
+    );
+    return { items: rows.map(rowToConfirmation) };
+  }
+
   decideConfirmation(req: { id?: string; approve?: boolean; actor?: string; reason?: string }): void {
-    const id = req.id?.trim();
-    if (!id) throw new Error('confirmation id is required');
-    const status = req.approve ? 'approved' : 'rejected';
+    this.decideApproval({
+      approval_request_id: req.id,
+      decision: req.approve ? 'approved' : 'rejected',
+      decided_by: req.actor || 'desktop_ui',
+      reason: req.reason,
+    });
+  }
+
+  decideApproval(req: {
+    run_id?: string;
+    approval_request_id?: string;
+    decision?: string;
+    decided_by?: string;
+    decided_at?: string;
+    reason?: string;
+    edited_parameters?: Record<string, unknown>;
+  }): { confirmation?: ConfirmationRecord } {
+    const id = req.approval_request_id?.trim();
+    if (!id) throw new Error('approval_request_id is required');
+    const status = normalizeApprovalDecisionStatus(req.decision);
+    const decidedBy = req.decided_by?.trim() || 'desktop_ui';
+    const decidedAt = req.decided_at?.trim() || '';
     const existing = this.get(
       `SELECT id, COALESCE(run_id, '') AS run_id, COALESCE(turn_id, '') AS turn_id,
               COALESCE(call_id, '') AS call_id, COALESCE(capability_id, '') AS capability_id,
-              status
+              status, input
        FROM confirmation_requests
        WHERE id=?`,
       id,
     );
-    if (!existing) return;
+    if (!existing) return {};
     const runID = optionalString(existing.run_id) || '';
+    if (req.run_id?.trim() && req.run_id.trim() !== runID) {
+      throw new Error('approval run_id does not match confirmation request');
+    }
     const turnID = optionalString(existing.turn_id) || '';
     const callID = optionalString(existing.call_id) || '';
     const capabilityID = optionalString(existing.capability_id) || '';
+    const editedParameters = sanitizeApprovalEditedParameters(req.edited_parameters);
+    const input = editedParameters ? { ...parseObject(existing.input), ...editedParameters } : parseObject(existing.input);
     this.transaction(() => {
-      if (req.approve) {
+      if (status === 'approved') {
         this.exec(
           `UPDATE confirmation_requests
-           SET status='approved', approved_by=?, rejected_by='', decision_reason=?, decided_at=datetime('now')
+           SET status='approved', approved_by=?, rejected_by='', decision_reason=?, input=?, decided_at=COALESCE(NULLIF(?, ''), datetime('now'))
            WHERE id=? AND status='pending'`,
-          req.actor || 'desktop_ui',
+          decidedBy,
           req.reason || '',
+          json(input),
+          decidedAt,
           id,
         );
       } else {
         this.exec(
           `UPDATE confirmation_requests
-           SET status='rejected', rejected_by=?, approved_by='', decision_reason=?, decided_at=datetime('now')
+           SET status='rejected', rejected_by=?, approved_by='', decision_reason=?, input=?, decided_at=COALESCE(NULLIF(?, ''), datetime('now'))
            WHERE id=? AND status='pending'`,
-          req.actor || 'desktop_ui',
+          decidedBy,
           req.reason || '',
+          json(input),
+          decidedAt,
           id,
         );
       }
       if (runID) {
-        const payload = { confirmation_id: id, run_id: runID, turn_id: turnID, call_id: callID, capability: capabilityID, status, approved: Boolean(req.approve), reason: req.reason || '' };
+        const payload = {
+          confirmation_id: id,
+          approval_request_id: id,
+          run_id: runID,
+          turn_id: turnID,
+          call_id: callID,
+          capability: capabilityID,
+          status,
+          decision: status,
+          approved: status === 'approved',
+          decided_by: decidedBy,
+          decided_at: decidedAt || nowIso(),
+          reason: req.reason || '',
+          edited_parameters: editedParameters || undefined,
+        };
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'approval.resolved', payload);
-        if (!req.approve) {
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), status === 'approved' ? 'approval.approved' : 'approval.denied', {
+          ...payload,
+          item_type: 'approval',
+          item_id: id,
+          visibility: 'approval',
+          source: 'store',
+        });
+        if (status !== 'approved') {
           const runMetadata = parseObject(this.get(`SELECT metadata FROM runs WHERE id=?`, runID)?.metadata);
           const productTaskID = optionalString(runMetadata.product_task_id);
+          if (callID) {
+            this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'tool.failed', {
+              item_type: 'tool_run',
+              item_id: callID,
+              call_id: callID,
+              tool_name: capabilityID,
+              status: 'failed',
+              summary: req.reason || 'Confirmation rejected',
+              output: { status: 'failed', reason: req.reason || 'Confirmation rejected' },
+              visibility: 'tool',
+              source: 'store',
+            });
+          }
           this.exec(
             `UPDATE runs
-             SET status='failed', error_code='confirmation_rejected', error_message=?, finished_at=datetime('now'),
+             SET status='failed', terminal_status='failed', terminal_reason=?, error_code='confirmation_rejected', error_message=?, finished_at=datetime('now'),
                  duration_ms=CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)
              WHERE id=? AND status='waiting_confirmation'`,
+            req.reason || 'Confirmation rejected',
             req.reason || 'Confirmation rejected',
             runID,
           );
           this.exec(
             `UPDATE turns
-             SET status='failed', finished_at=datetime('now')
+             SET status='failed', stream_status='failed', finished_at=datetime('now'), completed_at=datetime('now')
              WHERE id=? AND status='waiting_confirmation'`,
             turnID,
           );
@@ -2301,9 +3213,10 @@ export class JoiSQLiteStore {
         `audit_${newID()}`,
         status,
         req.reason || '',
-        json({ confirmation_id: id, actor: req.actor || 'desktop_ui', electron_native: true }),
+        json({ confirmation_id: id, actor: decidedBy, decided_at: decidedAt || nowIso(), edited_parameters: editedParameters || undefined, electron_native: true }),
       );
     });
+    return { confirmation: this.listConfirmations().items.find((item) => item.id === id) };
   }
 
   loadApprovedToolCallingResume(confirmationID: string): ToolCallingResumeRequest | undefined {
@@ -2359,8 +3272,12 @@ export class JoiSQLiteStore {
     const modelCallID = `mcall_${newID()}`;
     const assistantMessageID = `msg_${newID()}`;
     const usage = resume.usage || {};
+    const usageStatus = resume.usage_status || usageStatusForUsage(usage);
     const runMetadata = parseObject(this.get(`SELECT metadata FROM runs WHERE id=?`, request.run_id)?.metadata);
     const productTaskID = optionalString(runMetadata.product_task_id);
+    const operationID = optionalString(request.input.operation_id) || operationIDForTool(productTaskID, capability, request.input, request.call_id);
+    const toolStatus = toolRunStatusForOutput(toolResult.output);
+    const toolSummary = summaryForToolOutput(toolResult.output, toolStatus);
     let productTask: ProductTask | undefined;
     let artifacts: ArtifactSummary[] = [];
     const promptAssembly = this.get(
@@ -2374,16 +3291,30 @@ export class JoiSQLiteStore {
 
     this.transaction(() => {
       this.exec(
-        `INSERT INTO tool_runs (id, run_id, capability_id, workflow_name, tool_name, node_id, assignment_reason, risk_level, status, input, output, finished_at, duration_ms)
-         VALUES (?, ?, ?, ?, ?, 'main-node', 'confirmation_resume', ?, 'succeeded', ?, ?, datetime('now'), 0)`,
+        `INSERT INTO tool_runs (id, run_id, turn_id, tool_call_id, capability_id, workflow_name, tool_name, purpose,
+                                approval_request_id, node_id, assignment_reason, risk_level, side_effect_level,
+                                idempotency_key, status, input, output, output_summary, error_code, error_message,
+                                finished_at, completed_at, duration_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'main-node', 'confirmation_resume', ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''),
+                 datetime('now'), datetime('now'), 0)`,
         toolRunID,
         request.run_id,
+        request.turn_id,
+        request.call_id,
         capability,
         workflowName,
-        workflowName,
+        capability,
+        request.requested_action || `Execute ${capability}`,
+        request.confirmation_id,
         workflowRiskLevel(capability),
+        sideEffectLevelForCapability(capability),
+        operationID,
+        toolStatus,
         json(request.input),
         json(toolResult.output),
+        toolSummary,
+        toolStatus === 'failed' || toolStatus === 'policy_blocked' ? toolStatus : '',
+        optionalString(toolResult.output?.error) || '',
       );
       this.exec(
         `UPDATE turn_items
@@ -2414,21 +3345,45 @@ export class JoiSQLiteStore {
       );
       this.insertRunStep(request.run_id, 'approval_resumed', 'Approved tool execution resumed', { confirmation_id: request.confirmation_id, call_id: request.call_id, capability }, toolResult.output);
       this.insertRunStep(request.run_id, 'tool_finished', 'Tool runtime finished', { workflow_name: workflowName, tool_run_id: toolRunID, call_id: request.call_id, resumed: true }, toolResult.output);
+      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'approval.resumed', {
+        item_type: 'approval',
+        item_id: request.confirmation_id,
+        confirmation_id: request.confirmation_id,
+        call_id: request.call_id,
+        capability,
+        status: 'completed',
+        visibility: 'approval',
+        source: 'store',
+      });
+      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'run.resumed', {
+        run_id: request.run_id,
+        turn_id: request.turn_id,
+        status: 'running',
+        visibility: 'inline_status',
+        source: 'store',
+        resumed_from_confirmation_id: request.confirmation_id,
+      });
       this.recordProductTaskToolCheckpoint(productTaskID, {
         run_id: request.run_id,
         capability,
         requested_action: request.requested_action || `Execute ${capability}`,
         input: request.input,
         output: { ...toolResult.output, resumed: true },
-        status: String(toolResult.output?.status || '') === 'failed' ? 'failed' : 'done',
+        status: toolStatus === 'failed' || toolStatus === 'policy_blocked' ? 'failed' : 'done',
         tool_run_id: toolRunID,
-        operation_id: optionalString(request.input.operation_id) || operationIDForTool(productTaskID, capability, request.input, request.call_id),
+        operation_id: operationID,
       });
+      const persistedToolRunCount = this.persistedToolRunCountForRun(request.run_id);
       if (modelError) {
-        this.insertRunStep(request.run_id, 'model_call_failed', 'Model call failed after approval resume', { agent_id: request.agent_id, model_id: resume.model_name || request.model_name, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resume.provider || request.provider, model: resume.model_name || request.model_name, resumed: true, error: modelError, tool_run_ids: [toolRunID] }, 'failed');
-        this.exec(
-          `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name, prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens, cached_input_tokens, latency_ms, status, error_code, error_message, raw_response, metadata, created_at)
-           VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, 0, 'failed', 'approval_resume_model_failed', ?, ?, ?, datetime('now'))`,
+        this.insertRunStep(request.run_id, 'model_call_failed', 'Model call failed after approval resume', { agent_id: request.agent_id, model_id: resume.model_name || request.model_name, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resume.provider || request.provider, model: resume.model_name || request.model_name, resumed: true, error: modelError, tool_run_ids: [toolRunID], tool_run_count: persistedToolRunCount }, 'failed');
+	        this.exec(
+	          `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
+                                      prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens,
+                                      cached_input_tokens, latency_ms, status, streaming_enabled, completed_at,
+                                      finish_reason, usage_status, error_code, error_message, raw_response,
+                                      raw_finish_json, metadata, created_at)
+	           VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, 0, 'failed', 1, datetime('now'),
+                     'failed', 'failed', 'approval_resume_model_failed', ?, ?, ?, ?, datetime('now'))`,
           modelCallID,
           request.run_id,
           request.agent_id,
@@ -2441,11 +3396,12 @@ export class JoiSQLiteStore {
           optionalString(promptAssembly?.dynamic_tail_hash) || '',
           positiveNumber(usage.input_tokens),
           positiveNumber(usage.output_tokens),
-          positiveNumber(usage.cached_input_tokens),
-          modelError,
-          json({ responses: resume.model_responses || [], error: modelError }),
-          json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, error: modelError }),
-        );
+	          positiveNumber(usage.cached_input_tokens),
+	          modelError,
+	          json({ responses: resume.model_responses || [], error: modelError }),
+	          json({ status: 'failed', error: modelError, usage_status: 'failed' }),
+	          json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, tool_run_count: persistedToolRunCount, error: modelError }),
+	        );
         this.exec(
           `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
            VALUES (?, ?, 'assistant', ?, '[]', ?, datetime('now'))`,
@@ -2455,36 +3411,43 @@ export class JoiSQLiteStore {
           json({ run_id: request.run_id, source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, model_call_id: modelCallID, error: modelError }),
         );
         this.insertTurnItem(request.run_id, request.turn_id, this.nextTurnItemSeq(request.run_id), 'message', 'assistant', '', '', {}, response, {}, 'failed', { final_answer: true, resumed_from_confirmation_id: request.confirmation_id, error: modelError });
-        this.exec(
-          `UPDATE runs
-           SET status='failed', error_code='approval_resume_model_failed', error_message=?, finished_at=datetime('now'),
-               duration_ms=CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)
-           WHERE id=?`,
-          modelError,
-          request.run_id,
-        );
-        this.exec(
-          `UPDATE turns
-           SET status='failed', finished_at=datetime('now')
-           WHERE id=?`,
-          request.turn_id,
-        );
-        this.markProductTaskFailed(productTaskID, request.run_id, new Error(modelError), 'failed');
-        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.output.delta', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, resumed: true });
-        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.finished', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, resumed: true });
-        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'message.delta', { run_id: request.run_id, turn_id: request.turn_id, delta: response, status: 'failed', resumed: true, error: modelError });
-        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'run.failed', { run_id: request.run_id, turn_id: request.turn_id, status: 'failed', error: 'approval_resume_model_failed', message: modelError, resumed: true });
+	        this.exec(
+	          `UPDATE runs
+	           SET status='failed', terminal_status='failed', terminal_reason=?, error_code='approval_resume_model_failed', error_message=?, finished_at=datetime('now'),
+	               duration_ms=CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)
+	           WHERE id=?`,
+	          modelError,
+	          modelError,
+	          request.run_id,
+	        );
+	        this.exec(
+	          `UPDATE turns
+	           SET status='failed', stream_status='failed', finished_at=datetime('now'), completed_at=datetime('now')
+	           WHERE id=?`,
+	          request.turn_id,
+	        );
+	        this.markProductTaskFailed(productTaskID, request.run_id, new Error(modelError), 'failed');
+	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.output_delta', { item_type: 'tool_run', item_id: request.call_id, tool_run_id: toolRunID, call_id: request.call_id, tool_name: capability, status: toolStatus, output: toolResult.output, visibility: 'tool', source: 'tool', resumed: true });
+	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), toolStatus === 'failed' ? 'tool.failed' : toolStatus === 'policy_blocked' ? 'tool.policy_blocked' : 'tool.completed', { item_type: 'tool_run', item_id: request.call_id, tool_run_id: toolRunID, call_id: request.call_id, tool_name: capability, status: toolStatus, summary: toolSummary, output: toolResult.output, visibility: 'tool', source: 'tool', resumed: true });
+	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.finished', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, visibility: 'trace_only', resumed: true });
+	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'assistant.completed', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response }, status: 'failed', visibility: 'chat', source: 'store', resumed: true, error: modelError });
+	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'message.delta', { run_id: request.run_id, turn_id: request.turn_id, delta: response, status: 'failed', visibility: 'trace_only', resumed: true, error: modelError });
+	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'run.failed', { run_id: request.run_id, turn_id: request.turn_id, status: 'failed', terminal: true, error: 'approval_resume_model_failed', message: modelError, resumed: true });
         if (productTaskID) {
           productTask = this.getProductTask(productTaskID).task;
         }
         return;
       }
-      this.insertRunStep(request.run_id, 'model_call_finished', 'Model call finished', { agent_id: request.agent_id, model_id: resume.model_name || request.model_name, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resume.provider || request.provider, model: resume.model_name || request.model_name, real_model: (resume.provider || request.provider) !== 'mock_provider', resumed: true, input_tokens: positiveNumber(usage.input_tokens), output_tokens: positiveNumber(usage.output_tokens), cached_input_tokens: positiveNumber(usage.cached_input_tokens), tool_run_ids: [toolRunID] });
+      this.insertRunStep(request.run_id, 'model_call_finished', 'Model call finished', { agent_id: request.agent_id, model_id: resume.model_name || request.model_name, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resume.provider || request.provider, model: resume.model_name || request.model_name, real_model: (resume.provider || request.provider) !== 'mock_provider', resumed: true, input_tokens: positiveNumber(usage.input_tokens), output_tokens: positiveNumber(usage.output_tokens), cached_input_tokens: positiveNumber(usage.cached_input_tokens), tool_run_ids: [toolRunID], tool_run_count: persistedToolRunCount });
       this.insertRunStep(request.run_id, 'agent_output_parsed', 'Agent output parsed', { turn: 1, resumed: true }, { repaired: false, output_type: 'final_answer' });
       this.insertRunStep(request.run_id, 'response_generated', 'Response generated', {}, { response, resumed: true });
-      this.exec(
-        `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name, prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens, cached_input_tokens, latency_ms, status, raw_response, metadata, created_at)
-         VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, 0, 'succeeded', ?, ?, datetime('now'))`,
+	      this.exec(
+	        `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
+                                  prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens,
+                                  cached_input_tokens, latency_ms, status, streaming_enabled, completed_at,
+                                  finish_reason, usage_status, raw_response, raw_finish_json, metadata, created_at)
+	         VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, 0, 'succeeded', 1, datetime('now'),
+                   'completed', ?, ?, ?, ?, datetime('now'))`,
         modelCallID,
         request.run_id,
         request.agent_id,
@@ -2495,12 +3458,14 @@ export class JoiSQLiteStore {
         optionalString(promptAssembly?.prompt_cache_key) || '',
         optionalString(promptAssembly?.prefix_hash) || '',
         optionalString(promptAssembly?.dynamic_tail_hash) || '',
-        positiveNumber(usage.input_tokens),
-        positiveNumber(usage.output_tokens),
-        positiveNumber(usage.cached_input_tokens),
-        json({ responses: resume.model_responses || [] }),
-        json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID }),
-      );
+	        positiveNumber(usage.input_tokens),
+	        positiveNumber(usage.output_tokens),
+	        positiveNumber(usage.cached_input_tokens),
+	        usageStatus,
+	        json({ responses: resume.model_responses || [] }),
+	        json({ status: 'completed', usage_status: usageStatus }),
+	        json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, tool_run_count: persistedToolRunCount, usage_status: usageStatus }),
+	      );
       this.exec(
         `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
          VALUES (?, ?, 'assistant', ?, '[]', ?, datetime('now'))`,
@@ -2510,24 +3475,29 @@ export class JoiSQLiteStore {
         json({ run_id: request.run_id, source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, model_call_id: modelCallID }),
       );
       this.insertTurnItem(request.run_id, request.turn_id, this.nextTurnItemSeq(request.run_id), 'message', 'assistant', '', '', {}, response, {}, 'completed', { final_answer: true, resumed_from_confirmation_id: request.confirmation_id });
-      this.exec(
-        `UPDATE runs
-         SET status='succeeded', error_code=NULL, error_message=NULL, finished_at=datetime('now'),
-             duration_ms=CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)
-         WHERE id=?`,
+	      this.exec(
+	        `UPDATE runs
+	         SET status='succeeded', terminal_status='completed', terminal_reason='approval resume completed',
+               error_code=NULL, error_message=NULL, resumed_at=COALESCE(resumed_at, datetime('now')), finished_at=datetime('now'),
+	             duration_ms=CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)
+	         WHERE id=?`,
         request.run_id,
       );
-      this.exec(
-        `UPDATE turns
-         SET status='completed', finished_at=datetime('now')
-         WHERE id=?`,
-        request.turn_id,
-      );
-      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.output.delta', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, resumed: true });
-      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.finished', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, resumed: true });
-      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'message.delta', { run_id: request.run_id, turn_id: request.turn_id, delta: response, status: 'completed', resumed: true });
-      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'turn.completed', { run_id: request.run_id, turn_id: request.turn_id, status: 'completed', resumed: true });
-      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'run.completed', { run_id: request.run_id, status: 'succeeded', resumed: true });
+	      this.exec(
+	        `UPDATE turns
+	         SET status='completed', stream_status='completed', finished_at=datetime('now'), completed_at=datetime('now')
+	         WHERE id=?`,
+	        request.turn_id,
+	      );
+	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.output_delta', { item_type: 'tool_run', item_id: request.call_id, tool_run_id: toolRunID, call_id: request.call_id, tool_name: capability, status: toolStatus, output: toolResult.output, visibility: 'tool', source: 'tool', resumed: true });
+	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), toolStatus === 'failed' ? 'tool.failed' : toolStatus === 'policy_blocked' ? 'tool.policy_blocked' : 'tool.completed', { item_type: 'tool_run', item_id: request.call_id, tool_run_id: toolRunID, call_id: request.call_id, tool_name: capability, status: toolStatus, summary: toolSummary, output: toolResult.output, visibility: 'tool', source: 'tool', resumed: true });
+	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.finished', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, visibility: 'trace_only', resumed: true });
+	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'assistant.delta', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response, stream_source: 'resume_final_chunk' }, status: 'completed', visibility: 'chat', source: 'store', resumed: true });
+	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'assistant.completed', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response }, status: 'completed', visibility: 'chat', source: 'store', resumed: true, terminal: true });
+	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'usage.recorded', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'model', item_id: modelCallID, status: usageStatus, visibility: 'trace_only', source: 'store', usage, usage_status: usageStatus, resumed: true });
+	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'message.delta', { run_id: request.run_id, turn_id: request.turn_id, delta: response, status: 'completed', visibility: 'trace_only', resumed: true });
+	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'turn.completed', { run_id: request.run_id, turn_id: request.turn_id, status: 'completed', resumed: true });
+	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'run.completed', { run_id: request.run_id, status: 'succeeded', terminal: true, resumed: true });
       artifacts = this.finalizeProductTaskAfterRun(productTaskID, {
         run_id: request.run_id,
         conversation_id: request.conversation_id,
@@ -2565,18 +3535,26 @@ export class JoiSQLiteStore {
     const reason = req.reason || 'interrupted by user';
     const runMetadata = parseObject(this.get(`SELECT metadata FROM runs WHERE id=?`, runID)?.metadata);
     const productTaskID = optionalString(runMetadata.product_task_id);
+    const pendingApprovals = this.all(
+      `SELECT COALESCE(turn_id, '') AS turn_id, COALESCE(call_id, '') AS call_id, COALESCE(capability_id, '') AS capability_id
+       FROM confirmation_requests
+       WHERE run_id=? AND status='pending'`,
+      runID,
+    );
     this.transaction(() => {
       this.exec(
         `UPDATE runs
-         SET status='cancelled', error_code='interrupted', error_message=?, finished_at=datetime('now'),
+         SET status='cancelled', terminal_status='cancelled', terminal_reason=?, cancel_requested_at=COALESCE(cancel_requested_at, datetime('now')),
+             error_code='interrupted', error_message=?, finished_at=datetime('now'),
              duration_ms=CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)
          WHERE id=?`,
+        reason,
         reason,
         runID,
       );
       this.exec(
         `UPDATE turns
-         SET status='cancelled', finished_at=datetime('now')
+         SET status='cancelled', stream_status='cancelled', finished_at=datetime('now'), completed_at=datetime('now')
          WHERE run_id=? AND status IN ('running', 'waiting_confirmation', 'waiting_tool')`,
         runID,
       );
@@ -2593,15 +3571,594 @@ export class JoiSQLiteStore {
         reason,
         runID,
       );
-      this.exec(
-        `INSERT OR IGNORE INTO run_events (id, run_id, seq, event_type, payload, created_at)
-         VALUES (?, ?, COALESCE((SELECT MAX(seq) + 1 FROM run_events WHERE run_id=?), 1), 'run.interrupted', ?, datetime('now'))`,
-        `${runID}_evt_interrupt`,
-        runID,
-        runID,
-        json({ status: 'cancelled', reason }),
-      );
+      for (const approval of pendingApprovals) {
+        const callID = optionalString(approval.call_id);
+        if (!callID) continue;
+        this.insertRunEvent(runID, optionalString(approval.turn_id) || '', this.nextRunEventSeq(runID), 'tool.cancelled', {
+          item_type: 'tool_run',
+          item_id: callID,
+          call_id: callID,
+          tool_name: optionalString(approval.capability_id),
+          status: 'cancelled',
+          summary: reason,
+          output: { status: 'cancelled', reason },
+          visibility: 'tool',
+          source: 'store',
+        });
+      }
+      const appendCancelEventOnce = (eventType: string, status: string, visibility: string, terminal = false) => {
+        if (this.get(`SELECT id FROM run_events WHERE run_id=? AND event_type=? LIMIT 1`, runID, eventType)) return;
+        this.appendRunEventV2({
+          id: `${runID}_evt_${eventType.replace(/\W+/g, '_')}`,
+          run_id: runID,
+          event_type: eventType,
+          status,
+          source: 'store',
+          visibility,
+          terminal,
+          payload: { status, reason },
+        });
+      };
+      appendCancelEventOnce('run.cancel_requested', 'running', 'inline_status');
+      appendCancelEventOnce('run.cancelled', 'cancelled', 'inline_status', true);
+      appendCancelEventOnce('run.interrupted', 'cancelled', 'trace_only');
       this.markProductTaskFailed(productTaskID, runID, new Error(reason), 'cancelled');
+    });
+  }
+
+  redirectRun(req: { run_id?: string; target_run_id?: string; reason?: string }): RunTrace {
+    const runID = req.run_id?.trim();
+    if (!runID) throw new Error('run_id is required');
+    const run = this.get(`SELECT id, status, metadata FROM runs WHERE id=?`, runID);
+    if (!run) throw new Error(`Run not found: ${runID}`);
+    const status = String(run.status || '');
+    if (['completed', 'succeeded', 'failed', 'cancelled', 'redirected'].includes(status)) {
+      return this.getRunTrace(runID);
+    }
+    const reason = req.reason || 'redirected by user';
+    const productTaskID = optionalString(parseObject(run.metadata).product_task_id);
+    this.transaction(() => {
+      this.exec(
+        `UPDATE runs
+         SET status='redirected', terminal_status='redirected', terminal_reason=?, finished_at=datetime('now'),
+             duration_ms=CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)
+         WHERE id=?`,
+        reason,
+        runID,
+      );
+      this.exec(
+        `UPDATE turns
+         SET status='cancelled', stream_status='redirected', finished_at=datetime('now'), completed_at=datetime('now')
+         WHERE run_id=? AND status IN ('created', 'mode_resolved', 'prompting', 'running', 'streaming', 'tool_calling', 'waiting_confirmation', 'waiting_tool')`,
+        runID,
+      );
+      this.exec(
+        `UPDATE model_calls
+         SET status='cancelled', completed_at=datetime('now'), finish_reason='redirected',
+             error_code='redirected', error_message=?
+         WHERE run_id=? AND status IN ('pending', 'running')`,
+        reason,
+        runID,
+      );
+      this.exec(
+        `UPDATE confirmation_requests
+         SET status='rejected', rejected_by='desktop_ui', decision_reason=?, decided_at=datetime('now')
+         WHERE run_id=? AND status='pending'`,
+        reason,
+        runID,
+      );
+      if (productTaskID) {
+        this.exec(
+          `UPDATE product_tasks
+           SET status='paused', terminal_status='redirected', terminal_reason=?, summary=?,
+               updated_at=datetime('now'), last_projected_at=datetime('now')
+           WHERE id=?`,
+          reason,
+          `Redirected: ${reason}`,
+          productTaskID,
+        );
+      }
+      if (!this.get(`SELECT id FROM run_events WHERE run_id=? AND event_type='run.redirected' LIMIT 1`, runID)) {
+        this.appendRunEventV2({
+          id: `${runID}_evt_redirected`,
+          run_id: runID,
+          event_type: 'run.redirected',
+          status: 'redirected',
+          source: 'store',
+          visibility: 'inline_status',
+          terminal: true,
+          payload: {
+            status: 'redirected',
+            reason,
+            target_run_id: req.target_run_id?.trim() || undefined,
+          },
+        });
+      }
+    });
+    return this.getRunTrace(runID);
+  }
+
+  listRecoverableRuns(req: { limit?: number } = {}): { runs: RecoverableRunRecord[] } {
+    const limit = clampLimit(Number(req.limit || 50), 50);
+    const rows = this.all(
+      `SELECT r.id, r.conversation_id, r.status
+       FROM runs r
+       WHERE r.status IN ('queued', 'running', 'cancelling', 'resuming', 'waiting_confirmation', 'needs_recovery')
+          OR EXISTS (
+            SELECT 1 FROM run_events e
+            WHERE e.run_id=r.id AND e.event_type='run.recovery_required'
+          )
+       ORDER BY datetime(r.created_at) DESC, r.id DESC
+       LIMIT ?`,
+      limit,
+    );
+    return {
+      runs: rows.map((row) => {
+        const trace = this.getRunTrace(String(row.id));
+        const latestRecovery = [...(trace.events || [])].reverse().find((event) => event.event_type === 'run.recovery_required');
+        const payload = latestRecovery?.payload || {};
+        return {
+          run_id: String(row.id),
+          conversation_id: optionalString(row.conversation_id),
+          status: String(row.status || trace.status),
+          recovery_status: optionalString(payload.recovery_status) || (String(row.status) === 'waiting_confirmation' ? 'needs_user_decision' : 'runtime_lost'),
+          reason: optionalString(payload.reason) || trace.terminal_reason || 'non-terminal run requires review',
+          latest_event: latestRecovery,
+          trace,
+        };
+      }),
+    };
+  }
+
+  getRecentRunClosureReport(req: { limit?: number } = {}): RunClosureReport {
+    this.classifyExpiredOpenLoops();
+    const limit = clampLimit(Number(req.limit || 50), 50);
+    const rows = this.all(
+      `SELECT id, conversation_id, status, terminal_status, terminal_reason, metadata, created_at, finished_at
+       FROM runs
+       ORDER BY datetime(created_at) DESC, id DESC
+       LIMIT ?`,
+      limit,
+    );
+    const items = rows.map((row) => {
+      const runID = String(row.id);
+      const events = this.all(
+        `SELECT event_type, terminal, payload, payload_json
+         FROM run_events
+         WHERE run_id=?
+         ORDER BY seq`,
+        runID,
+      );
+      const terminalEvent = events.find((event) => Boolean(Number(event.terminal ?? 0)))
+        || events.find((event) => terminalRunEventType(String(event.event_type || '')));
+      const runMetadataTaskID = optionalString(parseObject(row.metadata).product_task_id) || '';
+      const task = this.get(
+        `SELECT id, status, terminal_status, evidence_summary, verification_status
+         FROM product_tasks
+         WHERE id=NULLIF(?, '') OR latest_run_id=? OR source_run_id=? OR json_extract(metadata, '$.checkpoints[0].run_id')=?
+         ORDER BY datetime(updated_at) DESC, id DESC
+         LIMIT 1`,
+        runMetadataTaskID,
+        runID,
+        runID,
+        runID,
+      );
+      const toolRunCount = Number(this.get(
+        `SELECT COUNT(*) AS count
+         FROM tool_runs
+         WHERE run_id=? AND status IN ('succeeded', 'failed', 'cancelled', 'policy_blocked')`,
+        runID,
+      )?.count || 0);
+      const terminalToolEventCount = events.filter((event) => [
+        'tool.completed',
+        'tool.failed',
+        'tool.cancelled',
+        'tool.policy_blocked',
+        'tool.finished',
+      ].includes(String(event.event_type))).length;
+      const memoryEventCount = events.filter((event) => String(event.event_type).startsWith('memory.')).length;
+      const proactiveEventCount = events.filter((event) => {
+        const type = String(event.event_type);
+        return type.startsWith('open_loop.') || type.startsWith('proactive.');
+      }).length;
+      const handoffEventCount = events.filter((event) => {
+        const type = String(event.event_type);
+        return type.startsWith('handoff.') || type.startsWith('notification.');
+      }).length;
+      const evidenceSummary = optionalString(task?.evidence_summary);
+      const taskStatus = optionalString(task?.terminal_status) || optionalString(task?.status);
+      return {
+        run_id: runID,
+        conversation_id: optionalString(row.conversation_id),
+        status: String(row.status || ''),
+        terminal_status: optionalString(row.terminal_status),
+        terminal_reason: optionalString(row.terminal_reason),
+        terminal_event_present: Boolean(terminalEvent),
+        terminal_event_type: optionalString(terminalEvent?.event_type),
+        task_id: optionalString(task?.id),
+        task_status: taskStatus,
+        task_evidence_summary: evidenceSummary,
+        has_task_evidence: Boolean(evidenceSummary) || optionalString(task?.verification_status) === 'passed',
+        tool_run_count: toolRunCount,
+        terminal_tool_event_count: terminalToolEventCount,
+        memory_event_count: memoryEventCount,
+        proactive_event_count: proactiveEventCount,
+        handoff_event_count: handoffEventCount,
+        recovery_required: events.some((event) => String(event.event_type) === 'run.recovery_required'),
+        created_at: optionalString(row.created_at),
+        updated_at: optionalString(row.finished_at),
+      };
+    });
+    const executionRuns = items.filter((item) => item.task_id || ['serious_task', 'background_task'].includes(String(this.get(`SELECT resolved_mode FROM runs WHERE id=?`, item.run_id)?.resolved_mode || '')));
+    const completedTasksByID = new Map<string, (typeof items)[number]>();
+    for (const item of items) {
+      if (item.task_status !== 'completed' || !item.task_id) continue;
+      const existing = completedTasksByID.get(item.task_id);
+      completedTasksByID.set(item.task_id, {
+        ...(existing || item),
+        has_task_evidence: Boolean(existing?.has_task_evidence || item.has_task_evidence),
+      });
+    }
+    const completedTasks = [...completedTasksByID.values()];
+    return {
+      items,
+      metrics: {
+        total_runs: items.length,
+        terminal_event_runs: items.filter((item) => item.terminal_event_present).length,
+        execution_runs: executionRuns.length,
+        execution_runs_with_task_or_refusal: executionRuns.filter((item) => item.task_id || item.terminal_reason?.includes('refusal')).length,
+        completed_tasks: completedTasks.length,
+        completed_tasks_with_evidence: completedTasks.filter((item) => item.has_task_evidence).length,
+        runs_with_tool_evidence: items.filter((item) => item.tool_run_count > 0 || item.terminal_tool_event_count > 0).length,
+        runs_with_memory_events: items.filter((item) => item.memory_event_count > 0).length,
+        runs_with_proactive_events: items.filter((item) => item.proactive_event_count > 0).length,
+        runs_with_handoff_events: items.filter((item) => item.handoff_event_count > 0).length,
+        recoverable_runs: items.filter((item) => item.recovery_required).length,
+      },
+    };
+  }
+
+  getExternalHandoffAudit(): ExternalHandoffAudit {
+    const requiredTables = ['runs', 'product_tasks', 'task_entry_links', 'channel_identities'];
+    const requiredRunColumns = ['entry_channel', 'principal_id', 'metadata'];
+    const requiredTaskColumns = ['principal_id', 'source_run_id', 'source_conversation_id'];
+    const missingSchema = [
+      ...requiredTables.filter((table) => !this.tableExists(table)).map((table) => `table:${table}`),
+      ...requiredRunColumns.filter((column) => !this.columnExists('runs', column)).map((column) => `runs.${column}`),
+      ...requiredTaskColumns.filter((column) => !this.columnExists('product_tasks', column)).map((column) => `product_tasks.${column}`),
+    ];
+    const audit: ExternalHandoffAudit = {
+      ok: true,
+      schema_current: missingSchema.length === 0,
+      missing_schema: missingSchema,
+      external_channels_seen: [],
+      linked_live_handoffs: [],
+      pending_external_handoffs: [],
+      metrics: {
+        external_runs: 0,
+        desktop_runs: 0,
+        linked_external_desktop_tasks: 0,
+      },
+      readiness: defaultExternalHandoffReadiness(),
+      status: missingSchema.length === 0 ? 'awaiting_external_input' : 'schema_missing',
+      next_action: '',
+    };
+    if (!audit.schema_current) {
+      audit.next_action = externalHandoffNextAction(audit.status);
+      return audit;
+    }
+
+    const rows = this.all(
+      `WITH run_tasks AS (
+         SELECT r.id AS run_id,
+                r.entry_channel,
+                r.principal_id,
+                r.conversation_id,
+                r.status,
+                r.terminal_status,
+                COALESCE(
+                  NULLIF(json_extract(r.metadata, '$.product_task_id'), ''),
+                  pt_latest.id,
+                  pt_source.id
+                ) AS product_task_id,
+                r.created_at
+         FROM runs r
+         LEFT JOIN product_tasks pt_latest ON pt_latest.latest_run_id = r.id
+         LEFT JOIN product_tasks pt_source ON pt_source.source_run_id = r.id
+         WHERE r.entry_channel IN ('desktop', 'telegram', 'imessage')
+       )
+       SELECT ext.entry_channel AS external_channel,
+              ext.run_id AS external_run_id,
+              desktop.run_id AS desktop_run_id,
+              ext.product_task_id,
+              ext.principal_id,
+              ext.conversation_id,
+              ext.status AS external_status,
+              desktop.status AS desktop_status,
+              ext.created_at AS external_created_at,
+              desktop.created_at AS desktop_created_at
+       FROM run_tasks ext
+       JOIN run_tasks desktop ON desktop.product_task_id = ext.product_task_id
+       WHERE ext.entry_channel IN ('telegram', 'imessage')
+         AND desktop.entry_channel = 'desktop'
+         AND COALESCE(ext.product_task_id, '') <> ''
+       ORDER BY datetime(ext.created_at) DESC
+       LIMIT 20`,
+    );
+    const pendingRows = this.all(
+      `WITH run_tasks AS (
+         SELECT r.id AS run_id,
+                r.entry_channel,
+                r.principal_id,
+                r.conversation_id,
+                r.status,
+                r.terminal_status,
+                COALESCE(
+                  NULLIF(json_extract(r.metadata, '$.product_task_id'), ''),
+                  pt_latest.id,
+                  pt_source.id
+                ) AS product_task_id,
+                r.created_at
+         FROM runs r
+         LEFT JOIN product_tasks pt_latest ON pt_latest.latest_run_id = r.id
+         LEFT JOIN product_tasks pt_source ON pt_source.source_run_id = r.id
+         WHERE r.entry_channel IN ('desktop', 'telegram', 'imessage')
+       )
+       SELECT ext.entry_channel AS external_channel,
+              ext.run_id AS external_run_id,
+              ext.product_task_id,
+              ext.principal_id,
+              ext.conversation_id,
+              ext.status AS external_status,
+              ext.created_at AS external_created_at,
+              pt.status AS latest_task_status,
+              pt.title AS latest_task_title
+       FROM run_tasks ext
+       LEFT JOIN product_tasks pt ON pt.id = ext.product_task_id
+       WHERE ext.entry_channel IN ('telegram', 'imessage')
+         AND COALESCE(ext.product_task_id, '') <> ''
+         AND NOT EXISTS (
+           SELECT 1
+           FROM run_tasks desktop
+           WHERE desktop.entry_channel = 'desktop'
+             AND desktop.product_task_id = ext.product_task_id
+         )
+       ORDER BY datetime(ext.created_at) DESC
+       LIMIT 20`,
+    );
+    const externalChannels = this.all(
+      `SELECT DISTINCT entry_channel AS channel
+       FROM runs
+       WHERE entry_channel IN ('telegram', 'imessage')
+       ORDER BY channel`,
+    ).map((row) => String(row.channel));
+    audit.external_channels_seen = externalChannels;
+    audit.linked_live_handoffs = rows.map((row) => ({
+      external_channel: String(row.external_channel),
+      external_run_id: String(row.external_run_id),
+      desktop_run_id: String(row.desktop_run_id),
+      product_task_id: String(row.product_task_id),
+      principal_id: optionalString(row.principal_id),
+      conversation_id: optionalString(row.conversation_id),
+      external_status: optionalString(row.external_status),
+      desktop_status: optionalString(row.desktop_status),
+      external_created_at: optionalString(row.external_created_at),
+      desktop_created_at: optionalString(row.desktop_created_at),
+    }));
+    audit.pending_external_handoffs = pendingRows.map((row) => ({
+      external_channel: String(row.external_channel),
+      external_run_id: String(row.external_run_id),
+      product_task_id: String(row.product_task_id),
+      principal_id: optionalString(row.principal_id),
+      conversation_id: optionalString(row.conversation_id),
+      external_status: optionalString(row.external_status),
+      external_created_at: optionalString(row.external_created_at),
+      latest_task_status: optionalString(row.latest_task_status),
+      latest_task_title: optionalString(row.latest_task_title),
+    }));
+    audit.metrics = {
+      external_runs: Number(this.get(`SELECT COUNT(*) AS count FROM runs WHERE entry_channel IN ('telegram', 'imessage')`)?.count || 0),
+      desktop_runs: Number(this.get(`SELECT COUNT(*) AS count FROM runs WHERE entry_channel='desktop'`)?.count || 0),
+      linked_external_desktop_tasks: audit.linked_live_handoffs.length,
+    };
+    audit.status = externalHandoffStatus(audit);
+    audit.next_action = externalHandoffNextAction(audit.status);
+    return audit;
+  }
+
+  private linkChannelIdentity(entry: EntryIdentityResolution, conversationID: string): void {
+    this.exec(
+      `INSERT INTO principals (id, display_name, status, metadata)
+       VALUES (?, ?, 'active', ?)
+       ON CONFLICT(id) DO UPDATE SET updated_at=datetime('now')`,
+      entry.principal_id,
+      entry.external_user_id,
+      json({ source: 'entry_identity', channel: entry.channel }),
+    );
+    this.exec(
+      `INSERT INTO channel_identities (id, principal_id, channel, external_user_id, external_thread_id, display_name, status, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, 'linked', ?)
+       ON CONFLICT(channel, external_user_id, external_thread_id) DO UPDATE SET
+         principal_id=excluded.principal_id,
+         status='linked',
+         updated_at=datetime('now')`,
+      entry.channel_identity_id,
+      entry.principal_id,
+      entry.channel,
+      entry.external_user_id,
+      entry.external_thread_id,
+      entry.external_user_id,
+      json({ selection_reason: entry.selection_reason }),
+    );
+    this.exec(
+      `INSERT INTO conversation_entry_links (id, principal_id, channel_identity_id, conversation_id, channel,
+                                             external_thread_id, selection_reason, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(channel_identity_id, conversation_id) DO UPDATE SET
+         principal_id=excluded.principal_id,
+         selection_reason=excluded.selection_reason,
+         updated_at=datetime('now')`,
+      `cel_${stableShortID(`${entry.channel_identity_id}:${conversationID}`)}`,
+      entry.principal_id,
+      entry.channel_identity_id,
+      conversationID,
+      entry.channel,
+      entry.external_thread_id,
+      entry.selection_reason,
+      json({ source: 'store_entry_link' }),
+    );
+  }
+
+  private linkTaskEntryIfNeeded(entry: EntryIdentityResolution, conversationID: string, productTaskID: string | undefined, reason: string): void {
+    if (!productTaskID) return;
+    this.exec(
+      `UPDATE product_tasks
+       SET principal_id=COALESCE(principal_id, ?), updated_at=datetime('now')
+       WHERE id=?`,
+      entry.principal_id,
+      productTaskID,
+    );
+    this.exec(
+      `INSERT INTO task_entry_links (id, principal_id, channel_identity_id, product_task_id,
+                                     conversation_id, selection_reason, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(channel_identity_id, product_task_id) DO UPDATE SET
+         principal_id=excluded.principal_id,
+         conversation_id=excluded.conversation_id,
+         selection_reason=excluded.selection_reason,
+         updated_at=datetime('now')`,
+      `tel_${stableShortID(`${entry.channel_identity_id}:${productTaskID}`)}`,
+      entry.principal_id,
+      entry.channel_identity_id,
+      productTaskID,
+      conversationID,
+      reason,
+      json({ source: 'store_task_entry_link', channel: entry.channel }),
+    );
+  }
+
+  private appendCrossEntryHandoffEvent(
+    runID: string,
+    turnID: string,
+    entry: EntryIdentityResolution,
+    req: ChatRequest,
+    productTaskID: string | undefined,
+  ): void {
+    const shouldEmit = entry.channel !== 'desktop' || Boolean(req.parent_run_id || req.redirected_from_run_id || productTaskID);
+    if (!shouldEmit) return;
+    const linked = Boolean(req.parent_run_id || req.redirected_from_run_id || productTaskID);
+    this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), linked ? 'handoff.linked' : 'handoff.created', {
+      item_type: 'handoff',
+      item_id: entry.channel_identity_id,
+      principal_id: entry.principal_id,
+      channel_identity_id: entry.channel_identity_id,
+      channel: entry.channel,
+      external_user_id: entry.external_user_id,
+      external_thread_id: entry.external_thread_id,
+      product_task_id: productTaskID || '',
+      parent_run_id: req.parent_run_id || '',
+      redirected_from_run_id: req.redirected_from_run_id || '',
+      status: 'completed',
+      visibility: 'handoff',
+      source: 'store',
+      summary: linked ? 'Cross-entry context linked.' : 'External entry linked to conversation.',
+    });
+  }
+
+  private recordNotificationDeliveryForProactive(proactiveMessageID: string, row: SQLiteRow): void {
+    const notificationID = `notif_${stableShortID(`${proactiveMessageID}:${nowIso()}`)}`;
+    const conversationID = optionalString(row.source_conversation_id);
+    const productTaskID = optionalString(row.source_product_task_id);
+    const channel = optionalString(row.channel) || 'desktop';
+    this.exec(
+      `INSERT INTO notification_deliveries (id, conversation_id, product_task_id, open_loop_id,
+                                           proactive_message_id, channel, status, deep_link_target,
+                                           metadata, sent_at)
+       VALUES (?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'delivered', ?, ?, datetime('now'))`,
+      notificationID,
+      conversationID || '',
+      productTaskID || '',
+      optionalString(row.source_open_loop_id) || '',
+      proactiveMessageID,
+      channel,
+      conversationID ? `joi://conversation/${conversationID}${productTaskID ? `?task=${productTaskID}` : ''}` : '',
+      json({ source: 'proactive_delivery', title: optionalString(row.title) }),
+    );
+    const runID = optionalString(row.source_run_id);
+    if (!runID) return;
+    this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), 'notification.sent', {
+      item_type: 'handoff',
+      item_id: notificationID,
+      notification_id: notificationID,
+      proactive_message_id: proactiveMessageID,
+      source_open_loop_id: optionalString(row.source_open_loop_id),
+      product_task_id: productTaskID,
+      channel,
+      status: 'delivered',
+      visibility: 'handoff',
+      source: 'store',
+      title: optionalString(row.title),
+      summary: optionalString(row.body),
+    });
+  }
+
+  recordNotificationOpened(req: { id?: string; actor?: string; external_delivery_id?: string }): void {
+    const id = req.id?.trim() || '';
+    const externalDeliveryID = req.external_delivery_id?.trim() || '';
+    if (!id && !externalDeliveryID) throw new Error('notification id or external_delivery_id is required');
+    const row = this.get(
+      `SELECT nd.id, nd.status, nd.channel, nd.conversation_id, nd.product_task_id, nd.open_loop_id,
+              nd.proactive_message_id, nd.deep_link_target, nd.external_delivery_id, nd.opened_at,
+              pm.title, pm.body, pm.source_product_task_id, pm.source_open_loop_id,
+              ol.source_run_id, ol.source_conversation_id
+       FROM notification_deliveries nd
+       LEFT JOIN proactive_messages pm ON pm.id = nd.proactive_message_id
+       LEFT JOIN open_loops ol ON ol.id = COALESCE(nd.open_loop_id, pm.source_open_loop_id)
+       WHERE nd.id=? OR (nd.external_delivery_id<>'' AND nd.external_delivery_id=?)
+       LIMIT 1`,
+      id,
+      externalDeliveryID,
+    );
+    if (!row) throw new Error('notification delivery not found');
+    const notificationID = String(row.id);
+    const alreadyOpened = Boolean(optionalString(row.opened_at)) || optionalString(row.status) === 'opened';
+    this.transaction(() => {
+      this.exec(
+        `UPDATE notification_deliveries
+         SET status=CASE WHEN status IN ('pending', 'sent', 'delivered') THEN 'opened' ELSE status END,
+             external_delivery_id=COALESCE(NULLIF(external_delivery_id, ''), NULLIF(?, '')),
+             opened_at=COALESCE(opened_at, datetime('now')),
+             updated_at=datetime('now')
+        WHERE id=?`,
+        externalDeliveryID,
+        notificationID,
+      );
+      if (alreadyOpened) return;
+      const runID = optionalString(row.source_run_id);
+      if (!runID) return;
+      const notificationPayload = {
+        item_type: 'handoff',
+        item_id: notificationID,
+        notification_id: notificationID,
+        proactive_message_id: optionalString(row.proactive_message_id),
+        source_open_loop_id: optionalString(row.open_loop_id) || optionalString(row.source_open_loop_id),
+        product_task_id: optionalString(row.product_task_id) || optionalString(row.source_product_task_id),
+        conversation_id: optionalString(row.conversation_id) || optionalString(row.source_conversation_id),
+        channel: optionalString(row.channel) || 'desktop',
+        deep_link_target: optionalString(row.deep_link_target),
+        actor: req.actor?.trim() || '',
+        status: 'opened',
+        visibility: 'handoff',
+        source: 'store',
+        title: optionalString(row.title),
+        summary: optionalString(row.body) || 'Notification opened.',
+      };
+      this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), 'notification.opened', notificationPayload);
+      this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), 'notification.resumed', {
+        ...notificationPayload,
+        status: 'resumed',
+        summary: optionalString(row.deep_link_target) || optionalString(row.body) || 'Notification target resumed.',
+      });
     });
   }
 
@@ -2866,7 +4423,9 @@ export class JoiSQLiteStore {
       this.db = new DatabaseSync(this.options.dbPath);
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
       this.db.exec(this.options.schemaSql);
+      this.ensureConversationClosureSchema();
       this.seedDefaults();
+      this.classifyRecoverableRunsOnStartup();
     } catch (error) {
       rmSync(replacementPath, { force: true });
       try {
@@ -2885,11 +4444,18 @@ export class JoiSQLiteStore {
     conversation_id: string;
     user_message_id: string;
     run_id: string;
+    turn_id?: string;
+    mode_resolution_id?: string;
+    mode_resolution?: ModeResolutionRecord;
     message: string;
   }): ProductTask | undefined {
-    const mode = effectiveInputMode(req, context.message);
-    const existingTaskID = req.product_task_id?.trim();
-    if (!existingTaskID && !shouldCreateProductTask(req, context.message, mode)) return undefined;
+    const mode = context.mode_resolution?.resolved_mode || effectiveInputMode(req, context.message);
+    const principalID = req.principal_id?.trim()
+      || optionalString(this.get(`SELECT principal_id FROM conversations WHERE id=?`, context.conversation_id)?.principal_id)
+      || entryIdentityForRequest(req, context.conversation_id).principal_id;
+    const explicitTaskID = req.product_task_id?.trim();
+    const inferredTaskID = explicitTaskID || this.resolveContinuationProductTaskID(principalID, context.message);
+    if (!inferredTaskID && !shouldCreateProductTask(req, context.message, mode)) return undefined;
     const contract = buildTaskContract(req, context.message, mode);
     const stepIDs = {
       understand: `pstep_${newID()}`,
@@ -2900,38 +4466,48 @@ export class JoiSQLiteStore {
       task_contract: contract,
       task_os_version: 'task_os_v1',
       effective_input_mode: mode,
+      mode_resolution: context.mode_resolution,
       checkpoints: [{ run_id: context.run_id, status: 'running', at: nowIso() }],
       verification: pendingTaskVerification('Task is running.'),
     };
 
-    const taskID = existingTaskID || `ptask_${newID()}`;
-    const existing = existingTaskID ? this.get(
+    const taskID = inferredTaskID || `ptask_${newID()}`;
+    const existing = inferredTaskID ? this.get(
       `SELECT metadata FROM product_tasks WHERE id=?`,
-      existingTaskID,
+      inferredTaskID,
     ) : undefined;
 
-    if (existingTaskID && existing) {
+    if (inferredTaskID && existing) {
       const metadata = { ...parseObject(existing.metadata), ...metadataBase };
       this.exec(
         `UPDATE product_tasks
-         SET latest_run_id=?, status='running', mode=?, risk_level=?, progress_percent=MAX(progress_percent, 10),
-             summary=?, metadata=?, updated_at=datetime('now')
+         SET latest_run_id=?, source_run_id=?, source_turn_id=NULLIF(?, ''), mode_resolution_id=NULLIF(?, ''),
+             principal_id=COALESCE(product_tasks.principal_id, ?), status='running', mode=?, risk_level=?, progress_percent=MAX(progress_percent, 10),
+             summary=?, verification_status='pending', last_projected_at=datetime('now'), metadata=?, updated_at=datetime('now')
          WHERE id=?`,
         context.run_id,
+        context.run_id,
+        context.turn_id || '',
+        context.mode_resolution_id || '',
+        principalID,
         mode,
         contract.risk_level,
         contract.objective,
         json(metadata),
-        existingTaskID,
+        inferredTaskID,
       );
-      this.insertRunStep(context.run_id, 'product_task_attached', 'Product task attached', {}, { product_task_id: existingTaskID, contract });
+      this.insertRunStep(context.run_id, 'product_task_attached', 'Product task attached', {}, { product_task_id: inferredTaskID, contract });
     } else {
       this.exec(
-        `INSERT INTO product_tasks (id, title, description, status, mode, priority, created_from_conversation_id,
+        `INSERT INTO product_tasks (id, principal_id, title, description, status, mode, priority, created_from_conversation_id,
                                     created_from_message_id, latest_run_id, owner_user_id, source_channel,
-                                    risk_level, progress_percent, current_step_id, summary, metadata)
-         VALUES (?, ?, ?, 'running', ?, 'normal', ?, ?, ?, ?, ?, ?, 10, ?, ?, ?)`,
+                                    risk_level, progress_percent, current_step_id, summary, source_conversation_id,
+                                    source_run_id, source_turn_id, mode_resolution_id, verification_status,
+                                    last_projected_at, metadata)
+         VALUES (?, ?, ?, ?, 'running', ?, 'normal', ?, ?, ?, ?, ?, ?, 10, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), 'pending',
+                 datetime('now'), ?)`,
         taskID,
+        principalID,
         titleFromMessage(context.message),
         contract.objective,
         mode,
@@ -2943,6 +4519,10 @@ export class JoiSQLiteStore {
         contract.risk_level,
         stepIDs.execute,
         contract.objective,
+        context.conversation_id,
+        context.run_id,
+        context.turn_id || '',
+        context.mode_resolution_id || '',
         json(metadataBase),
       );
       this.exec(
@@ -2970,6 +4550,16 @@ export class JoiSQLiteStore {
         context.run_id,
       );
       this.insertRunStep(context.run_id, 'product_task_created', 'Product task created', {}, { product_task_id: taskID, contract, step_count: 3 });
+      this.insertRunEvent(context.run_id, context.turn_id || '', this.nextRunEventSeq(context.run_id), 'task.created', {
+        item_type: 'task',
+        item_id: taskID,
+        task_id: taskID,
+        title: titleFromMessage(context.message),
+        status: 'running',
+        visibility: 'task',
+        source: 'store',
+        contract,
+      });
     }
 
     this.exec(
@@ -2983,14 +4573,43 @@ export class JoiSQLiteStore {
     );
 
     const row = this.get(
-      `SELECT id, title, description, status, mode, priority, created_from_conversation_id,
+      `SELECT id, principal_id, title, description, status, mode, priority, created_from_conversation_id,
               created_from_message_id, latest_run_id, owner_user_id, source_channel, risk_level,
-              progress_percent, current_step_id, summary, metadata, created_at, updated_at, completed_at
+              progress_percent, current_step_id, summary, source_conversation_id, source_run_id,
+              source_turn_id, mode_resolution_id, terminal_status, terminal_reason, evidence_summary,
+              verification_status, last_projected_at, metadata, created_at, updated_at, completed_at
        FROM product_tasks
        WHERE id=?`,
       taskID,
     );
     return row ? rowToProductTask(row) : undefined;
+  }
+
+  private resolveContinuationProductTaskID(principalID: string, message: string): string {
+    if (!principalID || !isTaskContinuationIntent(message)) return '';
+    const row = this.get(
+      `SELECT id FROM (
+         SELECT pt.id, pt.status, pt.updated_at
+         FROM product_tasks pt
+         WHERE pt.principal_id=?
+         UNION
+         SELECT pt.id, pt.status, pt.updated_at
+         FROM task_entry_links tel
+         JOIN product_tasks pt ON pt.id=tel.product_task_id
+         WHERE tel.principal_id=?
+       )
+       ORDER BY
+         CASE
+           WHEN status IN ('planning', 'running', 'waiting_confirmation', 'paused', 'verifying', 'blocked') THEN 0
+           ELSE 1
+         END,
+         datetime(updated_at) DESC,
+         id DESC
+       LIMIT 1`,
+      principalID,
+      principalID,
+    );
+    return optionalString(row?.id) || '';
   }
 
   private recordProductTaskToolCheckpoint(productTaskID: string | undefined, detail: {
@@ -3060,6 +4679,7 @@ export class JoiSQLiteStore {
       this.exec(
         `UPDATE product_tasks
          SET status='waiting_confirmation', progress_percent=MAX(progress_percent, 45),
+             verification_status='pending', last_projected_at=datetime('now'),
              metadata=json_set(COALESCE(metadata, '{}'), '$.verification', json(?)),
              updated_at=datetime('now')
          WHERE id=?`,
@@ -3075,6 +4695,7 @@ export class JoiSQLiteStore {
     const verification = verifyTaskCompletion(context.response, artifact, context.tool_results);
     const taskStatus = verification.status === 'passed' ? 'completed' : 'blocked';
     const progress = verification.status === 'passed' ? 100 : 85;
+    const evidenceSummary = evidenceSummaryForTask(artifact, context.tool_results, verification);
     this.exec(
       `UPDATE product_task_steps
        SET status='done', summary='执行完成。', finished_at=COALESCE(finished_at, datetime('now')), updated_at=datetime('now')
@@ -3092,18 +4713,47 @@ export class JoiSQLiteStore {
     );
     this.exec(
       `UPDATE product_tasks
-       SET status=?, progress_percent=?, summary=?, metadata=json_set(COALESCE(metadata, '{}'), '$.verification', json(?)),
+       SET status=?, progress_percent=?, summary=?, terminal_status=?, terminal_reason=?, evidence_summary=?,
+           verification_status=?, last_projected_at=datetime('now'),
+           metadata=json_set(COALESCE(metadata, '{}'), '$.verification', json(?), '$.evidence_summary', ?),
            completed_at=CASE WHEN ?='completed' THEN datetime('now') ELSE completed_at END,
            updated_at=datetime('now')
        WHERE id=?`,
       taskStatus,
       progress,
       context.response.slice(0, 500),
+      taskStatus,
+      verification.summary,
+      evidenceSummary,
+      verification.status,
       json(verification),
+      evidenceSummary,
       taskStatus,
       productTaskID,
     );
     this.insertRunStep(context.run_id, 'task_verification_finished', 'Task verification finished', {}, { product_task_id: productTaskID, verification }, verification.status === 'passed' ? 'succeeded' : 'blocked');
+    this.insertRunEvent(context.run_id, '', this.nextRunEventSeq(context.run_id), verification.status === 'passed' ? 'verification.completed' : 'verification.failed', {
+      item_type: 'artifact',
+      item_id: artifact?.id || productTaskID,
+      task_id: productTaskID,
+      artifact_id: artifact?.id,
+      status: verification.status === 'passed' ? 'completed' : 'failed',
+      visibility: 'artifact',
+      source: 'store',
+      summary: verification.summary,
+      verification,
+    });
+    this.insertRunEvent(context.run_id, '', this.nextRunEventSeq(context.run_id), verification.status === 'passed' ? 'task.completed' : 'task.blocked', {
+      item_type: 'task',
+      item_id: productTaskID,
+      task_id: productTaskID,
+      status: verification.status === 'passed' ? 'completed' : 'blocked',
+      visibility: 'task',
+      source: 'store',
+      terminal: true,
+      evidence_summary: evidenceSummary,
+      terminal_reason: verification.summary,
+    });
     return artifact ? [artifact] : [];
   }
 
@@ -3158,6 +4808,18 @@ export class JoiSQLiteStore {
       productTaskID,
     );
     this.insertRunStep(context.run_id, 'artifact_created', 'Artifact created', {}, { artifact_id: artifactID, product_task_id: productTaskID, type: 'report', title });
+    this.insertRunEvent(context.run_id, '', this.nextRunEventSeq(context.run_id), 'artifact.created', {
+      item_type: 'artifact',
+      item_id: artifactID,
+      artifact_id: artifactID,
+      task_id: productTaskID,
+      status: 'completed',
+      visibility: 'artifact',
+      source: 'store',
+      title,
+      artifact_type: 'report',
+      summary: 'Task result artifact created.',
+    });
     const row = this.get(
       `SELECT id, type, title, content_format, source_product_task_id, source_run_id,
               source_conversation_id, source_message_id, version, status, metadata, created_at, updated_at
@@ -3197,11 +4859,12 @@ export class JoiSQLiteStore {
       suggestedFollowup,
       json({ source: 'task_os_v1', mode: 'background_task' }),
     );
+    const proactiveMessageID = `pmsg_${newID()}`;
     this.exec(
       `INSERT INTO proactive_messages (id, type, title, body, reason, source_memory_ids, source_open_loop_id,
                                        source_product_task_id, score, status, channel, metadata)
        VALUES (?, 'followup', ?, ?, 'background_task_completed', '[]', ?, ?, 0.78, 'draft', 'desktop', ?)`,
-      `pmsg_${newID()}`,
+      proactiveMessageID,
       `Review ${taskTitle}`,
       suggestedFollowup,
       openLoopID,
@@ -3210,21 +4873,51 @@ export class JoiSQLiteStore {
     );
     this.insertRunStep(context.run_id, 'open_loop_created', 'Open loop created', {}, { open_loop_id: openLoopID, product_task_id: productTaskID });
     this.insertRunStep(context.run_id, 'proactive_candidate_created', 'Proactive candidate created', {}, { source_open_loop_id: openLoopID, product_task_id: productTaskID, status: 'draft' });
+    this.insertRunEvent(context.run_id, '', this.nextRunEventSeq(context.run_id), 'open_loop.created', {
+      item_type: 'open_loop',
+      item_id: openLoopID,
+      open_loop_id: openLoopID,
+      product_task_id: productTaskID,
+      status: 'open',
+      visibility: 'proactive',
+      source: 'store',
+      title: taskTitle,
+      summary: suggestedFollowup,
+    });
+    this.insertRunEvent(context.run_id, '', this.nextRunEventSeq(context.run_id), 'proactive.candidate_created', {
+      item_type: 'proactive',
+      item_id: proactiveMessageID,
+      proactive_message_id: proactiveMessageID,
+      source_open_loop_id: openLoopID,
+      product_task_id: productTaskID,
+      status: 'draft',
+      visibility: 'proactive',
+      source: 'store',
+      title: `Review ${taskTitle}`,
+      summary: suggestedFollowup,
+    });
   }
 
   private markProductTaskFailed(productTaskID: string | undefined, runID: string, error: Error, status: 'failed' | 'cancelled'): void {
     if (!productTaskID) return;
     const taskStatus = status === 'cancelled' ? 'paused' : 'blocked';
     const verification = failedTaskVerification(error.message);
+    const terminalStatus = status === 'cancelled' ? 'cancelled' : 'blocked';
     this.exec(
       `UPDATE product_tasks
-       SET status=?, summary=?, metadata=json_set(COALESCE(metadata, '{}'), '$.verification', json(?), '$.last_error', ?),
+       SET status=?, summary=?, terminal_status=?, terminal_reason=?, evidence_summary=?,
+           verification_status='failed', last_projected_at=datetime('now'),
+           metadata=json_set(COALESCE(metadata, '{}'), '$.verification', json(?), '$.last_error', ?, '$.terminal_status', ?),
            updated_at=datetime('now')
        WHERE id=?`,
       taskStatus,
       error.message,
+      terminalStatus,
+      error.message,
+      `runtime_error:${error.message.slice(0, 180)}`,
       json(verification),
       error.message,
+      terminalStatus,
       productTaskID,
     );
     this.exec(
@@ -3238,9 +4931,20 @@ export class JoiSQLiteStore {
       json({ run_id: runID, error: error.message }),
       productTaskID,
     );
+    this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), status === 'cancelled' ? 'task.cancelled' : 'task.blocked', {
+      item_type: 'task',
+      item_id: productTaskID,
+      task_id: productTaskID,
+      status: terminalStatus,
+      visibility: 'task',
+      source: 'store',
+      terminal: true,
+      terminal_reason: error.message,
+      evidence_summary: `runtime_error:${error.message.slice(0, 180)}`,
+    });
   }
 
-  listProductTasks(filter: { status?: string; limit?: number } = {}): { tasks: ProductTask[] } {
+  listProductTasks(filter: { status?: string; limit?: number; conversation_id?: string; principal_id?: string; channel?: string } = {}): { tasks: ProductTask[] } {
     const limit = clampLimit(filter.limit, 50);
     const status = filter.status?.trim();
     const where = [productTaskVisiblePredicate('product_tasks.created_from_conversation_id')];
@@ -3251,10 +4955,34 @@ export class JoiSQLiteStore {
       where.push('status = ?');
       params.push(status);
     }
+    const conversationID = filter.conversation_id?.trim();
+    if (conversationID) {
+      where.push('(created_from_conversation_id = ? OR source_conversation_id = ?)');
+      params.push(conversationID, conversationID);
+    }
+    const principalID = filter.principal_id?.trim();
+    if (principalID) {
+      where.push(`(principal_id = ? OR id IN (
+        SELECT product_task_id FROM task_entry_links WHERE principal_id = ?
+      ))`);
+      params.push(principalID, principalID);
+    }
+    const channel = filter.channel?.trim();
+    if (channel) {
+      where.push(`(source_channel = ? OR id IN (
+        SELECT tel.product_task_id
+        FROM task_entry_links tel
+        JOIN channel_identities ci ON ci.id = tel.channel_identity_id
+        WHERE ci.channel = ?
+      ))`);
+      params.push(channel, channel);
+    }
     const rows = this.all(
-      `SELECT id, title, description, status, mode, priority, created_from_conversation_id,
+      `SELECT id, principal_id, title, description, status, mode, priority, created_from_conversation_id,
               created_from_message_id, latest_run_id, owner_user_id, source_channel, risk_level,
-              progress_percent, current_step_id, summary, metadata, created_at, updated_at, completed_at
+              progress_percent, current_step_id, summary, source_conversation_id, source_run_id,
+              source_turn_id, mode_resolution_id, terminal_status, terminal_reason, evidence_summary,
+              verification_status, last_projected_at, metadata, created_at, updated_at, completed_at
        FROM product_tasks
        WHERE ${where.join(' AND ')}
        ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
@@ -3265,13 +4993,131 @@ export class JoiSQLiteStore {
     return { tasks: rows.map(rowToProductTask) };
   }
 
+  closeProductTask(req: { id?: string; outcome?: string; reason?: string; actor?: string; run_id?: string }): ProductTaskDetail {
+    const taskID = req.id?.trim() || '';
+    if (!taskID) throw new Error('product_task id is required');
+    const task = this.get(
+      `SELECT id, latest_run_id, source_run_id, source_turn_id, status, progress_percent, evidence_summary, verification_status
+       FROM product_tasks
+       WHERE id=?`,
+      taskID,
+    );
+    if (!task) throw new Error(`Product task not found: ${taskID}`);
+    const outcome = normalizeProductTaskCloseOutcome(req.outcome);
+    const reason = req.reason?.trim() || 'closed manually by user';
+    const evidenceSummary = optionalString(task.evidence_summary) || `manual_close:${reason.slice(0, 180)}`;
+    const eventType = productTaskTerminalEventType(outcome);
+    const progress = outcome === 'completed' ? 100 : Number(task.progress_percent ?? 0);
+    this.transaction(() => {
+      this.exec(
+        `UPDATE product_tasks
+         SET status=?,
+             terminal_status=?,
+             terminal_reason=?,
+             evidence_summary=?,
+             verification_status=CASE
+               WHEN ?='completed' THEN COALESCE(NULLIF(verification_status, ''), 'manual')
+               ELSE verification_status
+             END,
+             progress_percent=?,
+             completed_at=datetime('now'),
+             updated_at=datetime('now'),
+             metadata=json_set(COALESCE(metadata, '{}'),
+               '$.manual_close.reason', ?,
+               '$.manual_close.actor', ?,
+               '$.manual_close.outcome', ?,
+               '$.manual_close.closed_at', datetime('now'))
+         WHERE id=?`,
+        outcome,
+        outcome,
+        reason,
+        evidenceSummary,
+        outcome,
+        progress,
+        reason,
+        req.actor?.trim() || '',
+        outcome,
+        taskID,
+      );
+      const runID = req.run_id?.trim() || optionalString(task.latest_run_id) || optionalString(task.source_run_id);
+      if (runID) {
+        this.insertRunEvent(runID, optionalString(task.source_turn_id) || '', this.nextRunEventSeq(runID), eventType, {
+          item_type: 'task',
+          item_id: taskID,
+          product_task_id: taskID,
+          status: outcome,
+          terminal: true,
+          terminal_reason: reason,
+          evidence_summary: evidenceSummary,
+          manual: true,
+          actor: req.actor?.trim() || '',
+          visibility: 'task',
+          source: 'store',
+          summary: reason,
+        });
+      }
+    });
+    return this.getProductTask(taskID);
+  }
+
+  reopenProductTask(req: { id?: string; reason?: string; actor?: string; run_id?: string }): ProductTaskDetail {
+    const taskID = req.id?.trim() || '';
+    if (!taskID) throw new Error('product_task id is required');
+    const task = this.get(
+      `SELECT id, latest_run_id, source_run_id, source_turn_id, status, progress_percent
+       FROM product_tasks
+       WHERE id=?`,
+      taskID,
+    );
+    if (!task) throw new Error(`Product task not found: ${taskID}`);
+    const reason = req.reason?.trim() || 'reopened manually by user';
+    this.transaction(() => {
+      this.exec(
+        `UPDATE product_tasks
+         SET status='planning',
+             terminal_status=NULL,
+             terminal_reason=NULL,
+             completed_at=NULL,
+             progress_percent=CASE WHEN progress_percent >= 100 THEN 90 ELSE progress_percent END,
+             updated_at=datetime('now'),
+             metadata=json_set(COALESCE(metadata, '{}'),
+               '$.manual_reopen.reason', ?,
+               '$.manual_reopen.actor', ?,
+               '$.manual_reopen.reopened_at', datetime('now'))
+         WHERE id=?`,
+        reason,
+        req.actor?.trim() || '',
+        taskID,
+      );
+      const runID = req.run_id?.trim() || optionalString(task.latest_run_id) || optionalString(task.source_run_id);
+      if (runID) {
+        this.insertRunEvent(runID, optionalString(task.source_turn_id) || '', this.nextRunEventSeq(runID), 'task.planned', {
+          item_type: 'task',
+          item_id: taskID,
+          product_task_id: taskID,
+          status: 'planning',
+          phase: 'reopened',
+          reopened: true,
+          reason,
+          actor: req.actor?.trim() || '',
+          visibility: 'task',
+          source: 'store',
+          summary: reason,
+        });
+      }
+    });
+    return this.getProductTask(taskID);
+  }
+
   getProductTask(id: string): ProductTaskDetail {
     const taskID = id.trim();
     if (!taskID) throw new Error('product_task id is required');
     const task = this.get(
-      `SELECT id, title, description, status, mode, priority, created_from_conversation_id,
+      `SELECT id, principal_id, title, description, status, mode, priority, created_from_conversation_id,
               created_from_message_id, latest_run_id, owner_user_id, source_channel, risk_level,
-              progress_percent, current_step_id, summary, metadata, created_at, updated_at, completed_at
+              progress_percent, current_step_id, summary, source_conversation_id, source_run_id,
+              source_turn_id, mode_resolution_id, terminal_status, terminal_reason, evidence_summary,
+              verification_status, last_projected_at, metadata, created_at, updated_at, completed_at
        FROM product_tasks
        WHERE id = ?`,
       taskID,
@@ -3337,6 +5183,7 @@ export class JoiSQLiteStore {
   }
 
   listOpenLoops(filter: { status?: string; limit?: number } = {}): { open_loops: OpenLoop[] } {
+    this.classifyExpiredOpenLoops();
     const status = filter.status?.trim() || 'open';
     const rows = this.all(
       `SELECT id, topic, description, status, source_conversation_id, source_run_id,
@@ -3354,7 +5201,135 @@ export class JoiSQLiteStore {
     return { open_loops: rows.map(rowToOpenLoop) };
   }
 
+  decideOpenLoop(req: { id?: string; action?: string; feedback?: string; due_at?: string }): void {
+    const id = req.id?.trim();
+    const action = req.action?.trim();
+    if (!id || !action) throw new Error('id and action are required');
+    let status = '';
+    let closed = false;
+    let dueAt = req.due_at?.trim() || '';
+    switch (action) {
+      case 'close':
+      case 'done':
+        status = 'closed';
+        closed = true;
+        break;
+      case 'snooze':
+        status = 'snoozed';
+        break;
+      case 'schedule':
+        status = 'scheduled';
+        break;
+      case 'expire':
+        status = 'expired';
+        closed = true;
+        break;
+      case 'cancel':
+        status = 'cancelled';
+        closed = true;
+        break;
+      default:
+        throw new Error(`unsupported open loop action: ${action}`);
+    }
+    this.transaction(() => {
+      this.exec(
+        `UPDATE open_loops
+         SET status=?, due_at=COALESCE(NULLIF(?, ''), due_at),
+             metadata=json_set(COALESCE(metadata, '{}'), '$.last_action', ?, '$.last_feedback', ?, '$.last_decided_at', datetime('now')),
+             closed_at=CASE WHEN ? THEN datetime('now') ELSE closed_at END,
+             updated_at=datetime('now')
+         WHERE id=?`,
+        status,
+        dueAt,
+        action,
+        req.feedback || '',
+        closed ? 1 : 0,
+        id,
+      );
+      const row = this.get(
+        `SELECT id, topic, suggested_followup, source_run_id, source_product_task_id
+         FROM open_loops
+         WHERE id=?`,
+        id,
+      );
+      const runID = optionalString(row?.source_run_id);
+      if (runID) {
+        this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), `open_loop.${status}`, {
+          item_type: 'open_loop',
+          item_id: id,
+          open_loop_id: id,
+          product_task_id: optionalString(row?.source_product_task_id),
+          status,
+          visibility: 'proactive',
+          source: 'store',
+          title: optionalString(row?.topic),
+          summary: req.feedback || optionalString(row?.suggested_followup),
+          due_at: dueAt,
+          action,
+        });
+      }
+    });
+  }
+
+  private classifyExpiredOpenLoops(): number {
+    const rows = this.all(
+      `SELECT id, topic, suggested_followup, source_run_id, source_product_task_id, due_at
+       FROM open_loops
+       WHERE status IN ('open', 'scheduled', 'snoozed', 'delivered', 'awaiting_response')
+         AND due_at IS NOT NULL
+         AND due_at <> ''
+         AND datetime(due_at) <= datetime('now')`,
+    );
+    if (rows.length === 0) return 0;
+    this.transaction(() => {
+      for (const row of rows) {
+        const openLoopID = String(row.id);
+        this.exec(
+          `UPDATE open_loops
+           SET status='expired',
+               closed_at=COALESCE(closed_at, datetime('now')),
+               metadata=json_set(COALESCE(metadata, '{}'),
+                 '$.expiry.classified_at', datetime('now'),
+                 '$.expiry.reason', 'due_at elapsed',
+                 '$.expiry.previous_due_at', COALESCE(due_at, '')),
+               updated_at=datetime('now')
+           WHERE id=? AND status <> 'expired'`,
+          openLoopID,
+        );
+        this.exec(
+          `UPDATE proactive_messages
+           SET status='expired',
+               metadata=json_set(COALESCE(metadata, '{}'),
+                 '$.expiry.source', 'open_loop_expired',
+                 '$.expiry.classified_at', datetime('now')),
+               updated_at=datetime('now')
+           WHERE source_open_loop_id=?
+             AND status IN ('draft', 'needs_authorization', 'authorized', 'scheduled')`,
+          openLoopID,
+        );
+        const runID = optionalString(row.source_run_id);
+        if (!runID) continue;
+        this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), 'open_loop.expired', {
+          item_type: 'open_loop',
+          item_id: openLoopID,
+          open_loop_id: openLoopID,
+          product_task_id: optionalString(row.source_product_task_id),
+          status: 'expired',
+          terminal: true,
+          visibility: 'proactive',
+          source: 'store',
+          title: optionalString(row.topic),
+          summary: optionalString(row.suggested_followup) || 'Open loop expired.',
+          due_at: optionalString(row.due_at),
+          reason: 'due_at elapsed',
+        });
+      }
+    });
+    return rows.length;
+  }
+
   listProactiveMessages(filter: { status?: string; limit?: number } = {}): { messages: ProactiveMessage[] } {
+    this.classifyExpiredOpenLoops();
     const status = filter.status?.trim() || 'draft';
     const rows = this.all(
       `SELECT id, type, title, body, reason, source_memory_ids, source_open_loop_id,
@@ -3387,11 +5362,13 @@ export class JoiSQLiteStore {
     switch (action) {
       case 'send':
       case 'approve':
+        status = 'authorized';
+        break;
       case 'queue':
-        status = 'queued';
+        status = 'scheduled';
         break;
       case 'sent':
-        status = 'sent';
+        status = 'delivered';
         break;
       case 'dismiss':
       case 'ignore':
@@ -3404,19 +5381,67 @@ export class JoiSQLiteStore {
       case 'useful':
       case 'annoying':
       case 'inaccurate':
-        status = 'dismissed';
+        status = 'responded';
         feedback ||= action;
         break;
       default:
         throw new Error(`unsupported proactive action: ${action}`);
     }
     this.transaction(() => {
+      const before = this.get(
+        `SELECT id, source_open_loop_id, source_product_task_id, score
+         FROM proactive_messages
+         WHERE id=?`,
+        id,
+      );
+      const negativeFeedback = isNegativeProactiveFeedbackAction(action);
+      const scorePenalty = negativeFeedback ? proactiveFeedbackScorePenalty(action) : 0;
+      let negativeFeedbackCount = 0;
+      if (negativeFeedback && before) {
+        negativeFeedbackCount = Number(this.get(
+          `SELECT COUNT(*) AS count
+           FROM proactive_feedback pf
+           JOIN proactive_messages pm ON pm.id = pf.proactive_message_id
+           WHERE pf.action IN ('dismiss', 'ignore', 'annoying', 'inaccurate')
+             AND (
+               (COALESCE(?, '') <> '' AND pm.source_open_loop_id = ?)
+               OR (COALESCE(?, '') <> '' AND pm.source_product_task_id = ?)
+               OR pm.id = ?
+             )`,
+          optionalString(before.source_open_loop_id) || '',
+          optionalString(before.source_open_loop_id) || '',
+          optionalString(before.source_product_task_id) || '',
+          optionalString(before.source_product_task_id) || '',
+          id,
+        )?.count || 0) + 1;
+        if (negativeFeedbackCount >= 3) {
+          status = 'suppressed';
+        }
+        feedback ||= action;
+      }
       this.exec(
         `UPDATE proactive_messages
-         SET status=?, feedback=NULLIF(?, ''), updated_at=datetime('now'), sent_at=CASE WHEN ?='sent' THEN datetime('now') ELSE sent_at END
+         SET status=?,
+             feedback=NULLIF(?, ''),
+             score=CASE WHEN ? > 0 THEN MAX(score - ?, 0) ELSE score END,
+             metadata=CASE WHEN ? > 0 THEN json_set(COALESCE(metadata, '{}'),
+               '$.downranking.last_action', ?,
+               '$.downranking.negative_feedback_count', ?,
+               '$.downranking.score_penalty', ?,
+               '$.downranking.auto_suppressed', ?)
+               ELSE metadata END,
+             updated_at=datetime('now'),
+             sent_at=CASE WHEN ?='delivered' THEN datetime('now') ELSE sent_at END
          WHERE id=?`,
         status,
         feedback,
+        scorePenalty,
+        scorePenalty,
+        scorePenalty,
+        action,
+        negativeFeedbackCount,
+        scorePenalty,
+        status === 'suppressed' && negativeFeedback ? 1 : 0,
         status,
         id,
       );
@@ -3428,6 +5453,162 @@ export class JoiSQLiteStore {
         action,
         feedback,
       );
+      if (negativeFeedback && before) {
+        this.exec(
+          `UPDATE proactive_messages
+           SET score=MAX(score - ?, 0),
+               status=CASE WHEN ? THEN 'suppressed' ELSE status END,
+               metadata=json_set(COALESCE(metadata, '{}'),
+                 '$.downranking.last_action', ?,
+                 '$.downranking.negative_feedback_count', ?,
+                 '$.downranking.score_penalty', ?,
+                 '$.downranking.auto_suppressed', ?,
+                 '$.downranking.source_message_id', ?),
+               updated_at=datetime('now')
+           WHERE id <> ?
+             AND status IN ('draft', 'needs_authorization', 'authorized', 'scheduled')
+             AND (
+               (COALESCE(?, '') <> '' AND source_open_loop_id = ?)
+               OR (COALESCE(?, '') <> '' AND source_product_task_id = ?)
+             )`,
+          scorePenalty,
+          negativeFeedbackCount >= 3 ? 1 : 0,
+          action,
+          negativeFeedbackCount,
+          scorePenalty,
+          negativeFeedbackCount >= 3 ? 1 : 0,
+          id,
+          id,
+          optionalString(before.source_open_loop_id) || '',
+          optionalString(before.source_open_loop_id) || '',
+          optionalString(before.source_product_task_id) || '',
+          optionalString(before.source_product_task_id) || '',
+        );
+      }
+      const row = this.get(
+        `SELECT pm.id, pm.title, pm.body, pm.channel, pm.status, pm.source_open_loop_id, pm.source_product_task_id,
+                ol.source_run_id, ol.source_conversation_id
+         FROM proactive_messages pm
+         LEFT JOIN open_loops ol ON ol.id = pm.source_open_loop_id
+         WHERE pm.id=?`,
+        id,
+      );
+      const runID = optionalString(row?.source_run_id);
+      if (runID) {
+        this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), eventTypeForProactiveDecision(action, status), {
+          item_type: 'proactive',
+          item_id: id,
+          proactive_message_id: id,
+          source_open_loop_id: optionalString(row?.source_open_loop_id),
+          product_task_id: optionalString(row?.source_product_task_id),
+          status,
+          visibility: 'proactive',
+          source: 'store',
+          title: optionalString(row?.title),
+          summary: optionalString(row?.body) || feedback,
+          feedback,
+          action,
+        });
+        if (status === 'delivered' && row) {
+          this.recordNotificationDeliveryForProactive(id, row);
+        }
+      }
+    });
+  }
+
+  private classifyRecoverableRunsOnStartup(): void {
+    const rows = this.all(
+      `SELECT id, status
+       FROM runs
+       WHERE status IN ('queued', 'running', 'cancelling', 'resuming', 'waiting_confirmation')
+          AND NOT EXISTS (
+            SELECT 1 FROM run_events
+            WHERE run_events.run_id = runs.id
+              AND run_events.event_type = 'run.recovery_required'
+          )`,
+    );
+    if (rows.length === 0) return;
+    this.transaction(() => {
+      for (const row of rows) {
+        const runID = String(row.id);
+        const status = String(row.status || '');
+        if (status === 'waiting_confirmation') {
+          this.appendRunEventV2({
+            id: `${runID}_evt_recovery_required`,
+            run_id: runID,
+            event_type: 'run.recovery_required',
+            item_type: 'run',
+            item_id: runID,
+            status: 'waiting_confirmation',
+            source: 'store',
+            visibility: 'inline_status',
+            payload: {
+              recovery_status: 'needs_user_decision',
+              reason: 'pending approval survived app restart',
+            },
+          });
+          continue;
+        }
+        const reason = 'runtime state was lost after app restart';
+        this.exec(
+          `UPDATE runs
+           SET status='failed', terminal_status='failed', terminal_reason=?,
+               error_code='runtime_lost_on_restart', error_message=?,
+               finished_at=COALESCE(finished_at, datetime('now')),
+               duration_ms=COALESCE(duration_ms, CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER))
+           WHERE id=?`,
+          reason,
+          reason,
+          runID,
+        );
+        this.exec(
+          `UPDATE turns
+           SET status='failed', stream_status='failed',
+               finished_at=COALESCE(finished_at, datetime('now')),
+               completed_at=COALESCE(completed_at, datetime('now'))
+           WHERE run_id=? AND status IN ('created', 'mode_resolved', 'prompting', 'running', 'streaming', 'tool_calling', 'waiting_tool')`,
+          runID,
+        );
+        this.exec(
+          `UPDATE model_calls
+           SET status='failed', completed_at=COALESCE(completed_at, datetime('now')),
+               finish_reason='runtime_lost_on_restart', usage_status=CASE WHEN usage_status='' THEN 'failed' ELSE usage_status END,
+               error_code='runtime_lost_on_restart', error_message=?
+           WHERE run_id=? AND status IN ('pending', 'running')`,
+          reason,
+          runID,
+        );
+        this.appendRunEventV2({
+          id: `${runID}_evt_recovery_required`,
+          run_id: runID,
+          event_type: 'run.recovery_required',
+          item_type: 'run',
+          item_id: runID,
+          status: 'failed',
+          source: 'store',
+          visibility: 'inline_status',
+          payload: {
+            recovery_status: 'runtime_lost',
+            reason,
+          },
+        });
+        this.appendRunEventV2({
+          id: `${runID}_evt_recovery_failed`,
+          run_id: runID,
+          event_type: 'run.failed',
+          item_type: 'run',
+          item_id: runID,
+          status: 'failed',
+          source: 'store',
+          visibility: 'inline_status',
+          terminal: true,
+          error: { code: 'runtime_lost_on_restart', message: reason },
+          payload: {
+            recovery_status: 'runtime_lost',
+            reason,
+          },
+        });
+      }
     });
   }
 
@@ -3537,7 +5718,7 @@ export class JoiSQLiteStore {
     }
   }
 
-  private deterministicRunEvents(runID: string, response: string, createdAt: string): RunEvent[] {
+  private deterministicRunEvents(runID: string, response: string, createdAt: string, modeResolution: ModeResolutionRecord): RunEvent[] {
     return [
       {
         id: `${runID}_evt_1`,
@@ -3553,32 +5734,54 @@ export class JoiSQLiteStore {
         id: `${runID}_evt_2`,
         run_id: runID,
         seq: 2,
-        event_type: 'assistant.delta',
-        type: 'assistant.delta',
-        status: 'running',
-        delta: response,
+        event_type: 'run.mode_resolved',
+        type: 'run.mode_resolved',
+        status: 'completed',
         created_at: createdAt,
-        payload: { delta: response },
+        payload: {
+          item_type: 'mode_resolution',
+          item_id: modeResolution.id,
+          requested_mode: modeResolution.requested_mode,
+          resolved_mode: modeResolution.resolved_mode,
+          contract_mode: contractMode(modeResolution.resolved_mode),
+          mode_source: modeResolution.mode_source,
+          mode_locked_by_user: modeResolution.mode_locked_by_user,
+          reason: modeResolution.reason,
+          confidence: modeResolution.confidence,
+          visibility: 'inline_status',
+        },
       },
       {
         id: `${runID}_evt_3`,
         run_id: runID,
         seq: 3,
-        event_type: 'assistant.completed',
-        type: 'assistant.completed',
-        status: 'completed',
+        event_type: 'assistant.delta',
+        type: 'assistant.delta',
+        status: 'running',
+        delta: response,
         created_at: createdAt,
-        payload: { message: response },
+        payload: { item_type: 'assistant_message', delta: { text: response, stream_source: 'deterministic' }, visibility: 'chat' },
       },
       {
         id: `${runID}_evt_4`,
         run_id: runID,
         seq: 4,
+        event_type: 'assistant.completed',
+        type: 'assistant.completed',
+        status: 'completed',
+        created_at: createdAt,
+        payload: { item_type: 'assistant_message', delta: { text: response }, visibility: 'chat' },
+      },
+      {
+        id: `${runID}_evt_5`,
+        run_id: runID,
+        seq: 5,
         event_type: 'run.finalized',
         type: 'run.finalized',
         status: 'completed',
+        terminal: true,
         created_at: createdAt,
-        payload: { status: 'completed' },
+        payload: { status: 'completed', terminal: true },
       },
     ];
   }
@@ -3639,7 +5842,7 @@ export class JoiSQLiteStore {
     );
   }
 
-  private insertMemoryFeedback(memoryID: string, runID: string | undefined, feedback: string, comment: string): void {
+  private insertMemoryFeedback(memoryID: string, runID: string | undefined, feedback: string, comment: string, replacementMemoryID = ''): void {
     this.exec(
       `INSERT INTO memory_feedback (id, memory_id, run_id, feedback, comment)
        VALUES (?, ?, NULLIF(?, ''), ?, ?)`,
@@ -3649,6 +5852,64 @@ export class JoiSQLiteStore {
       feedback,
       comment,
     );
+    const cleanRunID = runID?.trim();
+    if (!cleanRunID) return;
+    const memory = this.get(
+      `SELECT id, type, content, summary, status, confidence, updated_at
+       FROM memories
+       WHERE id=?`,
+      replacementMemoryID || memoryID,
+    );
+    if (!memory) return;
+    const eventType = memoryFeedbackEventType(feedback);
+    this.appendRunEventV2({
+      run_id: cleanRunID,
+      event_type: eventType,
+      item_type: 'memory',
+      item_id: replacementMemoryID || memoryID,
+      status: statusForMemoryFeedback(feedback),
+      source: 'store',
+      visibility: 'memory',
+      payload: {
+        memory_id: replacementMemoryID || memoryID,
+        previous_memory_id: replacementMemoryID ? memoryID : undefined,
+        supersedes_id: replacementMemoryID ? memoryID : undefined,
+        memory_type: optionalString(memory.type),
+        summary: optionalString(memory.summary),
+        content: optionalString(memory.content),
+        memory_status: optionalString(memory.status),
+        confidence: optionalNumber(memory.confidence),
+        feedback,
+        comment,
+      },
+    });
+  }
+
+  private appendMemoryRecalledEvents(runID: string, turnID: string, memoryPackID: string, results: MemorySearchResult[]): void {
+    for (const result of results) {
+      const memory = result.memory;
+      if (!memory?.id) continue;
+      this.appendRunEventV2({
+        run_id: runID,
+        turn_id: turnID,
+        event_type: 'memory.recalled',
+        item_type: 'memory',
+        item_id: memory.id,
+        status: 'completed',
+        source: 'store',
+        visibility: 'memory',
+        payload: {
+          memory_context_pack_id: memoryPackID,
+          memory_id: memory.id,
+          memory_type: memory.type,
+          summary: memory.summary,
+          content: memory.content,
+          reason: result.reason,
+          score: result.score,
+          pinned: memory.pinned,
+        },
+      });
+    }
   }
 
   private setNodeEnabled(nodeID: string, enabled: boolean): void {
@@ -3767,21 +6028,33 @@ export class JoiSQLiteStore {
   }
 
   private insertRunEvent(runID: string, turnID: string, seq: number, eventType: string, payload: Record<string, unknown>): void {
-    this.exec(
-      `INSERT INTO run_events (id, run_id, turn_id, seq, event_type, payload, created_at)
-       VALUES (?, ?, NULLIF(?, ''), ?, ?, ?, datetime('now'))`,
-      `evt_${newID()}`,
-      runID,
-      turnID,
+    this.appendRunEventV2({
+      run_id: runID,
+      turn_id: turnID,
       seq,
-      eventType,
-      json(payload),
-    );
+      event_type: eventType,
+      item_type: optionalString(payload.item_type),
+      item_id: optionalString(payload.item_id) || optionalString(payload.call_id) || optionalString(payload.tool_run_id) || optionalString(payload.task_id),
+      parent_item_id: optionalString(payload.parent_item_id),
+      status: optionalString(payload.status),
+      source: optionalString(payload.source) || 'store',
+      visibility: optionalString(payload.visibility),
+      terminal: Boolean(payload.terminal),
+      delta: payload.delta,
+      snapshot: payload.snapshot,
+      error: payload.error,
+      usage: payload.usage,
+      payload,
+    });
   }
 
   private nextRunEventSeq(runID: string): number {
     const row = this.get(`SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM run_events WHERE run_id=?`, runID);
     return Number(row?.seq ?? 1);
+  }
+
+  private persistedToolRunCountForRun(runID: string): number {
+    return Number(this.get(`SELECT COUNT(*) AS count FROM tool_runs WHERE run_id=?`, runID)?.count || 0);
   }
 
   private nextTurnItemSeq(runID: string): number {
@@ -3802,6 +6075,7 @@ export class JoiSQLiteStore {
        WHERE status='confirmed'
          AND disabled_at IS NULL
          AND merged_into_memory_id IS NULL
+         AND ${activeMemoryTTLWhereClause('memories')}
        ORDER BY pinned DESC, confidence DESC, datetime(updated_at) DESC
        LIMIT 60`,
     );
@@ -3862,8 +6136,12 @@ export class JoiSQLiteStore {
     conversationID: string,
     userMessageID: string,
     modelName: string,
+    resolvedMode: InputMode,
+    response: string,
+    entryIdentity: EntryIdentityResolution,
+    req: ChatRequest,
     capabilityOutput?: Record<string, unknown>,
-  ): void {
+  ): string {
     const memoryID = optionalString(this.get(`SELECT id FROM memories ORDER BY pinned DESC, datetime(updated_at) DESC LIMIT 1`)?.id);
     if (plan.memoryUsage && memoryID) {
       this.exec(
@@ -3887,24 +6165,40 @@ export class JoiSQLiteStore {
       );
     }
     let productTaskID = '';
-    if (plan.productTask) {
+    let artifactID = '';
+    const shouldProjectTask = Boolean(plan.productTask) || resolvedMode === 'serious_task' || resolvedMode === 'background_task';
+    if (shouldProjectTask) {
       productTaskID = `ptask_${newID()}`;
+      const productTask = plan.productTask || {
+        title: titleFromMessage(response),
+        description: response.slice(0, 500),
+        summary: response.slice(0, 500),
+        stepCount: 3,
+      };
       this.exec(
-        `INSERT INTO product_tasks (id, title, description, status, mode, priority, created_from_conversation_id, created_from_message_id, latest_run_id, owner_user_id, source_channel, risk_level, progress_percent, summary, metadata)
-         VALUES (?, ?, ?, 'planning', 'serious_task', 'normal', ?, ?, ?, 'desktop_user', 'desktop', 'read_only', 20, ?, ?)`,
+        `INSERT INTO product_tasks (id, principal_id, title, description, status, mode, priority, created_from_conversation_id, created_from_message_id,
+                                    latest_run_id, owner_user_id, source_channel, risk_level, progress_percent, summary,
+                                    source_conversation_id, source_run_id, verification_status, metadata)
+         VALUES (?, ?, ?, ?, 'running', ?, 'normal', ?, ?, ?, ?, ?, 'read_only', 45, ?, ?, ?, 'pending', ?)`,
         productTaskID,
-        plan.productTask.title,
-        plan.productTask.description,
+        entryIdentity.principal_id,
+        productTask.title,
+        productTask.description,
+        resolvedMode === 'background_task' ? 'background_task' : 'serious_task',
         conversationID,
         userMessageID,
         runID,
-        plan.productTask.summary,
-        json({ source: 'electron_sqlite_deterministic' }),
+        req.user_id || 'desktop_user',
+        entryIdentity.channel,
+        productTask.summary,
+        conversationID,
+        runID,
+        json({ source: 'electron_sqlite_deterministic', deterministic_task_projection: !plan.productTask }),
       );
-      for (let index = 0; index < plan.productTask.stepCount; index++) {
+      for (let index = 0; index < productTask.stepCount; index++) {
         this.exec(
-          `INSERT INTO product_task_steps (id, product_task_id, title, description, status, sort_order, capability_id, run_id, input, output)
-           VALUES (?, ?, ?, '', 'pending', ?, 'file_analyze', ?, '{}', '{}')`,
+          `INSERT INTO product_task_steps (id, product_task_id, title, description, status, sort_order, capability_id, run_id, input, output, started_at, finished_at)
+           VALUES (?, ?, ?, '', 'done', ?, 'file_analyze', ?, '{}', '{}', datetime('now'), datetime('now'))`,
           `pstep_${newID()}`,
           productTaskID,
           `Step ${index + 1}`,
@@ -3912,9 +6206,27 @@ export class JoiSQLiteStore {
           runID,
         );
       }
+      this.exec(
+        `UPDATE runs
+         SET metadata=json_set(COALESCE(metadata, '{}'), '$.product_task_id', ?, '$.effective_input_mode', ?)
+         WHERE id=?`,
+        productTaskID,
+        resolvedMode,
+        runID,
+      );
+      this.insertRunStep(runID, plan.productTask ? 'product_task_created' : 'product_task_projected', plan.productTask ? 'Product task created' : 'Product task projected', {}, { product_task_id: productTaskID, mode: resolvedMode });
+      this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), 'task.created', {
+        item_type: 'task',
+        item_id: productTaskID,
+        task_id: productTaskID,
+        title: productTask.title,
+        status: 'running',
+        visibility: 'task',
+        source: 'store',
+      });
     }
     if (plan.artifact) {
-      const artifactID = `art_${newID()}`;
+      artifactID = `art_${newID()}`;
       this.exec(
         `INSERT INTO artifacts (id, type, title, content, content_format, source_product_task_id, source_run_id, source_conversation_id, source_message_id, linked_memory_ids, metadata)
          VALUES (?, 'report', ?, ?, 'markdown', NULLIF(?, ''), ?, ?, ?, '[]', ?)`,
@@ -3968,11 +6280,12 @@ export class JoiSQLiteStore {
       );
     }
     if (plan.toolRun) {
+      const toolRunID = `toolrun_${newID()}`;
       const output = capabilityOutput || { status: 'succeeded', model: modelName };
       this.exec(
         `INSERT INTO tool_runs (id, run_id, capability_id, workflow_name, tool_name, node_id, assignment_reason, risk_level, status, input, output, finished_at, duration_ms)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'read_only', 'succeeded', ?, ?, datetime('now'), 0)`,
-        `toolrun_${newID()}`,
+        toolRunID,
         runID,
         plan.capability || 'workspace_search',
         workflowNameForGateway(plan.capability || 'workspace_search'),
@@ -3995,6 +6308,44 @@ export class JoiSQLiteStore {
         json({ type: 'capability_request', capability: plan.capability, goal: 'mock desktop eval task', run_id: runID }),
       );
     }
+    if (productTaskID) {
+      const evidenceSummary = [
+        artifactID ? `artifact:${artifactID}` : '',
+        plan.toolRun ? 'tool_runs:1' : 'pure_reasoning_artifact',
+        'verification:passed',
+      ].filter(Boolean).join(' ');
+      const verification = {
+        status: 'passed',
+        summary: 'Deterministic run completed with persisted task evidence.',
+        checks: [{ name: 'deterministic_task_projection', status: 'passed' }],
+      };
+      this.exec(
+        `UPDATE product_tasks
+         SET status='completed', progress_percent=100, summary=?, terminal_status='completed',
+             terminal_reason=?, evidence_summary=?, verification_status='passed',
+             metadata=json_set(COALESCE(metadata, '{}'), '$.verification', json(?), '$.evidence_summary', ?),
+             completed_at=datetime('now'), updated_at=datetime('now')
+         WHERE id=?`,
+        response.slice(0, 500),
+        verification.summary,
+        evidenceSummary,
+        json(verification),
+        evidenceSummary,
+        productTaskID,
+      );
+      this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), 'task.completed', {
+        item_type: 'task',
+        item_id: productTaskID,
+        task_id: productTaskID,
+        status: 'completed',
+        visibility: 'task',
+        source: 'store',
+        terminal: true,
+        evidence_summary: evidenceSummary,
+        terminal_reason: verification.summary,
+      });
+    }
+    return productTaskID;
   }
 
   private currentBackupDir(): string {
@@ -4013,6 +6364,170 @@ export class JoiSQLiteStore {
     } catch (error) {
       return [{ error: error instanceof Error ? error.message : String(error) }];
     }
+  }
+
+  private ensureConversationClosureSchema(): void {
+    const ensure = (table: string, column: string, definition: string) => {
+      const columns = new Set(this.all(`PRAGMA table_info(${table})`).map((row) => String(row.name)));
+      if (!columns.has(column)) {
+        this.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+      }
+    };
+
+    for (const [column, definition] of [
+      ['principal_id', 'TEXT'],
+    ] as const) ensure('conversations', column, definition);
+
+    for (const [column, definition] of [
+      ['principal_id', 'TEXT'],
+      ['entry_channel', "TEXT NOT NULL DEFAULT 'desktop'"],
+      ['requested_mode', "TEXT NOT NULL DEFAULT 'auto'"],
+      ['resolved_mode', "TEXT NOT NULL DEFAULT 'chat_assist'"],
+      ['mode_source', "TEXT NOT NULL DEFAULT 'automatic'"],
+      ['terminal_status', 'TEXT'],
+      ['terminal_reason', 'TEXT'],
+      ['resume_token', 'TEXT'],
+      ['parent_run_id', 'TEXT'],
+      ['redirected_from_run_id', 'TEXT'],
+      ['cancel_requested_at', 'TEXT'],
+      ['resumed_at', 'TEXT'],
+    ] as const) ensure('runs', column, definition);
+
+    for (const [column, definition] of [
+      ['mode_resolution_id', 'TEXT'],
+      ['user_intent_summary', 'TEXT'],
+      ['assistant_message_id', 'TEXT'],
+      ['stream_status', "TEXT NOT NULL DEFAULT 'created'"],
+      ['completed_at', 'TEXT'],
+    ] as const) ensure('turns', column, definition);
+
+    for (const [column, definition] of [
+      ['schema_version', 'INTEGER NOT NULL DEFAULT 1'],
+      ['conversation_id', 'TEXT'],
+      ['item_type', 'TEXT'],
+      ['item_id', 'TEXT'],
+      ['parent_item_id', 'TEXT'],
+      ['phase', 'TEXT'],
+      ['visibility', 'TEXT'],
+      ['source', 'TEXT'],
+      ['terminal', 'INTEGER NOT NULL DEFAULT 0'],
+      ['payload_json', 'TEXT'],
+      ['error_json', 'TEXT'],
+      ['usage_json', 'TEXT'],
+    ] as const) ensure('run_events', column, definition);
+
+    for (const [column, definition] of [
+      ['streaming_enabled', 'INTEGER NOT NULL DEFAULT 0'],
+      ['first_delta_at', 'TEXT'],
+      ['completed_at', 'TEXT'],
+      ['finish_reason', 'TEXT'],
+      ['usage_status', "TEXT NOT NULL DEFAULT 'provider_missing'"],
+      ['raw_finish_json', "TEXT NOT NULL DEFAULT '{}'"],
+    ] as const) ensure('model_calls', column, definition);
+
+    for (const [column, definition] of [
+      ['turn_id', 'TEXT'],
+      ['tool_call_id', 'TEXT'],
+      ['purpose', "TEXT NOT NULL DEFAULT ''"],
+      ['approval_request_id', 'TEXT'],
+      ['side_effect_level', "TEXT NOT NULL DEFAULT 'none'"],
+      ['idempotency_key', 'TEXT'],
+      ['output_summary', 'TEXT'],
+      ['artifact_id', 'TEXT'],
+      ['error_code', 'TEXT'],
+      ['error_message', 'TEXT'],
+      ['completed_at', 'TEXT'],
+    ] as const) ensure('tool_runs', column, definition);
+
+    for (const [column, definition] of [
+      ['principal_id', 'TEXT'],
+      ['source_conversation_id', 'TEXT'],
+      ['source_run_id', 'TEXT'],
+      ['source_turn_id', 'TEXT'],
+      ['mode_resolution_id', 'TEXT'],
+      ['terminal_status', 'TEXT'],
+      ['terminal_reason', 'TEXT'],
+      ['evidence_summary', 'TEXT'],
+      ['verification_status', "TEXT NOT NULL DEFAULT 'pending'"],
+      ['last_projected_at', 'TEXT'],
+    ] as const) ensure('product_tasks', column, definition);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS principals (
+        id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS channel_identities (
+        id TEXT PRIMARY KEY,
+        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+        channel TEXT NOT NULL,
+        external_user_id TEXT NOT NULL,
+        external_thread_id TEXT NOT NULL DEFAULT '',
+        display_name TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'linked',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(channel, external_user_id, external_thread_id)
+      );
+      CREATE TABLE IF NOT EXISTS conversation_entry_links (
+        id TEXT PRIMARY KEY,
+        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+        channel_identity_id TEXT NOT NULL REFERENCES channel_identities(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        channel TEXT NOT NULL,
+        external_thread_id TEXT NOT NULL DEFAULT '',
+        external_message_id TEXT NOT NULL DEFAULT '',
+        selection_reason TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(channel_identity_id, conversation_id)
+      );
+      CREATE TABLE IF NOT EXISTS task_entry_links (
+        id TEXT PRIMARY KEY,
+        principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+        channel_identity_id TEXT NOT NULL REFERENCES channel_identities(id) ON DELETE CASCADE,
+        product_task_id TEXT NOT NULL REFERENCES product_tasks(id) ON DELETE CASCADE,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        external_task_ref TEXT NOT NULL DEFAULT '',
+        selection_reason TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(channel_identity_id, product_task_id)
+      );
+      CREATE TABLE IF NOT EXISTS notification_deliveries (
+        id TEXT PRIMARY KEY,
+        principal_id TEXT REFERENCES principals(id) ON DELETE SET NULL,
+        channel_identity_id TEXT REFERENCES channel_identities(id) ON DELETE SET NULL,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        product_task_id TEXT REFERENCES product_tasks(id) ON DELETE SET NULL,
+        open_loop_id TEXT REFERENCES open_loops(id) ON DELETE SET NULL,
+        proactive_message_id TEXT REFERENCES proactive_messages(id) ON DELETE SET NULL,
+        channel TEXT NOT NULL DEFAULT 'desktop',
+        status TEXT NOT NULL DEFAULT 'pending',
+        deep_link_target TEXT NOT NULL DEFAULT '',
+        external_delivery_id TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        sent_at TEXT,
+        opened_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_run_events_conversation_created ON run_events(conversation_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_run_events_type ON run_events(run_id, event_type);
+      CREATE INDEX IF NOT EXISTS idx_run_events_item ON run_events(item_type, item_id);
+      CREATE INDEX IF NOT EXISTS idx_principals_status ON principals(status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_channel_identities_principal ON channel_identities(principal_id, channel);
+      CREATE INDEX IF NOT EXISTS idx_conversation_entry_links_conversation ON conversation_entry_links(conversation_id, channel);
+      CREATE INDEX IF NOT EXISTS idx_task_entry_links_task ON task_entry_links(product_task_id, principal_id);
+      CREATE INDEX IF NOT EXISTS idx_notification_deliveries_target ON notification_deliveries(conversation_id, product_task_id, status);
+    `);
   }
 
   private transaction(fn: () => void): void {
@@ -4036,6 +6551,15 @@ export class JoiSQLiteStore {
 
   private all(sql: string, ...params: SQLiteValue[]): SQLiteRow[] {
     return this.db.prepare(sql).all(...params) as SQLiteRow[];
+  }
+
+  private tableExists(table: string): boolean {
+    return Boolean(this.get(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table));
+  }
+
+  private columnExists(table: string, column: string): boolean {
+    if (!this.tableExists(table)) return false;
+    return this.all(`PRAGMA table_info(${quoteIdentifier(table)})`).some((row) => String(row.name) === column);
   }
 
   private requireConversationSummary(conversationID: string): ConversationSummary {
@@ -4103,6 +6627,7 @@ function rowToConversationGroup(row: SQLiteRow): ConversationGroup {
 function rowToConversationSummary(row: SQLiteRow): ConversationSummary {
   return {
     id: String(row.id),
+    principal_id: optionalString(row.principal_id),
     channel: String(row.channel),
     user_id: String(row.user_id),
     title: optionalString(row.title) || 'Untitled',
@@ -4139,21 +6664,40 @@ function rowToConversationMessage(row: SQLiteRow): ConversationMessage {
 }
 
 function rowToRunEvent(row: SQLiteRow): RunEvent {
-  const payload = parseObject(row.payload);
+  const payload = {
+    ...parseObject(row.payload),
+    ...parseObject(row.payload_json),
+  };
+  const eventType = optionalString(row.event_type) || optionalString(payload.event_type) || optionalString(payload.type) || '';
+  const errorPayload = parseObject(row.error_json);
+  const usagePayload = parseObject(row.usage_json);
+  const snapshot = parseObject(payload.snapshot);
+  const delta = payload.delta;
   return {
     id: String(row.id),
     run_id: String(row.run_id),
     turn_id: optionalString(row.turn_id),
     seq: Number(row.seq),
-    event_type: String(row.event_type),
-    type: optionalString(payload.type) || String(row.event_type),
+    event_type: eventType,
+    type: optionalString(payload.type) || eventType,
+    schema_version: Number(row.schema_version ?? payload.schema_version ?? 1),
+    conversation_id: optionalString(row.conversation_id) || optionalString(payload.conversation_id),
+    item_type: optionalString(row.item_type) || optionalString(payload.item_type),
+    item_id: optionalString(row.item_id) || optionalString(payload.item_id),
+    parent_item_id: optionalString(row.parent_item_id) || optionalString(payload.parent_item_id),
+    phase: optionalString(row.phase) || optionalString(payload.phase),
+    visibility: optionalString(row.visibility) || optionalString(payload.visibility),
+    source: optionalString(row.source) || optionalString(payload.source),
+    terminal: Boolean(Number(row.terminal ?? 0) || payload.terminal),
     status: optionalString(payload.status),
     title: optionalString(payload.title),
     summary: optionalString(payload.summary),
     payload,
-    delta: typeof payload.delta === 'string' ? payload.delta : undefined,
+    snapshot: Object.keys(snapshot).length > 0 ? snapshot : undefined,
+    delta: typeof delta === 'string' ? delta : delta && typeof delta === 'object' ? delta as Record<string, unknown> : undefined,
     metadata: parseObject(payload.metadata),
-    error: optionalString(payload.error),
+    error: optionalString(payload.error) || optionalString(errorPayload.message),
+    usage: Object.keys(usagePayload).length > 0 ? usagePayload : parseObject(payload.usage),
     created_at: optionalString(row.created_at),
   };
 }
@@ -4312,6 +6856,7 @@ function rowToProductTask(row: SQLiteRow): ProductTask {
   const metadata = parseObject(row.metadata);
   return {
     id: String(row.id),
+    principal_id: optionalString(row.principal_id),
     title: String(row.title),
     description: optionalString(row.description) || '',
     status: optionalString(row.status) || 'planning',
@@ -4326,6 +6871,15 @@ function rowToProductTask(row: SQLiteRow): ProductTask {
     progress_percent: Number(row.progress_percent ?? 0),
     current_step_id: optionalString(row.current_step_id),
     summary: optionalString(row.summary),
+    source_conversation_id: optionalString(row.source_conversation_id),
+    source_run_id: optionalString(row.source_run_id),
+    source_turn_id: optionalString(row.source_turn_id),
+    mode_resolution_id: optionalString(row.mode_resolution_id),
+    terminal_status: optionalString(row.terminal_status),
+    terminal_reason: optionalString(row.terminal_reason),
+    evidence_summary: optionalString(row.evidence_summary),
+    verification_status: optionalString(row.verification_status),
+    last_projected_at: optionalString(row.last_projected_at),
     metadata,
     task_contract: taskContractFromMetadata(metadata),
     verification: taskVerificationFromMetadata(metadata),
@@ -5040,6 +7594,18 @@ function memorySearchTerms(query: string): string[] {
   return [...terms].slice(0, 12);
 }
 
+function activeMemoryTTLWhereClause(tableName: string): string {
+  const prefix = tableName ? `${tableName}.` : '';
+  const ttlValue = `COALESCE(
+    NULLIF(json_extract(${prefix}metadata, '$.ttl_until'), ''),
+    NULLIF(json_extract(${prefix}metadata, '$.expires_at'), ''),
+    NULLIF(json_extract(${prefix}metadata, '$.valid_until'), ''),
+    NULLIF(json_extract(${prefix}metadata, '$.ttl.until'), ''),
+    NULLIF(json_extract(${prefix}metadata, '$.expiry.expires_at'), '')
+  )`;
+  return `(${prefix}type NOT IN ('current_state', 'user_state') OR ${ttlValue} IS NULL OR datetime(${ttlValue}) > datetime('now'))`;
+}
+
 function memoryProfileVersionFor(results: MemorySearchResult[]): string {
   const source = results
     .map((result) => `${result.memory.id}:${result.memory.updated_at || ''}:${result.memory.confidence}`)
@@ -5067,14 +7633,59 @@ function effectiveInputMode(req: ChatRequest, message: string): InputMode {
   const requested = req.input_mode || 'auto';
   if (requested !== 'auto') return requested;
   const normalized = message.toLowerCase();
+  if (isExplicitChatOnlyIntent(message)) {
+    return 'chat_assist';
+  }
+  if (isMemoryOrReflectionOnlyIntent(message)) {
+    return 'chat_assist';
+  }
   if (/后台|持续|定时|之后提醒|稍后提醒|monitor|watch|background/.test(message) || /background|cron|schedule/.test(normalized)) {
     return 'background_task';
   }
-  if (/帮我|整理|分析|实现|修改|检查|生成|写一份|做一份|认真执行|执行|修复/.test(message)
+  if (/帮我|整理|分析|实现|修改|检查|生成|构建|开发|制作|搭建|写一份|做一份|认真执行|执行|修复/.test(message)
     || /\b(analyze|implement|fix|generate|write|check|run|build)\b/.test(normalized)) {
     return 'serious_task';
   }
   return 'chat_assist';
+}
+
+function isExplicitChatOnlyIntent(message: string): boolean {
+  return /纯聊天|普通聊天|只是?聊|只聊|不要创建任务|不创建任务|别创建任务|无需任务|不要认真执行|不要执行/.test(message)
+    || /\b(chat only|just chat|no task|do not create (?:a )?task|don't create (?:a )?task|without creating (?:a )?task)\b/i.test(message);
+}
+
+function isMemoryOrReflectionOnlyIntent(message: string): boolean {
+  return /记住|记忆|偏好|产品方向|我想把.+做成/.test(message)
+    && !/帮我(分析|实现|修改|检查|生成|构建|开发|制作|搭建|写|做|执行|修复)|认真执行|执行一下|修复|之后提醒|稍后提醒|定时|monitor|watch|cron|schedule/i.test(message);
+}
+
+function modeResolutionForRequest(req: ChatRequest, message: string): ModeResolutionRecord {
+  const requested = req.input_mode || 'auto';
+  const resolved = effectiveInputMode(req, message);
+  const explicit = requested !== 'auto';
+  return {
+    id: `mode_${newID()}`,
+    requested_mode: requested,
+    resolved_mode: resolved,
+    mode_source: explicit ? 'explicit' : 'automatic',
+    mode_locked_by_user: explicit,
+    reason: explicit
+      ? `User selected ${requested}.`
+      : modeResolutionReason(resolved, message),
+    confidence: explicit ? 1 : 0.78,
+  };
+}
+
+function modeResolutionReason(mode: InputMode, message: string): string {
+  if (mode === 'background_task') return 'Message contains reminder, schedule, monitoring, or background-follow-up intent.';
+  if (mode === 'serious_task') return 'Message asks Joi to analyze, build, implement, generate, fix, check, or execute a task.';
+  return message.trim() ? 'Message can be answered as ordinary chat without creating a durable task.' : 'Empty message defaults to ordinary chat.';
+}
+
+function contractMode(mode: InputMode): 'chat' | 'execution' | 'background' {
+  if (mode === 'serious_task') return 'execution';
+  if (mode === 'background_task') return 'background';
+  return 'chat';
 }
 
 function shouldCreateProductTask(req: ChatRequest, message: string, mode: InputMode): boolean {
@@ -5233,6 +7844,58 @@ function taskArtifactContent(response: string, toolResults: PersistedToolResult[
   ].join('\n');
 }
 
+function entryIdentityForRequest(req: ChatRequest, conversationID: string): EntryIdentityResolution {
+  const channel = optionalString(req.channel) || 'desktop';
+  const externalUserID = optionalString(req.user_id) || (channel === 'desktop' ? 'desktop_user' : `${channel}:unknown`);
+  const externalThreadID = optionalString(req.conversation_id) || conversationID;
+  const principalID = optionalString(req.principal_id) || defaultPrincipalIDForEntry(channel, externalUserID);
+  return {
+    principal_id: principalID,
+    channel_identity_id: `chid_${stableShortID(`${channel}:${externalUserID}:${externalThreadID}`)}`,
+    channel,
+    external_user_id: externalUserID,
+    external_thread_id: externalThreadID,
+    selection_reason: req.conversation_id ? 'explicit_conversation' : 'new_conversation',
+  };
+}
+
+function defaultPrincipalIDForEntry(channel: string, externalUserID: string): string {
+  if (channel === 'desktop' && (!externalUserID || externalUserID === 'desktop_user')) return localOwnerPrincipalID;
+  return `principal_${stableShortID(`${channel}:${externalUserID}`)}`;
+}
+
+function handoffReasonForRequest(req: ChatRequest, entry: EntryIdentityResolution): string {
+  if (req.redirected_from_run_id) return 'redirected_run';
+  if (req.parent_run_id) return 'parent_run';
+  if (req.product_task_id) return 'explicit_task';
+  return entry.channel === 'desktop' ? 'desktop_conversation' : 'external_entry';
+}
+
+function isTaskContinuationIntent(message: string): boolean {
+  return /继续|接着|进展|状态|刚才|上一个|同一个|这个任务|那个任务|任务进度|查询.*任务|查看.*任务|汇报.*任务|继续.*任务/.test(message)
+    || /\b(continue|resume|status|progress|same task|previous task|last task|task update)\b/i.test(message);
+}
+
+const localOwnerPrincipalID = 'principal_local_owner';
+
+function stableShortID(value: string): string {
+  return hashText(value).slice(0, 20);
+}
+
+function evidenceSummaryForTask(
+  artifact: ArtifactSummary | undefined,
+  toolResults: PersistedToolResult[],
+  verification: TaskVerification,
+): string {
+  const toolCount = toolResults.filter((result) => !isWaitingConfirmationToolResult(result)).length;
+  const parts = [
+    artifact ? `artifact:${artifact.id}` : '',
+    toolCount > 0 ? `tool_runs:${toolCount}` : 'pure_reasoning_artifact',
+    `verification:${verification.status}`,
+  ].filter(Boolean);
+  return parts.join(' ');
+}
+
 function titleForTaskCapability(capability: string): string {
   switch (capability) {
     case 'workspace_search':
@@ -5263,6 +7926,28 @@ function summaryForToolOutput(output: Record<string, unknown>, fallback: string)
     || optionalString(output.message)
     || optionalString(output.error)
     || fallback;
+}
+
+function toolRunStatusForOutput(output: Record<string, unknown>): string {
+  const status = (optionalString(output.status) || '').toLowerCase();
+  if (status === 'failed' || status === 'error') return 'failed';
+  if (status === 'policy_blocked' || status === 'blocked') return 'policy_blocked';
+  if (status === 'cancelled' || status === 'canceled') return 'cancelled';
+  return 'succeeded';
+}
+
+function usageStatusForUsage(usage: { input_tokens?: number; output_tokens?: number; cached_input_tokens?: number } | undefined): string {
+  if (!usage) return 'provider_missing';
+  return positiveNumber(usage.input_tokens) > 0 || positiveNumber(usage.output_tokens) > 0 || positiveNumber(usage.cached_input_tokens) > 0
+    ? 'recorded'
+    : 'provider_missing';
+}
+
+function sideEffectLevelForCapability(capability: string): string {
+  if (capability === 'apply_patch') return 'write_local';
+  if (capability === 'browser_click' || capability === 'browser_type') return 'external_action';
+  if (capability === 'shell_command' || capability === 'test_command') return 'write_local';
+  return 'read';
 }
 
 function operationIDForTool(productTaskID: string | undefined, capability: string, args: Record<string, unknown>, callID: string): string {
@@ -5410,6 +8095,190 @@ function boolString(value: boolean): string {
 
 function json(value: unknown): string {
   return JSON.stringify(value);
+}
+
+function pruneUndefined(value: Record<string, unknown>): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (item === undefined) continue;
+    output[key] = item;
+  }
+  return output;
+}
+
+function statusForRunEventType(eventType: string): string {
+  if (eventType.endsWith('.failed')) return 'failed';
+  if (eventType.endsWith('.cancelled')) return 'cancelled';
+  if (eventType.endsWith('.redirected')) return 'redirected';
+  if (eventType === 'run.recovery_required') return 'waiting_approval';
+  if (eventType.endsWith('.completed') || eventType.endsWith('.finished')) return 'completed';
+  if (eventType.endsWith('.requested') || eventType.endsWith('.required')) return 'waiting_approval';
+  if (eventType.endsWith('.started') || eventType.endsWith('.delta')) return 'running';
+  return 'running';
+}
+
+function memoryFeedbackEventType(feedback: string): string {
+  switch (feedback) {
+    case 'confirm':
+    case 'positive':
+      return 'memory.confirmed';
+    case 'edit':
+      return 'memory.corrected';
+    case 'reject':
+    case 'negative':
+      return 'memory.rejected';
+    case 'delete':
+      return 'memory.deleted';
+    default:
+      return 'memory.corrected';
+  }
+}
+
+function memoryCandidateDecisionAction(decision: string): string {
+  switch (decision) {
+    case 'confirm':
+    case 'approve':
+      return 'confirm';
+    case 'correct':
+    case 'edit':
+    case 'edit_confirm':
+      return 'edit_confirm';
+    case 'reject':
+    case 'ignore':
+      return 'reject';
+    case 'delete':
+      return 'delete';
+    default:
+      throw new Error(`unsupported memory candidate decision: ${decision}`);
+  }
+}
+
+function normalizeApprovalDecisionStatus(decision?: string): 'approved' | 'rejected' {
+  const normalized = (decision || '').trim();
+  if (['approve', 'approved', 'allow', 'allowed', 'yes'].includes(normalized)) return 'approved';
+  if (['deny', 'denied', 'reject', 'rejected', 'no'].includes(normalized)) return 'rejected';
+  throw new Error(`unsupported approval decision: ${decision || ''}`);
+}
+
+function sanitizeApprovalEditedParameters(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const cleaned = pruneUndefined(value as Record<string, unknown>);
+  return Object.keys(cleaned).length > 0 ? cleaned : undefined;
+}
+
+function statusForMemoryFeedback(feedback: string): string {
+  if (feedback === 'reject' || feedback === 'negative' || feedback === 'delete') return 'completed';
+  return 'completed';
+}
+
+function eventTypeForProactiveDecision(action: string, status: string): string {
+  if (action === 'sent' || status === 'sent' || status === 'delivered') return 'proactive.delivered';
+  if (action === 'send' || action === 'approve' || status === 'authorized') return 'proactive.authorized';
+  if (action === 'queue' || status === 'queued' || status === 'scheduled') return 'proactive.scheduled';
+  if (action === 'useful' || action === 'annoying' || action === 'inaccurate' || status === 'responded') return 'proactive.responded';
+  if (status === 'suppressed') return 'proactive.suppressed';
+  return 'proactive.suppressed';
+}
+
+function isNegativeProactiveFeedbackAction(action: string): boolean {
+  return ['dismiss', 'ignore', 'annoying', 'inaccurate'].includes(action);
+}
+
+function proactiveFeedbackScorePenalty(action: string): number {
+  if (action === 'annoying' || action === 'inaccurate') return 0.4;
+  return 0.25;
+}
+
+function normalizeProductTaskCloseOutcome(outcome?: string): string {
+  const normalized = (outcome || '').trim();
+  if (['completed', 'completed_with_limitations', 'blocked', 'failed', 'cancelled'].includes(normalized)) {
+    return normalized;
+  }
+  return 'completed_with_limitations';
+}
+
+function productTaskTerminalEventType(outcome: string): string {
+  if (outcome === 'completed') return 'task.completed';
+  if (outcome === 'blocked') return 'task.blocked';
+  if (outcome === 'failed') return 'task.failed';
+  if (outcome === 'cancelled') return 'task.cancelled';
+  return 'task.completed_with_limitations';
+}
+
+function visibilityForRunEventType(eventType: string, itemType?: string): string {
+  if (eventType === 'assistant.delta' || eventType === 'assistant.completed') return 'chat';
+  if (eventType.startsWith('approval.')) return 'approval';
+  if (eventType.startsWith('artifact.') || eventType.startsWith('verification.')) return 'artifact';
+  if (eventType.startsWith('task.')) return 'task';
+  if (eventType.startsWith('tool.')) return 'tool';
+  if (eventType.startsWith('memory.') || eventType === 'user_state.updated' || eventType === 'relationship_state.updated') return 'memory';
+  if (eventType.startsWith('open_loop.') || eventType.startsWith('proactive.')) return 'proactive';
+  if (eventType.startsWith('handoff.') || eventType.startsWith('notification.')) return 'handoff';
+  if (eventType === 'run.mode_resolved') return 'inline_status';
+  if (eventType === 'run.redirected' || eventType === 'run.recovery_required') return 'inline_status';
+  if (itemType === 'model' || eventType.startsWith('model.') || eventType === 'usage.recorded') return 'trace_only';
+  return 'trace_only';
+}
+
+function terminalRunEventType(eventType: string): boolean {
+  return [
+    'run.completed',
+    'run.failed',
+    'run.cancelled',
+    'run.redirected',
+    'task.completed',
+    'task.completed_with_limitations',
+    'task.blocked',
+    'task.failed',
+    'task.cancelled',
+  ].includes(eventType);
+}
+
+function defaultExternalHandoffReadiness() {
+  return {
+    checked: false,
+    ok: false,
+    credentials: {},
+    checks: {},
+    services: {},
+  };
+}
+
+function externalHandoffStatus(audit: Pick<ExternalHandoffAudit, 'schema_current' | 'linked_live_handoffs' | 'readiness' | 'metrics'>): ExternalHandoffAudit['status'] {
+  if (!audit.schema_current) return 'schema_missing';
+  if (audit.linked_live_handoffs.length > 0) return 'live_handoff_linked';
+  if (audit.readiness.checked && !audit.readiness.ok) return 'external_not_ready';
+  if (audit.metrics.external_runs > 0) return 'awaiting_desktop_continuation';
+  return 'awaiting_external_input';
+}
+
+function externalHandoffNextAction(status: ExternalHandoffAudit['status']): string {
+  const actions: Record<ExternalHandoffAudit['status'], string> = {
+    sqlite_missing: 'Start Joi once so the production SQLite database exists.',
+    schema_missing: 'Run pnpm joi:prod-schema:migrate, then rerun the live audit.',
+    external_not_ready: 'Fix Telegram/iMessage credential or connection checks, then rerun the live audit.',
+    awaiting_external_input: 'Send a real Telegram or iMessage task, then continue the same task in Desktop.',
+    awaiting_desktop_continuation: 'Open Desktop recent tasks and continue the external-origin task so the same Product Task has a Desktop run.',
+    live_handoff_linked: 'Live external-to-Desktop handoff evidence is present.',
+    unknown: '',
+  };
+  return actions[status] || '';
+}
+
+function quoteIdentifier(value: string): string {
+  return `"${String(value).replaceAll('"', '""')}"`;
+}
+
+function errorSummary(error: unknown): string | undefined {
+  if (!error) return undefined;
+  if (typeof error === 'string') return error;
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'object' && !Array.isArray(error)) {
+    return optionalString((error as Record<string, unknown>).message)
+      || optionalString((error as Record<string, unknown>).error)
+      || JSON.stringify(error);
+  }
+  return String(error);
 }
 
 function hashText(value: string): string {

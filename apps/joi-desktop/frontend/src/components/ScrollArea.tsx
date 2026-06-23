@@ -7,6 +7,8 @@ type ScrollAreaProps = HTMLAttributes<HTMLElement> & {
   as?: ScrollAreaElement;
   children: ReactNode;
   contentClassName?: string;
+  stickToBottom?: boolean;
+  stickToBottomKey?: string | number;
 };
 
 const TRACK_INSET = 10;
@@ -18,11 +20,15 @@ export function ScrollArea({
   children,
   className = '',
   contentClassName = '',
+  stickToBottom = false,
+  stickToBottomKey,
   ...props
 }: ScrollAreaProps) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ maxScroll: number; maxTop: number; startScrollTop: number; startY: number } | null>(null);
+  const programmaticScrollRef = useRef(false);
+  const shouldStickToBottomRef = useRef(true);
   const [hovering, setHovering] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [metrics, setMetrics] = useState({ canScroll: false, thumbHeight: MIN_THUMB_HEIGHT, thumbTop: TRACK_INSET });
@@ -32,6 +38,9 @@ export function ScrollArea({
     if (!viewport) return;
 
     const { clientHeight, scrollHeight, scrollTop } = viewport;
+    if (stickToBottom && !programmaticScrollRef.current) {
+      shouldStickToBottomRef.current = scrollHeight - clientHeight - scrollTop < 80;
+    }
     const canScroll = scrollHeight > clientHeight + 1;
     if (!canScroll) {
       setMetrics((current) => current.canScroll ? { canScroll: false, thumbHeight: MIN_THUMB_HEIGHT, thumbTop: TRACK_INSET } : current);
@@ -45,22 +54,47 @@ export function ScrollArea({
     const maxScroll = Math.max(1, scrollHeight - clientHeight);
     const thumbTop = TRACK_INSET + (scrollTop / maxScroll) * maxTop;
     setMetrics({ canScroll, thumbHeight, thumbTop });
-  }, []);
+  }, [stickToBottom]);
+
+  const scrollToBottom = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    programmaticScrollRef.current = true;
+    viewport.scrollTop = viewport.scrollHeight;
+    requestAnimationFrame(() => {
+      programmaticScrollRef.current = false;
+      updateMetrics();
+    });
+  }, [updateMetrics]);
 
   useEffect(() => {
-    updateMetrics();
+    const refreshMetrics = () => {
+      if (stickToBottom && shouldStickToBottomRef.current) {
+        requestAnimationFrame(scrollToBottom);
+        return;
+      }
+      updateMetrics();
+    };
+
+    refreshMetrics();
     const viewport = viewportRef.current;
     const content = contentRef.current;
-    const resizeObserver = new ResizeObserver(updateMetrics);
+    const resizeObserver = new ResizeObserver(refreshMetrics);
     if (viewport) resizeObserver.observe(viewport);
     if (content) resizeObserver.observe(content);
-    window.addEventListener('resize', updateMetrics);
+    window.addEventListener('resize', refreshMetrics);
 
     return () => {
       resizeObserver.disconnect();
-      window.removeEventListener('resize', updateMetrics);
+      window.removeEventListener('resize', refreshMetrics);
     };
-  }, [updateMetrics]);
+  }, [scrollToBottom, stickToBottom, updateMetrics]);
+
+  useEffect(() => {
+    if (!stickToBottom) return;
+    shouldStickToBottomRef.current = true;
+    requestAnimationFrame(scrollToBottom);
+  }, [scrollToBottom, stickToBottom, stickToBottomKey]);
 
   function startThumbDrag(event: ReactPointerEvent<HTMLDivElement>) {
     const viewport = viewportRef.current;

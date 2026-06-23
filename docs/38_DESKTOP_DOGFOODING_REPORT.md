@@ -1,5 +1,7 @@
 # Desktop Dogfooding Report
 
+Historical note: Day 1 predates the Electron-native cutover and mentions Wails UI. The current default desktop path is Electron-native; use `docs/54_LOCAL_REPO_AND_APP_STATE.md`, `docs/36_DESKTOP_INSTALLATION.md`, and `docs/53_ELECTRON_NATIVE_REFACTOR.md` for current app state.
+
 Period: 3 days  
 Rule: use Joi Desktop App only. Do not use Server Console unless a blocker is recorded.
 

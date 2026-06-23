@@ -1,6 +1,8 @@
 # Joi Desktop Installation
 
-Version: `0.1.0-rc0`
+Version: `0.1.0-20260623.1115`
+
+Local state reference: `docs/54_LOCAL_REPO_AND_APP_STATE.md`
 
 ## Product Mode
 
@@ -31,8 +33,8 @@ cd /Users/hao/project/Joi
 Output:
 
 ```text
-dist/desktop/Joi-0.1.0-rc0-macos-arm64.zip
-dist/desktop/Joi-0.1.0-rc0-macos-arm64.manifest.json
+dist/desktop/Joi-0.1.0-20260623.1115-macos-arm64.zip
+dist/desktop/Joi-0.1.0-20260623.1115-macos-arm64.manifest.json
 ```
 
 ## Runtime Defaults
@@ -56,6 +58,20 @@ pnpm test:store
 pnpm eval:desktop:ts
 pnpm build:electron
 ```
+
+Installed app verification:
+
+```bash
+/usr/bin/codesign --verify --deep --strict --verbose=2 /Applications/Joi.app
+open -a /Applications/Joi.app
+```
+
+The 2026-06-23 launch regression fix requires this manual reopen check:
+
+1. Launch `/Applications/Joi.app`.
+2. Close the last Joi window.
+3. Launch `/Applications/Joi.app` again.
+4. Confirm the Joi window reappears.
 
 The TS desktop eval acceptance target is:
 

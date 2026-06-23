@@ -3,14 +3,24 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { desktopIpcMethods, type DesktopIpcMethod, type JoiInvokeRequest } from '../../../../packages/shared-types/src/preload-api';
 import type {
+  ApprovalDecisionRequest,
+  ApprovalResumeRunRequest,
   ChatRequest,
   ConversationFilter,
   ConnectionTest,
+  ExternalHandoffAudit,
+  ExternalHandoffReadiness,
   ModelConnectionTestRequest,
   ModelConfigRequest,
   ModelSettingsRequest,
   PhotonIMessageStatus,
+  RedirectRunRequest,
   SettingsRecord,
+  TelegramInboundStatus,
+  TerminalSessionInputRequest,
+  TerminalSessionKillRequest,
+  TerminalSessionResizeRequest,
+  TerminalSessionStartRequest,
   WorkspaceSettings,
 } from '../../../../packages/shared-types/src/desktop-api';
 import type { JoiSQLiteStore, PersistedToolResult, StartedToolCallingChat, ToolCallingPromptAssembly, ToolCallingResumeRequest } from '../../../../packages/store/src/sqlite';
@@ -26,6 +36,7 @@ import { executeDesktopAppInspect, executeDesktopAppList } from '../../../../pac
 import { executeServerDiagnose, executeSystemHealthCheck } from '../../../../packages/runtime/src/diagnostics';
 import { runChatCompletionsToolTurn } from '../../../../packages/runtime/src/tool-calling';
 import { compileElectronCapabilityTools } from '../../../../packages/runtime/src/capability-compiler';
+import { TerminalSessionManager } from './terminal';
 
 const invokeRequestSchema = z.object({
   method: z.enum(desktopIpcMethods),
@@ -46,29 +57,82 @@ export type AppDirs = {
 export type RegisterIpcOptions = {
   onTelegramConfigChanged?: () => void;
   onIMessageConfigChanged?: () => void;
+  getTelegramStatus?: () => TelegramInboundStatus | undefined;
   getIMessageStatus?: () => PhotonIMessageStatus | undefined;
   testIMessageConnection?: () => Promise<ConnectionTest> | ConnectionTest | undefined;
   sendTestIMessageMessage?: (spaceID?: string, message?: string) => Promise<ConnectionTest> | ConnectionTest | undefined;
+  deterministicChat?: boolean;
 };
+
+let terminalSessionManager: TerminalSessionManager | null = null;
+let terminalDisposeRegistered = false;
+
+function getTerminalSessionManager() {
+  if (!terminalSessionManager) {
+    terminalSessionManager = new TerminalSessionManager();
+  }
+  if (!terminalDisposeRegistered) {
+    terminalDisposeRegistered = true;
+    app.once('before-quit', () => {
+      terminalSessionManager?.dispose();
+      terminalSessionManager = null;
+      terminalDisposeRegistered = false;
+    });
+  }
+  return terminalSessionManager;
+}
 
 export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: JoiSQLiteStore, secrets: KeychainSecretStore, options: RegisterIpcOptions = {}) {
   const activeToolCallingRuns = new Map<string, AbortController>();
+  const emittedRunSeqByRunID = new Map<string, number>();
+  const terminalManager = getTerminalSessionManager();
+  terminalManager.attachWindow(window);
+  window.once('closed', () => {
+    terminalManager.detachWindow(window);
+    terminalManager.dispose();
+  });
+  const emitNewRunEvents = (runID: string) => {
+    emitRunEventsSince(window, store.getRunTrace(runID), emittedRunSeqByRunID);
+  };
   const sqliteApi: Record<DesktopIpcMethod, Handler> = {
     async SendChat(payload) {
       const chatRequest = payload as ChatRequest;
+      if (options.deterministicChat) {
+        const result = await store.sendDeterministicChat({
+          ...chatRequest,
+          runtime_mode: chatRequest.runtime_mode || 'tool_calling',
+        });
+        emitRunEvents(window, store.getRunTrace(result.run_id));
+        return result;
+      }
       const settings = store.getSettings();
       const apiKey = await resolveAPIKeyForModelEndpoint(settings, secrets);
       if (!canRunRealToolCalling(settings, apiKey, chatRequest)) {
         throw new Error(unconfiguredModelMessage(settings, apiKey, chatRequest));
       }
-      const result = await runLiveElectronToolCallingChat(chatRequest, settings, apiKey, store, activeToolCallingRuns, (runID) => {
-        emitRunEvents(window, store.getRunTrace(runID));
-      });
-      emitRunEvents(window, store.getRunTrace(result.run_id));
+      const result = await runLiveElectronToolCallingChat(chatRequest, settings, apiKey, store, activeToolCallingRuns, emitNewRunEvents);
+      emitNewRunEvents(result.run_id);
       return result;
     },
     GetRunTrace(payload) {
       return store.getRunTrace(String(payload ?? ''));
+    },
+    GetRecentRunClosureReport(payload) {
+      return store.getRecentRunClosureReport(payload as { limit?: number });
+    },
+    async GetExternalHandoffAudit() {
+      const base = store.getExternalHandoffAudit();
+      const readiness = await getExternalHandoffReadiness(store.getSettings(), secrets, {
+        getTelegramStatus: options.getTelegramStatus,
+        getIMessageStatus: options.getIMessageStatus,
+      });
+      const audit: ExternalHandoffAudit = {
+        ...base,
+        readiness,
+      };
+      audit.status = statusForExternalHandoffAudit(audit);
+      audit.next_action = nextActionForExternalHandoffStatus(audit.status);
+      return audit;
     },
     ListConversations(payload) {
       return store.listConversations(payload as ConversationFilter);
@@ -154,6 +218,27 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     UpdateMemory(payload) {
       store.updateMemory(payload as Parameters<typeof store.updateMemory>[0]);
     },
+    ListMemoriesUsedForRun(payload) {
+      return store.listMemoriesUsedForRun(String(payload ?? ''));
+    },
+    ListMemoryCandidates(payload) {
+      return store.listMemoryCandidates(payload as { status?: string; limit?: number });
+    },
+    DecideMemoryCandidate(payload) {
+      store.decideMemoryCandidate(payload as { id?: string; decision?: string; run_id?: string; comment?: string; reason?: string; content?: string; summary?: string });
+    },
+    CorrectMemory(payload) {
+      store.correctMemory(payload as { id?: string; content?: string; summary?: string; run_id?: string; comment?: string; reason?: string });
+    },
+    DeleteMemory(payload) {
+      store.deleteMemory(payload as { id?: string; run_id?: string; reason?: string; comment?: string });
+    },
+    ListUserStates(payload) {
+      return store.listUserStates(payload as { limit?: number });
+    },
+    ListRelationshipStates(payload) {
+      return store.listRelationshipStates(payload as { limit?: number });
+    },
     ListNodes() {
       return store.listNodes();
     },
@@ -172,19 +257,20 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     ListConfirmations() {
       return store.listConfirmations();
     },
+    ListPendingApprovals() {
+      return store.listPendingApprovals();
+    },
+    DecideApproval(payload) {
+      return store.decideApproval(payload as ApprovalDecisionRequest);
+    },
+    async ResumeApprovalRun(payload) {
+      return resumeApprovalRunFromPayload(payload as ApprovalResumeRunRequest, window, store, secrets);
+    },
     async DecideConfirmation(payload) {
       const req = payload as Parameters<typeof store.decideConfirmation>[0];
       store.decideConfirmation(req);
       if (req.approve && req.id) {
-        const resume = store.loadApprovedToolCallingResume(req.id);
-        if (resume) {
-          const settings = store.getSettings();
-          await resumeElectronToolCallingRun(resume, settings, await resolveAPIKeyForModelEndpoint(settings, secrets), store);
-          const trace = store.getRunTrace(resume.run_id);
-          for (const event of trace.events ?? []) {
-            window.webContents.send('joi:run:event', event);
-          }
-        }
+        await resumeApprovalRunFromPayload({ approval_request_id: req.id, run_id: '' }, window, store, secrets);
       }
     },
     InterruptRun(payload) {
@@ -196,6 +282,37 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
       }
       store.interruptRun(req);
       if (runID) emitRunEvents(window, store.getRunTrace(runID));
+    },
+    async RedirectRun(payload) {
+      const req = payload as RedirectRunRequest;
+      const runID = req.run_id?.trim() || '';
+      const active = activeToolCallingRuns.get(runID);
+      if (active && !active.signal.aborted) {
+        active.abort(new Error(req.reason || 'redirected by user'));
+      }
+      const redirected = store.redirectRun(req);
+      if (runID) emitRunEvents(window, redirected);
+      const message = req.message?.trim();
+      if (!message) {
+        return { redirected_run: redirected };
+      }
+      const settings = store.getSettings();
+      const apiKey = await resolveAPIKeyForModelEndpoint(settings, secrets);
+      const result = await runLiveElectronToolCallingChat({
+        conversation_id: redirected.conversation_id,
+        channel: redirected.entry_channel || 'desktop',
+        message,
+        input_mode: req.requested_mode || (redirected.resolved_mode as ChatRequest['input_mode']) || 'auto',
+        product_task_id: req.product_task_id || (typeof redirected.metadata?.product_task_id === 'string' ? redirected.metadata.product_task_id : undefined),
+        parent_run_id: runID,
+        redirected_from_run_id: runID,
+        runtime_mode: 'tool_calling',
+      }, settings, apiKey, store, activeToolCallingRuns, emitNewRunEvents);
+      emitNewRunEvents(result.run_id);
+      return { redirected_run: redirected, new_run: result };
+    },
+    ListRecoverableRuns(payload) {
+      return store.listRecoverableRuns(payload as { limit?: number });
     },
     ListBackups() {
       return store.listBackups();
@@ -346,10 +463,22 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
       store.completeOnboarding();
     },
     ListProductTasks(payload) {
-      return store.listProductTasks(payload as { status?: string; limit?: number });
+      return store.listProductTasks(payload as { status?: string; limit?: number; conversation_id?: string; principal_id?: string; channel?: string });
+    },
+    ListProductTasksByConversation(payload) {
+      return store.listProductTasks({ conversation_id: String(payload ?? ''), limit: 100 });
+    },
+    ListProductTasksByPrincipal(payload) {
+      return store.listProductTasks({ principal_id: String(payload ?? ''), limit: 100 });
     },
     GetProductTask(payload) {
       return store.getProductTask(String(payload ?? ''));
+    },
+    CloseProductTask(payload) {
+      return store.closeProductTask(payload as { id?: string; outcome?: string; reason?: string; actor?: string; run_id?: string });
+    },
+    ReopenProductTask(payload) {
+      return store.reopenProductTask(payload as { id?: string; reason?: string; actor?: string; run_id?: string });
     },
     ListArtifacts(payload) {
       return store.listArtifacts(payload as { product_task_id?: string; type?: string; limit?: number });
@@ -360,11 +489,17 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     ListOpenLoops(payload) {
       return store.listOpenLoops(payload as { status?: string; limit?: number });
     },
+    DecideOpenLoop(payload) {
+      store.decideOpenLoop(payload as { id?: string; action?: string; feedback?: string; due_at?: string });
+    },
     ListProactiveMessages(payload) {
       return store.listProactiveMessages(payload as { status?: string; limit?: number });
     },
     DecideProactiveMessage(payload) {
       store.decideProactiveMessage(payload as { id?: string; action?: string; feedback?: string });
+    },
+    RecordNotificationOpened(payload) {
+      store.recordNotificationOpened(payload as { id?: string; actor?: string; external_delivery_id?: string });
     },
     GetSecretStatus() {
       return secrets.status();
@@ -401,6 +536,7 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     },
   };
 
+  ipcMain.removeHandler('joi:invoke');
   ipcMain.handle('joi:invoke', async (_event, input: unknown) => {
     const { method, payload } = invokeRequestSchema.parse(input);
     const handler = sqliteApi[method as DesktopIpcMethod];
@@ -410,12 +546,190 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     return handler(payload);
   });
 
+  ipcMain.removeHandler('joi:app:getVersion');
   ipcMain.handle('joi:app:getVersion', () => app.getVersion());
 
+  ipcMain.removeHandler('joi:app:openExternal');
   ipcMain.handle('joi:app:openExternal', async (_event, rawUrl: unknown) => {
     const url = externalUrlSchema.parse(rawUrl);
     await shell.openExternal(url);
   });
+
+  ipcMain.removeHandler('joi:terminal:start');
+  ipcMain.handle('joi:terminal:start', (_event, payload: unknown) => terminalManager.start(payload as TerminalSessionStartRequest | undefined));
+
+  ipcMain.removeHandler('joi:terminal:input');
+  ipcMain.handle('joi:terminal:input', (_event, payload: unknown) => {
+    terminalManager.input(payload as TerminalSessionInputRequest);
+  });
+
+  ipcMain.removeHandler('joi:terminal:resize');
+  ipcMain.handle('joi:terminal:resize', (_event, payload: unknown) => {
+    terminalManager.resize(payload as TerminalSessionResizeRequest);
+  });
+
+  ipcMain.removeHandler('joi:terminal:kill');
+  ipcMain.handle('joi:terminal:kill', (_event, payload: unknown) => {
+    terminalManager.kill(payload as TerminalSessionKillRequest);
+  });
+
+  ipcMain.removeHandler('joi:terminal:getStatus');
+  ipcMain.handle('joi:terminal:getStatus', (_event, rawID: unknown) => terminalManager.getStatus(String(rawID ?? '')));
+}
+
+async function getExternalHandoffReadiness(
+  settings: SettingsRecord,
+  secrets: KeychainSecretStore,
+  serviceStatus: { getTelegramStatus?: () => TelegramInboundStatus | undefined; getIMessageStatus?: () => PhotonIMessageStatus | undefined } = {},
+): Promise<ExternalHandoffReadiness> {
+  const telegramToken = await resolvedSecretStatus(secrets, 'TELEGRAM_BOT_TOKEN');
+  const photonProjectSecret = await resolvedSecretStatus(secrets, PHOTON_PROJECT_SECRET_SECRET);
+  const photonDashboardToken = await resolvedSecretStatus(secrets, PHOTON_DASHBOARD_TOKEN_SECRET);
+  const telegramAllowedUsers = resolvedSettingStatus('TELEGRAM_ALLOWED_USER_IDS', settings.telegram_allowed_user_ids);
+  const photonProjectID = resolvedSettingStatus('PHOTON_PROJECT_ID', settings.imessage_project_id);
+  const credentials: ExternalHandoffReadiness['credentials'] = {
+    TELEGRAM_BOT_TOKEN: statusRecord(telegramToken),
+    TELEGRAM_ALLOWED_USER_IDS: statusRecord(telegramAllowedUsers),
+    PHOTON_PROJECT_ID: statusRecord(photonProjectID),
+    PHOTON_PROJECT_SECRET: statusRecord(photonProjectSecret),
+    PHOTON_DASHBOARD_TOKEN: statusRecord(photonDashboardToken),
+  };
+  const readiness: ExternalHandoffReadiness = {
+    checked: true,
+    ok: false,
+    credentials,
+    checks: {},
+    services: {},
+  };
+  const missing = Object.entries(credentials)
+    .filter(([, credential]) => !credential.present)
+    .map(([name]) => name);
+  if (missing.length > 0) {
+    readiness.missing = missing;
+  }
+
+  if (telegramToken.value && telegramAllowedUsers.value) {
+    readiness.checks.telegram_get_me = await testTelegramConnection({ token: telegramToken.value });
+  }
+  if (photonProjectID.value && photonProjectSecret.value) {
+    readiness.checks.imessage_photon = await testPhotonIMessageConnection({
+      project_id: photonProjectID.value,
+      project_secret: photonProjectSecret.value,
+    });
+  }
+
+  readiness.failed_checks = Object.entries(readiness.checks)
+    .filter(([, check]) => !check.ok)
+    .map(([name]) => name);
+  const telegramStatus = serviceStatus.getTelegramStatus?.() || fallbackTelegramStatus(settings, Boolean(telegramToken.value));
+  const imessageStatus = serviceStatus.getIMessageStatus?.() || fallbackIMessageStatus(settings, Boolean(photonProjectSecret.value));
+  const telegramCheckOK = Boolean(readiness.checks.telegram_get_me?.ok);
+  const imessageCheckOK = Boolean(readiness.checks.imessage_photon?.ok);
+  readiness.services.telegram = {
+    label: 'Telegram',
+    enabled: telegramStatus.enabled,
+    configured: telegramStatus.configured,
+    running: telegramStatus.polling,
+    ready: Boolean(telegramStatus.enabled && telegramStatus.configured && telegramStatus.polling && telegramCheckOK),
+    last_poll_at: telegramStatus.last_poll_at,
+    last_update_id: telegramStatus.last_update_id,
+    last_error: telegramStatus.last_error,
+    details: {
+      allowed_user_ids_configured: telegramStatus.allowed_user_ids_configured,
+      active_runs: telegramStatus.active_runs,
+      connection_check: telegramCheckOK,
+    },
+  };
+  readiness.services.imessage = {
+    label: 'iMessage',
+    enabled: imessageStatus.enabled,
+    configured: imessageStatus.configured,
+    running: Boolean(imessageStatus.sidecar_running),
+    ready: Boolean(imessageStatus.enabled && imessageStatus.configured && imessageStatus.sidecar_running && imessageCheckOK),
+    last_error: imessageStatus.last_error,
+    details: {
+      connected: imessageStatus.connected,
+      sidecar_running: imessageStatus.sidecar_running,
+      sidecar_port: imessageStatus.sidecar_port || null,
+      allowed_users_configured: Boolean(imessageStatus.allowed_users?.trim()),
+      require_mention: Boolean(imessageStatus.require_mention),
+      connection_check: imessageCheckOK,
+    },
+  };
+  readiness.failed_services = Object.entries(readiness.services)
+    .filter(([, service]) => service.enabled && service.configured && !service.ready)
+    .map(([name]) => name);
+  readiness.ok = Object.values(readiness.services).some((service) => service.ready);
+  return readiness;
+}
+
+function fallbackTelegramStatus(settings: SettingsRecord, tokenConfigured: boolean): TelegramInboundStatus {
+  return {
+    enabled: Boolean(settings.telegram_enabled),
+    configured: tokenConfigured,
+    polling: false,
+    allowed_user_ids_configured: Boolean(settings.telegram_allowed_user_ids?.trim()),
+    active_runs: 0,
+  };
+}
+
+function fallbackIMessageStatus(settings: SettingsRecord, projectSecretConfigured: boolean): PhotonIMessageStatus {
+  return {
+    enabled: Boolean(settings.imessage_enabled),
+    configured: Boolean(settings.imessage_project_id?.trim()) && projectSecretConfigured,
+    connected: false,
+    sidecar_running: false,
+    sidecar_port: settings.imessage_sidecar_port,
+    project_id: settings.imessage_project_id,
+    operator_phone: settings.imessage_operator_phone,
+    assigned_number: settings.imessage_assigned_number,
+    allowed_users: settings.imessage_allowed_users,
+    require_mention: settings.imessage_require_mention,
+  };
+}
+
+async function resolvedSecretStatus(secrets: KeychainSecretStore, name: string): Promise<{ value: string; source: string }> {
+  const envValue = process.env[name]?.trim() || '';
+  if (envValue) return { value: envValue, source: 'env' };
+  const keychainValue = await secrets.get(name);
+  if (keychainValue) return { value: keychainValue, source: 'keychain' };
+  return { value: '', source: 'missing' };
+}
+
+function resolvedSettingStatus(envName: string, settingValue?: string): { value: string; source: string } {
+  const envValue = process.env[envName]?.trim() || '';
+  if (envValue) return { value: envValue, source: 'env' };
+  const value = settingValue?.trim() || '';
+  if (value) return { value, source: 'sqlite_settings' };
+  return { value: '', source: 'missing' };
+}
+
+function statusRecord(resolved: { value: string; source: string }): { present: boolean; source: string } {
+  return {
+    present: Boolean(resolved.value),
+    source: resolved.source,
+  };
+}
+
+function statusForExternalHandoffAudit(audit: ExternalHandoffAudit): ExternalHandoffAudit['status'] {
+  if (!audit.schema_current) return 'schema_missing';
+  if (audit.linked_live_handoffs.length > 0) return 'live_handoff_linked';
+  if (audit.readiness.checked && !audit.readiness.ok) return 'external_not_ready';
+  if (audit.metrics.external_runs > 0) return 'awaiting_desktop_continuation';
+  return 'awaiting_external_input';
+}
+
+function nextActionForExternalHandoffStatus(status: ExternalHandoffAudit['status']): string {
+  const actions: Record<ExternalHandoffAudit['status'], string> = {
+    sqlite_missing: 'Start Joi once so the production SQLite database exists.',
+    schema_missing: 'Run pnpm joi:prod-schema:migrate, then rerun the live audit.',
+    external_not_ready: 'Fix Telegram/iMessage credential or connection checks, then rerun the live audit.',
+    awaiting_external_input: 'Send a real Telegram or iMessage task, then continue the same task in Desktop.',
+    awaiting_desktop_continuation: 'Open Desktop recent tasks and continue the external-origin task so the same Product Task has a Desktop run.',
+    live_handoff_linked: 'Live external-to-Desktop handoff evidence is present.',
+    unknown: '',
+  };
+  return actions[status] || '';
 }
 
 export async function runLiveElectronToolCallingChat(
@@ -443,6 +757,7 @@ export async function runLiveElectronToolCallingChat(
       started,
       promptAssembly,
       signal: controller.signal,
+      onRunEvent: () => emitInitialEvents(started.run_id),
     });
     return store.finishToolCallingChat(started, turn);
   } catch (error) {
@@ -459,6 +774,27 @@ export function emitRunEvents(window: BrowserWindow, trace: ReturnType<JoiSQLite
     if (!window.isDestroyed()) {
       window.webContents.send('joi:run:event', event);
     }
+  }
+}
+
+function emitRunEventsSince(
+  window: BrowserWindow,
+  trace: ReturnType<JoiSQLiteStore['getRunTrace']>,
+  emittedSeqByRunID: Map<string, number>,
+): void {
+  const runID = trace.id || '';
+  const lastSeq = emittedSeqByRunID.get(runID) || 0;
+  let nextSeq = lastSeq;
+  for (const event of trace.events ?? []) {
+    const seq = typeof event.seq === 'number' ? event.seq : Number((event as Record<string, unknown>).seq || 0);
+    if (seq <= lastSeq) continue;
+    if (!window.isDestroyed()) {
+      window.webContents.send('joi:run:event', event);
+    }
+    if (seq > nextSeq) nextSeq = seq;
+  }
+  if (runID && nextSeq > lastSeq) {
+    emittedSeqByRunID.set(runID, nextSeq);
   }
 }
 
@@ -524,6 +860,7 @@ async function runElectronToolCallingTurn(
     started?: StartedToolCallingChat;
     promptAssembly?: ToolCallingPromptAssembly;
     signal?: AbortSignal;
+    onRunEvent?: () => void;
   } = {},
 ) {
   const modelName = options.started?.model_name || (req.model_name || settings.model_name || '').trim();
@@ -542,6 +879,7 @@ async function runElectronToolCallingTurn(
     max_steps: 6,
     timeout_seconds: 60,
     signal: options.signal,
+    callbacks: options.started ? store.createToolCallingEventCallbacks(options.started, options.onRunEvent) : undefined,
     executeTool: async (call, toolOptions) => {
       try {
         if (shouldPauseElectronToolForConfirmation(call.name)) {
@@ -606,12 +944,34 @@ async function runElectronToolCallingTurn(
       output_tokens: result.usage.output_tokens,
       cached_input_tokens: result.usage.cached_input_tokens,
     },
+    usage_status: result.usage_status,
+    finish_reason: result.finish_reason,
     model_responses: result.model_responses,
   };
 }
 
 function isAbortError(error: Error): boolean {
   return error.name === 'AbortError' || /abort|interrupted|cancel/i.test(error.message);
+}
+
+async function resumeApprovalRunFromPayload(
+  payload: ApprovalResumeRunRequest,
+  window: BrowserWindow,
+  store: JoiSQLiteStore,
+  secrets: KeychainSecretStore,
+) {
+  const approvalRequestID = payload.approval_request_id?.trim() || '';
+  if (!approvalRequestID) throw new Error('approval_request_id is required');
+  const resume = store.loadApprovedToolCallingResume(approvalRequestID);
+  if (!resume) return { resumed: false };
+  if (payload.run_id?.trim() && payload.run_id.trim() !== resume.run_id) {
+    throw new Error('approval run_id does not match confirmation request');
+  }
+  const settings = store.getSettings();
+  await resumeElectronToolCallingRun(resume, settings, await resolveAPIKeyForModelEndpoint(settings, secrets), store);
+  const trace = store.getRunTrace(resume.run_id);
+  emitRunEvents(window, trace);
+  return { resumed: true, trace };
 }
 
 async function resumeElectronToolCallingRun(

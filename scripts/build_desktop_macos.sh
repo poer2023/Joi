@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${APP_VERSION:-0.1.0-rc0}"
+VERSION="${APP_VERSION:-0.1.1}"
 ELECTRON_DIR="$ROOT_DIR/apps/joi-electron"
 OUTPUT_DIR="$ELECTRON_DIR/release-desktop"
 APP_BUNDLE="$OUTPUT_DIR/mac-arm64/Joi.app"

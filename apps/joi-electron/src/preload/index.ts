@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { DesktopIpcMethod, JoiPreloadApi, RunEventCallback } from '@joi/shared-types';
+import type { DesktopIpcMethod, JoiPreloadApi, RunEventCallback, TerminalSessionEvent } from '@joi/shared-types';
 
 const joiApi: JoiPreloadApi = {
   invoke<T = unknown>(method: DesktopIpcMethod, payload?: unknown): Promise<T> {
@@ -13,6 +13,32 @@ const joiApi: JoiPreloadApi = {
     return () => {
       ipcRenderer.off('joi:run:event', listener);
     };
+  },
+  terminal: {
+    start(req) {
+      return ipcRenderer.invoke('joi:terminal:start', req);
+    },
+    input(req) {
+      return ipcRenderer.invoke('joi:terminal:input', req);
+    },
+    resize(req) {
+      return ipcRenderer.invoke('joi:terminal:resize', req);
+    },
+    kill(req) {
+      return ipcRenderer.invoke('joi:terminal:kill', req);
+    },
+    getStatus(id) {
+      return ipcRenderer.invoke('joi:terminal:getStatus', id);
+    },
+    onEvent(callback: (event: TerminalSessionEvent) => void): () => void {
+      const listener = (_event: Electron.IpcRendererEvent, payload: TerminalSessionEvent) => {
+        callback(payload);
+      };
+      ipcRenderer.on('joi:terminal:event', listener);
+      return () => {
+        ipcRenderer.off('joi:terminal:event', listener);
+      };
+    },
   },
   app: {
     getVersion(): Promise<string> {

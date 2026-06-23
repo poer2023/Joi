@@ -1,117 +1,88 @@
 # 03 仓库结构与工程规范
 
-## 1. 推荐结构
+当前真实仓库是 `/Users/hao/project/Joi`。旧路径 `/Users/hao/Documents/Joi` 是残留路径，不是源码入口。
+
+## 1. 当前结构
 
 ```text
-agent-os/
+Joi/
   apps/
-    console-web/
-    telegram-gateway/
-  services/
-    orchestrator-core/
-    agent-runtime/
-    memory-service/
-    worker-runtime/
-    model-gateway/
+    joi-electron/          # Electron-native desktop shell
+    joi-desktop/frontend/  # Shared React renderer
+    console-web/           # Server Mode / historical Web Console
   packages/
-    shared-types/
-    api-client/
+    store/                 # SQLite store and local persistence
+    runtime/               # Tool-calling runtime and capability executors
+    secrets/               # Keychain/env secret adapter
+    shared-types/          # Shared Desktop API contracts
   database/
-    migrations/
-    seeds/
-  infra/
-  configs/
-  prompts/
+    sqlite/                # Desktop SQLite schema
+  services/
+    orchestrator-core/     # Server Mode / historical Go path
   docs/
+  scripts/
   tasks/
 ```
 
-## 2. Go 服务建议结构
+## 2. Desktop Code Boundaries
 
-```text
-services/orchestrator-core/
-  cmd/orchestrator/main.go
-  internal/api
-  internal/store
-  internal/runs
-  internal/router
-  internal/session
-  internal/policy
-  internal/agent
-  internal/memory
-  internal/capability
-  internal/toolcompiler
-  internal/nodes
-  internal/config
-```
+- Electron lifecycle, window behavior, IPC registration, and inbound service startup live in `apps/joi-electron/src/main`.
+- Controlled renderer bridge code lives in `apps/joi-electron/src/preload`.
+- Shared UI components and Desktop screens live in `apps/joi-desktop/frontend`.
+- Runtime/tool execution logic lives in `packages/runtime`.
+- SQLite persistence and schema migration compatibility live in `packages/store` and `database/sqlite`.
 
-## 3. Python 服务建议结构
+Do not reintroduce a Wails runtime fallback or treat browser preview as proof of installed app behavior.
 
-```text
-services/agent-runtime/
-  app/main.py
-  app/runtime
-  app/providers
-  app/prompts
-  app/schemas
-  app/output_parser
+## 3. IDs and Statuses
 
-services/memory-service/
-  app/main.py
-  app/search
-  app/extract
-  app/context_pack
-  app/embedding
-  app/conflict
-```
+ID prefixes:
 
-## 4. 命名规范
-
-ID 前缀：
-
-| 类型 | 前缀 |
+| Type | Prefix |
 |---|---|
-| run | run_ |
-| step | step_ |
-| message | msg_ |
-| memory | mem_ |
-| node | node_ |
-| task | task_ |
-| tool_run | toolrun_ |
+| run | `run_` |
+| step | `step_` |
+| message | `msg_` |
+| memory | `mem_` |
+| node | `node_` |
+| task | `task_` |
+| tool run | `toolrun_` |
 
-状态统一小写 snake_case：`pending`、`running`、`succeeded`、`failed`、`blocked`、`requires_confirmation`。
+Statuses are lower snake case: `pending`, `running`, `succeeded`, `failed`, `blocked`, `requires_confirmation`.
 
-## 5. 日志规范
+## 4. Logs and Diagnostics
 
-所有日志必须结构化：
+Logs and diagnostics must be structured enough to link back to run or task state:
 
 ```json
 {
   "timestamp": "...",
-  "service": "orchestrator-core",
+  "service": "joi-desktop",
   "level": "info",
   "run_id": "run_xxx",
   "step_id": "step_xxx",
-  "message": "router selected agent",
+  "message": "tool finished",
   "metadata": {}
 }
 ```
 
-## 6. 迁移规范
+Diagnostics exports must redact secrets, prompt bodies, raw model output, and sensitive tool output.
 
-所有表结构用 SQL migration，不允许代码隐式建表。
+## 5. Schema and Data Rules
 
-## 7. 错误码
+- Desktop user data lives in `~/Library/Application Support/Joi`.
+- Schema changes must be represented in `database/sqlite/001_init_schema.sql` and store migration/compatibility code when needed.
+- Do not delete, reset, or overwrite the live user data directory during app repair unless explicitly requested.
+
+## 6. Error Codes
 
 ```text
 VALIDATION_ERROR
 ROUTER_LOW_CONFIDENCE
-AGENT_RUNTIME_ERROR
 MODEL_PROVIDER_ERROR
 POLICY_DENIED
 REQUIRES_CONFIRMATION
 CAPABILITY_NOT_FOUND
-TOOL_COMPILE_FAILED
 TOOL_EXECUTION_FAILED
 NODE_UNAVAILABLE
 MEMORY_SEARCH_FAILED

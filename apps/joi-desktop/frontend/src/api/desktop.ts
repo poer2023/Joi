@@ -2,6 +2,8 @@ import {
   desktopBindingMethods,
   type DesktopBindings,
   type JoiPreloadApi,
+  type ApprovalDecisionRequest,
+  type ApprovalResumeRunRequest,
   type ArtifactDetail,
   type ArtifactSummary,
   type AvailableModel,
@@ -19,10 +21,15 @@ import {
   type ConversationMessage,
   type ConversationSummary,
   type ConnectionTest,
+  type ExternalHandoffAudit,
   type InputMode,
   type InterruptRunRequest,
   type MCPServerRecord,
   type MCPWrapToolRequest,
+  type MemoryCandidateDecisionRequest,
+  type MemoryCandidateFilter,
+  type MemoryCorrectionRequest,
+  type MemoryDeleteRequest,
   type MemoryRecord,
   type MemorySearchResult,
   type ModelCall,
@@ -40,8 +47,16 @@ import {
   type PhotonIMessageStatus,
   type ProactiveMessage,
   type ProductTask,
+  type ProductTaskCloseRequest,
   type ProductTaskDetail,
+  type ProductTaskFilter,
+  type ProductTaskReopenRequest,
   type ReflectionResult,
+  type RecordNotificationOpenedRequest,
+  type RecoverableRunRecord,
+  type RedirectRunRequest,
+  type RedirectRunResponse,
+  type RunClosureReport,
   type RunEvent,
   type RunTrace,
   type RuntimeMode,
@@ -49,12 +64,21 @@ import {
   type SettingsRecord,
   type SkillRecord,
   type SystemHealth,
+  type TerminalSessionEvent,
+  type TerminalSessionInfo,
+  type TerminalSessionInputRequest,
+  type TerminalSessionKillRequest,
+  type TerminalSessionResizeRequest,
+  type TerminalSessionSnapshot,
+  type TerminalSessionStartRequest,
   type ToolRunRecord,
   type ToolWorkflowRecord,
   type WorkerGatewayAuditRecord,
   type WorkspaceSettings,
 } from '../../../../../packages/shared-types/src/desktop-api';
 export type {
+  ApprovalDecisionRequest,
+  ApprovalResumeRunRequest,
   ArtifactDetail,
   ArtifactSummary,
   AvailableModel,
@@ -72,10 +96,15 @@ export type {
   ConversationMessage,
   ConversationSummary,
   ConnectionTest,
+  ExternalHandoffAudit,
   InputMode,
   InterruptRunRequest,
   MCPServerRecord,
   MCPWrapToolRequest,
+  MemoryCandidateDecisionRequest,
+  MemoryCandidateFilter,
+  MemoryCorrectionRequest,
+  MemoryDeleteRequest,
   MemoryRecord,
   MemorySearchResult,
   ModelCall,
@@ -93,8 +122,15 @@ export type {
   PhotonIMessageStatus,
   ProactiveMessage,
   ProductTask,
+  ProductTaskCloseRequest,
   ProductTaskDetail,
+  ProductTaskFilter,
+  ProductTaskReopenRequest,
   ReflectionResult,
+  RecoverableRunRecord,
+  RedirectRunRequest,
+  RedirectRunResponse,
+  RunClosureReport,
   RunEvent,
   RunTrace,
   RuntimeMode,
@@ -102,6 +138,13 @@ export type {
   SettingsRecord,
   SkillRecord,
   SystemHealth,
+  TerminalSessionEvent,
+  TerminalSessionInfo,
+  TerminalSessionInputRequest,
+  TerminalSessionKillRequest,
+  TerminalSessionResizeRequest,
+  TerminalSessionSnapshot,
+  TerminalSessionStartRequest,
   ToolRunRecord,
   ToolWorkflowRecord,
   WorkerGatewayAuditRecord,
@@ -264,6 +307,21 @@ function bindings(): DesktopBindings {
         return { memories: [] };
       },
       async UpdateMemory() {},
+      async ListMemoriesUsedForRun() {
+        return { memories: [] };
+      },
+      async ListMemoryCandidates() {
+        return { memories: [] };
+      },
+      async DecideMemoryCandidate() {},
+      async CorrectMemory() {},
+      async DeleteMemory() {},
+      async ListUserStates() {
+        return { memories: [] };
+      },
+      async ListRelationshipStates() {
+        return { memories: [] };
+      },
       async ListProductTasks() {
         return {
           tasks: [
@@ -281,6 +339,12 @@ function bindings(): DesktopBindings {
             },
           ],
         };
+      },
+      async ListProductTasksByConversation() {
+        return this.ListProductTasks({});
+      },
+      async ListProductTasksByPrincipal() {
+        return this.ListProductTasks({});
       },
       async GetProductTask() {
         return {
@@ -304,6 +368,54 @@ function bindings(): DesktopBindings {
           deliverables: [],
         };
       },
+      async CloseProductTask(req) {
+        return this.GetProductTask(req.id);
+      },
+      async ReopenProductTask(req) {
+        return this.GetProductTask(req.id);
+      },
+      async GetRecentRunClosureReport() {
+        return {
+          items: [],
+          metrics: {
+            total_runs: 0,
+            terminal_event_runs: 0,
+            execution_runs: 0,
+            execution_runs_with_task_or_refusal: 0,
+            completed_tasks: 0,
+            completed_tasks_with_evidence: 0,
+            runs_with_tool_evidence: 0,
+            runs_with_memory_events: 0,
+            runs_with_proactive_events: 0,
+            runs_with_handoff_events: 0,
+            recoverable_runs: 0,
+          },
+        };
+      },
+      async GetExternalHandoffAudit() {
+        return {
+          ok: true,
+          schema_current: true,
+          missing_schema: [],
+          external_channels_seen: [],
+          linked_live_handoffs: [],
+          pending_external_handoffs: [],
+          metrics: {
+            external_runs: 0,
+            desktop_runs: 0,
+            linked_external_desktop_tasks: 0,
+          },
+          readiness: {
+            checked: false,
+            ok: false,
+            credentials: {},
+            checks: {},
+            services: {},
+          },
+          status: 'unknown',
+          next_action: '',
+        };
+      },
       async ListArtifacts() {
         return { artifacts: [] };
       },
@@ -321,10 +433,12 @@ function bindings(): DesktopBindings {
       async ListOpenLoops() {
         return { open_loops: [] };
       },
+      async DecideOpenLoop() {},
       async ListProactiveMessages() {
         return { messages: [] };
       },
       async DecideProactiveMessage() {},
+      async RecordNotificationOpened() {},
       async ListNodes() {
         return { nodes: [] };
       },
@@ -340,7 +454,30 @@ function bindings(): DesktopBindings {
         return { items: [] };
       },
       async DecideConfirmation() {},
+      async ListPendingApprovals() {
+        return { items: [] };
+      },
+      async DecideApproval() {
+        return {};
+      },
+      async ResumeApprovalRun() {
+        return { resumed: false };
+      },
       async InterruptRun() {},
+      async RedirectRun(req) {
+        return {
+          redirected_run: {
+            id: req.run_id,
+            status: 'redirected',
+            selected_agent_id: 'general_agent',
+            events: [{ id: 'evt_preview_redirected', run_id: req.run_id, seq: 1, event_type: 'run.redirected', terminal: true }],
+            steps: [],
+          },
+        };
+      },
+      async ListRecoverableRuns() {
+        return { runs: [] };
+      },
       async ListBackups() {
         return { backups: [] };
       },
@@ -554,13 +691,28 @@ export const desktopApi = {
   getSystemHealth: () => bindings().GetSystemHealth(),
   listMemories: (filter: { query?: string; limit?: number }) => bindings().ListMemories(filter),
   updateMemory: (req: { id: string; action: string; feedback?: string; comment?: string; target_id?: string; reason?: string; content?: string; summary?: string; scope_type?: string; run_id?: string }) => bindings().UpdateMemory(req),
-  listProductTasks: (filter: { status?: string; limit?: number }) => bindings().ListProductTasks(filter),
+  listMemoriesUsedForRun: (runID: string) => bindings().ListMemoriesUsedForRun(runID),
+  listMemoryCandidates: (filter: MemoryCandidateFilter = {}) => bindings().ListMemoryCandidates(filter),
+  decideMemoryCandidate: (req: MemoryCandidateDecisionRequest) => bindings().DecideMemoryCandidate(req),
+  correctMemory: (req: MemoryCorrectionRequest) => bindings().CorrectMemory(req),
+  deleteMemory: (req: MemoryDeleteRequest) => bindings().DeleteMemory(req),
+  listUserStates: (filter: { limit?: number } = {}) => bindings().ListUserStates(filter),
+  listRelationshipStates: (filter: { limit?: number } = {}) => bindings().ListRelationshipStates(filter),
+  listProductTasks: (filter: ProductTaskFilter) => bindings().ListProductTasks(filter),
+  listProductTasksByConversation: (conversationID: string) => bindings().ListProductTasksByConversation(conversationID),
+  listProductTasksByPrincipal: (principalID: string) => bindings().ListProductTasksByPrincipal(principalID),
   getProductTask: (id: string) => bindings().GetProductTask(id),
+  closeProductTask: (req: ProductTaskCloseRequest) => bindings().CloseProductTask(req),
+  reopenProductTask: (req: ProductTaskReopenRequest) => bindings().ReopenProductTask(req),
+  getRecentRunClosureReport: (req: { limit?: number } = {}) => bindings().GetRecentRunClosureReport(req),
+  getExternalHandoffAudit: () => bindings().GetExternalHandoffAudit(),
   listArtifacts: (filter: { product_task_id?: string; type?: string; limit?: number }) => bindings().ListArtifacts(filter),
   getArtifact: (id: string) => bindings().GetArtifact(id),
   listOpenLoops: (filter: { status?: string; limit?: number }) => bindings().ListOpenLoops(filter),
+  decideOpenLoop: (req: { id: string; action: string; feedback?: string; due_at?: string }) => bindings().DecideOpenLoop(req),
   listProactiveMessages: (filter: { status?: string; limit?: number }) => bindings().ListProactiveMessages(filter),
   decideProactiveMessage: (req: { id: string; action: string; feedback?: string }) => bindings().DecideProactiveMessage(req),
+  recordNotificationOpened: (req: RecordNotificationOpenedRequest) => bindings().RecordNotificationOpened(req),
   listNodes: () => bindings().ListNodes(),
   disableNode: (nodeID: string) => bindings().DisableNode(nodeID),
   enableNode: (nodeID: string) => bindings().EnableNode(nodeID),
@@ -568,7 +720,12 @@ export const desktopApi = {
   getModelUsage: () => bindings().GetModelUsage(),
   listConfirmations: () => bindings().ListConfirmations(),
   decideConfirmation: (req: { id: string; approve: boolean; actor?: string; reason?: string }) => bindings().DecideConfirmation(req),
+  listPendingApprovals: () => bindings().ListPendingApprovals(),
+  decideApproval: (req: ApprovalDecisionRequest) => bindings().DecideApproval(req),
+  resumeApprovalRun: (req: ApprovalResumeRunRequest) => bindings().ResumeApprovalRun(req),
   interruptRun: (req: InterruptRunRequest) => bindings().InterruptRun(req),
+  redirectRun: (req: RedirectRunRequest) => bindings().RedirectRun(req),
+  listRecoverableRuns: (req: { limit?: number } = {}) => bindings().ListRecoverableRuns(req),
   listBackups: () => bindings().ListBackups(),
   createBackup: () => bindings().CreateBackup(),
   restoreBackup: (path: string) => bindings().RestoreBackup(path),
