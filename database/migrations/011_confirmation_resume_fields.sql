@@ -5,7 +5,7 @@ ALTER TABLE confirmation_requests
 ADD COLUMN IF NOT EXISTS turn_id TEXT;
 
 ALTER TABLE confirmation_requests
-ADD COLUMN IF NOT EXISTS approval_scope TEXT NOT NULL DEFAULT 'once';
+ADD COLUMN IF NOT EXISTS approval_scope TEXT NOT NULL DEFAULT 'one_call';
 
 ALTER TABLE confirmation_requests
 ADD COLUMN IF NOT EXISTS approval_key TEXT NOT NULL DEFAULT '';
@@ -17,7 +17,7 @@ CREATE INDEX IF NOT EXISTS idx_confirmation_requests_call_id
 ON confirmation_requests(call_id);
 
 UPDATE confirmation_requests
-SET approval_scope='once'
+SET approval_scope='one_call'
 WHERE approval_scope IS NULL OR approval_scope='';
 
 UPDATE confirmation_requests

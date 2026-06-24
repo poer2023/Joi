@@ -18,6 +18,7 @@ export function InlineStatus({ item, onOpenTrace }: { item: InlineStatusRenderIt
 
 function statusDotClass(status: InlineStatusRenderItem['status']) {
   if (status === 'running' || status === 'pending') return 'running';
-  if (status === 'failed' || status === 'waiting_approval') return 'failed';
+  if (status === 'waiting_approval') return 'waiting';
+  if (status === 'failed') return 'failed';
   return 'done';
 }

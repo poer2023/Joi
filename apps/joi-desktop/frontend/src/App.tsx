@@ -87,7 +87,7 @@ type StreamingAssistantMessage = ConversationMessage & {
   role: 'assistant';
   complete?: boolean;
 };
-type ExecutionRunStatus = 'pending' | 'running' | 'completed' | 'failed';
+type ExecutionRunStatus = 'pending' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'cancelled';
 type ExecutionEvent = {
   id?: string;
   type?: string;
@@ -562,8 +562,9 @@ export default function App() {
     }
 
     if (eventType === 'approval.requested') {
-      setActiveExecutionStatus('running');
-      setActiveExecutionActions((current) => upsertExecutionAction(current, approvalEventToExecutionAction(event), 'blocked'));
+      setActiveExecutionStatus('waiting_approval');
+      setActiveExecutionActions((current) => upsertExecutionAction(current, approvalEventToExecutionAction(event), 'waiting_approval'));
+      void refreshAll();
       return;
     }
 
@@ -578,6 +579,11 @@ export default function App() {
       if (!approved) {
         setActiveExecutionStatus('failed');
       }
+      return;
+    }
+
+    if (eventType === 'run.waiting_approval' || eventType === 'run.waiting_confirmation') {
+      setActiveExecutionStatus('waiting_approval');
       return;
     }
 
@@ -611,6 +617,7 @@ export default function App() {
     }
 
     if (eventType === 'assistant.completed') {
+      if (normalized.status === 'waiting_approval') return;
       if (normalized.runId) {
         assistantCompletedRunIDsRef.current.add(normalized.runId);
         clearRunCompletedFallback(normalized.runId);
@@ -799,13 +806,36 @@ export default function App() {
     event?.preventDefault();
     setError('');
     setNotice('');
+    const prompt = message.trim();
+    if (!prompt) return;
+    const currentActiveRunID = latestActiveRunId(runEventsByRunId) || chat?.run_id || trace?.id || '';
+    if (isSubmitting && currentActiveRunID) {
+      setMessage('');
+      showNotice('已追加到当前任务。');
+      try {
+        const redirected = await desktopApi.redirectRun({
+          run_id: currentActiveRunID,
+          message: prompt,
+          reason: 'steer_in_desktop',
+          requested_mode: inputMode,
+          product_task_id: activeProductTaskID || undefined,
+        });
+        setTrace(redirected.new_run ? await desktopApi.getRunTrace(redirected.new_run.run_id) : redirected.redirected_run);
+        if (redirected.new_run) {
+          setChat(redirected.new_run);
+          setCurrentConversationID(redirected.new_run.conversation_id);
+        }
+        await refreshAll();
+      } catch (err) {
+        showError(err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
     setTrace(null);
     setStreamingAssistantMessage(null);
     setActiveExecutionActions([]);
     setActiveExecutionStatus('pending');
     if (isSubmitting) return;
-    const prompt = message.trim();
-    if (!prompt) return;
     const optimisticActions = createOptimisticExecutionActions(prompt);
     const pendingConversationID = currentConversationID || 'pending-conversation';
     pendingConversationIDRef.current = pendingConversationID;
@@ -869,7 +899,7 @@ export default function App() {
           complete: true,
         }));
         await sleep(120);
-      } else {
+      } else if (userFacingAssistantText(result.response)) {
         await streamAssistantText({
           id: result.assistant_message_id,
           conversation_id: result.conversation_id,
@@ -877,6 +907,8 @@ export default function App() {
           content: '',
           run_id: result.run_id,
         }, userFacingAssistantText(result.response));
+      } else {
+        setStreamingAssistantMessage(null);
       }
       const detail = await desktopApi.getConversation(result.conversation_id);
       setConversationMessages(detail.messages ?? []);
@@ -1036,8 +1068,20 @@ export default function App() {
     await refreshAll();
   }
 
-  async function decideConfirmation(id: string, approve: boolean) {
-    await desktopApi.decideConfirmation({ id, approve, actor: 'desktop_admin', reason: approve ? 'approved_in_desktop' : 'rejected_in_desktop' });
+  async function decideConfirmation(id: string, approve: boolean, scope: 'one_call' | 'current_run' = 'one_call') {
+    const runID = confirmations.find((item) => item.id === id)?.run_id || trace?.id || chat?.run_id || '';
+    await desktopApi.decideConfirmation({
+      id,
+      approve,
+      actor: 'desktop_admin',
+      reason: approve ? `approved_in_desktop:${scope}` : 'rejected_in_desktop',
+      scope,
+    });
+    if (runID) {
+      const runTrace = await desktopApi.getRunTrace(runID);
+      setTrace(runTrace);
+      setRunEventsByRunId((current) => mergeRunEvents(current, runID, normalizeTraceEvents(runTrace)));
+    }
     await refreshAll();
   }
 
@@ -1288,6 +1332,7 @@ export default function App() {
               conversationMessages={conversationMessages}
               cancelRun={cancelRun}
               continueProductTask={continueProductTask}
+              decideConfirmation={decideConfirmation}
               decideProactiveMessage={decideProactiveMessage}
               executionTarget={executionTarget}
               health={health}
@@ -3879,6 +3924,7 @@ function ChatHome({
   conversationMessages,
   cancelRun,
   continueProductTask,
+  decideConfirmation,
   decideProactiveMessage,
   executionTarget,
   health,
@@ -3916,6 +3962,7 @@ function ChatHome({
   conversationMessages: ConversationMessage[];
   cancelRun: (runID: string) => Promise<void>;
   continueProductTask: (task: ProductTask) => Promise<void>;
+  decideConfirmation: (id: string, approve: boolean, scope?: 'one_call' | 'current_run') => Promise<void>;
   decideProactiveMessage: (id: string, action: string, feedback?: string) => Promise<void>;
   executionTarget: ExecutionTarget;
   health: SystemHealth | null;
@@ -4114,6 +4161,7 @@ function ChatHome({
                 onOpenArtifact={(artifactId) => void openArtifact(artifactId)}
                 onOpenTask={(taskId) => void selectProductTask(taskId)}
                 onOpenTrace={() => setActiveTab('trace')}
+                onResolveApproval={(approvalId, approve, scope) => void decideConfirmation(approvalId, approve, scope)}
               />
               {isSubmitting && !streamingAssistantMessage && !renderItems.some((item) => item.type === 'message' && item.role === 'assistant') && (
                 <article className="message-row assistant-message pending-message">
@@ -4144,7 +4192,7 @@ function ChatHome({
 
         <form className="composer" aria-busy={isSubmitting} onSubmit={submit}>
           <textarea
-            placeholder="输入任务，或直接和 Joi 说你想做什么..."
+            placeholder={isSubmitting ? '补充或修改当前任务...' : '输入任务，或直接和 Joi 说你想做什么...'}
             value={message}
             onChange={(event) => setMessage(event.target.value)}
             onKeyDown={handleComposerKeyDown}
@@ -4203,7 +4251,7 @@ function ChatHome({
               )}
             </div>
           </div>
-          {isSubmitting ? (
+          {isSubmitting && !message.trim() ? (
             <button
               className="send-button stop-button"
               disabled={!activeRunId}
@@ -4218,7 +4266,7 @@ function ChatHome({
               className="send-button"
               disabled={!message.trim()}
               type="button"
-              title="发送"
+              title={isSubmitting ? '追加到当前任务' : '发送'}
               onClick={() => void submit()}
             >
               ↑
@@ -4876,7 +4924,7 @@ function TerminalEventStream({ events }: { events: NormalizedRunEvent[] }) {
       <ol>
         {events.map((event) => (
           <li key={event.id}>
-            <span className={`status-dot ${event.status === 'running' ? 'running' : event.status === 'failed' ? 'failed' : 'done'}`} />
+            <span className={`status-dot ${event.status === 'running' ? 'running' : event.status === 'waiting_approval' ? 'waiting' : event.status === 'failed' ? 'failed' : 'done'}`} />
             <div>
               <strong>{event.type}</strong>
               <small>
@@ -4906,9 +4954,9 @@ function CompanionInsightPanel({
   trace: RunTrace | null;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
 }) {
-  const confirmed = memories.filter((memory) => memory.status === 'confirmed' && !isMemoryDisabled(memory)).slice(0, 4);
-  const pending = memories.filter((memory) => memory.status !== 'confirmed' && memory.status !== 'rejected' && !isMemoryDisabled(memory)).slice(0, 4);
   const usedMemories = extractUsedMemories(trace).slice(0, 4);
+  const currentRunID = trace?.id || '';
+  const pending = memories.filter((memory) => isMemoryProposalForRun(memory, currentRunID)).slice(0, 4);
 
   async function editAndConfirm(memory: MemoryRecord) {
     const edited = window.prompt('修改后确认这条记忆', memory.content);
@@ -4932,40 +4980,20 @@ function CompanionInsightPanel({
         {usedMemories.map((result) => (
           <InsightItem key={`used-${result.memory.id}`} title={result.memory.summary || result.memory.type} body={result.memory.content}>
             <small>score {result.score.toFixed(2)} · {formatMemoryReason(result.reason)}</small>
+            <button type="button" onClick={() => updateMemory(result.memory.id, 'feedback_positive')}>准确</button>
+            <button type="button" onClick={() => updateMemory(result.memory.id, 'feedback_negative')}>不准确</button>
+            <button type="button" onClick={() => updateMemory(result.memory.id, 'disable')}>停用</button>
           </InsightItem>
         ))}
       </InsightList>
-      <InsightList empty="我还没有确认过长期记忆。">
-        {confirmed.map((memory) => (
-          <InsightItem key={memory.id} title={memory.summary || memory.type} body={memory.content}>
-            <button type="button" onClick={() => updateMemory(memory.id, 'feedback_positive')}>准确</button>
-            <button type="button" onClick={() => updateMemory(memory.id, 'feedback_negative')}>不准确</button>
-            <button type="button" onClick={() => updateMemory(memory.id, 'disable')}>别记</button>
-          </InsightItem>
-        ))}
-      </InsightList>
-      <h3>我可能理解错了这些</h3>
-      <InsightList empty="没有待确认记忆。">
+      <h3>本次建议</h3>
+      <InsightList empty="本轮没有新的学习建议。">
         {pending.map((memory) => (
           <InsightItem key={memory.id} title={memory.summary || memory.type} body={memory.content}>
+            {memoryProposalWhy(memory) ? <small>{memoryProposalWhy(memory)}</small> : null}
             <button type="button" onClick={() => updateMemory(memory.id, 'confirm')}>准确</button>
             <button type="button" onClick={() => editAndConfirm(memory)}>修改</button>
             <button type="button" onClick={() => updateMemory(memory.id, 'reject')}>别记</button>
-          </InsightItem>
-        ))}
-      </InsightList>
-      <h3>未完成话题</h3>
-      <InsightList empty="现在没有未完成话题。">
-        {openLoops.slice(0, 4).map((loop) => (
-          <InsightItem key={loop.id} title={loop.topic} body={loop.suggested_followup || loop.description} />
-        ))}
-      </InsightList>
-      <h3>我准备之后提醒你这些</h3>
-      <InsightList empty="现在没有准备提醒你的事。">
-        {proactiveMessages.slice(0, 3).map((item) => (
-          <InsightItem key={item.id} title={item.title} body={item.reason}>
-            <button type="button" onClick={() => decideProactiveMessage(item.id, 'send')}>发送</button>
-            <button type="button" onClick={() => decideProactiveMessage(item.id, 'dismiss')}>忽略</button>
           </InsightItem>
         ))}
       </InsightList>
@@ -5167,6 +5195,19 @@ function isMemoryDisabled(memory: MemoryRecord) {
   return Boolean(memory.disabled || memory.disabled_at);
 }
 
+function isMemoryProposalForRun(memory: MemoryRecord, runID: string) {
+  if (!runID || isMemoryDisabled(memory)) return false;
+  if (memory.status === 'confirmed' || memory.status === 'rejected' || memory.status === 'deleted') return false;
+  const metadataRunID = String(memory.metadata?.run_id || '');
+  return metadataRunID === runID || Boolean(memory.source_event_ids?.includes(runID));
+}
+
+function memoryProposalWhy(memory: MemoryRecord) {
+  const why = typeof memory.metadata?.why === 'string' ? memory.metadata.why : '';
+  const futureEffect = typeof memory.metadata?.futureEffect === 'string' ? memory.metadata.futureEffect : '';
+  return [why, futureEffect].filter(Boolean).join(' · ');
+}
+
 function extractUsedMemories(trace: RunTrace | null): MemorySearchResult[] {
   const results: MemorySearchResult[] = [];
   const seen = new Set<string>();
@@ -5246,7 +5287,7 @@ function ExecutionActionFlow({
             <ExecutionActionCard
               key={action.id}
               action={action}
-              defaultOpen={action.status === 'running' || action.status === 'queued' || (index === visibleActions.length - 1 && mode === 'detail')}
+              defaultOpen={action.status === 'running' || action.status === 'queued' || action.status === 'waiting_approval' || (index === visibleActions.length - 1 && mode === 'detail')}
             />
           ))}
         </div>
@@ -5274,7 +5315,7 @@ function ExecutionActionFlow({
 function ExecutionInlineStatus({ action, expanded, onExpand }: { action: ExecutionAction; expanded?: boolean; onExpand: () => void }) {
   return (
     <div className="execution-inline-status">
-      <span className="status-dot done" />
+      <span className={`status-dot ${action.status === 'waiting_approval' ? 'waiting' : action.status === 'running' || action.status === 'queued' ? 'running' : action.status === 'failed' || action.status === 'blocked' ? 'failed' : 'done'}`} />
       <span>{action.completedLabel || action.summary || action.title}</span>
       <button className="inline-link" type="button" aria-expanded={expanded} onClick={onExpand}>展开</button>
     </div>
@@ -5292,6 +5333,7 @@ function ExecutionActionRail({
   onExpand: () => void;
   runStatus: string;
 }) {
+  const waiting = runStatus === 'waiting_approval' || actions.some((action) => action.status === 'waiting_approval');
   const running = runStatus === 'running' || actions.some((action) => action.status === 'running' || action.status === 'queued');
   const failed = actions.some((action) => action.status === 'failed' || action.status === 'blocked' || action.status === 'limited');
   if (collapsed && !running && !failed) {
@@ -5305,12 +5347,12 @@ function ExecutionActionRail({
   return (
     <div className="execution-action-rail">
       <header className="execution-action-rail-header">
-        <strong>{running ? 'Joi 正在处理' : summarizeExecutionActions(actions)}</strong>
+        <strong>{waiting ? 'Joi 等待你的确认' : running ? 'Joi 正在处理' : summarizeExecutionActions(actions)}</strong>
       </header>
       <div className="execution-action-rail-list">
         {actions.map((action) => (
           <div key={action.id} className={`execution-action-row status-${action.status}`}>
-            <span className={`status-dot ${action.status === 'running' || action.status === 'queued' ? 'running' : action.status === 'failed' || action.status === 'blocked' ? 'failed' : 'done'}`} />
+            <span className={`status-dot ${action.status === 'running' || action.status === 'queued' ? 'running' : action.status === 'waiting_approval' ? 'waiting' : action.status === 'failed' || action.status === 'blocked' ? 'failed' : 'done'}`} />
             <span>
               <strong>{actionLineTitle(action, running)}</strong>
               {running || action.summary || action.limitations?.length ? <small>{actionRowSummary(action, running)}</small> : null}
@@ -5340,7 +5382,7 @@ function ExecutionActionCard({ action, defaultOpen = false }: { action: Executio
 
   useEffect(() => {
     if (!userTouched) {
-      setOpen(action.status === 'running' || action.status === 'queued');
+      setOpen(action.status === 'running' || action.status === 'queued' || action.status === 'waiting_approval');
     }
   }, [action.status, userTouched]);
 
@@ -5403,6 +5445,7 @@ function actionLineTitle(action: ExecutionAction, running: boolean) {
 }
 
 function actionRowSummary(action: ExecutionAction, running: boolean) {
+  if (action.status === 'waiting_approval') return action.summary || action.description || '等待你的确认';
   if (running && (action.status === 'running' || action.status === 'queued')) {
     if (action.kind === 'web') return '正在提取正文...';
     return action.summary || action.description || '正在执行...';
@@ -5477,7 +5520,7 @@ function approvalEventToExecutionAction(event: ExecutionEvent): ExecutionEvent {
     action_id: String(raw.confirmation_id || event.action_id || `${capability}-confirmation`),
     kind: 'confirmation',
     title: '等待确认',
-    summary: String(event.summary || `${capability} 需要确认`),
+    summary: String(event.summary || `${capability} 等待你的确认`),
     source_label: capability,
     details: mergeExecutionEventDetails([
       { label: 'INPUT', value: { capability, risk: raw.risk, confirmation_id: raw.confirmation_id } },
@@ -5552,6 +5595,8 @@ function sourceLabelFromExecutionEvent(event: ExecutionEvent) {
 function normalizeRunExecutionStatus(status?: string): ExecutionRunStatus {
   if (status === 'succeeded' || status === 'success' || status === 'completed') return 'completed';
   if (status === 'running') return 'running';
+  if (status === 'waiting_confirmation' || status === 'waiting_approval') return 'waiting_approval';
+  if (status === 'cancelled' || status === 'canceled') return 'cancelled';
   if (status === 'failed') return 'failed';
   return 'pending';
 }
@@ -5573,6 +5618,9 @@ function sleep(ms: number) {
 }
 
 function userFacingAssistantText(content: string) {
+  if (/^confirmation_required\s*:/i.test(content.trim())) {
+    return '';
+  }
   if (content.includes('task_attempts') || content.includes('tool_runs') || content.includes('Run Trace')) {
     if (content.includes('已将任务派发') || content.includes('已交给') || content.includes('worker')) {
       return '已交给执行后台处理，结果会在这里更新。';

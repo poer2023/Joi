@@ -810,12 +810,13 @@ try {
   const waitingTrace = store.getRunTrace(waitingToolCallingChat.run_id);
   assert.equal(waitingTrace.status, 'waiting_confirmation');
   assert.ok(waitingTrace.events.some((event) => event.event_type === 'approval.requested'));
-  assert.ok(waitingTrace.events.some((event) => event.event_type === 'run.waiting_confirmation'));
+  assert.ok(waitingTrace.events.some((event) => event.event_type === 'run.waiting_approval'));
+  assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND role='assistant'`, waitingToolCallingChat.conversation_id).count), 0);
   const waitingConfirmation = store.listConfirmations().items.find((item) => item.run_id === waitingToolCallingChat.run_id);
   assert.ok(waitingConfirmation);
   assert.equal(waitingConfirmation.call_id, 'call_apply_patch_waiting');
   assert.equal(waitingConfirmation.turn_id?.startsWith('turn_'), true);
-  assert.equal(waitingConfirmation.approval_scope, 'once');
+  assert.equal(waitingConfirmation.approval_scope, 'one_call');
   assert.equal(waitingConfirmation.approval_key, 'call_apply_patch_waiting');
   assert.equal(waitingConfirmation.status, 'pending');
   assert.ok(waitingConfirmation.operation_id.startsWith('op_'));
@@ -928,7 +929,8 @@ try {
     resumableConfirmation.id,
   ).metadata);
   assert.equal(resumedModelMetadata.tool_run_count, 1);
-  assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM messages WHERE json_extract(metadata, '$.run_id')=? AND role='assistant'`, resumableChat.run_id).count), 2);
+  assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM messages WHERE json_extract(metadata, '$.run_id')=? AND role='assistant'`, resumableChat.run_id).count), 1);
+  assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND role='assistant' AND content LIKE 'confirmation_required:%'`, resumableChat.conversation_id).count), 0);
 
   const failingResumeChat = store.recordToolCallingChat({
     message: 'Use a model-generated patch whose final resume model call fails',

@@ -250,6 +250,7 @@ export type StartedToolCallingChat = {
   memory_pack_id: string;
   prompt_assembly_id: string;
   selected_agent_id: string;
+  user_message: string;
   provider: string;
   model_name: string;
   prompt_assembly: ToolCallingPromptAssembly;
@@ -2103,6 +2104,7 @@ export class JoiSQLiteStore {
       memory_pack_id: memoryPackID,
       prompt_assembly_id: promptAssemblyID,
       selected_agent_id: agentID,
+      user_message: message,
       provider,
       model_name: modelName,
       prompt_assembly: prompt,
@@ -2112,25 +2114,28 @@ export class JoiSQLiteStore {
   }
 
   finishToolCallingChat(started: StartedToolCallingChat, turn: PersistedToolCallingTurn): ChatResponse {
-    const response = turn.final_message.trim() || '模型没有返回可展示内容。';
+    const rawResponse = turn.final_message.trim() || '模型没有返回可展示内容。';
     const toolResults = turn.tool_results || [];
     const usage = turn.usage || {};
     const normalizedUsage = canonicalModelUsage(usage);
     const usageStatus = turn.usage_status || usageStatusForUsage(normalizedUsage);
     const costEstimate = this.estimateModelUsageCost(started.provider, started.model_name, normalizedUsage);
     const waitingConfirmation = turn.status === 'waiting_confirmation' || toolResults.some(isWaitingConfirmationToolResult);
+    const response = waitingConfirmation ? '' : rawResponse;
     let artifacts: ArtifactSummary[] = [];
     let productTask: ProductTask | undefined = started.product_task;
 
     this.transaction(() => {
-      this.exec(
-        `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
-         VALUES (?, ?, 'assistant', ?, '[]', ?, datetime('now'))`,
-        started.assistant_message_id,
-        started.conversation_id,
-        response,
-        json({ run_id: started.run_id, source: 'electron_ts_tool_calling' }),
-      );
+      if (!waitingConfirmation) {
+        this.exec(
+          `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
+           VALUES (?, ?, 'assistant', ?, '[]', ?, datetime('now'))`,
+          started.assistant_message_id,
+          started.conversation_id,
+          response,
+          json({ run_id: started.run_id, source: 'electron_ts_tool_calling' }),
+        );
+      }
       let itemSeq = this.nextTurnItemSeq(started.run_id);
       const hasRunEvent = (eventType: string, itemID?: string): boolean => Boolean(itemID
         ? this.get(`SELECT id FROM run_events WHERE run_id=? AND event_type=? AND item_id=? LIMIT 1`, started.run_id, eventType, itemID)
@@ -2174,7 +2179,7 @@ export class JoiSQLiteStore {
             confirmation_id: confirmationID,
             capability,
             risk,
-            approval_scope: 'once',
+            approval_scope: 'one_call',
             approval_key: approvalKey,
             operation_id: confirmationInput.operation_id,
             affected_paths: confirmationInput.affected_paths,
@@ -2185,7 +2190,7 @@ export class JoiSQLiteStore {
           };
           this.exec(
             `INSERT INTO confirmation_requests (id, run_id, capability_id, requested_action, risk_level, status, input, call_id, turn_id, approval_scope, approval_key)
-             VALUES (?, ?, ?, ?, ?, 'pending', ?, NULLIF(?, ''), ?, 'once', ?)`,
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, NULLIF(?, ''), ?, 'one_call', ?)`,
             confirmationID,
             started.run_id,
             capability,
@@ -2309,11 +2314,16 @@ export class JoiSQLiteStore {
       if (started.product_task_id) {
         productTask = this.getProductTask(started.product_task_id).task;
       }
+      if (!waitingConfirmation) {
+        this.insertPostRunMemoryProposal(started.run_id, started.turn_id, started.user_message);
+      }
       const persistedToolRunCount = this.persistedToolRunCountForRun(started.run_id);
       this.insertRunStep(started.run_id, 'model_call_finished', 'Model call finished', { agent_id: started.selected_agent_id, model_id: started.model_name, prompt_assembly_id: started.prompt_assembly_id }, { provider: started.provider, model: started.model_name, real_model: started.provider !== 'mock_provider', fallback_to_mock: false, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_count: persistedToolRunCount });
-      this.insertRunStep(started.run_id, 'agent_output_parsed', 'Agent output parsed', { turn: 1 }, { repaired: false, output_type: 'final_answer' });
-      this.insertRunStep(started.run_id, 'response_generated', waitingConfirmation ? 'Confirmation response generated' : 'Response generated', {}, { response }, waitingConfirmation ? 'waiting_confirmation' : 'succeeded');
-      this.insertTurnItem(started.run_id, started.turn_id, itemSeq++, 'message', 'assistant', '', '', {}, response, {}, waitingConfirmation ? 'waiting_confirmation' : 'completed', { final_answer: !waitingConfirmation, waiting_confirmation: waitingConfirmation });
+      if (!waitingConfirmation) {
+        this.insertRunStep(started.run_id, 'agent_output_parsed', 'Agent output parsed', { turn: 1 }, { repaired: false, output_type: 'final_answer' });
+        this.insertRunStep(started.run_id, 'response_generated', 'Response generated', {}, { response }, 'succeeded');
+        this.insertTurnItem(started.run_id, started.turn_id, itemSeq++, 'message', 'assistant', '', '', {}, response, {}, 'completed', { final_answer: true, waiting_confirmation: false });
+      }
       this.exec(
         `UPDATE model_calls
          SET input_tokens=?, output_tokens=?, cached_input_tokens=?, cache_write_input_tokens=?, reasoning_tokens=?, total_tokens=?,
@@ -2365,11 +2375,10 @@ export class JoiSQLiteStore {
         started.turn_id,
       );
       if (waitingConfirmation) {
-        if (!hasRunEvent('assistant.completed', started.assistant_message_id)) {
-          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'assistant.completed', { run_id: started.run_id, turn_id: started.turn_id, item_type: 'assistant_message', item_id: started.assistant_message_id, delta: { text: response }, status: 'waiting_confirmation', visibility: 'chat', source: 'store', type: 'assistant.completed' });
+        if (!hasRunEvent('usage.recorded', started.model_call_id)) {
+          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'usage.recorded', { run_id: started.run_id, turn_id: started.turn_id, item_type: 'model', item_id: started.model_call_id, status: usageStatus, visibility: 'trace_only', source: 'store', usage: normalizedUsage, usage_status: usageStatus, estimated_cost: roundCost(costEstimate), type: 'usage.recorded' });
         }
-        this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'message.delta', { run_id: started.run_id, turn_id: started.turn_id, delta: response, status: 'waiting_confirmation', visibility: 'trace_only', source: 'store', type: 'message.delta' });
-        this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'run.waiting_confirmation', { run_id: started.run_id, turn_id: started.turn_id, status: 'waiting_confirmation', message: response, type: 'run.waiting_confirmation' });
+        this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'run.waiting_approval', { run_id: started.run_id, turn_id: started.turn_id, status: 'waiting_approval', message: 'waiting for approval', visibility: 'inline_status', type: 'run.waiting_approval' });
       } else {
         const hasAssistantDelta = Boolean(this.get(`SELECT id FROM run_events WHERE run_id=? AND event_type='assistant.delta' LIMIT 1`, started.run_id));
         if (!hasAssistantDelta) {
@@ -2489,7 +2498,7 @@ export class JoiSQLiteStore {
     const promptAssemblyID = `pa_${newID()}`;
     const createdAt = nowIso();
     const message = req.message.trim();
-    const response = turn.final_message.trim() || '模型没有返回可展示内容。';
+    const rawResponse = turn.final_message.trim() || '模型没有返回可展示内容。';
     const title = titleFromMessage(message);
     const agentID = turn.selected_agent_id?.trim() || agentIDForMessage(message);
     const provider = turn.provider.trim() || 'openai_compatible';
@@ -2507,6 +2516,7 @@ export class JoiSQLiteStore {
     const costEstimate = this.estimateModelUsageCost(provider, modelName, normalizedUsage);
     const waitingResult = toolResults.find(isWaitingConfirmationToolResult);
     const waitingConfirmation = turn.status === 'waiting_confirmation' || Boolean(waitingResult);
+    const response = waitingConfirmation ? '' : rawResponse;
     const runStatus = waitingConfirmation ? 'waiting_confirmation' : 'completed';
     const turnStatus = waitingConfirmation ? 'waiting_confirmation' : 'completed';
     const modeResolution = modeResolutionForRequest(req, message);
@@ -2579,14 +2589,16 @@ export class JoiSQLiteStore {
         json({ runtime_mode: 'tool_calling', input_mode: req.input_mode || 'auto', mode_resolution: modeResolution, source: 'electron_ts_tool_calling' }),
       );
 
-      this.exec(
-        `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
-         VALUES (?, ?, 'assistant', ?, '[]', ?, datetime('now'))`,
-        assistantMessageID,
-        conversationID,
-        response,
-        json({ run_id: runID, source: 'electron_ts_tool_calling' }),
-      );
+      if (!waitingConfirmation) {
+        this.exec(
+          `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
+           VALUES (?, ?, 'assistant', ?, '[]', ?, datetime('now'))`,
+          assistantMessageID,
+          conversationID,
+          response,
+          json({ run_id: runID, source: 'electron_ts_tool_calling' }),
+        );
+      }
 
       this.exec(
         `INSERT INTO turns (id, run_id, turn_index, status, mode_resolution_id, user_intent_summary,
@@ -2720,7 +2732,7 @@ export class JoiSQLiteStore {
             confirmation_id: confirmationID,
             capability,
             risk,
-            approval_scope: 'once',
+            approval_scope: 'one_call',
             approval_key: approvalKey,
             operation_id: confirmationInput.operation_id,
             affected_paths: confirmationInput.affected_paths,
@@ -2731,7 +2743,7 @@ export class JoiSQLiteStore {
           };
           this.exec(
             `INSERT INTO confirmation_requests (id, run_id, capability_id, requested_action, risk_level, status, input, call_id, turn_id, approval_scope, approval_key)
-             VALUES (?, ?, ?, ?, ?, 'pending', ?, NULLIF(?, ''), ?, 'once', ?)`,
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, NULLIF(?, ''), ?, 'one_call', ?)`,
             confirmationID,
             runID,
             capability,
@@ -2848,12 +2860,17 @@ export class JoiSQLiteStore {
       if (productTask?.id) {
         productTask = this.getProductTask(productTask.id).task;
       }
+      if (!waitingConfirmation) {
+        this.insertPostRunMemoryProposal(runID, turnID, message);
+      }
 
       const persistedToolRunCount = this.persistedToolRunCountForRun(runID);
       this.insertRunStep(runID, 'model_call_finished', 'Model call finished', { agent_id: agentID, model_id: modelName, prompt_assembly_id: promptAssemblyID }, { provider, model: modelName, real_model: provider !== 'mock_provider', fallback_to_mock: false, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_count: persistedToolRunCount });
-      this.insertRunStep(runID, 'agent_output_parsed', 'Agent output parsed', { turn: 1 }, { repaired: false, output_type: 'final_answer' });
-      this.insertRunStep(runID, 'response_generated', waitingConfirmation ? 'Confirmation response generated' : 'Response generated', {}, { response }, waitingConfirmation ? 'waiting_confirmation' : 'succeeded');
-      this.insertTurnItem(runID, turnID, itemSeq++, 'message', 'assistant', '', '', {}, response, {}, waitingConfirmation ? 'waiting_confirmation' : 'completed', { final_answer: !waitingConfirmation, waiting_confirmation: waitingConfirmation });
+      if (!waitingConfirmation) {
+        this.insertRunStep(runID, 'agent_output_parsed', 'Agent output parsed', { turn: 1 }, { repaired: false, output_type: 'final_answer' });
+        this.insertRunStep(runID, 'response_generated', 'Response generated', {}, { response }, 'succeeded');
+        this.insertTurnItem(runID, turnID, itemSeq++, 'message', 'assistant', '', '', {}, response, {}, 'completed', { final_answer: true, waiting_confirmation: false });
+      }
 
       this.exec(
         `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
@@ -2888,9 +2905,8 @@ export class JoiSQLiteStore {
       );
 
       if (waitingConfirmation) {
-        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'assistant.completed', { run_id: runID, turn_id: turnID, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response }, status: 'waiting_confirmation', visibility: 'chat', source: 'store', type: 'assistant.completed' });
-        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'message.delta', { run_id: runID, turn_id: turnID, delta: response, status: 'waiting_confirmation', visibility: 'trace_only', source: 'store', type: 'message.delta' });
-        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'run.waiting_confirmation', { run_id: runID, turn_id: turnID, status: 'waiting_confirmation', message: response, type: 'run.waiting_confirmation' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'usage.recorded', { run_id: runID, turn_id: turnID, item_type: 'model', item_id: modelCallID, status: usageStatus, visibility: 'trace_only', source: 'store', usage: normalizedUsage, usage_status: usageStatus, estimated_cost: roundCost(costEstimate), type: 'usage.recorded' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'run.waiting_approval', { run_id: runID, turn_id: turnID, status: 'waiting_approval', message: 'waiting for approval', visibility: 'inline_status', type: 'run.waiting_approval' });
       } else {
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'assistant.delta', { run_id: runID, turn_id: turnID, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response, stream_source: 'fallback_final_chunk' }, status: 'completed', visibility: 'chat', source: 'store', type: 'assistant.delta' });
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'assistant.completed', { run_id: runID, turn_id: turnID, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response }, status: 'completed', visibility: 'chat', source: 'store', terminal: true, type: 'assistant.completed' });
@@ -4124,7 +4140,7 @@ export class JoiSQLiteStore {
     const rows = this.all(
       `SELECT id, COALESCE(run_id, '') AS run_id, COALESCE(capability_id, '') AS capability_id,
               requested_action, risk_level, status, input, COALESCE(call_id, '') AS call_id,
-              COALESCE(turn_id, '') AS turn_id, COALESCE(approval_scope, 'once') AS approval_scope,
+              COALESCE(turn_id, '') AS turn_id, COALESCE(approval_scope, 'one_call') AS approval_scope,
               COALESCE(approval_key, '') AS approval_key, COALESCE(approved_by, '') AS approved_by,
               COALESCE(rejected_by, '') AS rejected_by, COALESCE(decision_reason, '') AS decision_reason,
               created_at, decided_at, resumed_at
@@ -4139,7 +4155,7 @@ export class JoiSQLiteStore {
     const rows = this.all(
       `SELECT id, COALESCE(run_id, '') AS run_id, COALESCE(capability_id, '') AS capability_id,
               requested_action, risk_level, status, input, COALESCE(call_id, '') AS call_id,
-              COALESCE(turn_id, '') AS turn_id, COALESCE(approval_scope, 'once') AS approval_scope,
+              COALESCE(turn_id, '') AS turn_id, COALESCE(approval_scope, 'one_call') AS approval_scope,
               COALESCE(approval_key, '') AS approval_key, COALESCE(approved_by, '') AS approved_by,
               COALESCE(rejected_by, '') AS rejected_by, COALESCE(decision_reason, '') AS decision_reason,
               created_at, decided_at, resumed_at
@@ -4151,10 +4167,11 @@ export class JoiSQLiteStore {
     return { items: rows.map(rowToConfirmation) };
   }
 
-  decideConfirmation(req: { id?: string; approve?: boolean; actor?: string; reason?: string }): void {
+  decideConfirmation(req: { id?: string; approve?: boolean; actor?: string; reason?: string; scope?: string }): void {
     this.decideApproval({
       approval_request_id: req.id,
       decision: req.approve ? 'approved' : 'rejected',
+      decision_scope: req.scope,
       decided_by: req.actor || 'desktop_ui',
       reason: req.reason,
     });
@@ -4164,6 +4181,7 @@ export class JoiSQLiteStore {
     run_id?: string;
     approval_request_id?: string;
     decision?: string;
+    decision_scope?: string;
     decided_by?: string;
     decided_at?: string;
     reason?: string;
@@ -4172,6 +4190,7 @@ export class JoiSQLiteStore {
     const id = req.approval_request_id?.trim();
     if (!id) throw new Error('approval_request_id is required');
     const status = normalizeApprovalDecisionStatus(req.decision);
+    const decisionScope = normalizeApprovalScope(req.decision_scope);
     const decidedBy = req.decided_by?.trim() || 'desktop_ui';
     const decidedAt = req.decided_at?.trim() || '';
     const existing = this.get(
@@ -4196,22 +4215,24 @@ export class JoiSQLiteStore {
       if (status === 'approved') {
         this.exec(
           `UPDATE confirmation_requests
-           SET status='approved', approved_by=?, rejected_by='', decision_reason=?, input=?, decided_at=COALESCE(NULLIF(?, ''), datetime('now'))
+           SET status='approved', approved_by=?, rejected_by='', decision_reason=?, input=?, approval_scope=?, decided_at=COALESCE(NULLIF(?, ''), datetime('now'))
            WHERE id=? AND status='pending'`,
           decidedBy,
           req.reason || '',
           json(input),
+          decisionScope,
           decidedAt,
           id,
         );
       } else {
         this.exec(
           `UPDATE confirmation_requests
-           SET status='rejected', rejected_by=?, approved_by='', decision_reason=?, input=?, decided_at=COALESCE(NULLIF(?, ''), datetime('now'))
+           SET status='rejected', rejected_by=?, approved_by='', decision_reason=?, input=?, approval_scope=?, decided_at=COALESCE(NULLIF(?, ''), datetime('now'))
            WHERE id=? AND status='pending'`,
           decidedBy,
           req.reason || '',
           json(input),
+          decisionScope,
           decidedAt,
           id,
         );
@@ -4230,6 +4251,7 @@ export class JoiSQLiteStore {
           decided_by: decidedBy,
           decided_at: decidedAt || nowIso(),
           reason: req.reason || '',
+          decision_scope: decisionScope,
           edited_parameters: editedParameters || undefined,
         };
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'approval.resolved', payload);
@@ -4244,14 +4266,14 @@ export class JoiSQLiteStore {
           const runMetadata = parseObject(this.get(`SELECT metadata FROM runs WHERE id=?`, runID)?.metadata);
           const productTaskID = optionalString(runMetadata.product_task_id);
           if (callID) {
-            this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'tool.failed', {
+            this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'tool.cancelled', {
               item_type: 'tool_run',
               item_id: callID,
               call_id: callID,
               tool_name: capabilityID,
-              status: 'failed',
+              status: 'cancelled',
               summary: req.reason || 'Confirmation rejected',
-              output: { status: 'failed', reason: req.reason || 'Confirmation rejected' },
+              output: { status: 'cancelled', reason: req.reason || 'Confirmation rejected' },
               visibility: 'tool',
               source: 'store',
             });
@@ -4434,6 +4456,18 @@ export class JoiSQLiteStore {
         visibility: 'inline_status',
         source: 'store',
         resumed_from_confirmation_id: request.confirmation_id,
+      });
+      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.started', {
+        item_type: 'tool_run',
+        item_id: request.call_id,
+        tool_run_id: toolRunID,
+        call_id: request.call_id,
+        tool_name: capability,
+        capability,
+        status: 'running',
+        visibility: 'tool',
+        source: 'tool',
+        resumed: true,
       });
       this.recordProductTaskToolCheckpoint(productTaskID, {
         run_id: request.run_id,
@@ -7324,6 +7358,72 @@ export class JoiSQLiteStore {
     );
   }
 
+  private insertPostRunMemoryProposal(runID: string, turnID: string, message: string): void {
+    const proposal = memoryProposalFromMessage(message);
+    if (!proposal) return;
+    if (proposal.negativeSignals.length > 0 || proposal.scopeIntent !== 'durable') {
+      this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'memory.proposal.suppressed', {
+        item_type: 'memory',
+        status: 'skipped',
+        visibility: 'memory',
+        source: 'store',
+        scope_intent: proposal.scopeIntent,
+        negative_signals: proposal.negativeSignals,
+      });
+      return;
+    }
+    const existing = this.get(
+      `SELECT id FROM memories
+       WHERE json_extract(metadata, '$.dedup_key')=? AND status <> 'deleted'
+       LIMIT 1`,
+      proposal.dedupKey,
+    );
+    if (existing) {
+      this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'memory.proposal.deduped', {
+        item_type: 'memory',
+        item_id: optionalString(existing.id),
+        status: 'skipped',
+        visibility: 'memory',
+        source: 'store',
+        dedup_key: proposal.dedupKey,
+      });
+      return;
+    }
+    const memoryID = `mem_${newID()}`;
+    this.exec(
+      `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata)
+       VALUES (?, ?, ?, ?, 'global', 'internal', ?, 'pending', ?, '[]', ?)`,
+      memoryID,
+      proposal.type,
+      proposal.statement,
+      proposal.summary,
+      proposal.confidence,
+      json([runID, turnID].filter(Boolean)),
+      json({
+        source: 'post_run_learning_v1',
+        run_id: runID,
+        turn_id: turnID,
+        why: proposal.why,
+        futureEffect: proposal.futureEffect,
+        scopeIntent: proposal.scopeIntent,
+        negativeSignals: proposal.negativeSignals,
+        dedup_key: proposal.dedupKey,
+      }),
+    );
+    this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'memory.proposal.created', {
+      item_type: 'memory',
+      item_id: memoryID,
+      status: 'pending',
+      visibility: 'memory',
+      source: 'store',
+      statement: proposal.statement,
+      why: proposal.why,
+      futureEffect: proposal.futureEffect,
+      scope_intent: proposal.scopeIntent,
+      dedup_key: proposal.dedupKey,
+    });
+  }
+
   private applyDeterministicRuntimeArtifacts(
     plan: DeterministicRuntimePlan,
     runID: string,
@@ -7348,15 +7448,42 @@ export class JoiSQLiteStore {
         json({ source: 'electron_sqlite_deterministic' }),
       );
     }
-    if (plan.pendingMemory) {
-      this.exec(
-        `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata)
-         VALUES (?, 'preference', ?, ?, 'global', 'internal', 0.8, 'pending', '[]', '[]', ?)`,
-        `mem_${newID()}`,
-        plan.pendingMemory.content,
-        plan.pendingMemory.summary,
-        json({ source: 'electron_sqlite_deterministic', run_id: runID }),
+    if (plan.pendingMemory && memoryHardNegativeSignals(plan.pendingMemory.content).length === 0) {
+      const dedupKey = memoryDedupKey(plan.pendingMemory.content);
+      const existing = this.get(
+        `SELECT id FROM memories
+         WHERE json_extract(metadata, '$.dedup_key')=? AND status <> 'deleted'
+         LIMIT 1`,
+        dedupKey,
       );
+      if (existing) {
+        this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), 'memory.proposal.deduped', {
+          item_type: 'memory',
+          item_id: optionalString(existing.id),
+          status: 'skipped',
+          visibility: 'memory',
+          source: 'store',
+          dedup_key: dedupKey,
+        });
+      } else {
+        this.exec(
+          `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata)
+           VALUES (?, 'preference', ?, ?, 'global', 'internal', 0.8, 'pending', ?, '[]', ?)`,
+          `mem_${newID()}`,
+          plan.pendingMemory.content,
+          plan.pendingMemory.summary,
+          json([runID]),
+          json({ source: 'electron_sqlite_deterministic', run_id: runID, dedup_key: dedupKey, why: '用户表达了可复用的长期偏好。', futureEffect: '后续相似任务会优先应用这条偏好。', scopeIntent: 'durable' }),
+        );
+      }
+    } else if (plan.pendingMemory) {
+      this.insertRunEvent(runID, '', this.nextRunEventSeq(runID), 'memory.proposal.suppressed', {
+        item_type: 'memory',
+        status: 'skipped',
+        visibility: 'memory',
+        source: 'store',
+        negative_signals: memoryHardNegativeSignals(plan.pendingMemory.content),
+      });
     }
     let productTaskID = '';
     let artifactID = '';
@@ -8190,7 +8317,7 @@ function rowToConfirmation(row: SQLiteRow): ConfirmationRecord {
     input,
     call_id: optionalString(row.call_id),
     turn_id: optionalString(row.turn_id),
-    approval_scope: optionalString(row.approval_scope),
+    approval_scope: normalizeApprovalScope(optionalString(row.approval_scope)),
     approval_key: optionalString(row.approval_key),
     operation_id: optionalString(input.operation_id),
     affected_paths: parseStringArray(input.affected_paths),
@@ -8384,6 +8511,83 @@ type DeterministicRuntimePlan = {
   toolRun?: boolean;
   workerTask?: boolean;
 };
+
+type PostRunMemoryProposal = {
+  type: 'user_preference' | 'project_fact' | 'workflow_rule' | 'task_context';
+  statement: string;
+  summary: string;
+  why: string;
+  futureEffect: string;
+  scopeIntent: 'durable' | 'session_only' | 'do_not_store';
+  confidence: number;
+  negativeSignals: string[];
+  dedupKey: string;
+};
+
+const HARD_NEGATIVE_MEMORY_SIGNALS = [
+  '不要记住',
+  '不要写入长期记忆',
+  '别记住',
+  '仅本轮',
+  '当前会话',
+  '临时上下文',
+  '测试',
+  '暗号',
+  '验证码',
+  'token',
+  'secret',
+];
+
+function memoryProposalFromMessage(message: string): PostRunMemoryProposal | null {
+  const text = message.trim();
+  if (!text) return null;
+  const negativeSignals = memoryHardNegativeSignals(text);
+  const scopeIntent = negativeSignals.length > 0
+    ? negativeSignals.some((signal) => signal.includes('不要') || signal.includes('别记') || signal === 'secret' || signal === 'token' || signal === '验证码')
+      ? 'do_not_store'
+      : 'session_only'
+    : 'durable';
+  const explicitDurable = /请记住|记住[:：]|以后|以后都|后续|以后给我|我偏好|我的偏好|总是|默认/.test(text);
+  if (!explicitDurable && negativeSignals.length === 0) return null;
+  const statement = cleanMemoryStatement(text);
+  if (!statement) return null;
+  return {
+    type: inferMemoryProposalType(statement),
+    statement,
+    summary: titleFromMessage(statement),
+    why: explicitDurable ? '用户表达了可复用的长期偏好或工作规则。' : '用户消息包含长期记忆候选。',
+    futureEffect: '后续相似对话会优先参考这条偏好，直到用户编辑、停用或删除。',
+    scopeIntent,
+    confidence: explicitDurable ? 0.82 : 0.62,
+    negativeSignals,
+    dedupKey: memoryDedupKey(statement),
+  };
+}
+
+function memoryHardNegativeSignals(message: string): string[] {
+  const normalized = message.toLowerCase();
+  return HARD_NEGATIVE_MEMORY_SIGNALS.filter((signal) => normalized.includes(signal.toLowerCase()));
+}
+
+function cleanMemoryStatement(message: string): string {
+  return message
+    .replace(/^请记住[:：]?\s*/u, '')
+    .replace(/^记住[:：]?\s*/u, '')
+    .replace(/不要写入长期记忆。?/gu, '')
+    .replace(/不要记住。?/gu, '')
+    .replace(/别记住。?/gu, '')
+    .trim();
+}
+
+function inferMemoryProposalType(statement: string): PostRunMemoryProposal['type'] {
+  if (/流程|步骤|以后都按|默认先|先.+再/u.test(statement)) return 'workflow_rule';
+  if (/项目|Joi|仓库|路径|环境/u.test(statement)) return 'project_fact';
+  return 'user_preference';
+}
+
+function memoryDedupKey(statement: string): string {
+  return hashText(statement.replace(/\s+/g, '').toLowerCase()).slice(0, 24);
+}
 
 function buildDeterministicRuntimePlan(req: ChatRequest, message: string): DeterministicRuntimePlan {
   const normalized = message.toLowerCase();
@@ -8972,7 +9176,7 @@ function isWaitingConfirmationToolResult(result: PersistedToolResult): boolean {
 
 function confirmationMessageForToolResult(result: PersistedToolResult): string {
   return optionalString(result.output?.message)
-    || 'confirmation_required: tool execution requires approval before it can continue.';
+    || '这个受控能力需要你确认后才会执行。';
 }
 
 function requestedActionForTool(capability: string, args: Record<string, unknown>, output: Record<string, unknown>): string {
@@ -9668,6 +9872,12 @@ function normalizeApprovalDecisionStatus(decision?: string): 'approved' | 'rejec
   if (['approve', 'approved', 'allow', 'allowed', 'yes'].includes(normalized)) return 'approved';
   if (['deny', 'denied', 'reject', 'rejected', 'no'].includes(normalized)) return 'rejected';
   throw new Error(`unsupported approval decision: ${decision || ''}`);
+}
+
+function normalizeApprovalScope(scope?: string): 'one_call' | 'current_run' {
+  const normalized = (scope || '').trim();
+  if (normalized === 'current_run') return 'current_run';
+  return 'one_call';
 }
 
 function sanitizeApprovalEditedParameters(value: unknown): Record<string, unknown> | undefined {

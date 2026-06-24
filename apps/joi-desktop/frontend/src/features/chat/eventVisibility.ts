@@ -23,10 +23,6 @@ export function getEventVisibility(event: NormalizedRunEvent, mode: ChatInputMod
     return 'hidden';
   }
 
-  if (isExecutionProcessEvent(event)) {
-    return 'transcript';
-  }
-
   if (declared === 'trace_only' || declared === 'chat') {
     return declared;
   }
@@ -47,7 +43,12 @@ export function getEventVisibility(event: NormalizedRunEvent, mode: ChatInputMod
     return 'transcript';
   }
 
+  if (isExecutionProcessEvent(event)) {
+    return 'transcript';
+  }
+
   if (type === 'assistant.delta' || type === 'assistant.completed') return 'chat';
+  if (type === 'work_summary.updated' || type === 'plan.created' || type === 'plan.updated') return 'transcript';
   if (type === 'approval.required' || type === 'approval.requested') return 'transcript';
   if (type === 'artifact.created' || type.startsWith('verification.')) return 'trace_only';
   if (type === 'run.mode_resolved') return 'trace_only';
@@ -88,7 +89,9 @@ function isExecutionProcessEvent(event: NormalizedRunEvent): boolean {
   const type = event.type.toLowerCase();
   const itemType = event.itemType.toLowerCase();
   if (
-    type.startsWith('model.')
+    type === 'work_summary.updated'
+    || type === 'plan.created'
+    || type === 'plan.updated'
     || type.startsWith('tool.')
     || type.startsWith('approval.')
     || type.startsWith('artifact.')
@@ -115,11 +118,6 @@ function isExecutionProcessEvent(event: NormalizedRunEvent): boolean {
     || itemType === 'approval'
     || itemType === 'artifact'
     || itemType === 'task'
-    || itemType === 'worker'
-    || itemType === 'memory'
-    || itemType === 'open_loop'
-    || itemType === 'proactive'
-    || itemType === 'handoff'
   );
 }
 

@@ -14,7 +14,7 @@ export DOCKER_REQUIRED=false
 export APP_VERSION="$VERSION"
 
 cd "$ROOT_DIR"
-pnpm build:electron
+pnpm --filter @joi/electron build
 rm -rf "$OUTPUT_DIR"
 pnpm --filter @joi/electron exec electron-builder --mac dir --arm64 --config.directories.output=release-desktop --config.mac.identity=null
 

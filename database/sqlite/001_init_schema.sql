@@ -917,7 +917,7 @@ CREATE TABLE IF NOT EXISTS confirmation_requests (
   input TEXT NOT NULL DEFAULT '{}',
   call_id TEXT,
   turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
-  approval_scope TEXT NOT NULL DEFAULT 'once',
+  approval_scope TEXT NOT NULL DEFAULT 'one_call',
   approval_key TEXT NOT NULL DEFAULT '',
   approved_by TEXT,
   rejected_by TEXT,

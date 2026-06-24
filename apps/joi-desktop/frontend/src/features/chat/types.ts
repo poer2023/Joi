@@ -84,6 +84,14 @@ export type TranscriptLineRenderItem = {
   kind: TranscriptLineKind;
   label: string;
   detail?: string;
+  approval?: {
+    id: string;
+    capability: string;
+    requestedAction: string;
+    riskLevel: string;
+    resourceLabel?: string;
+    preview?: string;
+  };
   traceAvailable?: boolean;
   startedAt?: string;
   completedAt?: string;

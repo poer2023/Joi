@@ -289,6 +289,7 @@ export type ApprovalDecisionRequest = {
   run_id: string;
   approval_request_id: string;
   decision: 'approve' | 'approved' | 'deny' | 'denied' | 'reject' | 'rejected' | string;
+  decision_scope?: 'one_call' | 'current_run' | string;
   decided_by: string;
   decided_at?: string;
   reason?: string;
@@ -1295,7 +1296,7 @@ export type DesktopBindings = {
   ListWorkerGatewayAuditLogs(): Promise<{ items: WorkerGatewayAuditRecord[] }>;
   GetModelUsage(): Promise<{ items: Record<string, unknown>[] }>;
   ListConfirmations(): Promise<{ items: ConfirmationRecord[] }>;
-  DecideConfirmation(req: { id: string; approve: boolean; actor?: string; reason?: string }): Promise<void>;
+  DecideConfirmation(req: { id: string; approve: boolean; actor?: string; reason?: string; scope?: 'one_call' | 'current_run' | string }): Promise<void>;
   ListPendingApprovals(): Promise<{ items: ConfirmationRecord[] }>;
   DecideApproval(req: ApprovalDecisionRequest): Promise<ApprovalDecisionResponse>;
   ResumeApprovalRun(req: ApprovalResumeRunRequest): Promise<ApprovalResumeRunResponse>;

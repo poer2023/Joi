@@ -18,7 +18,17 @@ export type ExecutionActionKind =
   | 'model'
   | 'finalize';
 
-export type ExecutionActionStatus = 'pending' | 'running' | 'completed' | 'failed' | 'limited' | 'blocked' | 'queued';
+export type ExecutionActionStatus =
+  | 'pending'
+  | 'queued'
+  | 'running'
+  | 'waiting_approval'
+  | 'completed'
+  | 'failed'
+  | 'limited'
+  | 'blocked'
+  | 'cancelled'
+  | 'skipped';
 
 export type ExecutionActionDetail = {
   label: 'COMMAND' | 'INPUT' | 'SOURCE' | 'RESULT' | 'LIMITATIONS' | 'ERROR';
@@ -64,7 +74,6 @@ export const VISIBLE_KINDS = [
   'observe',
   'artifact',
   'confirmation',
-  'memory',
   'evidence',
   'model',
   'proactive',
@@ -100,6 +109,7 @@ const toolStepTypes = new Set([
   'workflow_compiled',
   'tool_compiled',
   'node_selected',
+  'approval_requested',
   'tool_started',
   'tool_step_started',
   'tool_step_completed',
@@ -269,6 +279,7 @@ export function projectRunTraceToActions(trace: RunTrace | null): ExecutionActio
       kind: 'memory',
       title: '处理记忆',
       description: '已处理本轮记忆相关动作',
+      visible: false,
       steps: memorySteps,
       details: buildDetails([
         ['RESULT', sanitizeForDisplay(memorySteps.map((step) => step.output))],
@@ -329,6 +340,7 @@ export function summarizeExecutionActions(actions: ExecutionAction[]) {
   const visible = visibleExecutionActions(actions);
   const completed = visible.filter((action) => action.status === 'completed').length;
   const failed = visible.filter((action) => action.status === 'failed' || action.status === 'blocked').length;
+  const waiting = visible.filter((action) => action.status === 'waiting_approval').length;
   const webReads = visible.filter((action) => action.kind === 'web').length;
   const artifacts = visible.filter((action) => action.kind === 'artifact').length;
   const memories = visible.filter((action) => action.kind === 'memory').length;
@@ -341,6 +353,7 @@ export function summarizeExecutionActions(actions: ExecutionAction[]) {
   }
   if (artifacts > 0) parts.push(`生成 ${artifacts} 个交付物`);
   if (memories > 0) parts.push(`处理 ${memories} 个记忆动作`);
+  if (waiting > 0) parts.push(`${waiting} 个等待确认`);
   if (failed > 0) parts.push(`${failed} 个需要查看`);
   if (duration > 0) parts.push(formatActionDuration(duration));
   return parts.join(' · ');
@@ -458,6 +471,11 @@ function projectEvidenceSteps(runID: string, steps: RunStep[]): ExecutionAction 
 }
 
 function descriptionForToolAction(title: string, status: ExecutionActionStatus) {
+  if (status === 'waiting_approval') {
+    if (title === '写入文件') return '等待你的确认，批准前不会写入';
+    if (title === '点击浏览器' || title === '输入浏览器') return '等待你的确认，批准前不会操作页面';
+    return '等待你的确认，批准前不会执行';
+  }
   if (status === 'running' || status === 'queued') {
     if (title === '读取网页') return '正在读取网页...';
     if (title === '搜索工作区') return '正在搜索工作区...';
@@ -485,6 +503,7 @@ function descriptionForToolAction(title: string, status: ExecutionActionStatus) 
   if (title === '观察浏览器') return '本轮执行了工具：已观察当前浏览器';
   if (title === '观察屏幕') return '本轮执行了工具：已观察当前窗口';
   if (title === '运行命令') return '本轮执行了工具：已运行命令';
+  if (title === '写入文件') return '本轮执行了工具：已写入文件';
   return '本轮执行了工具：已完成工具动作';
 }
 
@@ -544,6 +563,7 @@ function makeAction(input: {
 }
 
 function statusForSteps(steps: RunStep[]): ExecutionActionStatus {
+  if (steps.some((step) => step.status === 'waiting_approval' || step.status === 'waiting_confirmation' || step.step_type === 'approval_requested')) return 'waiting_approval';
   if (steps.some((step) => step.step_type.includes('blocked') || step.status === 'blocked')) return 'blocked';
   if (steps.some((step) => step.step_type.includes('failed') || step.status === 'failed' || step.error)) return 'failed';
   if (steps.some((step) => step.status === 'running')) return 'running';
@@ -581,6 +601,7 @@ function capabilityFromStep(step?: RunStep) {
 
 function titleForCapability(capability: string, workflow: string) {
   const key = `${capability} ${workflow}`.toLowerCase();
+  if (key.includes('apply_patch') || key.includes('patch') || key.includes('workspace_write') || key.includes('write_file')) return '写入文件';
   if (key.includes('web') || key.includes('research') || key.includes('fetch') || key.includes('crawl')) return '读取网页';
   if (key.includes('desktop_app_list') || key.includes('desktop_list_app')) return '列出本机 App';
   if (key.includes('desktop_app_inspect') || key.includes('desktop_inspect_app')) return '检查本机 App';
@@ -591,6 +612,7 @@ function titleForCapability(capability: string, workflow: string) {
   if (key.includes('computer_observe') || key.includes('computer_snapshot')) return '观察屏幕';
   if (key.includes('workspace_search') || key.includes('search')) return '搜索工作区';
   if (key.includes('file') || key.includes('read')) return '读取文件';
+  if (key.includes('test_command') || key.includes('test')) return '运行测试';
   if (key.includes('shell') || key.includes('bash') || key.includes('command')) return '运行命令';
   if (key.includes('memory')) return '处理记忆';
   if (capability && capability !== 'unknown') return formatCapabilityTitle(capability);
@@ -599,6 +621,7 @@ function titleForCapability(capability: string, workflow: string) {
 
 function kindForCapability(capability: string, workflow: string, title: string): ExecutionActionKind {
   const key = `${capability} ${workflow} ${title}`.toLowerCase();
+  if (key.includes('apply_patch') || title === '写入文件') return 'file';
   if (key.includes('web') || key.includes('research') || key.includes('fetch') || key.includes('crawl')) return 'web';
   if (key.includes('browser_click') || key.includes('browser_type') || title === '点击浏览器' || title === '输入浏览器') return 'command';
   if (key.includes('browser_navigate') || title === '导航浏览器') return 'observe';
@@ -611,6 +634,7 @@ function kindForCapability(capability: string, workflow: string, title: string):
 }
 
 function completedLabelForAction(kind: ExecutionActionKind, sourceLabel: string | undefined, title: string) {
+  if (title === '写入文件') return `已写入文件${sourceLabel ? ` · ${sourceLabel}` : ''}`;
   if (kind === 'web') return `已读取网页${sourceLabel ? ` · ${sourceLabel}` : ''}`;
   if (kind === 'file') return `已读取文件${sourceLabel ? ` · ${sourceLabel}` : ''}`;
   if (kind === 'workspace') return `已搜索工作区${sourceLabel ? ` · ${sourceLabel}` : ''}`;
@@ -633,11 +657,14 @@ function extractInput(capabilityStep: RunStep | undefined, steps: RunStep[]) {
 }
 
 function extractSource(steps: RunStep[]) {
-  const found = findNestedValue(steps.map((step) => ({ input: step.input, output: step.output })), ['url', 'source_url', 'source', 'path', 'root', 'query', 'title', 'window_title', 'frontmost_app', 'browser_app']);
+  const found = findNestedValue(steps.map((step) => ({ input: step.input, output: step.output })), ['url', 'source_url', 'source', 'path', 'target_path', 'file_path', 'affected_paths', 'root', 'query', 'title', 'window_title', 'frontmost_app', 'browser_app']);
   return sanitizeForDisplay(found);
 }
 
 function extractSourceLabel(source: unknown) {
+  if (Array.isArray(source)) {
+    return extractSourceLabel(source.find(Boolean));
+  }
   if (typeof source !== 'string') return undefined;
   return sourceLabelFromURL(source) || fileLabelFromPath(source) || truncatePlainLabel(source, 36);
 }
@@ -697,7 +724,8 @@ export function actionDurationMs(action: ExecutionAction) {
 
 function normalizeActionStatus(status?: string): ExecutionActionStatus {
   if (status === 'succeeded' || status === 'success') return 'completed';
-  if (status === 'completed' || status === 'running' || status === 'pending' || status === 'failed' || status === 'blocked' || status === 'queued' || status === 'limited') {
+  if (status === 'waiting_confirmation') return 'waiting_approval';
+  if (status === 'completed' || status === 'running' || status === 'pending' || status === 'failed' || status === 'blocked' || status === 'queued' || status === 'limited' || status === 'waiting_approval' || status === 'cancelled' || status === 'skipped') {
     return status;
   }
   return 'pending';
@@ -705,7 +733,8 @@ function normalizeActionStatus(status?: string): ExecutionActionStatus {
 
 function normalizeRunStatus(status?: string) {
   if (status === 'succeeded' || status === 'success') return 'completed';
-  if (status === 'completed' || status === 'running' || status === 'failed') return status;
+  if (status === 'waiting_confirmation') return 'waiting_approval';
+  if (status === 'completed' || status === 'running' || status === 'failed' || status === 'waiting_approval') return status;
   return status || 'pending';
 }
 

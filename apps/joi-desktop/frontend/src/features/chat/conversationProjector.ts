@@ -249,7 +249,7 @@ function aggregateVisibleEventGroups(input: {
 }
 
 function isLeadingAssistantProcessItem(item: ConversationRenderItem): boolean {
-  return item.type === 'transcript_line' && (item.kind === 'thinking' || item.kind === 'tool');
+  return item.type === 'transcript_line' && (item.kind === 'thinking' || item.kind === 'tool' || item.kind === 'approval');
 }
 
 function groupEventsByItem(events: NormalizedRunEvent[]): Map<string, NormalizedRunEvent[]> {
@@ -262,7 +262,7 @@ function groupEventsByItem(events: NormalizedRunEvent[]): Map<string, Normalized
 }
 
 function groupKeyForEvent(event: NormalizedRunEvent): string {
-  if (isModelProgressEvent(event)) {
+  if (isWorkSummaryEvent(event)) {
     return `${event.itemType || 'model'}:${event.itemId || event.runId || 'model'}:step:${modelStepValue(event) || '0'}`;
   }
   if (event.itemType === 'run') {
@@ -273,6 +273,7 @@ function groupKeyForEvent(event: NormalizedRunEvent): string {
 
 function projectMessage(message: ConversationMessage, streaming: boolean): ChatMessageRenderItem | null {
   if (message.role !== 'user' && message.role !== 'assistant') return null;
+  if (message.role === 'assistant' && isRawConfirmationMessage(message.content)) return null;
   return {
     type: 'message',
     id: message.id,
@@ -301,6 +302,7 @@ function projectTranscriptLine(
     kind,
     label: transcriptLabel(event, kind, status),
     detail: transcriptDetail(event, kind),
+    approval: kind === 'approval' || status === 'waiting_approval' ? approvalForEvent(event) : undefined,
     traceAvailable: status === 'failed' || status === 'waiting_approval',
     startedAt: started?.createdAt,
     completedAt: completed?.createdAt,
@@ -308,7 +310,7 @@ function projectTranscriptLine(
 }
 
 function transcriptKind(event: NormalizedRunEvent): TranscriptLineKind {
-  if (isModelProgressEvent(event)) return 'thinking';
+  if (isWorkSummaryEvent(event)) return 'thinking';
   if (event.type.startsWith('tool.') || event.itemType === 'tool' || event.itemType === 'capability' || event.itemType === 'node') return 'tool';
   if (event.type.startsWith('approval.') || event.itemType === 'approval') return 'approval';
   if (event.type.startsWith('artifact.') || event.itemType === 'artifact') return 'artifact';
@@ -340,32 +342,35 @@ function transcriptLabel(
     return toolTranscriptLabel(event, status);
   }
   if (kind === 'thinking') {
-    if (status === 'failed') return 'Thinking failed';
+    if (status === 'failed') return 'Thinking 失败';
     return 'Thinking';
   }
   if (kind === 'approval') {
-    return `Needs confirmation · ${compactText(event.title || stringFromEvent(event, ['requested_action', 'action', 'capability']) || 'action')}`;
+    const action = localizedActionFromEvent(event);
+    const target = resourceLabelFromEvent(event);
+    return `等待确认 · ${action}${target ? ` · ${compactText(target)}` : ''}`;
   }
   if (kind === 'artifact') {
-    return `Generated artifact · ${compactText(event.title || stringFromEvent(event, ['title', 'artifact_type', 'type']) || 'artifact')}`;
+    return `生成交付物 · ${compactText(event.title || stringFromEvent(event, ['title', 'artifact_type', 'type']) || 'artifact')}`;
   }
   if (event.itemType === 'automation' || event.type.startsWith('automation.')) {
     const target = compactText(event.summary || event.title || stringFromEvent(event, ['automation_name', 'name', 'automation_id']) || 'automation');
-    if (status === 'running' || status === 'pending') return `Automation running · ${target}`;
-    if (status === 'failed') return `Automation failed · ${target}`;
-    return `Automation updated · ${target}`;
+    if (status === 'running' || status === 'pending') return `自动化运行中 · ${target}`;
+    if (status === 'failed') return `自动化失败 · ${target}`;
+    return `自动化更新 · ${target}`;
   }
   if (kind === 'task') {
     const target = compactText(event.title || stringFromEvent(event, ['title', 'task_title', 'task_id']) || 'task');
-    if (status === 'running' || status === 'pending') return `Running task · ${target}`;
-    if (status === 'failed') return `Task failed · ${target}`;
-    return `Task updated · ${target}`;
+    if (status === 'running' || status === 'pending') return `任务执行中 · ${target}`;
+    if (status === 'failed') return `任务失败 · ${target}`;
+    return `任务更新 · ${target}`;
   }
   return compactText(summarizeExecutionEvent(event));
 }
 
 function transcriptDetail(event: NormalizedRunEvent, kind: TranscriptLineKind): string | undefined {
-  if (kind === 'thinking') return undefined;
+  if (kind === 'thinking') return workSummaryText(event) || undefined;
+  if (kind === 'approval') return approvalDetail(event);
   const detail = event.summary || detailForExecutionEvent(event);
   if (!detail) return undefined;
   if (kind === 'tool' && transcriptLabel(event, kind, transcriptStatus(event.status)).includes(detail)) return undefined;
@@ -373,7 +378,7 @@ function transcriptDetail(event: NormalizedRunEvent, kind: TranscriptLineKind): 
 }
 
 function transcriptIdentity(event: NormalizedRunEvent): string {
-  if (isModelProgressEvent(event)) {
+  if (isWorkSummaryEvent(event)) {
     return `${event.itemId || event.runId || 'model'}:step:${modelStepValue(event) || '0'}`;
   }
   return event.itemId || event.id;
@@ -391,26 +396,31 @@ function toolTranscriptLabel(event: NormalizedRunEvent, status: TranscriptLineRe
   const toolName = toolNameFromEvent(event);
   const lower = toolName.toLowerCase();
   const verb = status === 'running' || status === 'pending'
-    ? 'Running'
+    ? '正在执行'
     : status === 'failed'
-      ? 'Failed'
+      ? '执行失败'
       : status === 'waiting_approval'
-        ? 'Needs confirmation'
-        : 'Ran';
+        ? '等待确认'
+        : '已执行';
   if (event.terminal || lower.includes('terminal') || lower.includes('shell') || lower.includes('command') || lower.includes('exec') || lower.includes('bash')) {
-    return `${verb} · ${compactText(stringFromEvent(event, ['command', 'cmd', 'shell_command', 'script']) || 'command')}`;
+    const command = compactText(stringFromEvent(event, ['command', 'cmd', 'shell_command', 'script']) || 'command');
+    return `${status === 'completed' ? '运行命令' : verb} · ${command}`;
+  }
+  if (lower.includes('apply_patch') || lower.includes('patch') || lower.includes('workspace_write')) {
+    const target = compactText(resourceLabelFromEvent(event) || stringFromEvent(event, ['path', 'target_path', 'file_path']) || 'workspace');
+    return `${status === 'failed' ? '写入失败' : '写入文件'} · ${target}`;
   }
   if (lower.includes('web') || lower.includes('browser') || lower.includes('url')) {
     const url = stringFromEvent(event, ['final_url', 'url', 'source_url', 'href']) || detailForExecutionEvent(event) || '';
     const target = compactText(hostLabel(url) || url || humanizeToolName(toolName));
-    const action = status === 'running' || status === 'pending' ? 'Reading' : status === 'completed' ? 'Read' : verb;
+    const action = status === 'running' || status === 'pending' ? '读取中' : status === 'completed' ? '读取网页' : verb;
     return `${action} · ${target}`;
   }
   if (lower.includes('workspace') || lower.includes('search') || lower.includes('grep') || lower.includes('rg')) {
-    return `${status === 'completed' ? 'Searched' : 'Searching'} · ${compactText(stringFromEvent(event, ['query', 'q', 'pattern', 'search']) || humanizeToolName(toolName))}`;
+    return `搜索工作区 · ${compactText(stringFromEvent(event, ['query', 'q', 'pattern', 'search']) || humanizeToolName(toolName))}`;
   }
   if (lower.includes('file') || lower.includes('read') || lower.includes('path')) {
-    return `${status === 'completed' ? 'Read file' : 'Reading file'} · ${compactText(stringFromEvent(event, ['path', 'file', 'filename', 'target_path']) || humanizeToolName(toolName))}`;
+    return `读取文件 · ${compactText(stringFromEvent(event, ['path', 'file', 'filename', 'target_path']) || humanizeToolName(toolName))}`;
   }
   return `${verb} · ${compactText(humanizeToolName(toolName))}`;
 }
@@ -467,6 +477,14 @@ function stringFromEvent(event: NormalizedRunEvent, keys: string[]): string {
 
 function isModelProgressEvent(event: NormalizedRunEvent): boolean {
   return event.type.toLowerCase().startsWith('model.');
+}
+
+function isWorkSummaryEvent(event: NormalizedRunEvent): boolean {
+  return event.type === 'work_summary.updated' || event.type === 'plan.created' || event.type === 'plan.updated';
+}
+
+function workSummaryText(event: NormalizedRunEvent): string {
+  return stringFromEvent(event, ['summary', 'text', 'message', 'plan_summary', 'rationale']);
 }
 
 function modelStepValue(event: NormalizedRunEvent): string {
@@ -530,12 +548,17 @@ function hasPersistedAssistant(messages: ConversationMessage[], streaming: Conve
   const streamingRunId = getMessageRunId(streaming);
   return messages.some((message) => (
     message.role === 'assistant'
+    && !isRawConfirmationMessage(message.content)
     && (message.id === streaming.id || (streamingRunId && getMessageRunId(message) === streamingRunId))
   ));
 }
 
 function hasAssistantForRun(messages: ConversationMessage[], runId: string): boolean {
-  return messages.some((message) => message.role === 'assistant' && getMessageRunId(message) === runId);
+  return messages.some((message) => (
+    message.role === 'assistant'
+    && getMessageRunId(message) === runId
+    && !isRawConfirmationMessage(message.content)
+  ));
 }
 
 function orderedRunIds(input: BuildConversationRenderItemsInput): string[] {
@@ -601,4 +624,80 @@ function messageContentValue(value: unknown): string {
     }
   }
   return '';
+}
+
+function isRawConfirmationMessage(value: unknown): boolean {
+  return /^confirmation_required\s*:/i.test(messageContentValue(value).trim());
+}
+
+function approvalForEvent(event: NormalizedRunEvent): TranscriptLineRenderItem['approval'] {
+  const id = stringFromEvent(event, ['confirmation_id', 'approval_request_id']) || event.itemId;
+  if (!id) return undefined;
+  return {
+    id,
+    capability: capabilityFromEvent(event),
+    requestedAction: stringFromEvent(event, ['requested_action', 'purpose', 'action']) || localizedActionFromEvent(event),
+    riskLevel: stringFromEvent(event, ['risk', 'risk_level']) || 'workspace_write',
+    resourceLabel: resourceLabelFromEvent(event),
+    preview: approvalPreviewFromEvent(event),
+  };
+}
+
+function capabilityFromEvent(event: NormalizedRunEvent): string {
+  return stringFromEvent(event, ['capability', 'capability_id', 'tool_name', 'name']) || toolNameFromEvent(event);
+}
+
+function localizedActionFromEvent(event: NormalizedRunEvent): string {
+  const capability = capabilityFromEvent(event).toLowerCase();
+  if (capability.includes('apply_patch') || capability.includes('patch')) return '写入文件';
+  if (capability.includes('browser_click')) return '点击页面元素';
+  if (capability.includes('browser_type')) return '输入页面内容';
+  if (capability.includes('shell') || capability.includes('command')) return '运行命令';
+  return '执行受控能力';
+}
+
+function resourceLabelFromEvent(event: NormalizedRunEvent): string {
+  const direct = stringFromEvent(event, ['resource_ref', 'target', 'path', 'target_path', 'file_path', 'root', 'url']);
+  if (direct) return direct;
+  const affectedPaths = arrayFromEvent(event, ['affected_paths', 'paths', 'targetRefs']);
+  if (affectedPaths.length === 1) return affectedPaths[0];
+  if (affectedPaths.length > 1) return `${affectedPaths[0]} 等 ${affectedPaths.length} 项`;
+  return '';
+}
+
+function approvalDetail(event: NormalizedRunEvent): string | undefined {
+  const action = localizedActionFromEvent(event);
+  const target = resourceLabelFromEvent(event);
+  const risk = stringFromEvent(event, ['risk', 'risk_level']);
+  return [`${action}等待你的确认`, target, risk ? `风险 ${risk}` : ''].filter(Boolean).join(' · ');
+}
+
+function approvalPreviewFromEvent(event: NormalizedRunEvent): string | undefined {
+  const patch = stringFromEvent(event, ['patch', 'diff', 'preview']);
+  if (patch) return compactText(patch, 300);
+  const message = stringFromEvent(event, ['message']);
+  if (message && !/^confirmation_required\s*:/i.test(message)) return compactText(message, 220);
+  return undefined;
+}
+
+function arrayFromEvent(event: NormalizedRunEvent, keys: string[]): string[] {
+  const payload = eventPayload(event);
+  const sources = [
+    event.snapshot,
+    event.delta,
+    event.metadata,
+    payload,
+    objectValue(payload.input),
+    objectValue(payload.snapshot),
+    objectValue(payload.delta),
+  ];
+  for (const source of sources) {
+    for (const key of keys) {
+      const value = source[key];
+      if (Array.isArray(value)) return value.map(stringValue).filter(Boolean);
+      const single = stringValue(value);
+      if (single) return [single];
+    }
+  }
+  return [];
 }

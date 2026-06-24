@@ -156,7 +156,6 @@ export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): P
     for (const call of toolCalls) {
       throwIfAborted(req.signal);
       req.callbacks?.onToolCallRequested?.({ step, call });
-      req.callbacks?.onToolStarted?.({ step, call });
       let result: ToolResult;
       try {
         result = await req.executeTool(call, { signal: req.signal });
@@ -177,7 +176,7 @@ export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): P
         req.callbacks?.onApprovalRequired?.({ step, call, result });
         return {
           status: 'waiting_confirmation',
-          final_message: stringValue(result.output.message) || 'confirmation_required: tool execution requires approval before it can continue.',
+          final_message: stringValue(result.output.message) || '这个受控能力需要你确认后才会执行。',
           tool_results: toolResults,
           usage,
           usage_status: usageStatus,
@@ -185,6 +184,7 @@ export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): P
           model_responses: modelResponses,
         };
       }
+      req.callbacks?.onToolStarted?.({ step, call });
       if (toolResultFailed(result)) {
         req.callbacks?.onToolFailed?.({ step, call, result });
       } else {

@@ -1449,6 +1449,10 @@ img.message-avatar {
   animation: action-pulse 1.2s ease-in-out infinite;
 }
 
+.status-dot.waiting {
+  background: #9a7134;
+}
+
 .status-dot.failed {
   background: var(--color-error);
 }
@@ -1518,8 +1522,7 @@ img.message-avatar {
 }
 
 .transcript-line {
-  display: inline-flex;
-  align-items: baseline;
+  display: grid;
   gap: 8px;
   width: fit-content;
   max-width: min(760px, calc(100% - 50px));
@@ -1527,6 +1530,13 @@ img.message-avatar {
   color: var(--color-on-surface-variant);
   font-size: 12.5px;
   line-height: 1.35;
+}
+
+.transcript-line-main {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
 }
 
 .transcript-line .status-dot {
@@ -1555,6 +1565,70 @@ img.message-avatar {
   font-size: 12px;
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+
+.inline-approval-strip {
+  display: grid;
+  gap: 10px;
+  max-width: min(640px, 100%);
+  border: 1px solid rgba(154, 113, 52, 0.24);
+  border-radius: 8px;
+  background: rgba(154, 113, 52, 0.07);
+  padding: 10px 12px;
+  color: var(--color-on-surface);
+}
+
+.inline-approval-strip strong,
+.inline-approval-strip small {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.inline-approval-strip strong {
+  font-size: 13px;
+}
+
+.inline-approval-strip small {
+  margin-top: 3px;
+  color: var(--color-outline);
+  font-size: 12px;
+}
+
+.inline-approval-strip pre {
+  max-height: 160px;
+  margin: 8px 0 0;
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.58);
+  padding: 8px;
+  color: var(--color-on-surface-variant);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.inline-approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.inline-approval-actions button {
+  min-height: 28px;
+  border: 1px solid var(--border-medium);
+  border-radius: 8px;
+  background: var(--color-surface-container-lowest);
+  color: var(--color-primary);
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.inline-approval-actions button:last-child {
+  color: var(--color-error);
 }
 
 .inline-link,
@@ -1778,6 +1852,10 @@ img.message-avatar {
 .status-failed .execution-action-dot,
 .status-blocked .execution-action-dot {
   background: var(--color-error);
+}
+
+.status-waiting_approval .execution-action-dot {
+  background: #9a7134;
 }
 
 .status-running .execution-action-dot,

@@ -1100,8 +1100,8 @@ async function runElectronToolCallingTurn(
               risk,
               requested_action: String(call.arguments.reason || call.arguments.goal || `Execute ${call.name}`),
               message: risk === 'browser_interaction'
-                ? 'confirmation_required: browser interaction requires approval before execution'
-                : 'confirmation_required: workspace write requires approval before execution',
+                ? '浏览器操作需要你确认后才会执行。'
+                : '工作区写入需要你确认后才会执行。',
             },
           };
         }

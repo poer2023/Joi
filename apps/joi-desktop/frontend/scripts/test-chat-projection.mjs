@@ -72,8 +72,8 @@ try {
   assert.equal(getEventVisibility(event('workflow.completed', { item_type: 'workflow', status: 'completed' }), 'auto'), 'trace_only');
   assert.equal(getEventVisibility(event('tool.call.started', { tool_name: 'workspace_search_v1', status: 'running' }), 'auto'), 'transcript');
   assert.equal(getEventVisibility(event('tool.call.started', { tool_name: 'workspace_search_v1', status: 'running' }), 'chat_assist'), 'transcript');
-  assert.equal(getEventVisibility(event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'trace_only', status: 'running', step: 0 }), 'auto'), 'transcript');
-  assert.equal(getEventVisibility(event('worker.started', { task_id: 'task_1', status: 'running' }), 'background_task'), 'transcript');
+  assert.equal(getEventVisibility(event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'trace_only', status: 'running', step: 0 }), 'auto'), 'trace_only');
+  assert.equal(getEventVisibility(event('worker.started', { task_id: 'task_1', status: 'running' }), 'background_task'), 'trace_only');
   assert.equal(getEventVisibility(event('run.completed', { status: 'succeeded' }), 'auto'), 'hidden');
   assert.equal(getEventVisibility(event('automation.run_started', { status: 'running', summary: '自动化开始执行' }, { item_type: 'automation', visibility: 'inline_status' }), 'background_task'), 'transcript');
 
@@ -208,7 +208,7 @@ try {
     });
     assert.equal(result.items.length, 1);
     assert.equal(result.items[0].type, 'transcript_line');
-    assert.equal(result.items[0].label, 'Automation updated · Daily report done');
+    assert.equal(result.items[0].label, '自动化更新 · Daily report done');
     assert.equal(result.items[0].detail, 'Daily report done');
     assert.equal(result.activeRunStatusByRunId.run_auto, 'completed');
   }
@@ -240,7 +240,7 @@ try {
       mode: 'auto',
     });
     assert.equal(result.items.some((item) => item.type === 'message' && item.content === 'leaked answer'), false);
-    assert.equal(result.items.some((item) => item.type === 'transcript_line' && item.label === 'Read · current.example'), true);
+    assert.equal(result.items.some((item) => item.type === 'transcript_line' && item.label === '读取网页 · current.example'), true);
     assert.deepEqual(result.items.map((item) => item.type), ['transcript_line', 'message']);
   }
 
@@ -356,7 +356,7 @@ try {
       mode: 'auto',
     });
     assert.equal(result.items[0].type, 'transcript_line');
-    assert.equal(result.items[0].label, 'Read · example.com');
+    assert.equal(result.items[0].label, '读取网页 · example.com');
     assert.equal(result.items[0].detail, undefined);
     assert.equal(result.items[1].type, 'message');
     assert.equal(result.activeRunStatusByRunId.run_1, 'completed');
@@ -390,11 +390,28 @@ try {
       mode: 'auto',
     });
     const transcriptLines = result.items.filter((item) => item.type === 'transcript_line');
-    assert.deepEqual(transcriptLines.map((item) => item.kind), ['thinking', 'thinking', 'tool', 'thinking']);
-    assert.deepEqual(transcriptLines.map((item) => item.label), ['Thinking', 'Thinking', 'Read · example.com', 'Thinking']);
-    assert.equal(transcriptLines[0].detail, undefined);
+    assert.deepEqual(transcriptLines.map((item) => item.kind), ['tool']);
+    assert.deepEqual(transcriptLines.map((item) => item.label), ['读取网页 · example.com']);
     assert.equal(JSON.stringify(result.items).includes('hidden reasoning must not render'), false);
-    assert.deepEqual(result.items.map((item) => item.type), ['transcript_line', 'transcript_line', 'transcript_line', 'transcript_line', 'message']);
+    assert.deepEqual(result.items.map((item) => item.type), ['transcript_line', 'message']);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('work_summary.updated', { item_type: 'work_summary', item_id: 'summary_1', summary: '先检查现有实现', status: 'running', step: 0, seq: 1 }),
+          event('plan.updated', { item_type: 'plan', item_id: 'plan_1', summary: '接着补回归测试', status: 'running', step: 1, seq: 2 }),
+          event('assistant.completed', { status: 'completed', seq: 3 }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const transcriptLines = result.items.filter((item) => item.type === 'transcript_line');
+    assert.deepEqual(transcriptLines.map((item) => item.kind), ['thinking', 'thinking']);
+    assert.deepEqual(transcriptLines.map((item) => item.label), ['Thinking', 'Thinking']);
+    assert.deepEqual(transcriptLines.map((item) => item.detail), ['先检查现有实现', '接着补回归测试']);
   }
 
   {
@@ -422,8 +439,7 @@ try {
       },
       mode: 'background_task',
     });
-    assert.deepEqual(result.items.map((item) => item.type), ['message', 'transcript_line']);
-    assert.equal(result.items[1].label, 'Running task · 后台整理');
+    assert.deepEqual(result.items.map((item) => item.type), ['message']);
     assert.equal(result.items.some((item) => item.type === 'compact_run_card'), false);
   }
 
@@ -446,7 +462,7 @@ try {
       mode: 'serious_task',
     });
     assert.deepEqual(result.items.map((item) => item.type), ['message', 'transcript_line']);
-    assert.equal(result.items[1].label, 'Generated artifact · verification.completed');
+    assert.equal(result.items[1].label, '生成交付物 · verification.completed');
   }
 
   {
@@ -529,14 +545,50 @@ try {
     assert.equal(result.items.some((item) => item.type === 'memory_update'), false);
     assert.equal(result.items.some((item) => item.type === 'proactive_update'), false);
     assert.equal(result.items.some((item) => item.type === 'handoff_banner'), false);
-    assert.equal(result.traceOnlyEventsByRunId.run_1.filter((item) => ['memory', 'open_loop', 'proactive', 'handoff'].includes(item.itemType)).length, 0);
-    assert.ok(result.items.some((item) => item.type === 'transcript_line' && item.label.includes('Use direct status updates')));
-    assert.ok(result.items.some((item) => item.type === 'transcript_line' && item.label.includes('External entry linked')));
+    assert.equal(result.traceOnlyEventsByRunId.run_1.filter((item) => ['memory', 'open_loop', 'proactive', 'handoff'].includes(item.itemType)).length, 5);
+    assert.equal(result.items.some((item) => item.type === 'transcript_line' && item.label.includes('Use direct status updates')), false);
+    assert.equal(result.items.some((item) => item.type === 'transcript_line' && item.label.includes('External entry linked')), false);
     assert.ok(result.items.some((item) => item.type === 'transcript_line' && item.status === 'running' && item.label === '已恢复执行'));
     assert.ok(result.items.some((item) => item.type === 'transcript_line' && item.status === 'running' && item.label.includes('User requested cancel')));
     assert.ok(result.items.some((item) => item.type === 'transcript_line' && item.status === 'failed' && item.label.includes('User cancelled')));
     assert.ok(result.items.some((item) => item.type === 'transcript_line' && item.status === 'failed' && item.label.includes('User changed direction')));
     assert.equal(result.activeRunStatusByRunId.run_1, 'cancelled');
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [
+        { id: 'msg_confirm_user', conversation_id: 'conv_1', role: 'user', content: '帮我写入文件' },
+        {
+          id: 'msg_confirm_raw',
+          conversation_id: 'conv_1',
+          role: 'assistant',
+          content: 'confirmation_required: apply_patch needs approval',
+          metadata: { run_id: 'run_confirm' },
+        },
+      ],
+      activeRunId: 'run_confirm',
+      runEventsByRunId: {
+        run_confirm: [
+          event('approval.requested', {
+            confirmation_id: 'confirm_1',
+            capability: 'apply_patch',
+            target_path: '/Users/hao/project/Joi/apps/joi-desktop/frontend/src/App.tsx',
+            risk: 'workspace_write',
+            status: 'waiting_confirmation',
+            seq: 1,
+          }, { run_id: 'run_confirm' }),
+          event('run.waiting_approval', { status: 'waiting_approval', seq: 2 }, { run_id: 'run_confirm' }),
+        ],
+      },
+      mode: 'serious_task',
+    });
+    assert.equal(JSON.stringify(result.items).includes('confirmation_required'), false);
+    const approvalLine = result.items.find((item) => item.type === 'transcript_line' && item.kind === 'approval');
+    assert.equal(approvalLine.status, 'waiting_approval');
+    assert.equal(approvalLine.approval.id, 'confirm_1');
+    assert.equal(approvalLine.approval.requestedAction, '写入文件');
+    assert.equal(result.activeRunStatusByRunId.run_confirm, 'waiting_approval');
   }
 } finally {
   rmSync(outDir, { recursive: true, force: true });
