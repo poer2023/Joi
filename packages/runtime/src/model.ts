@@ -195,6 +195,7 @@ export function parseOpenAICompatibleModels(raw: string): AvailableModel[] {
       max_output_tokens: maxOutputTokens || undefined,
       input_price_per_1m: firstPricePer1M(object, pricing, ['input_price_per_1m', 'prompt_price_per_1m', 'prompt']),
       output_price_per_1m: firstPricePer1M(object, pricing, ['output_price_per_1m', 'completion_price_per_1m', 'completion']),
+      cached_input_price_per_1m: firstPricePer1M(object, pricing, ['cached_input_price_per_1m', 'cached_prompt_price_per_1m', 'cached_input', 'cache_read', 'cache_read_input']),
       supports_json_mode: supportsJSONMode,
       supports_tool_calling: supportsToolCalling,
       supports_reasoning: supportsReasoning,

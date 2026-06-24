@@ -17,6 +17,12 @@ import type {
   AvailableModel,
   ArtifactDetail,
   ArtifactSummary,
+  AutomationDefinition,
+  AutomationDefinitionRequest,
+  AutomationKind,
+  AutomationRunRecord,
+  AutomationTriggerNowRequest,
+  AutomationTriggerRecord,
   BackupRecord,
   CapabilityRecord,
   ChatRequest,
@@ -32,6 +38,11 @@ import type {
   ConversationSummary,
   ExternalHandoffAudit,
   InputMode,
+  LogCleanupPreview,
+  LogCleanupRequest,
+  LogCleanupResult,
+  LogEntry,
+  LogFilter,
   MCPServerRecord,
   MCPWrapToolRequest,
   MemoryRecord,
@@ -42,6 +53,7 @@ import type {
   NodeRecord,
   OnboardingStatus,
   OpenLoop,
+  PermissionProfile,
   ProactiveMessage,
   ProductTask,
   ProductTaskDetail,
@@ -114,6 +126,43 @@ export type SendChatOptions = {
   executeCapability?: CapabilityExecutor;
 };
 
+export type AutomationTriggerEnqueueRequest = {
+  automation_id: string;
+  trigger_type?: string;
+  dedup_key: string;
+  payload?: Record<string, unknown>;
+  fire_at?: string;
+  status?: string;
+};
+
+export type AutomationTriggerClaim = {
+  trigger: AutomationTriggerRecord;
+  automation: AutomationDefinition;
+};
+
+export type AutomationRunStartRequest = {
+  automation_id: string;
+  trigger_id: string;
+  run_id: string;
+  product_task_id?: string;
+};
+
+export type AutomationRunFinishRequest = {
+  automation_run_id: string;
+  run_id?: string;
+  product_task_id?: string;
+  output_summary?: string;
+};
+
+export type AutomationRunFailRequest = {
+  automation_run_id: string;
+  run_id?: string;
+  product_task_id?: string;
+  error_code?: string;
+  error_message: string;
+  retry_at?: string;
+};
+
 export type PersistedToolResult = {
   call_id: string;
   name: string;
@@ -132,6 +181,9 @@ export type PersistedToolCallingTurn = {
     input_tokens?: number;
     output_tokens?: number;
     cached_input_tokens?: number;
+    cache_write_input_tokens?: number;
+    reasoning_tokens?: number;
+    total_tokens?: number;
   };
   usage_status?: 'recorded' | 'provider_missing' | 'estimated' | 'failed' | string;
   finish_reason?: string;
@@ -167,6 +219,9 @@ export type PersistedToolCallingResume = {
     input_tokens?: number;
     output_tokens?: number;
     cached_input_tokens?: number;
+    cache_write_input_tokens?: number;
+    reasoning_tokens?: number;
+    total_tokens?: number;
   };
   usage_status?: 'recorded' | 'provider_missing' | 'estimated' | 'failed' | string;
   finish_reason?: string;
@@ -217,6 +272,12 @@ export type RunEventV2Input = {
   phase?: string;
   source?: string;
   visibility?: string;
+  level?: string;
+  risk_level?: string;
+  category?: string;
+  feature_key?: string;
+  message?: string;
+  duration_ms?: number;
   created_at?: string;
   delta?: unknown;
   snapshot?: unknown;
@@ -224,6 +285,25 @@ export type RunEventV2Input = {
   error?: unknown;
   usage?: unknown;
   terminal?: boolean;
+};
+
+export type AppLogInput = {
+  id?: string;
+  level?: string;
+  risk_level?: string;
+  category?: string;
+  feature_key?: string;
+  source?: string;
+  message: string;
+  run_id?: string;
+  turn_id?: string;
+  conversation_id?: string;
+  item_type?: string;
+  item_id?: string;
+  payload?: Record<string, unknown>;
+  error?: unknown;
+  duration_ms?: number;
+  created_at?: string;
 };
 
 type ToolCallingCallbackToolCall = {
@@ -243,6 +323,9 @@ type ToolCallingCallbackUsage = {
   input_tokens?: number;
   output_tokens?: number;
   cached_input_tokens?: number;
+  cache_write_input_tokens?: number;
+  reasoning_tokens?: number;
+  total_tokens?: number;
 };
 
 export type ToolCallingEventCallbacks = {
@@ -293,6 +376,21 @@ type PromptConversationContext = {
   omitted_count: number;
 };
 
+type CanonicalModelUsage = {
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+  cache_write_input_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+};
+
+type ModelPricing = {
+  input_per_1m: number;
+  output_per_1m: number;
+  cached_input_per_1m: number;
+};
+
 const promptConversationContextLimit = 24;
 const promptConversationVerbatimLimit = 8;
 const promptConversationSummaryLimit = 220;
@@ -307,14 +405,870 @@ export class JoiSQLiteStore {
     mkdirSync(dirname(options.dbPath), { recursive: true });
     this.db = new DatabaseSync(options.dbPath);
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
+    this.ensurePreSchemaCompatibilityColumns();
     this.db.exec(options.schemaSql);
     this.ensureConversationClosureSchema();
     this.seedDefaults();
     this.classifyRecoverableRunsOnStartup();
+    this.recoverInterruptedAutomationTriggersOnStartup();
   }
 
   close(): void {
     this.db.close();
+  }
+
+  private ensurePreSchemaCompatibilityColumns(): void {
+    const ensure = (table: string, column: string, definition: string) => {
+      if (!this.tableExists(table) || this.columnExists(table, column)) return;
+      this.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${quoteIdentifier(column)} ${definition}`);
+    };
+    for (const [column, definition] of [
+      ['level', "TEXT NOT NULL DEFAULT 'info'"],
+      ['risk_level', "TEXT NOT NULL DEFAULT 'read_only'"],
+      ['category', "TEXT NOT NULL DEFAULT 'runtime'"],
+      ['feature_key', "TEXT NOT NULL DEFAULT ''"],
+      ['message', "TEXT NOT NULL DEFAULT ''"],
+      ['duration_ms', 'INTEGER'],
+    ] as const) ensure('run_events', column, definition);
+
+    for (const [column, definition] of [
+      ['level', "TEXT NOT NULL DEFAULT 'info'"],
+      ['risk_level', "TEXT NOT NULL DEFAULT 'read_only'"],
+      ['category', "TEXT NOT NULL DEFAULT 'system'"],
+      ['feature_key', "TEXT NOT NULL DEFAULT ''"],
+      ['source', "TEXT NOT NULL DEFAULT 'app'"],
+      ['message', "TEXT NOT NULL DEFAULT ''"],
+      ['run_id', 'TEXT'],
+      ['turn_id', 'TEXT'],
+      ['conversation_id', 'TEXT'],
+      ['item_type', 'TEXT'],
+      ['item_id', 'TEXT'],
+      ['payload', "TEXT NOT NULL DEFAULT '{}'"],
+      ['error', 'TEXT'],
+      ['duration_ms', 'INTEGER'],
+    ] as const) ensure('app_logs', column, definition);
+  }
+
+  recordAppLog(input: AppLogInput): LogEntry {
+    const level = normalizeLogLevel(input.level || (input.error ? 'error' : 'info'));
+    const riskLevel = normalizeLogRiskLevel(input.risk_level || 'read_only');
+    const category = normalizeLogCategory(input.category || 'system');
+    const featureKey = normalizeFeatureKey(input.feature_key || category);
+    const payload = sanitizeLogPayload(input.payload || {});
+    const errorPayload = sanitizeLogPayload(errorObject(input.error));
+    const message = redactSensitiveText(input.message || featureKey);
+    const id = input.id || `log_${newID()}`;
+    this.exec(
+      `INSERT INTO app_logs (
+         id, level, risk_level, category, feature_key, source, message,
+         run_id, turn_id, conversation_id, item_type, item_id, payload, error, duration_ms, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, COALESCE(?, datetime('now')))`,
+      id,
+      level,
+      riskLevel,
+      category,
+      featureKey,
+      input.source?.trim() || 'app',
+      message,
+      input.run_id || '',
+      input.turn_id || '',
+      input.conversation_id || '',
+      input.item_type || '',
+      input.item_id || '',
+      json(payload),
+      json(errorPayload),
+      optionalNumber(input.duration_ms) ?? null,
+      input.created_at || '',
+    );
+    return this.getLogEntry(id) as LogEntry;
+  }
+
+  listLogs(filter: LogFilter = {}): { logs: LogEntry[]; next_cursor?: string } {
+    const limit = clampLimit(filter.limit, 100);
+    const params: SQLiteValue[] = [];
+    const where = ['1=1'];
+    const listWhere = (column: string, values?: string[]) => {
+      const cleaned = (values || []).map((value) => value.trim()).filter(Boolean);
+      if (cleaned.length === 0) return;
+      where.push(`${column} IN (${cleaned.map(() => '?').join(', ')})`);
+      params.push(...cleaned);
+    };
+    if (filter.run_id?.trim()) {
+      where.push('run_id = ?');
+      params.push(filter.run_id.trim());
+    }
+    if (filter.conversation_id?.trim()) {
+      where.push('conversation_id = ?');
+      params.push(filter.conversation_id.trim());
+    }
+    if (filter.since?.trim()) {
+      where.push("datetime(created_at) >= datetime(?)");
+      params.push(filter.since.trim());
+    }
+    if (filter.until?.trim()) {
+      where.push("datetime(created_at) <= datetime(?)");
+      params.push(filter.until.trim());
+    }
+    if (filter.cursor?.trim()) {
+      where.push("datetime(created_at) < datetime(?)");
+      params.push(filter.cursor.trim());
+    }
+    listWhere('level', filter.levels);
+    listWhere('risk_level', filter.risk_levels);
+    listWhere('category', filter.categories);
+    listWhere('source', filter.sources);
+    if (filter.query?.trim()) {
+      const like = `%${escapeLike(filter.query.trim())}%`;
+      where.push(`(message LIKE ? ESCAPE '\\' OR feature_key LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\' OR event_type LIKE ? ESCAPE '\\' OR action LIKE ? ESCAPE '\\')`);
+      params.push(like, like, like, like, like, like);
+    }
+    if (!filter.include_trace) {
+      where.push(`NOT (source_table='run_events' AND (level='trace' OR event_type IN ('assistant.delta','model.delta','message.delta')))`);
+    }
+    if (!filter.include_worker_heartbeat) {
+      where.push(`NOT (source_table='worker_gateway_audit_logs' AND action IN ('heartbeat','claim'))`);
+    }
+    const rows = this.all(
+      `SELECT * FROM (
+         SELECT
+           id,
+           'run_events' AS source_table,
+           COALESCE(level, 'info') AS level,
+           COALESCE(risk_level, 'read_only') AS risk_level,
+           COALESCE(category, 'runtime') AS category,
+           COALESCE(feature_key, event_type) AS feature_key,
+           COALESCE(source, 'runtime') AS source,
+           COALESCE(NULLIF(message, ''), event_type) AS message,
+           run_id,
+           COALESCE(turn_id, '') AS turn_id,
+           COALESCE(conversation_id, '') AS conversation_id,
+           COALESCE(item_type, '') AS item_type,
+           COALESCE(item_id, '') AS item_id,
+           event_type,
+           '' AS action,
+           COALESCE(json_extract(payload, '$.status'), '') AS status,
+           COALESCE(payload_json, payload, '{}') AS payload,
+           COALESCE(error_json, '{}') AS error,
+           duration_ms,
+           created_at
+         FROM run_events
+         UNION ALL
+         SELECT
+           id,
+           'app_logs' AS source_table,
+           level,
+           risk_level,
+           category,
+           feature_key,
+           source,
+           message,
+           COALESCE(run_id, '') AS run_id,
+           COALESCE(turn_id, '') AS turn_id,
+           COALESCE(conversation_id, '') AS conversation_id,
+           COALESCE(item_type, '') AS item_type,
+           COALESCE(item_id, '') AS item_id,
+           '' AS event_type,
+           '' AS action,
+           '' AS status,
+           payload,
+           COALESCE(error, '{}') AS error,
+           duration_ms,
+           created_at
+         FROM app_logs
+         UNION ALL
+         SELECT
+           id,
+           'worker_gateway_audit_logs' AS source_table,
+           CASE WHEN status='denied' THEN 'warn' ELSE 'debug' END AS level,
+           'read_only' AS risk_level,
+           'worker_gateway' AS category,
+           'worker_gateway.' || action AS feature_key,
+           'worker_gateway' AS source,
+           action || ' ' || status AS message,
+           '' AS run_id,
+           '' AS turn_id,
+           '' AS conversation_id,
+           'worker' AS item_type,
+           COALESCE(node_id, '') AS item_id,
+           '' AS event_type,
+           action,
+           status,
+           metadata AS payload,
+           CASE WHEN status='denied' THEN json_object('message', COALESCE(reason, 'denied')) ELSE '{}' END AS error,
+           NULL AS duration_ms,
+           created_at
+         FROM worker_gateway_audit_logs
+       )
+       WHERE ${where.join(' AND ')}
+       ORDER BY datetime(created_at) DESC, id DESC
+       LIMIT ?`,
+      ...params,
+      limit + 1,
+    );
+    const entries = rows.slice(0, limit).map(rowToLogEntry);
+    return {
+      logs: entries,
+      next_cursor: rows.length > limit ? optionalString(rows[limit]?.created_at) : undefined,
+    };
+  }
+
+  getLogEntry(id: string): LogEntry | null {
+    const cleanID = id.trim();
+    if (!cleanID) return null;
+    const runEvent = this.get(
+      `SELECT
+         id, 'run_events' AS source_table, COALESCE(level, 'info') AS level,
+         COALESCE(risk_level, 'read_only') AS risk_level, COALESCE(category, 'runtime') AS category,
+         COALESCE(feature_key, event_type) AS feature_key, COALESCE(source, 'runtime') AS source,
+         COALESCE(NULLIF(message, ''), event_type) AS message, run_id, COALESCE(turn_id, '') AS turn_id,
+         COALESCE(conversation_id, '') AS conversation_id, COALESCE(item_type, '') AS item_type,
+         COALESCE(item_id, '') AS item_id, event_type, '' AS action,
+         COALESCE(json_extract(payload, '$.status'), '') AS status, COALESCE(payload_json, payload, '{}') AS payload,
+         COALESCE(error_json, '{}') AS error, duration_ms, created_at
+       FROM run_events WHERE id=?`,
+      cleanID,
+    );
+    if (runEvent) return rowToLogEntry(runEvent);
+    const appLog = this.get(
+      `SELECT
+         id, 'app_logs' AS source_table, level, risk_level, category, feature_key, source, message,
+         COALESCE(run_id, '') AS run_id, COALESCE(turn_id, '') AS turn_id,
+         COALESCE(conversation_id, '') AS conversation_id, COALESCE(item_type, '') AS item_type,
+         COALESCE(item_id, '') AS item_id, '' AS event_type, '' AS action, '' AS status,
+         payload, COALESCE(error, '{}') AS error, duration_ms, created_at
+       FROM app_logs WHERE id=?`,
+      cleanID,
+    );
+    if (appLog) return rowToLogEntry(appLog);
+    const gateway = this.get(
+      `SELECT
+         id, 'worker_gateway_audit_logs' AS source_table,
+         CASE WHEN status='denied' THEN 'warn' ELSE 'debug' END AS level,
+         'read_only' AS risk_level, 'worker_gateway' AS category, 'worker_gateway.' || action AS feature_key,
+         'worker_gateway' AS source, action || ' ' || status AS message, '' AS run_id, '' AS turn_id,
+         '' AS conversation_id, 'worker' AS item_type, COALESCE(node_id, '') AS item_id,
+         '' AS event_type, action, status, metadata AS payload,
+         CASE WHEN status='denied' THEN json_object('message', COALESCE(reason, 'denied')) ELSE '{}' END AS error,
+         NULL AS duration_ms, created_at
+       FROM worker_gateway_audit_logs WHERE id=?`,
+      cleanID,
+    );
+    return gateway ? rowToLogEntry(gateway) : null;
+  }
+
+  previewLogCleanup(req: LogCleanupRequest): LogCleanupPreview {
+    const scopes = normalizeLogCleanupScopes(req.scopes);
+    const counts: Record<string, number> = {};
+    for (const scope of scopes) {
+      counts[scope] = scope === 'log_files'
+        ? this.logFilesForCleanup().length
+        : this.countLogCleanupScope(scope, req);
+    }
+    const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+    const warnings = scopes.includes('run_events')
+      ? ['Run Trace events will be removed for matching runs; conversations and messages stay intact.']
+      : [];
+    return {
+      scopes,
+      counts,
+      log_file_paths: scopes.includes('log_files') ? this.logFilesForCleanup() : undefined,
+      total_count: total,
+      safe_to_clear: true,
+      warnings,
+    };
+  }
+
+  clearLogs(req: LogCleanupRequest): LogCleanupResult {
+    const scopes = normalizeLogCleanupScopes(req.scopes);
+    const preview = this.previewLogCleanup({ ...req, scopes });
+    const cleanupID = `cleanup_${newID()}`;
+    if (!req.dry_run) {
+      this.transaction(() => {
+        for (const scope of scopes) {
+          if (scope === 'log_files') continue;
+          this.deleteLogCleanupScope(scope, req);
+        }
+        this.exec(
+          `INSERT INTO log_cleanup_history (id, actor, scopes, filters, deleted_counts, reason)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          cleanupID,
+          req.actor?.trim() || 'desktop_user',
+          json(scopes),
+          json(sanitizeLogPayload({ ...req, scopes })),
+          json(preview.counts),
+          redactSensitiveText(req.reason || ''),
+        );
+      });
+      if (scopes.includes('log_files')) {
+        for (const file of this.logFilesForCleanup()) {
+          try {
+            rmSync(file, { force: true });
+          } catch {
+            // Best-effort cleanup; DB cleanup already recorded exact intent.
+          }
+        }
+      }
+    }
+    return {
+      ...preview,
+      cleanup_id: cleanupID,
+      cleared_at: nowIso(),
+    };
+  }
+
+  exportLogs(filter: LogFilter = {}): { path: string } {
+    mkdirSync(this.options.logDir, { recursive: true });
+    const path = join(this.options.logDir, `joi-logs-${timestampForFilename()}.json`);
+    const logs = this.listLogs({ ...filter, limit: filter.limit || 500 }).logs;
+    writeFileSync(path, JSON.stringify({ exported_at: nowIso(), filter, logs }, null, 2));
+    return { path };
+  }
+
+  private countLogCleanupScope(scope: string, req: LogCleanupRequest): number {
+    const { where, params } = this.logCleanupWhere(scope, req);
+    return Number(this.get(`SELECT COUNT(*) AS count FROM ${logCleanupTable(scope)} WHERE ${where}`, ...params)?.count || 0);
+  }
+
+  private deleteLogCleanupScope(scope: string, req: LogCleanupRequest): void {
+    const { where, params } = this.logCleanupWhere(scope, req);
+    this.exec(`DELETE FROM ${logCleanupTable(scope)} WHERE ${where}`, ...params);
+  }
+
+  private logCleanupWhere(scope: string, req: LogCleanupRequest): { where: string; params: SQLiteValue[] } {
+    const params: SQLiteValue[] = [];
+    const where = ['1=1'];
+    if (req.older_than?.trim()) {
+      where.push("datetime(created_at) < datetime(?)");
+      params.push(req.older_than.trim());
+    }
+    if (req.run_id?.trim() && ['run_events', 'run_steps', 'tool_runs', 'model_calls', 'app_logs'].includes(scope)) {
+      where.push('run_id = ?');
+      params.push(req.run_id.trim());
+    }
+    if (scope === 'run_events') {
+      if (!req.include_trace_delta) {
+        where.push("event_type NOT IN ('assistant.delta','model.delta','message.delta')");
+      }
+      const levels = (req.levels || []).map((item) => item.trim()).filter(Boolean);
+      if (levels.length > 0) {
+        where.push(`level IN (${levels.map(() => '?').join(', ')})`);
+        params.push(...levels);
+      }
+      const categories = (req.categories || []).map((item) => item.trim()).filter(Boolean);
+      if (categories.length > 0) {
+        where.push(`category IN (${categories.map(() => '?').join(', ')})`);
+        params.push(...categories);
+      }
+    }
+    if (scope === 'app_logs') {
+      const levels = (req.levels || []).map((item) => item.trim()).filter(Boolean);
+      if (levels.length > 0) {
+        where.push(`level IN (${levels.map(() => '?').join(', ')})`);
+        params.push(...levels);
+      }
+      const categories = (req.categories || []).map((item) => item.trim()).filter(Boolean);
+      if (categories.length > 0) {
+        where.push(`category IN (${categories.map(() => '?').join(', ')})`);
+        params.push(...categories);
+      }
+    }
+    if (scope === 'worker_gateway_audit_logs' && !req.include_worker_heartbeat) {
+      where.push("action NOT IN ('heartbeat','claim')");
+    }
+    return { where: where.join(' AND '), params };
+  }
+
+  private logFilesForCleanup(): string[] {
+    try {
+      return readdirSync(this.options.logDir)
+        .map((name) => join(this.options.logDir, name))
+        .filter((path) => {
+          try {
+            const stat = statSync(path);
+            return stat.isFile() && /\.(log|json|txt)$/i.test(path);
+          } catch {
+            return false;
+          }
+        });
+    } catch {
+      return [];
+    }
+  }
+
+  listAutomations(filter: { kind?: AutomationKind; enabled?: boolean; limit?: number } = {}): { automations: AutomationDefinition[] } {
+    const where = ['deleted_at IS NULL'];
+    const params: SQLiteValue[] = [];
+    if (filter.kind) {
+      where.push('kind = ?');
+      params.push(normalizeAutomationKind(filter.kind));
+    }
+    if (typeof filter.enabled === 'boolean') {
+      where.push('enabled = ?');
+      params.push(filter.enabled ? 1 : 0);
+    }
+    const limit = clampLimit(filter.limit, 100);
+    const rows = this.all(
+      `SELECT * FROM automation_definitions
+       WHERE ${where.join(' AND ')}
+       ORDER BY enabled DESC, datetime(updated_at) DESC, datetime(created_at) DESC
+       LIMIT ?`,
+      ...params,
+      limit,
+    );
+    return { automations: rows.map(rowToAutomationDefinition) };
+  }
+
+  getAutomation(idOrSlug: string): AutomationDefinition {
+    const key = idOrSlug.trim();
+    if (!key) throw new Error('automation id is required');
+    const row = this.get(
+      `SELECT * FROM automation_definitions
+       WHERE deleted_at IS NULL AND (id=? OR slug=?)
+       LIMIT 1`,
+      key,
+      key,
+    );
+    if (!row) throw new Error(`Automation not found: ${key}`);
+    return rowToAutomationDefinition(row);
+  }
+
+  saveAutomation(req: AutomationDefinitionRequest): AutomationDefinition {
+    const id = req.id?.trim() || `automation_${newID()}`;
+    const existing = req.id?.trim()
+      ? this.get(`SELECT * FROM automation_definitions WHERE id=? AND deleted_at IS NULL`, req.id.trim())
+      : undefined;
+    const name = req.name?.trim() || optionalString(existing?.name) || 'Untitled automation';
+    const baseSlug = sanitizeAutomationSlug(req.slug || optionalString(existing?.slug) || name || id);
+    const slug = this.availableAutomationSlug(baseSlug, id);
+    const kind = normalizeAutomationKind(req.kind || optionalString(existing?.kind) || 'schedule');
+    const now = nowIso();
+    const triggerConfig = req.trigger_config ?? parseObject(existing?.trigger_config);
+    const metadata = {
+      ...parseObject(existing?.metadata),
+      ...(req.metadata || {}),
+    };
+    const retryPolicy = Object.keys(req.retry_policy || {}).length > 0
+      ? req.retry_policy
+      : Object.keys(parseObject(existing?.retry_policy)).length > 0
+        ? parseObject(existing?.retry_policy)
+        : defaultAutomationRetryPolicy();
+    const maxConcurrency = Math.max(1, Math.floor(Number(req.max_concurrency ?? existing?.max_concurrency ?? 1) || 1));
+    if (existing) {
+      this.exec(
+        `UPDATE automation_definitions
+         SET kind=?, slug=?, name=?, description=?, enabled=?, trigger_config=?, prompt_template=?,
+             input_mode=?, permission_profile=?, preferred_node=?, allow_worker=?, conversation_id=NULLIF(?, ''),
+             principal_id=NULLIF(?, ''), dedup_policy=?, retry_policy=?, max_concurrency=?,
+             notification_policy=?, metadata=?, updated_at=?
+         WHERE id=?`,
+        kind,
+        slug,
+        name,
+        req.description ?? optionalString(existing.description) ?? '',
+        req.enabled ?? Boolean(Number(existing.enabled ?? 1)) ? 1 : 0,
+        json(triggerConfig),
+        req.prompt_template ?? optionalString(existing.prompt_template) ?? defaultAutomationPromptTemplate(kind),
+        normalizeAutomationInputMode(req.input_mode || optionalString(existing.input_mode)),
+        normalizeAutomationPermissionProfile(req.permission_profile || optionalString(existing.permission_profile)),
+        req.preferred_node?.trim() || optionalString(existing.preferred_node) || 'main-node',
+        req.allow_worker ?? Boolean(Number(existing.allow_worker ?? 0)) ? 1 : 0,
+        req.conversation_id?.trim() || optionalString(existing.conversation_id) || '',
+        req.principal_id?.trim() || optionalString(existing.principal_id) || '',
+        json(req.dedup_policy ?? parseObject(existing.dedup_policy)),
+        json(retryPolicy),
+        maxConcurrency,
+        json(req.notification_policy ?? parseObject(existing.notification_policy)),
+        json(metadata),
+        now,
+        id,
+      );
+      return this.getAutomation(id);
+    }
+    this.exec(
+      `INSERT INTO automation_definitions (
+         id, kind, slug, name, description, enabled, trigger_config, prompt_template, input_mode,
+         permission_profile, preferred_node, allow_worker, conversation_id, principal_id, dedup_policy,
+         retry_policy, max_concurrency, notification_policy, metadata, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?)`,
+      id,
+      kind,
+      slug,
+      name,
+      req.description || '',
+      req.enabled ?? true ? 1 : 0,
+      json(triggerConfig),
+      req.prompt_template || defaultAutomationPromptTemplate(kind),
+      normalizeAutomationInputMode(req.input_mode),
+      normalizeAutomationPermissionProfile(req.permission_profile),
+      req.preferred_node?.trim() || 'main-node',
+      req.allow_worker ? 1 : 0,
+      req.conversation_id?.trim() || '',
+      req.principal_id?.trim() || '',
+      json(req.dedup_policy || {}),
+      json(retryPolicy),
+      maxConcurrency,
+      json(req.notification_policy || {}),
+      json(metadata),
+      now,
+      now,
+    );
+    return this.getAutomation(id);
+  }
+
+  deleteAutomation(id: string): void {
+    const automationID = id.trim();
+    if (!automationID) throw new Error('automation id is required');
+    this.exec(
+      `UPDATE automation_definitions
+       SET enabled=0, deleted_at=datetime('now'), updated_at=datetime('now')
+       WHERE id=? OR slug=?`,
+      automationID,
+      automationID,
+    );
+  }
+
+  setAutomationEnabled(req: { id: string; enabled: boolean }): AutomationDefinition {
+    const automation = this.getAutomation(req.id);
+    this.exec(
+      `UPDATE automation_definitions
+       SET enabled=?, updated_at=datetime('now')
+       WHERE id=?`,
+      req.enabled ? 1 : 0,
+      automation.id,
+    );
+    return this.getAutomation(automation.id);
+  }
+
+  listAutomationTriggers(filter: { automation_id?: string; status?: string; limit?: number } = {}): { triggers: AutomationTriggerRecord[] } {
+    const where = ['1=1'];
+    const params: SQLiteValue[] = [];
+    if (filter.automation_id?.trim()) {
+      where.push('automation_id = ?');
+      params.push(filter.automation_id.trim());
+    }
+    if (filter.status?.trim()) {
+      where.push('status = ?');
+      params.push(filter.status.trim());
+    }
+    const rows = this.all(
+      `SELECT * FROM automation_triggers
+       WHERE ${where.join(' AND ')}
+       ORDER BY datetime(created_at) DESC
+       LIMIT ?`,
+      ...params,
+      clampLimit(filter.limit, 100),
+    );
+    return { triggers: rows.map(rowToAutomationTrigger) };
+  }
+
+  listAutomationRuns(filter: { automation_id?: string; trigger_id?: string; limit?: number } = {}): { runs: AutomationRunRecord[] } {
+    const where = ['1=1'];
+    const params: SQLiteValue[] = [];
+    if (filter.automation_id?.trim()) {
+      where.push('automation_id = ?');
+      params.push(filter.automation_id.trim());
+    }
+    if (filter.trigger_id?.trim()) {
+      where.push('trigger_id = ?');
+      params.push(filter.trigger_id.trim());
+    }
+    const rows = this.all(
+      `SELECT * FROM automation_runs
+       WHERE ${where.join(' AND ')}
+       ORDER BY datetime(created_at) DESC
+       LIMIT ?`,
+      ...params,
+      clampLimit(filter.limit, 100),
+    );
+    return { runs: rows.map(rowToAutomationRun) };
+  }
+
+  enqueueAutomationTrigger(req: AutomationTriggerEnqueueRequest): { trigger: AutomationTriggerRecord; deduped: boolean } {
+    const automation = this.getAutomation(req.automation_id);
+    if (!automation.enabled) throw codedError('AUTOMATION_DISABLED', 'Automation is disabled');
+    const dedupKey = req.dedup_key.trim();
+    if (!dedupKey) throw codedError('INVALID_PAYLOAD', 'automation trigger dedup_key is required');
+    const triggerID = `autotrig_${newID()}`;
+    const fireAt = req.fire_at || nowIso();
+    try {
+      this.exec(
+        `INSERT INTO automation_triggers (
+           id, automation_id, trigger_type, dedup_key, payload, status, fire_at, next_attempt_at, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+        triggerID,
+        automation.id,
+        req.trigger_type?.trim() || automation.kind,
+        dedupKey,
+        json(req.payload || {}),
+        req.status?.trim() || 'pending',
+        fireAt,
+        fireAt,
+      );
+      return { trigger: this.requireAutomationTrigger(triggerID), deduped: false };
+    } catch (error) {
+      const existing = this.get(
+        `SELECT * FROM automation_triggers WHERE automation_id=? AND dedup_key=?`,
+        automation.id,
+        dedupKey,
+      );
+      if (existing) {
+        const trigger = rowToAutomationTrigger(existing);
+        if (trigger.run_id) {
+          this.appendAutomationRunEvent(trigger.run_id, 'automation.trigger_deduped', {
+            automation_id: automation.id,
+            trigger_id: trigger.id,
+            dedup_key: dedupKey,
+            title: 'Automation trigger deduped',
+            summary: automation.name,
+          });
+        }
+        return { trigger, deduped: true };
+      }
+      throw error;
+    }
+  }
+
+  triggerAutomationNow(req: AutomationTriggerNowRequest): { trigger: AutomationTriggerRecord } {
+    const automation = this.getAutomation(req.id);
+    const dedupKey = `manual:${nowIso()}:${newID()}`;
+    const result = this.enqueueAutomationTrigger({
+      automation_id: automation.id,
+      trigger_type: 'manual',
+      dedup_key: dedupKey,
+      payload: req.payload || {},
+      fire_at: nowIso(),
+    });
+    return { trigger: result.trigger };
+  }
+
+  listDueScheduleAutomations(now = nowIso()): AutomationDefinition[] {
+    return this.all(
+      `SELECT * FROM automation_definitions
+       WHERE kind='schedule' AND enabled=1 AND deleted_at IS NULL
+         AND (next_fire_at IS NULL OR datetime(next_fire_at) <= datetime(?))
+       ORDER BY datetime(COALESCE(next_fire_at, created_at)) ASC
+       LIMIT 100`,
+      now,
+    ).map(rowToAutomationDefinition);
+  }
+
+  updateAutomationScheduleState(id: string, nextFireAt?: string, lastFireAt?: string): AutomationDefinition {
+    this.exec(
+      `UPDATE automation_definitions
+       SET next_fire_at=NULLIF(?, ''), last_fire_at=COALESCE(NULLIF(?, ''), last_fire_at), updated_at=datetime('now')
+       WHERE id=?`,
+      nextFireAt || '',
+      lastFireAt || '',
+      id,
+    );
+    return this.getAutomation(id);
+  }
+
+  claimDueAutomationTrigger(now = nowIso()): AutomationTriggerClaim | undefined {
+    let claimedID = '';
+    let claimToken = '';
+    this.transaction(() => {
+      const row = this.get(
+        `SELECT t.id
+         FROM automation_triggers t
+         JOIN automation_definitions a ON a.id=t.automation_id
+         WHERE a.enabled=1
+           AND a.deleted_at IS NULL
+           AND t.status IN ('pending', 'retry_scheduled')
+           AND datetime(COALESCE(t.next_attempt_at, t.fire_at, t.created_at)) <= datetime(?)
+           AND (
+             SELECT COUNT(*)
+             FROM automation_triggers active
+             WHERE active.automation_id=t.automation_id
+               AND active.status IN ('claimed', 'running')
+           ) < MAX(1, a.max_concurrency)
+         ORDER BY datetime(COALESCE(t.next_attempt_at, t.fire_at, t.created_at)) ASC, datetime(t.created_at) ASC
+         LIMIT 1`,
+        now,
+      );
+      const triggerID = optionalString(row?.id);
+      if (!triggerID) return;
+      claimToken = `claim_${newID()}`;
+      const result = this.db.prepare(
+        `UPDATE automation_triggers
+         SET status='claimed', claim_token=?, claimed_at=datetime('now'), attempt_count=attempt_count+1, updated_at=datetime('now')
+         WHERE id=? AND status IN ('pending', 'retry_scheduled')`,
+      ).run(claimToken, triggerID);
+      if (Number(result.changes ?? 0) === 1) {
+        claimedID = triggerID;
+      }
+    });
+    if (!claimedID) return undefined;
+    const trigger = this.requireAutomationTrigger(claimedID);
+    const automation = this.getAutomation(trigger.automation_id);
+    return { trigger, automation };
+  }
+
+  recordAutomationRunStarted(req: AutomationRunStartRequest): AutomationRunRecord {
+    const trigger = this.requireAutomationTrigger(req.trigger_id);
+    const automation = this.getAutomation(req.automation_id);
+    const runID = req.run_id.trim();
+    if (!runID) throw new Error('automation run_id is required');
+    const automationRunID = `autorun_${newID()}`;
+    const attempt = Math.max(1, trigger.attempt_count || 1);
+    this.transaction(() => {
+      this.exec(
+        `INSERT INTO automation_runs (
+           id, automation_id, trigger_id, run_id, product_task_id, status, attempt_number, started_at, metadata, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, NULLIF(?, ''), 'running', ?, datetime('now'), ?, datetime('now'), datetime('now'))`,
+        automationRunID,
+        automation.id,
+        trigger.id,
+        runID,
+        req.product_task_id || '',
+        attempt,
+        json({ claim_token: trigger.claim_token || '', trigger_type: trigger.trigger_type }),
+      );
+      this.exec(
+        `UPDATE automation_triggers
+         SET status='running', run_id=?, product_task_id=NULLIF(?, ''), updated_at=datetime('now')
+         WHERE id=?`,
+        runID,
+        req.product_task_id || '',
+        trigger.id,
+      );
+      this.appendAutomationRunEvent(runID, 'automation.trigger_received', {
+        automation_id: automation.id,
+        automation_name: automation.name,
+        trigger_id: trigger.id,
+        trigger_type: trigger.trigger_type,
+        dedup_key: trigger.dedup_key,
+        payload_keys: Object.keys(trigger.payload).slice(0, 32),
+        title: 'Automation trigger received',
+        summary: automation.name,
+      });
+      this.appendAutomationRunEvent(runID, 'automation.claimed', {
+        automation_id: automation.id,
+        automation_name: automation.name,
+        trigger_id: trigger.id,
+        attempt_number: attempt,
+        title: 'Automation claimed',
+        summary: automation.name,
+      });
+      this.appendAutomationRunEvent(runID, 'automation.run_started', {
+        automation_id: automation.id,
+        automation_name: automation.name,
+        trigger_id: trigger.id,
+        automation_run_id: automationRunID,
+        product_task_id: req.product_task_id || undefined,
+        title: 'Automation run started',
+        summary: automation.name,
+      });
+    });
+    return this.requireAutomationRun(automationRunID);
+  }
+
+  recordAutomationTriggerFailed(req: { trigger_id: string; error_code?: string; error_message: string; retry_at?: string }): AutomationTriggerRecord {
+    const status = req.retry_at ? 'retry_scheduled' : 'failed';
+    this.exec(
+      `UPDATE automation_triggers
+       SET status=?, next_attempt_at=NULLIF(?, ''), error_code=?, error_message=?, updated_at=datetime('now')
+       WHERE id=?`,
+      status,
+      req.retry_at || '',
+      req.error_code || '',
+      req.error_message,
+      req.trigger_id,
+    );
+    return this.requireAutomationTrigger(req.trigger_id);
+  }
+
+  recordAutomationRunCompleted(req: AutomationRunFinishRequest): AutomationRunRecord {
+    const run = this.requireAutomationRun(req.automation_run_id);
+    const runID = req.run_id?.trim() || run.run_id || '';
+    this.transaction(() => {
+      this.exec(
+        `UPDATE automation_runs
+         SET status='succeeded', run_id=COALESCE(NULLIF(?, ''), run_id), product_task_id=COALESCE(NULLIF(?, ''), product_task_id),
+             output_summary=?, finished_at=datetime('now'), updated_at=datetime('now')
+         WHERE id=?`,
+        runID,
+        req.product_task_id || '',
+        req.output_summary || '',
+        req.automation_run_id,
+      );
+      this.exec(
+        `UPDATE automation_triggers
+         SET status='succeeded', run_id=COALESCE(NULLIF(?, ''), run_id), product_task_id=COALESCE(NULLIF(?, ''), product_task_id),
+             error_code=NULL, error_message=NULL, updated_at=datetime('now')
+         WHERE id=?`,
+        runID,
+        req.product_task_id || '',
+        run.trigger_id,
+      );
+      if (runID) {
+        this.appendAutomationRunEvent(runID, 'automation.run_completed', {
+          automation_id: run.automation_id,
+          trigger_id: run.trigger_id,
+          automation_run_id: run.id,
+          product_task_id: req.product_task_id || run.product_task_id || undefined,
+          title: 'Automation run completed',
+          summary: req.output_summary || 'Automation completed.',
+        });
+      }
+    });
+    return this.requireAutomationRun(req.automation_run_id);
+  }
+
+  recordAutomationRunFailed(req: AutomationRunFailRequest): AutomationRunRecord {
+    const run = this.requireAutomationRun(req.automation_run_id);
+    const runID = req.run_id?.trim() || run.run_id || '';
+    const runStatus = isPendingConfirmationAutomationError(req.error_code, req.error_message) ? 'waiting_confirmation' : 'failed';
+    const triggerStatus = req.retry_at ? 'retry_scheduled' : runStatus === 'waiting_confirmation' ? 'waiting_confirmation' : 'failed';
+    this.transaction(() => {
+      this.exec(
+        `UPDATE automation_runs
+         SET status=?, run_id=COALESCE(NULLIF(?, ''), run_id), product_task_id=COALESCE(NULLIF(?, ''), product_task_id),
+             error_code=?, error_message=?, finished_at=datetime('now'), updated_at=datetime('now')
+         WHERE id=?`,
+        runStatus,
+        runID,
+        req.product_task_id || '',
+        req.error_code || '',
+        req.error_message,
+        run.id,
+      );
+      this.exec(
+        `UPDATE automation_triggers
+         SET status=?, run_id=COALESCE(NULLIF(?, ''), run_id), product_task_id=COALESCE(NULLIF(?, ''), product_task_id),
+             next_attempt_at=NULLIF(?, ''), error_code=?, error_message=?, updated_at=datetime('now')
+         WHERE id=?`,
+        triggerStatus,
+        runID,
+        req.product_task_id || '',
+        req.retry_at || '',
+        req.error_code || '',
+        req.error_message,
+        run.trigger_id,
+      );
+      if (runID) {
+        this.appendAutomationRunEvent(runID, 'automation.run_failed', {
+          automation_id: run.automation_id,
+          trigger_id: run.trigger_id,
+          automation_run_id: run.id,
+          product_task_id: req.product_task_id || run.product_task_id || undefined,
+          error_code: req.error_code || '',
+          title: 'Automation run failed',
+          summary: req.error_message,
+        });
+        if (req.retry_at) {
+          this.appendAutomationRunEvent(runID, 'automation.retry_scheduled', {
+            automation_id: run.automation_id,
+            trigger_id: run.trigger_id,
+            automation_run_id: run.id,
+            retry_at: req.retry_at,
+            title: 'Automation retry scheduled',
+            summary: req.retry_at,
+          });
+        }
+      }
+    });
+    return this.requireAutomationRun(run.id);
   }
 
   appendRunEventV2(input: RunEventV2Input): RunEvent {
@@ -326,6 +1280,12 @@ export class JoiSQLiteStore {
     const seq = input.seq && input.seq > 0 ? input.seq : this.nextRunEventSeq(runID);
     const schemaVersion = input.schema_version || 2;
     const status = input.status || statusForRunEventType(eventType);
+    const level = normalizeLogLevel(input.level || logLevelForRunEvent(eventType, status, input.error));
+    const riskLevel = normalizeLogRiskLevel(input.risk_level || logRiskForRunEvent(eventType, input.payload || {}));
+    const category = normalizeLogCategory(input.category || logCategoryForRunEvent(eventType, input.item_type));
+    const featureKey = normalizeFeatureKey(input.feature_key || logFeatureKeyForRunEvent(eventType, input.payload || {}));
+    const message = redactSensitiveText(input.message || logMessageForRunEvent(eventType, input.payload || {}, status));
+    const durationMs = optionalNumber(input.duration_ms);
     const payload = pruneUndefined({
       ...(input.payload || {}),
       schema_version: schemaVersion,
@@ -342,18 +1302,26 @@ export class JoiSQLiteStore {
       phase: input.phase,
       source: input.source || 'runtime',
       visibility: input.visibility || visibilityForRunEventType(eventType, input.item_type),
+      level,
+      risk_level: riskLevel,
+      category,
+      feature_key: featureKey,
+      message,
       terminal: input.terminal || terminalRunEventType(eventType) || undefined,
       delta: input.delta,
       snapshot: input.snapshot,
       error: errorSummary(input.error),
       usage: input.usage,
+      duration_ms: durationMs,
     });
     this.exec(
       `INSERT INTO run_events (id, run_id, turn_id, schema_version, conversation_id, seq, event_type,
-                               item_type, item_id, parent_item_id, phase, visibility, source, terminal,
-                               payload, payload_json, error_json, usage_json, created_at)
+                               item_type, item_id, parent_item_id, phase, visibility, source,
+                               level, risk_level, category, feature_key, message, terminal,
+                               payload, payload_json, error_json, usage_json, duration_ms, created_at)
        VALUES (?, ?, NULLIF(?, ''), ?, NULLIF(?, ''), ?, ?, NULLIF(?, ''), NULLIF(?, ''),
-               NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?,
+               NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
+               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                COALESCE(?, datetime('now')))`,
       input.id || `evt_${newID()}`,
       runID,
@@ -368,11 +1336,17 @@ export class JoiSQLiteStore {
       input.phase || '',
       payload.visibility ? String(payload.visibility) : '',
       payload.source ? String(payload.source) : '',
+      level,
+      riskLevel,
+      category,
+      featureKey,
+      message,
       payload.terminal ? 1 : 0,
       json(payload),
       json(payload),
       json(input.error || {}),
       json(input.usage || {}),
+      durationMs ?? null,
       input.created_at || '',
     );
     return rowToRunEvent(this.get(`SELECT * FROM run_events WHERE run_id=? AND seq=?`, runID, seq)!);
@@ -533,6 +1507,26 @@ export class JoiSQLiteStore {
         });
       },
       onUsage: (event) => {
+        const normalizedUsage = canonicalModelUsage(event.usage);
+        const costEstimate = this.estimateModelUsageCost(started.provider, started.model_name, normalizedUsage);
+        this.exec(
+          `UPDATE model_calls
+           SET input_tokens=?, output_tokens=?, cached_input_tokens=?, cache_write_input_tokens=?,
+               reasoning_tokens=?, total_tokens=?, cost_estimate=?, usage_status=?,
+               metadata=json_set(COALESCE(metadata, '{}'), '$.usage_status', ?, '$.estimated_cost', ?)
+           WHERE id=?`,
+          normalizedUsage.input_tokens,
+          normalizedUsage.output_tokens,
+          normalizedUsage.cached_input_tokens,
+          normalizedUsage.cache_write_input_tokens,
+          normalizedUsage.reasoning_tokens,
+          normalizedUsage.total_tokens,
+          roundCost(costEstimate),
+          event.usage_status,
+          event.usage_status,
+          roundCost(costEstimate),
+          started.model_call_id,
+        );
         append({
           event_type: 'usage.recorded',
           item_type: 'model',
@@ -540,8 +1534,8 @@ export class JoiSQLiteStore {
           status: event.usage_status,
           source: 'model_provider',
           visibility: 'trace_only',
-          usage: event.usage,
-          payload: { step: event.step, usage_status: event.usage_status },
+          usage: normalizedUsage,
+          payload: { step: event.step, usage_status: event.usage_status, estimated_cost: roundCost(costEstimate) },
         });
       },
       onError: (event) => {
@@ -1121,6 +2115,9 @@ export class JoiSQLiteStore {
     const response = turn.final_message.trim() || '模型没有返回可展示内容。';
     const toolResults = turn.tool_results || [];
     const usage = turn.usage || {};
+    const normalizedUsage = canonicalModelUsage(usage);
+    const usageStatus = turn.usage_status || usageStatusForUsage(normalizedUsage);
+    const costEstimate = this.estimateModelUsageCost(started.provider, started.model_name, normalizedUsage);
     const waitingConfirmation = turn.status === 'waiting_confirmation' || toolResults.some(isWaitingConfirmationToolResult);
     let artifacts: ArtifactSummary[] = [];
     let productTask: ProductTask | undefined = started.product_task;
@@ -1313,26 +2310,31 @@ export class JoiSQLiteStore {
         productTask = this.getProductTask(started.product_task_id).task;
       }
       const persistedToolRunCount = this.persistedToolRunCountForRun(started.run_id);
-      this.insertRunStep(started.run_id, 'model_call_finished', 'Model call finished', { agent_id: started.selected_agent_id, model_id: started.model_name, prompt_assembly_id: started.prompt_assembly_id }, { provider: started.provider, model: started.model_name, real_model: started.provider !== 'mock_provider', fallback_to_mock: false, input_tokens: positiveNumber(usage.input_tokens), output_tokens: positiveNumber(usage.output_tokens), cached_input_tokens: positiveNumber(usage.cached_input_tokens), tool_run_count: persistedToolRunCount });
+      this.insertRunStep(started.run_id, 'model_call_finished', 'Model call finished', { agent_id: started.selected_agent_id, model_id: started.model_name, prompt_assembly_id: started.prompt_assembly_id }, { provider: started.provider, model: started.model_name, real_model: started.provider !== 'mock_provider', fallback_to_mock: false, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_count: persistedToolRunCount });
       this.insertRunStep(started.run_id, 'agent_output_parsed', 'Agent output parsed', { turn: 1 }, { repaired: false, output_type: 'final_answer' });
       this.insertRunStep(started.run_id, 'response_generated', waitingConfirmation ? 'Confirmation response generated' : 'Response generated', {}, { response }, waitingConfirmation ? 'waiting_confirmation' : 'succeeded');
       this.insertTurnItem(started.run_id, started.turn_id, itemSeq++, 'message', 'assistant', '', '', {}, response, {}, waitingConfirmation ? 'waiting_confirmation' : 'completed', { final_answer: !waitingConfirmation, waiting_confirmation: waitingConfirmation });
-      const usageStatus = turn.usage_status || usageStatusForUsage(usage);
       this.exec(
         `UPDATE model_calls
-         SET input_tokens=?, output_tokens=?, cached_input_tokens=?, latency_ms=0, status='succeeded',
-             completed_at=datetime('now'), finish_reason=?, usage_status=?, raw_response=?, raw_finish_json=?,
-             metadata=json_set(COALESCE(metadata, '{}'), '$.tool_run_count', ?, '$.usage_status', ?)
+         SET input_tokens=?, output_tokens=?, cached_input_tokens=?, cache_write_input_tokens=?, reasoning_tokens=?, total_tokens=?,
+             cost_estimate=?, latency_ms=0, status='succeeded', completed_at=datetime('now'), finish_reason=?,
+             usage_status=?, raw_response=?, raw_finish_json=?,
+             metadata=json_set(COALESCE(metadata, '{}'), '$.tool_run_count', ?, '$.usage_status', ?, '$.estimated_cost', ?)
          WHERE id=?`,
-        positiveNumber(usage.input_tokens),
-        positiveNumber(usage.output_tokens),
-        positiveNumber(usage.cached_input_tokens),
+        normalizedUsage.input_tokens,
+        normalizedUsage.output_tokens,
+        normalizedUsage.cached_input_tokens,
+        normalizedUsage.cache_write_input_tokens,
+        normalizedUsage.reasoning_tokens,
+        normalizedUsage.total_tokens,
+        roundCost(costEstimate),
         turn.status || 'completed',
         usageStatus,
         json({ responses: turn.model_responses || [] }),
         json({ status: turn.status || 'completed', usage_status: usageStatus }),
         persistedToolRunCount,
         usageStatus,
+        roundCost(costEstimate),
         started.model_call_id,
       );
       this.exec(
@@ -1377,7 +2379,7 @@ export class JoiSQLiteStore {
           this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'assistant.completed', { run_id: started.run_id, turn_id: started.turn_id, item_type: 'assistant_message', item_id: started.assistant_message_id, delta: { text: response }, status: 'completed', visibility: 'chat', source: 'store', type: 'assistant.completed' });
         }
         if (!hasRunEvent('usage.recorded', started.model_call_id)) {
-          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'usage.recorded', { run_id: started.run_id, turn_id: started.turn_id, item_type: 'model', item_id: started.model_call_id, status: usageStatus, visibility: 'trace_only', source: 'store', usage, usage_status: usageStatus, type: 'usage.recorded' });
+          this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'usage.recorded', { run_id: started.run_id, turn_id: started.turn_id, item_type: 'model', item_id: started.model_call_id, status: usageStatus, visibility: 'trace_only', source: 'store', usage: normalizedUsage, usage_status: usageStatus, estimated_cost: roundCost(costEstimate), type: 'usage.recorded' });
         }
         this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'message.delta', { run_id: started.run_id, turn_id: started.turn_id, delta: response, status: 'completed', visibility: 'trace_only', source: 'store', type: 'message.delta' });
         this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'turn.completed', { run_id: started.run_id, turn_id: started.turn_id, status: 'completed', type: 'turn.completed' });
@@ -1500,6 +2502,9 @@ export class JoiSQLiteStore {
     const promptCacheKey = prompt.prompt_cache_key;
     const toolResults = turn.tool_results || [];
     const usage = turn.usage || {};
+    const normalizedUsage = canonicalModelUsage(usage);
+    const usageStatus = turn.usage_status || usageStatusForUsage(normalizedUsage);
+    const costEstimate = this.estimateModelUsageCost(provider, modelName, normalizedUsage);
     const waitingResult = toolResults.find(isWaitingConfirmationToolResult);
     const waitingConfirmation = turn.status === 'waiting_confirmation' || Boolean(waitingResult);
     const runStatus = waitingConfirmation ? 'waiting_confirmation' : 'completed';
@@ -1845,18 +2850,18 @@ export class JoiSQLiteStore {
       }
 
       const persistedToolRunCount = this.persistedToolRunCountForRun(runID);
-      this.insertRunStep(runID, 'model_call_finished', 'Model call finished', { agent_id: agentID, model_id: modelName, prompt_assembly_id: promptAssemblyID }, { provider, model: modelName, real_model: provider !== 'mock_provider', fallback_to_mock: false, input_tokens: positiveNumber(usage.input_tokens), output_tokens: positiveNumber(usage.output_tokens), cached_input_tokens: positiveNumber(usage.cached_input_tokens), tool_run_count: persistedToolRunCount });
+      this.insertRunStep(runID, 'model_call_finished', 'Model call finished', { agent_id: agentID, model_id: modelName, prompt_assembly_id: promptAssemblyID }, { provider, model: modelName, real_model: provider !== 'mock_provider', fallback_to_mock: false, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_count: persistedToolRunCount });
       this.insertRunStep(runID, 'agent_output_parsed', 'Agent output parsed', { turn: 1 }, { repaired: false, output_type: 'final_answer' });
       this.insertRunStep(runID, 'response_generated', waitingConfirmation ? 'Confirmation response generated' : 'Response generated', {}, { response }, waitingConfirmation ? 'waiting_confirmation' : 'succeeded');
       this.insertTurnItem(runID, turnID, itemSeq++, 'message', 'assistant', '', '', {}, response, {}, waitingConfirmation ? 'waiting_confirmation' : 'completed', { final_answer: !waitingConfirmation, waiting_confirmation: waitingConfirmation });
 
-      const usageStatus = turn.usage_status || usageStatusForUsage(usage);
       this.exec(
         `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
                                   prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens,
-                                  cached_input_tokens, latency_ms, status, streaming_enabled, completed_at,
+                                  cached_input_tokens, cache_write_input_tokens, reasoning_tokens, total_tokens,
+                                  cost_estimate, latency_ms, status, streaming_enabled, completed_at,
                                   finish_reason, usage_status, raw_response, raw_finish_json, metadata, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'succeeded', ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'succeeded', ?, datetime('now'), ?, ?, ?, ?, ?, datetime('now'))`,
         modelCallID,
         runID,
         agentID,
@@ -1867,15 +2872,19 @@ export class JoiSQLiteStore {
         promptCacheKey,
         prefixHash,
         dynamicTailHash,
-        positiveNumber(usage.input_tokens),
-        positiveNumber(usage.output_tokens),
-        positiveNumber(usage.cached_input_tokens),
+        normalizedUsage.input_tokens,
+        normalizedUsage.output_tokens,
+        normalizedUsage.cached_input_tokens,
+        normalizedUsage.cache_write_input_tokens,
+        normalizedUsage.reasoning_tokens,
+        normalizedUsage.total_tokens,
+        roundCost(costEstimate),
         1,
         turn.status || 'completed',
         usageStatus,
         json({ responses: turn.model_responses || [] }),
         json({ status: turn.status || 'completed', usage_status: usageStatus }),
-        json({ source: 'electron_ts_tool_calling', real_model: provider !== 'mock_provider', fallback_to_mock: false, tool_run_count: persistedToolRunCount, usage_status: usageStatus }),
+        json({ source: 'electron_ts_tool_calling', real_model: provider !== 'mock_provider', fallback_to_mock: false, tool_run_count: persistedToolRunCount, usage_status: usageStatus, estimated_cost: roundCost(costEstimate) }),
       );
 
       if (waitingConfirmation) {
@@ -1885,7 +2894,7 @@ export class JoiSQLiteStore {
       } else {
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'assistant.delta', { run_id: runID, turn_id: turnID, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response, stream_source: 'fallback_final_chunk' }, status: 'completed', visibility: 'chat', source: 'store', type: 'assistant.delta' });
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'assistant.completed', { run_id: runID, turn_id: turnID, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response }, status: 'completed', visibility: 'chat', source: 'store', terminal: true, type: 'assistant.completed' });
-        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'usage.recorded', { run_id: runID, turn_id: turnID, item_type: 'model', item_id: modelCallID, status: usageStatus, visibility: 'trace_only', source: 'store', usage, usage_status: usageStatus, type: 'usage.recorded' });
+        this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'usage.recorded', { run_id: runID, turn_id: turnID, item_type: 'model', item_id: modelCallID, status: usageStatus, visibility: 'trace_only', source: 'store', usage: normalizedUsage, usage_status: usageStatus, estimated_cost: roundCost(costEstimate), type: 'usage.recorded' });
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'message.delta', { run_id: runID, turn_id: turnID, delta: response, status: 'completed', visibility: 'trace_only', source: 'store', type: 'message.delta' });
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'turn.completed', { run_id: runID, turn_id: turnID, status: 'completed', type: 'turn.completed' });
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'run.completed', { run_id: runID, status: 'succeeded', terminal: true, type: 'run.completed' });
@@ -2106,7 +3115,10 @@ export class JoiSQLiteStore {
       created_at: optionalString(row.created_at),
     }));
     const modelCalls = this.all(
-      `SELECT id, provider, model_name, status, input_tokens, output_tokens, cached_input_tokens, cacheable_prefix_tokens, dynamic_tail_tokens, latency_ms, prompt_cache_key, prefix_hash, dynamic_tail_hash, metadata
+      `SELECT id, provider, model_name, status, input_tokens, output_tokens, cached_input_tokens,
+              cache_write_input_tokens, reasoning_tokens, total_tokens, cost_estimate,
+              cacheable_prefix_tokens, dynamic_tail_tokens, latency_ms, usage_status, finish_reason,
+              prompt_cache_key, prefix_hash, dynamic_tail_hash, metadata
        FROM model_calls
        WHERE run_id = ?
        ORDER BY datetime(created_at), id`,
@@ -2162,7 +3174,7 @@ export class JoiSQLiteStore {
 
   listSavedModels(): { models: AvailableModel[] } {
     const rows = this.all(
-      `SELECT id, provider, model_name, display_name, base_url, supports_json_mode, supports_tool_calling, context_window, input_price_per_1m, output_price_per_1m, enabled, metadata
+      `SELECT id, provider, model_name, display_name, base_url, supports_json_mode, supports_tool_calling, context_window, input_price_per_1m, output_price_per_1m, cached_input_price_per_1m, enabled, metadata
        FROM models
        WHERE enabled = 1
        ORDER BY id`,
@@ -2177,6 +3189,7 @@ export class JoiSQLiteStore {
         context_window: optionalNumber(row.context_window),
         input_price_per_1m: optionalNumber(row.input_price_per_1m),
         output_price_per_1m: optionalNumber(row.output_price_per_1m),
+        cached_input_price_per_1m: optionalNumber(row.cached_input_price_per_1m),
         supports_json_mode: Boolean(Number(row.supports_json_mode ?? 0)),
         supports_tool_calling: Boolean(Number(row.supports_tool_calling ?? 0)),
         supports_reasoning: Boolean(parseObject(row.metadata).supports_reasoning),
@@ -2228,8 +3241,8 @@ export class JoiSQLiteStore {
           electron_native: true,
         };
         this.exec(
-          `INSERT INTO models (id, provider, model_name, display_name, base_url, supports_json_mode, supports_tool_calling, context_window, input_price_per_1m, output_price_per_1m, enabled, metadata, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, 0), NULLIF(?, 0), NULLIF(?, 0), 1, ?, datetime('now'))
+          `INSERT INTO models (id, provider, model_name, display_name, base_url, supports_json_mode, supports_tool_calling, context_window, input_price_per_1m, output_price_per_1m, cached_input_price_per_1m, enabled, metadata, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, 0), NULLIF(?, 0), NULLIF(?, 0), NULLIF(?, 0), 1, ?, datetime('now'))
            ON CONFLICT(id) DO UPDATE SET
              provider=excluded.provider,
              model_name=excluded.model_name,
@@ -2240,6 +3253,7 @@ export class JoiSQLiteStore {
              context_window=excluded.context_window,
              input_price_per_1m=excluded.input_price_per_1m,
              output_price_per_1m=excluded.output_price_per_1m,
+             cached_input_price_per_1m=excluded.cached_input_price_per_1m,
              enabled=excluded.enabled,
              metadata=excluded.metadata,
              updated_at=datetime('now')`,
@@ -2253,6 +3267,7 @@ export class JoiSQLiteStore {
           model.context_window || 0,
           model.input_price_per_1m || 0,
           model.output_price_per_1m || 0,
+          model.cached_input_price_per_1m || 0,
           json(metadata),
         );
       }
@@ -2294,6 +3309,8 @@ export class JoiSQLiteStore {
 
   systemHealth() {
     const integrity = this.get(`PRAGMA integrity_check`);
+    const todayUsage = this.modelUsageSummaryItems("date(model_calls.created_at, 'localtime') = date('now', 'localtime')");
+    const tokenCostToday = sumModelUsageItems(todayUsage);
     return {
       service_status: {
         sqlite: String(integrity?.integrity_check || '') === 'ok',
@@ -2302,9 +3319,13 @@ export class JoiSQLiteStore {
       },
       queue_status: { driver: 'sqlite', pending: 0 },
       worker_status: [],
-      model_latency: {},
+      model_latency: {
+        model_calls_today: tokenCostToday.calls,
+        avg_latency_ms: tokenCostToday.avg_latency_ms,
+        error_calls_today: tokenCostToday.error_calls,
+      },
       tool_failure_rate: {},
-      token_cost_today: {},
+      token_cost_today: tokenCostToday,
       warnings: [],
     };
   }
@@ -3018,7 +4039,8 @@ export class JoiSQLiteStore {
     });
   }
 
-  getModelUsage(): { items: Record<string, unknown>[] } {
+  private modelUsageSummaryItems(whereSQL = ''): Record<string, unknown>[] {
+    const where = whereSQL.trim() ? `WHERE ${whereSQL.trim()}` : '';
     const rows = this.all(
       `SELECT COALESCE(provider, '') AS provider,
               COALESCE(model_name, '') AS model,
@@ -3027,29 +4049,75 @@ export class JoiSQLiteStore {
               COALESCE(SUM(input_tokens), 0) AS input_tokens,
               COALESCE(SUM(output_tokens), 0) AS output_tokens,
               COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+              COALESCE(SUM(cache_write_input_tokens), 0) AS cache_write_input_tokens,
+              COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+              COALESCE(SUM(CASE WHEN total_tokens > 0 THEN total_tokens ELSE COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) END), 0) AS total_tokens,
               COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
               SUM(CASE WHEN status='fallback_to_mock' THEN 1 ELSE 0 END) AS fallback_calls,
-              SUM(CASE WHEN status NOT IN ('succeeded', 'fallback_to_mock') THEN 1 ELSE 0 END) AS error_calls
+              SUM(CASE WHEN status NOT IN ('succeeded', 'fallback_to_mock') THEN 1 ELSE 0 END) AS error_calls,
+              COALESCE(SUM(cost_estimate), 0) AS estimated_cost,
+              MAX(created_at) AS last_call_at
        FROM model_calls
+       ${where}
        GROUP BY provider, model_name, agent_id
-       ORDER BY calls DESC, provider ASC, model ASC`,
+       ORDER BY total_tokens DESC, calls DESC, provider ASC, model ASC`,
     );
-    return {
-      items: rows.map((row) => ({
-        provider: optionalString(row.provider) || '',
-        model: optionalString(row.model) || '',
+    return rows.map((row) => {
+      const provider = optionalString(row.provider) || '';
+      const model = optionalString(row.model) || '';
+      const usage = canonicalModelUsage(row);
+      const persistedCost = positiveFloat(row.estimated_cost);
+      const estimatedCost = persistedCost > 0 ? persistedCost : this.estimateModelUsageCost(provider, model, usage);
+      return {
+        provider,
+        model,
         agent: optionalString(row.agent) || '',
         calls: Number(row.calls ?? 0),
-        input_tokens: Number(row.input_tokens ?? 0),
-        output_tokens: Number(row.output_tokens ?? 0),
-        cached_input_tokens: Number(row.cached_input_tokens ?? 0),
-        cache_hit_ratio: Number(row.input_tokens ?? 0) > 0 ? Number(row.cached_input_tokens ?? 0) / Number(row.input_tokens ?? 1) : 0,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_write_input_tokens: usage.cache_write_input_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        total_tokens: usage.total_tokens,
+        cache_hit_ratio: usage.input_tokens > 0 ? usage.cached_input_tokens / usage.input_tokens : 0,
         avg_latency_ms: Number(row.avg_latency_ms ?? 0),
         fallback_calls: Number(row.fallback_calls ?? 0),
         error_calls: Number(row.error_calls ?? 0),
-        estimated_cost: 0,
-      })),
-    };
+        estimated_cost: roundCost(estimatedCost),
+        last_call_at: optionalString(row.last_call_at),
+      };
+    });
+  }
+
+  private estimateModelUsageCost(provider: string, model: string, usage: CanonicalModelUsage): number {
+    const pricing = this.modelPricing(provider, model);
+    return estimateCostWithPricing(usage, pricing);
+  }
+
+  private modelPricing(provider: string, model: string): ModelPricing | undefined {
+    const providerKey = provider.trim();
+    const modelKey = model.trim();
+    const row = this.get(
+      `SELECT input_price_per_1m, output_price_per_1m, cached_input_price_per_1m
+       FROM models
+       WHERE provider=? AND (model_name=? OR id=?)
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      providerKey,
+      modelKey,
+      modelKey,
+    );
+    const input = positiveFloat(row?.input_price_per_1m);
+    const output = positiveFloat(row?.output_price_per_1m);
+    const cached = positiveFloat(row?.cached_input_price_per_1m);
+    if (input > 0 || output > 0 || cached > 0) {
+      return { input_per_1m: input, output_per_1m: output, cached_input_per_1m: cached };
+    }
+    return builtinModelPricing(providerKey, modelKey);
+  }
+
+  getModelUsage(): { items: Record<string, unknown>[] } {
+    return { items: this.modelUsageSummaryItems() };
   }
 
   listConfirmations(): { items: ConfirmationRecord[] } {
@@ -3272,7 +4340,11 @@ export class JoiSQLiteStore {
     const modelCallID = `mcall_${newID()}`;
     const assistantMessageID = `msg_${newID()}`;
     const usage = resume.usage || {};
-    const usageStatus = resume.usage_status || usageStatusForUsage(usage);
+    const normalizedUsage = canonicalModelUsage(usage);
+    const usageStatus = resume.usage_status || usageStatusForUsage(normalizedUsage);
+    const resumeProvider = resume.provider || request.provider;
+    const resumeModelName = resume.model_name || request.model_name;
+    const costEstimate = this.estimateModelUsageCost(resumeProvider, resumeModelName, normalizedUsage);
     const runMetadata = parseObject(this.get(`SELECT metadata FROM runs WHERE id=?`, request.run_id)?.metadata);
     const productTaskID = optionalString(runMetadata.product_task_id);
     const operationID = optionalString(request.input.operation_id) || operationIDForTool(productTaskID, capability, request.input, request.call_id);
@@ -3375,32 +4447,37 @@ export class JoiSQLiteStore {
       });
       const persistedToolRunCount = this.persistedToolRunCountForRun(request.run_id);
       if (modelError) {
-        this.insertRunStep(request.run_id, 'model_call_failed', 'Model call failed after approval resume', { agent_id: request.agent_id, model_id: resume.model_name || request.model_name, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resume.provider || request.provider, model: resume.model_name || request.model_name, resumed: true, error: modelError, tool_run_ids: [toolRunID], tool_run_count: persistedToolRunCount }, 'failed');
+        this.insertRunStep(request.run_id, 'model_call_failed', 'Model call failed after approval resume', { agent_id: request.agent_id, model_id: resumeModelName, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resumeProvider, model: resumeModelName, resumed: true, error: modelError, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_ids: [toolRunID], tool_run_count: persistedToolRunCount }, 'failed');
 	        this.exec(
 	          `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
                                       prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens,
-                                      cached_input_tokens, latency_ms, status, streaming_enabled, completed_at,
+                                      cached_input_tokens, cache_write_input_tokens, reasoning_tokens, total_tokens,
+                                      cost_estimate, latency_ms, status, streaming_enabled, completed_at,
                                       finish_reason, usage_status, error_code, error_message, raw_response,
                                       raw_finish_json, metadata, created_at)
-	           VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, 0, 'failed', 1, datetime('now'),
+		           VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'failed', 1, datetime('now'),
                      'failed', 'failed', 'approval_resume_model_failed', ?, ?, ?, ?, datetime('now'))`,
           modelCallID,
           request.run_id,
           request.agent_id,
-          request.model_id || resume.model_name || request.model_name,
+          request.model_id || resumeModelName,
           optionalString(promptAssembly?.id) || '',
-          resume.provider || request.provider,
-          resume.model_name || request.model_name,
+          resumeProvider,
+          resumeModelName,
           optionalString(promptAssembly?.prompt_cache_key) || '',
           optionalString(promptAssembly?.prefix_hash) || '',
           optionalString(promptAssembly?.dynamic_tail_hash) || '',
-          positiveNumber(usage.input_tokens),
-          positiveNumber(usage.output_tokens),
-	          positiveNumber(usage.cached_input_tokens),
+          normalizedUsage.input_tokens,
+          normalizedUsage.output_tokens,
+          normalizedUsage.cached_input_tokens,
+          normalizedUsage.cache_write_input_tokens,
+          normalizedUsage.reasoning_tokens,
+          normalizedUsage.total_tokens,
+          roundCost(costEstimate),
 	          modelError,
 	          json({ responses: resume.model_responses || [], error: modelError }),
 	          json({ status: 'failed', error: modelError, usage_status: 'failed' }),
-	          json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, tool_run_count: persistedToolRunCount, error: modelError }),
+	          json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, tool_run_count: persistedToolRunCount, error: modelError, estimated_cost: roundCost(costEstimate) }),
 	        );
         this.exec(
           `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
@@ -3438,33 +4515,38 @@ export class JoiSQLiteStore {
         }
         return;
       }
-      this.insertRunStep(request.run_id, 'model_call_finished', 'Model call finished', { agent_id: request.agent_id, model_id: resume.model_name || request.model_name, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resume.provider || request.provider, model: resume.model_name || request.model_name, real_model: (resume.provider || request.provider) !== 'mock_provider', resumed: true, input_tokens: positiveNumber(usage.input_tokens), output_tokens: positiveNumber(usage.output_tokens), cached_input_tokens: positiveNumber(usage.cached_input_tokens), tool_run_ids: [toolRunID], tool_run_count: persistedToolRunCount });
+      this.insertRunStep(request.run_id, 'model_call_finished', 'Model call finished', { agent_id: request.agent_id, model_id: resumeModelName, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resumeProvider, model: resumeModelName, real_model: resumeProvider !== 'mock_provider', resumed: true, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_ids: [toolRunID], tool_run_count: persistedToolRunCount });
       this.insertRunStep(request.run_id, 'agent_output_parsed', 'Agent output parsed', { turn: 1, resumed: true }, { repaired: false, output_type: 'final_answer' });
       this.insertRunStep(request.run_id, 'response_generated', 'Response generated', {}, { response, resumed: true });
 	      this.exec(
 	        `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
                                   prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens,
-                                  cached_input_tokens, latency_ms, status, streaming_enabled, completed_at,
+                                  cached_input_tokens, cache_write_input_tokens, reasoning_tokens, total_tokens,
+                                  cost_estimate, latency_ms, status, streaming_enabled, completed_at,
                                   finish_reason, usage_status, raw_response, raw_finish_json, metadata, created_at)
-	         VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, 0, 'succeeded', 1, datetime('now'),
+	         VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'succeeded', 1, datetime('now'),
                    'completed', ?, ?, ?, ?, datetime('now'))`,
         modelCallID,
         request.run_id,
         request.agent_id,
-        request.model_id || resume.model_name || request.model_name,
+        request.model_id || resumeModelName,
         optionalString(promptAssembly?.id) || '',
-        resume.provider || request.provider,
-        resume.model_name || request.model_name,
+        resumeProvider,
+        resumeModelName,
         optionalString(promptAssembly?.prompt_cache_key) || '',
         optionalString(promptAssembly?.prefix_hash) || '',
         optionalString(promptAssembly?.dynamic_tail_hash) || '',
-	        positiveNumber(usage.input_tokens),
-	        positiveNumber(usage.output_tokens),
-	        positiveNumber(usage.cached_input_tokens),
+	        normalizedUsage.input_tokens,
+	        normalizedUsage.output_tokens,
+	        normalizedUsage.cached_input_tokens,
+          normalizedUsage.cache_write_input_tokens,
+          normalizedUsage.reasoning_tokens,
+          normalizedUsage.total_tokens,
+          roundCost(costEstimate),
 	        usageStatus,
 	        json({ responses: resume.model_responses || [] }),
 	        json({ status: 'completed', usage_status: usageStatus }),
-	        json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, tool_run_count: persistedToolRunCount, usage_status: usageStatus }),
+	        json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, tool_run_count: persistedToolRunCount, usage_status: usageStatus, estimated_cost: roundCost(costEstimate) }),
 	      );
       this.exec(
         `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
@@ -3494,7 +4576,7 @@ export class JoiSQLiteStore {
 	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.finished', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, visibility: 'trace_only', resumed: true });
 	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'assistant.delta', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response, stream_source: 'resume_final_chunk' }, status: 'completed', visibility: 'chat', source: 'store', resumed: true });
 	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'assistant.completed', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response }, status: 'completed', visibility: 'chat', source: 'store', resumed: true, terminal: true });
-	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'usage.recorded', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'model', item_id: modelCallID, status: usageStatus, visibility: 'trace_only', source: 'store', usage, usage_status: usageStatus, resumed: true });
+	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'usage.recorded', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'model', item_id: modelCallID, status: usageStatus, visibility: 'trace_only', source: 'store', usage: normalizedUsage, usage_status: usageStatus, estimated_cost: roundCost(costEstimate), resumed: true });
 	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'message.delta', { run_id: request.run_id, turn_id: request.turn_id, delta: response, status: 'completed', visibility: 'trace_only', resumed: true });
 	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'turn.completed', { run_id: request.run_id, turn_id: request.turn_id, status: 'completed', resumed: true });
 	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'run.completed', { run_id: request.run_id, status: 'succeeded', terminal: true, resumed: true });
@@ -4249,7 +5331,7 @@ export class JoiSQLiteStore {
       ['backup_status.json', this.listBackups()],
       ['last_100_run_steps.json', this.diagnosticRows(`SELECT id, run_id, step_type, title, status, input, output, COALESCE(error,'') AS error, started_at, finished_at, created_at FROM run_steps ORDER BY created_at DESC LIMIT 100`)],
       ['last_100_tool_runs.json', this.diagnosticRows(`SELECT id, COALESCE(run_id,'') AS run_id, COALESCE(task_id,'') AS task_id, capability_id, workflow_name, tool_name, node_id, assignment_reason, risk_level, status, input, output, COALESCE(error,'') AS error, started_at, finished_at, created_at FROM tool_runs ORDER BY created_at DESC LIMIT 100`)],
-      ['last_100_model_calls.json', this.diagnosticRows(`SELECT id, COALESCE(run_id,'') AS run_id, COALESCE(agent_id,'') AS agent_id, COALESCE(provider,'') AS provider, COALESCE(model_name,'') AS model_name, COALESCE(prompt_cache_key,'') AS prompt_cache_key, COALESCE(prefix_hash,'') AS prefix_hash, COALESCE(dynamic_tail_hash,'') AS dynamic_tail_hash, COALESCE(input_tokens,0) AS input_tokens, COALESCE(output_tokens,0) AS output_tokens, COALESCE(cached_input_tokens,0) AS cached_input_tokens, COALESCE(latency_ms,0) AS latency_ms, status, COALESCE(error_code,'') AS error_code, COALESCE(error_message,'') AS error_message, metadata, created_at FROM model_calls ORDER BY created_at DESC LIMIT 100`)],
+      ['last_100_model_calls.json', this.diagnosticRows(`SELECT id, COALESCE(run_id,'') AS run_id, COALESCE(agent_id,'') AS agent_id, COALESCE(provider,'') AS provider, COALESCE(model_name,'') AS model_name, COALESCE(prompt_cache_key,'') AS prompt_cache_key, COALESCE(prefix_hash,'') AS prefix_hash, COALESCE(dynamic_tail_hash,'') AS dynamic_tail_hash, COALESCE(input_tokens,0) AS input_tokens, COALESCE(output_tokens,0) AS output_tokens, COALESCE(cached_input_tokens,0) AS cached_input_tokens, COALESCE(cache_write_input_tokens,0) AS cache_write_input_tokens, COALESCE(reasoning_tokens,0) AS reasoning_tokens, COALESCE(total_tokens,0) AS total_tokens, COALESCE(cost_estimate,0) AS cost_estimate, COALESCE(latency_ms,0) AS latency_ms, COALESCE(usage_status,'') AS usage_status, COALESCE(finish_reason,'') AS finish_reason, status, COALESCE(error_code,'') AS error_code, COALESCE(error_message,'') AS error_message, metadata, created_at FROM model_calls ORDER BY created_at DESC LIMIT 100`)],
     ] satisfies Array<[string, unknown]>;
     writeZip(path, entries.map(([name, payload]) => ({
       name,
@@ -5612,6 +6694,73 @@ export class JoiSQLiteStore {
     });
   }
 
+  private recoverInterruptedAutomationTriggersOnStartup(): void {
+    const rows = this.all(
+      `SELECT t.id, t.automation_id, t.status, t.trigger_type, t.dedup_key, t.run_id, t.product_task_id,
+              t.attempt_count, a.name AS automation_name, a.retry_policy
+       FROM automation_triggers t
+       JOIN automation_definitions a ON a.id=t.automation_id
+       WHERE t.status IN ('claimed', 'running')`,
+    );
+    if (rows.length === 0) return;
+    const reason = 'automation runtime state was lost after app restart';
+    this.transaction(() => {
+      for (const row of rows) {
+        const triggerID = String(row.id);
+        const automationID = String(row.automation_id);
+        const automationName = optionalString(row.automation_name) || automationID;
+        const runID = optionalString(row.run_id);
+        const productTaskID = optionalString(row.product_task_id);
+        const attemptCount = Number(row.attempt_count ?? 0);
+        const maxAttempts = automationMaxAttempts(parseObject(row.retry_policy));
+        const shouldRetry = attemptCount > 0 && attemptCount < maxAttempts;
+        const nextAttemptAt = shouldRetry ? nowIso() : '';
+        const triggerStatus = shouldRetry ? 'retry_scheduled' : 'failed';
+        this.exec(
+          `UPDATE automation_triggers
+           SET status=?, claim_token=NULL, next_attempt_at=NULLIF(?, ''),
+               error_code='runtime_lost_on_restart', error_message=?, updated_at=datetime('now')
+           WHERE id=? AND status IN ('claimed', 'running')`,
+          triggerStatus,
+          nextAttemptAt,
+          reason,
+          triggerID,
+        );
+        this.exec(
+          `UPDATE automation_runs
+           SET status='failed', error_code='runtime_lost_on_restart', error_message=?,
+               finished_at=COALESCE(finished_at, datetime('now')), updated_at=datetime('now')
+           WHERE trigger_id=? AND status='running'`,
+          reason,
+          triggerID,
+        );
+        if (runID) {
+          this.appendAutomationRunEvent(runID, 'automation.run_failed', {
+            automation_id: automationID,
+            automation_name: automationName,
+            trigger_id: triggerID,
+            product_task_id: productTaskID || undefined,
+            error_code: 'runtime_lost_on_restart',
+            error_message: reason,
+            title: 'Automation interrupted',
+            summary: reason,
+          });
+          if (shouldRetry) {
+            this.appendAutomationRunEvent(runID, 'automation.retry_scheduled', {
+              automation_id: automationID,
+              automation_name: automationName,
+              trigger_id: triggerID,
+              product_task_id: productTaskID || undefined,
+              retry_at: nextAttemptAt,
+              title: 'Automation retry scheduled',
+              summary: reason,
+            });
+          }
+        }
+      }
+    });
+  }
+
   private seedDefaults(): void {
     this.exec(
       `INSERT INTO models (id, provider, model_name, display_name, supports_json_mode, supports_tool_calling, enabled, metadata)
@@ -5988,6 +7137,51 @@ export class JoiSQLiteStore {
       json(output),
       gatewayAssignmentReason(task),
     );
+  }
+
+  private availableAutomationSlug(baseSlug: string, id: string): string {
+    const base = sanitizeAutomationSlug(baseSlug || id);
+    const existing = this.get(
+      `SELECT id FROM automation_definitions
+       WHERE slug=? AND id<>? AND deleted_at IS NULL
+       LIMIT 1`,
+      base,
+      id,
+    );
+    if (!existing) return base;
+    const suffix = stableShortID(id).slice(0, 8);
+    return `${base}-${suffix}`.slice(0, 80);
+  }
+
+  private requireAutomationTrigger(id: string): AutomationTriggerRecord {
+    const row = this.get(`SELECT * FROM automation_triggers WHERE id=?`, id);
+    if (!row) throw new Error(`Automation trigger not found: ${id}`);
+    return rowToAutomationTrigger(row);
+  }
+
+  private requireAutomationRun(id: string): AutomationRunRecord {
+    const row = this.get(`SELECT * FROM automation_runs WHERE id=?`, id);
+    if (!row) throw new Error(`Automation run not found: ${id}`);
+    return rowToAutomationRun(row);
+  }
+
+  private appendAutomationRunEvent(runID: string, eventType: string, payload: Record<string, unknown>): void {
+    if (!runID.trim()) return;
+    this.appendRunEventV2({
+      run_id: runID,
+      event_type: eventType,
+      item_type: 'automation',
+      item_id: optionalString(payload.automation_id),
+      source: 'automation',
+      visibility: 'inline_status',
+      payload: pruneUndefined({
+        ...payload,
+        payload: undefined,
+        headers: undefined,
+        secret: undefined,
+        signature: undefined,
+      }),
+    });
   }
 
   private insertGatewayRunStep(
@@ -6375,6 +7569,10 @@ export class JoiSQLiteStore {
     };
 
     for (const [column, definition] of [
+      ['cached_input_price_per_1m', 'REAL'],
+    ] as const) ensure('models', column, definition);
+
+    for (const [column, definition] of [
       ['principal_id', 'TEXT'],
     ] as const) ensure('conversations', column, definition);
 
@@ -6410,10 +7608,16 @@ export class JoiSQLiteStore {
       ['phase', 'TEXT'],
       ['visibility', 'TEXT'],
       ['source', 'TEXT'],
+      ['level', "TEXT NOT NULL DEFAULT 'info'"],
+      ['risk_level', "TEXT NOT NULL DEFAULT 'read_only'"],
+      ['category', "TEXT NOT NULL DEFAULT 'runtime'"],
+      ['feature_key', "TEXT NOT NULL DEFAULT ''"],
+      ['message', "TEXT NOT NULL DEFAULT ''"],
       ['terminal', 'INTEGER NOT NULL DEFAULT 0'],
       ['payload_json', 'TEXT'],
       ['error_json', 'TEXT'],
       ['usage_json', 'TEXT'],
+      ['duration_ms', 'INTEGER'],
     ] as const) ensure('run_events', column, definition);
 
     for (const [column, definition] of [
@@ -6423,6 +7627,9 @@ export class JoiSQLiteStore {
       ['finish_reason', 'TEXT'],
       ['usage_status', "TEXT NOT NULL DEFAULT 'provider_missing'"],
       ['raw_finish_json', "TEXT NOT NULL DEFAULT '{}'"],
+      ['cache_write_input_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+      ['reasoning_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+      ['total_tokens', 'INTEGER NOT NULL DEFAULT 0'],
     ] as const) ensure('model_calls', column, definition);
 
     for (const [column, definition] of [
@@ -6519,9 +7726,44 @@ export class JoiSQLiteStore {
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+      CREATE TABLE IF NOT EXISTS app_logs (
+        id TEXT PRIMARY KEY,
+        level TEXT NOT NULL DEFAULT 'info',
+        risk_level TEXT NOT NULL DEFAULT 'read_only',
+        category TEXT NOT NULL DEFAULT 'system',
+        feature_key TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'app',
+        message TEXT NOT NULL DEFAULT '',
+        run_id TEXT,
+        turn_id TEXT,
+        conversation_id TEXT,
+        item_type TEXT,
+        item_id TEXT,
+        payload TEXT NOT NULL DEFAULT '{}',
+        error TEXT,
+        duration_ms INTEGER,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS log_cleanup_history (
+        id TEXT PRIMARY KEY,
+        actor TEXT NOT NULL DEFAULT 'desktop_user',
+        scopes TEXT NOT NULL DEFAULT '[]',
+        filters TEXT NOT NULL DEFAULT '{}',
+        deleted_counts TEXT NOT NULL DEFAULT '{}',
+        reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
       CREATE INDEX IF NOT EXISTS idx_run_events_conversation_created ON run_events(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_run_events_type ON run_events(run_id, event_type);
       CREATE INDEX IF NOT EXISTS idx_run_events_item ON run_events(item_type, item_id);
+      CREATE INDEX IF NOT EXISTS idx_run_events_level ON run_events(level, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_run_events_risk ON run_events(risk_level, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_run_events_category ON run_events(category, feature_key, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_app_logs_created ON app_logs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_app_logs_level ON app_logs(level, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_app_logs_risk ON app_logs(risk_level, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_app_logs_category ON app_logs(category, feature_key, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_app_logs_run_id ON app_logs(run_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_principals_status ON principals(status, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_channel_identities_principal ON channel_identities(principal_id, channel);
       CREATE INDEX IF NOT EXISTS idx_conversation_entry_links_conversation ON conversation_entry_links(conversation_id, channel);
@@ -6612,6 +7854,76 @@ export class JoiSQLiteStore {
   }
 }
 
+function rowToAutomationDefinition(row: SQLiteRow): AutomationDefinition {
+  return {
+    id: String(row.id),
+    kind: normalizeAutomationKind(row.kind),
+    slug: String(row.slug),
+    name: String(row.name),
+    description: optionalString(row.description),
+    enabled: Boolean(Number(row.enabled ?? 1)),
+    trigger_config: parseObject(row.trigger_config),
+    prompt_template: optionalString(row.prompt_template) || '',
+    input_mode: normalizeAutomationInputMode(row.input_mode),
+    permission_profile: normalizeAutomationPermissionProfile(row.permission_profile),
+    preferred_node: optionalString(row.preferred_node) || 'main-node',
+    allow_worker: Boolean(Number(row.allow_worker ?? 0)),
+    conversation_id: optionalString(row.conversation_id),
+    principal_id: optionalString(row.principal_id),
+    dedup_policy: parseObject(row.dedup_policy),
+    retry_policy: parseObject(row.retry_policy),
+    max_concurrency: Math.max(1, Number(row.max_concurrency ?? 1)),
+    notification_policy: parseObject(row.notification_policy),
+    next_fire_at: optionalString(row.next_fire_at),
+    last_fire_at: optionalString(row.last_fire_at),
+    metadata: parseObject(row.metadata),
+    created_at: optionalString(row.created_at),
+    updated_at: optionalString(row.updated_at),
+  };
+}
+
+function rowToAutomationTrigger(row: SQLiteRow): AutomationTriggerRecord {
+  return {
+    id: String(row.id),
+    automation_id: String(row.automation_id),
+    trigger_type: optionalString(row.trigger_type) || 'schedule',
+    dedup_key: String(row.dedup_key),
+    payload: parseObject(row.payload),
+    status: optionalString(row.status) || 'pending',
+    fire_at: optionalString(row.fire_at),
+    claimed_at: optionalString(row.claimed_at),
+    claim_token: optionalString(row.claim_token),
+    run_id: optionalString(row.run_id),
+    product_task_id: optionalString(row.product_task_id),
+    attempt_count: Number(row.attempt_count ?? 0),
+    next_attempt_at: optionalString(row.next_attempt_at),
+    error_code: optionalString(row.error_code),
+    error_message: optionalString(row.error_message),
+    created_at: optionalString(row.created_at),
+    updated_at: optionalString(row.updated_at),
+  };
+}
+
+function rowToAutomationRun(row: SQLiteRow): AutomationRunRecord {
+  return {
+    id: String(row.id),
+    automation_id: String(row.automation_id),
+    trigger_id: String(row.trigger_id),
+    run_id: optionalString(row.run_id),
+    product_task_id: optionalString(row.product_task_id),
+    status: optionalString(row.status) || 'running',
+    attempt_number: Math.max(1, Number(row.attempt_number ?? 1)),
+    started_at: optionalString(row.started_at),
+    finished_at: optionalString(row.finished_at),
+    output_summary: optionalString(row.output_summary),
+    error_code: optionalString(row.error_code),
+    error_message: optionalString(row.error_message),
+    metadata: parseObject(row.metadata),
+    created_at: optionalString(row.created_at),
+    updated_at: optionalString(row.updated_at),
+  };
+}
+
 function rowToConversationGroup(row: SQLiteRow): ConversationGroup {
   return {
     id: String(row.id),
@@ -6688,6 +8000,11 @@ function rowToRunEvent(row: SQLiteRow): RunEvent {
     phase: optionalString(row.phase) || optionalString(payload.phase),
     visibility: optionalString(row.visibility) || optionalString(payload.visibility),
     source: optionalString(row.source) || optionalString(payload.source),
+    level: optionalString(row.level) || optionalString(payload.level),
+    risk_level: optionalString(row.risk_level) || optionalString(payload.risk_level),
+    category: optionalString(row.category) || optionalString(payload.category),
+    feature_key: optionalString(row.feature_key) || optionalString(payload.feature_key),
+    message: optionalString(row.message) || optionalString(payload.message),
     terminal: Boolean(Number(row.terminal ?? 0) || payload.terminal),
     status: optionalString(payload.status),
     title: optionalString(payload.title),
@@ -6702,6 +8019,36 @@ function rowToRunEvent(row: SQLiteRow): RunEvent {
   };
 }
 
+function rowToLogEntry(row: SQLiteRow): LogEntry {
+  const sourceTable = optionalString(row.source_table) || 'app_logs';
+  const eventType = optionalString(row.event_type);
+  const action = optionalString(row.action);
+  return {
+    id: String(row.id),
+    source_table: sourceTable,
+    level: optionalString(row.level) || 'info',
+    risk_level: optionalString(row.risk_level) || 'read_only',
+    category: optionalString(row.category) || 'system',
+    feature_key: optionalString(row.feature_key) || eventType || action || 'log',
+    source: optionalString(row.source) || sourceTable,
+    message: optionalString(row.message) || eventType || action || 'log',
+    run_id: optionalString(row.run_id),
+    turn_id: optionalString(row.turn_id),
+    conversation_id: optionalString(row.conversation_id),
+    item_type: optionalString(row.item_type),
+    item_id: optionalString(row.item_id),
+    event_type: eventType,
+    action,
+    status: optionalString(row.status),
+    payload: sanitizeLogPayload(parseObject(row.payload)),
+    error: sanitizeLogPayload(parseObject(row.error)),
+    duration_ms: optionalNumber(row.duration_ms),
+    hidden_by_default: sourceTable === 'worker_gateway_audit_logs' && ['heartbeat', 'claim'].includes(action || '')
+      || sourceTable === 'run_events' && ['assistant.delta', 'model.delta', 'message.delta'].includes(eventType || ''),
+    created_at: optionalString(row.created_at),
+  };
+}
+
 function rowToModelCall(row: SQLiteRow): ModelCall {
   return {
     id: String(row.id),
@@ -6711,9 +8058,15 @@ function rowToModelCall(row: SQLiteRow): ModelCall {
     input_tokens: Number(row.input_tokens ?? 0),
     output_tokens: Number(row.output_tokens ?? 0),
     cached_input_tokens: Number(row.cached_input_tokens ?? 0),
+    cache_write_input_tokens: optionalNumber(row.cache_write_input_tokens),
+    reasoning_tokens: optionalNumber(row.reasoning_tokens),
+    total_tokens: optionalNumber(row.total_tokens) || Number(row.input_tokens ?? 0) + Number(row.output_tokens ?? 0),
     cacheable_prefix_tokens: optionalNumber(row.cacheable_prefix_tokens),
     dynamic_tail_tokens: optionalNumber(row.dynamic_tail_tokens),
+    cost_estimate: optionalNumber(row.cost_estimate),
     latency_ms: Number(row.latency_ms ?? 0),
+    usage_status: optionalString(row.usage_status),
+    finish_reason: optionalString(row.finish_reason),
     prompt_cache_key: optionalString(row.prompt_cache_key),
     prefix_hash: optionalString(row.prefix_hash),
     dynamic_tail_hash: optionalString(row.dynamic_tail_hash),
@@ -7936,11 +9289,101 @@ function toolRunStatusForOutput(output: Record<string, unknown>): string {
   return 'succeeded';
 }
 
-function usageStatusForUsage(usage: { input_tokens?: number; output_tokens?: number; cached_input_tokens?: number } | undefined): string {
+function usageStatusForUsage(usage: Partial<CanonicalModelUsage> | undefined): string {
   if (!usage) return 'provider_missing';
-  return positiveNumber(usage.input_tokens) > 0 || positiveNumber(usage.output_tokens) > 0 || positiveNumber(usage.cached_input_tokens) > 0
+  const normalized = canonicalModelUsage(usage);
+  return normalized.input_tokens > 0
+    || normalized.output_tokens > 0
+    || normalized.cached_input_tokens > 0
+    || normalized.cache_write_input_tokens > 0
+    || normalized.reasoning_tokens > 0
+    || normalized.total_tokens > 0
     ? 'recorded'
     : 'provider_missing';
+}
+
+function canonicalModelUsage(value: unknown): CanonicalModelUsage {
+  const usage = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const inputTokens = positiveNumber(usage.input_tokens ?? usage.prompt_tokens);
+  const outputTokens = positiveNumber(usage.output_tokens ?? usage.completion_tokens);
+  const cachedInputTokens = positiveNumber(usage.cached_input_tokens ?? usage.cached_tokens);
+  const cacheWriteInputTokens = positiveNumber(usage.cache_write_input_tokens ?? usage.cache_creation_input_tokens);
+  const reasoningTokens = positiveNumber(usage.reasoning_tokens ?? usage.reasoning_output_tokens);
+  const totalTokens = positiveNumber(usage.total_tokens) || inputTokens + outputTokens;
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cached_input_tokens: cachedInputTokens,
+    cache_write_input_tokens: cacheWriteInputTokens,
+    reasoning_tokens: reasoningTokens,
+    total_tokens: totalTokens,
+  };
+}
+
+function estimateCostWithPricing(usage: CanonicalModelUsage, pricing?: ModelPricing): number {
+  if (!pricing) return 0;
+  const cachedTokens = Math.min(usage.cached_input_tokens, usage.input_tokens);
+  const cacheWriteTokens = Math.min(usage.cache_write_input_tokens, Math.max(usage.input_tokens - cachedTokens, 0));
+  const billableInputTokens = Math.max(usage.input_tokens - cachedTokens - cacheWriteTokens, 0);
+  const cachedInputCost = pricing.cached_input_per_1m > 0 ? cachedTokens * pricing.cached_input_per_1m : 0;
+  const cacheWriteInputCost = cacheWriteTokens * pricing.input_per_1m;
+  const inputCost = billableInputTokens * pricing.input_per_1m;
+  const outputCost = usage.output_tokens * pricing.output_per_1m;
+  return (inputCost + cacheWriteInputCost + cachedInputCost + outputCost) / 1_000_000;
+}
+
+function builtinModelPricing(provider: string, model: string): ModelPricing | undefined {
+  const key = `${provider}/${model}`.toLowerCase();
+  const wildcard = `${provider}/*`.toLowerCase();
+  const prices: Record<string, ModelPricing> = {
+    'openai_compatible/deepseek-v4-flash': { input_per_1m: 0.14, output_per_1m: 0.28, cached_input_per_1m: 0.028 },
+    'openai_compatible/deepseek-v4-pro': { input_per_1m: 1.74, output_per_1m: 3.48, cached_input_per_1m: 0.145 },
+    'deterministic_provider/*': { input_per_1m: 0, output_per_1m: 0, cached_input_per_1m: 0 },
+    'mock_provider/*': { input_per_1m: 0, output_per_1m: 0, cached_input_per_1m: 0 },
+  };
+  return prices[key] || prices[wildcard];
+}
+
+function sumModelUsageItems(items: Record<string, unknown>[]): Record<string, unknown> {
+  let calls = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedInputTokens = 0;
+  let cacheWriteInputTokens = 0;
+  let reasoningTokens = 0;
+  let totalTokens = 0;
+  let estimatedCost = 0;
+  let weightedLatency = 0;
+  let fallbackCalls = 0;
+  let errorCalls = 0;
+  for (const item of items) {
+    const itemCalls = Number(item.calls ?? 0);
+    calls += itemCalls;
+    inputTokens += Number(item.input_tokens ?? 0);
+    outputTokens += Number(item.output_tokens ?? 0);
+    cachedInputTokens += Number(item.cached_input_tokens ?? 0);
+    cacheWriteInputTokens += Number(item.cache_write_input_tokens ?? 0);
+    reasoningTokens += Number(item.reasoning_tokens ?? 0);
+    totalTokens += Number(item.total_tokens ?? 0);
+    estimatedCost += Number(item.estimated_cost ?? 0);
+    weightedLatency += Number(item.avg_latency_ms ?? 0) * itemCalls;
+    fallbackCalls += Number(item.fallback_calls ?? 0);
+    errorCalls += Number(item.error_calls ?? 0);
+  }
+  return {
+    calls,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cached_input_tokens: cachedInputTokens,
+    cache_write_input_tokens: cacheWriteInputTokens,
+    reasoning_tokens: reasoningTokens,
+    total_tokens: totalTokens,
+    cache_hit_ratio: inputTokens > 0 ? cachedInputTokens / inputTokens : 0,
+    avg_latency_ms: calls > 0 ? weightedLatency / calls : 0,
+    fallback_calls: fallbackCalls,
+    error_calls: errorCalls,
+    estimated_cost: roundCost(estimatedCost),
+  };
 }
 
 function sideEffectLevelForCapability(capability: string): string {
@@ -8084,9 +9527,76 @@ function positiveNumber(value: unknown): number {
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
 }
 
+function positiveFloat(value: unknown): number {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function roundCost(value: number): number {
+  return Number.isFinite(value) && value > 0 ? Number(value.toFixed(8)) : 0;
+}
+
 function clampLimit(value: number | undefined, fallback: number): number {
   if (!value || value < 1) return fallback;
   return Math.min(Math.floor(value), 200);
+}
+
+function normalizeAutomationKind(value: unknown): AutomationKind {
+  return value === 'webhook' ? 'webhook' : 'schedule';
+}
+
+function normalizeAutomationInputMode(value: unknown): InputMode {
+  const text = optionalString(value);
+  if (text === 'chat_assist' || text === 'serious_task' || text === 'background_task' || text === 'auto') return text;
+  return 'background_task';
+}
+
+function normalizeAutomationPermissionProfile(value: unknown): PermissionProfile {
+  const text = optionalString(value);
+  if (text === 'workspace_write' || text === 'danger_full_access') return text;
+  return 'read_only';
+}
+
+function sanitizeAutomationSlug(value: string): string {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 72);
+  return slug || `automation-${newID()}`;
+}
+
+function defaultAutomationPromptTemplate(kind: AutomationKind): string {
+  if (kind === 'webhook') {
+    return '请处理这个 webhook 自动化任务。payload 摘要：{{payload}}';
+  }
+  return '请处理这个定时自动化任务。payload 摘要：{{payload}}';
+}
+
+function defaultAutomationRetryPolicy(): Record<string, unknown> {
+  return {
+    max_attempts: 2,
+    backoff_seconds: [60, 300],
+    no_retry_error_codes: ['POLICY_DENIED', 'INVALID_PAYLOAD', 'PENDING_CONFIRMATION'],
+  };
+}
+
+function automationMaxAttempts(policy: Record<string, unknown>): number {
+  const value = Number(policy.max_attempts ?? defaultAutomationRetryPolicy().max_attempts);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 2;
+}
+
+function codedError(code: string, message: string): Error & { code?: string } {
+  const error = new Error(message) as Error & { code?: string };
+  error.code = code;
+  return error;
+}
+
+function isPendingConfirmationAutomationError(code?: string, message?: string): boolean {
+  const normalizedCode = (code || '').toUpperCase();
+  if (normalizedCode === 'PENDING_CONFIRMATION') return true;
+  return /confirmation|approval|waiting_confirmation/i.test(message || '');
 }
 
 function boolString(value: boolean): string {
@@ -8267,6 +9777,138 @@ function externalHandoffNextAction(status: ExternalHandoffAudit['status']): stri
 
 function quoteIdentifier(value: string): string {
   return `"${String(value).replaceAll('"', '""')}"`;
+}
+
+function normalizeLogLevel(value: string): string {
+  const level = value.trim().toLowerCase();
+  if (['trace', 'debug', 'info', 'warn', 'error', 'fatal'].includes(level)) return level;
+  return 'info';
+}
+
+function normalizeLogRiskLevel(value: string): string {
+  const risk = value.trim().toLowerCase();
+  if (['read_only', 'write_candidate', 'browser_interaction', 'workspace_write', 'state_change', 'destructive', 'unsafe'].includes(risk)) return risk;
+  return 'read_only';
+}
+
+function normalizeLogCategory(value: string): string {
+  return value.trim().replace(/[^A-Za-z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80) || 'system';
+}
+
+function normalizeFeatureKey(value: string): string {
+  return value.trim().replace(/[^A-Za-z0-9_.:-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'log';
+}
+
+function logLevelForRunEvent(eventType: string, status: string, error: unknown): string {
+  if (error) return 'error';
+  if (eventType.endsWith('.failed') || status === 'failed' || status === 'blocked') return 'error';
+  if (eventType.endsWith('.cancelled') || eventType.includes('policy_blocked') || eventType.includes('denied')) return 'warn';
+  if (eventType.endsWith('.delta') || eventType === 'usage.recorded') return 'trace';
+  if (eventType.startsWith('model.')) return 'debug';
+  return 'info';
+}
+
+function logRiskForRunEvent(eventType: string, payload: Record<string, unknown>): string {
+  const explicit = optionalString(payload.risk_level) || optionalString(payload.risk);
+  if (explicit) return explicit;
+  const capability = optionalString(payload.capability) || optionalString(payload.tool_name) || eventType;
+  if (capability === 'apply_patch') return 'workspace_write';
+  if (capability === 'browser_click' || capability === 'browser_type') return 'browser_interaction';
+  if (eventType.startsWith('approval.')) return 'state_change';
+  if (eventType.startsWith('memory.')) return 'write_candidate';
+  return 'read_only';
+}
+
+function logCategoryForRunEvent(eventType: string, itemType?: string): string {
+  if (eventType.startsWith('model.') || eventType === 'usage.recorded') return 'model';
+  if (eventType.startsWith('tool.')) return 'tool';
+  if (eventType.startsWith('approval.')) return 'approval';
+  if (eventType.startsWith('memory.')) return 'memory';
+  if (eventType.startsWith('handoff.') || eventType.startsWith('notification.')) return 'external';
+  if (eventType.startsWith('task.') || itemType === 'task') return 'task';
+  if (eventType.startsWith('run.') || eventType.startsWith('turn.')) return 'runtime';
+  return itemType || 'runtime';
+}
+
+function logFeatureKeyForRunEvent(eventType: string, payload: Record<string, unknown>): string {
+  return optionalString(payload.feature_key)
+    || optionalString(payload.capability)
+    || optionalString(payload.tool_name)
+    || eventType;
+}
+
+function logMessageForRunEvent(eventType: string, payload: Record<string, unknown>, status: string): string {
+  return optionalString(payload.message)
+    || optionalString(payload.summary)
+    || optionalString(payload.title)
+    || `${eventType} ${status}`;
+}
+
+function errorObject(error: unknown): Record<string, unknown> {
+  if (!error) return {};
+  if (error instanceof Error) return { message: error.message, name: error.name, stack: error.stack };
+  if (typeof error === 'object' && !Array.isArray(error)) return error as Record<string, unknown>;
+  return { message: String(error) };
+}
+
+function sanitizeLogPayload(value: unknown): Record<string, unknown> {
+  const sanitized = sanitizeLogValue(value);
+  if (sanitized && typeof sanitized === 'object' && !Array.isArray(sanitized)) return sanitized as Record<string, unknown>;
+  if (sanitized === undefined || sanitized === null || sanitized === '') return {};
+  return { value: sanitized };
+}
+
+function sanitizeLogValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeLogValue(item));
+  }
+  if (value && typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    const redactNamedValue = objectHasSensitiveNameHint(value as Record<string, unknown>);
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = diagnosticSensitiveKey(key) || (key.toLowerCase() === 'value' && redactNamedValue)
+        ? '[REDACTED]'
+        : sanitizeLogValue(item);
+    }
+    return result;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        return sanitizeLogValue(JSON.parse(trimmed));
+      } catch {
+        // Keep non-JSON strings on the normal redaction path.
+      }
+    }
+    return redactSensitiveText(value);
+  }
+  return value;
+}
+
+function normalizeLogCleanupScopes(scopes: string[] | undefined): string[] {
+  const allowed = new Set(['app_logs', 'run_events', 'run_steps', 'tool_runs', 'model_calls', 'worker_gateway_audit_logs', 'log_files']);
+  const cleaned = [...new Set((scopes || []).map((scope) => scope.trim()).filter((scope) => allowed.has(scope)))];
+  return cleaned.length > 0 ? cleaned : ['app_logs', 'run_events', 'run_steps', 'tool_runs', 'model_calls', 'worker_gateway_audit_logs', 'log_files'];
+}
+
+function logCleanupTable(scope: string): string {
+  switch (scope) {
+    case 'app_logs':
+      return 'app_logs';
+    case 'run_events':
+      return 'run_events';
+    case 'run_steps':
+      return 'run_steps';
+    case 'tool_runs':
+      return 'tool_runs';
+    case 'model_calls':
+      return 'model_calls';
+    case 'worker_gateway_audit_logs':
+      return 'worker_gateway_audit_logs';
+    default:
+      throw new Error(`unsupported log cleanup scope: ${scope}`);
+  }
 }
 
 function errorSummary(error: unknown): string | undefined {
@@ -8452,8 +10094,11 @@ function sanitizeDiagnosticValue(value: unknown): unknown {
   }
   if (value && typeof value === 'object') {
     const result: Record<string, unknown> = {};
+    const redactNamedValue = objectHasSensitiveNameHint(value as Record<string, unknown>);
     for (const [key, item] of Object.entries(value)) {
-      result[key] = diagnosticSensitiveKey(key) ? '[REDACTED]' : sanitizeDiagnosticValue(item);
+      result[key] = diagnosticSensitiveKey(key) || (key.toLowerCase() === 'value' && redactNamedValue)
+        ? '[REDACTED]'
+        : sanitizeDiagnosticValue(item);
     }
     return result;
   }
@@ -8493,6 +10138,14 @@ function diagnosticSensitiveKey(key: string): boolean {
     'memory',
     'prompt',
   ].some((marker) => normalized.includes(marker));
+}
+
+function objectHasSensitiveNameHint(value: Record<string, unknown>): boolean {
+  for (const key of ['name', 'key', 'secret_name', 'secretName', 'env', 'env_name', 'envName']) {
+    const hint = value[key];
+    if (typeof hint === 'string' && diagnosticSensitiveKey(hint)) return true;
+  }
+  return false;
 }
 
 function desktopModelRecordID(provider: string, baseURL: string, modelID: string): string {

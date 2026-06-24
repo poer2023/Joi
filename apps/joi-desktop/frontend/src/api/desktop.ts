@@ -6,6 +6,13 @@ import {
   type ApprovalResumeRunRequest,
   type ArtifactDetail,
   type ArtifactSummary,
+  type AutomationDefinition,
+  type AutomationDefinitionRequest,
+  type AutomationRunRecord,
+  type AutomationTriggerNowRequest,
+  type AutomationTriggerRecord,
+  type AutomationWebhookEndpoint,
+  type AutomationWebhookTestRequest,
   type AvailableModel,
   type BackupRecord,
   type CapabilityRecord,
@@ -24,6 +31,11 @@ import {
   type ExternalHandoffAudit,
   type InputMode,
   type InterruptRunRequest,
+  type LogCleanupPreview,
+  type LogCleanupRequest,
+  type LogCleanupResult,
+  type LogEntry,
+  type LogFilter,
   type MCPServerRecord,
   type MCPWrapToolRequest,
   type MemoryCandidateDecisionRequest,
@@ -81,6 +93,13 @@ export type {
   ApprovalResumeRunRequest,
   ArtifactDetail,
   ArtifactSummary,
+  AutomationDefinition,
+  AutomationDefinitionRequest,
+  AutomationRunRecord,
+  AutomationTriggerNowRequest,
+  AutomationTriggerRecord,
+  AutomationWebhookEndpoint,
+  AutomationWebhookTestRequest,
   AvailableModel,
   BackupRecord,
   CapabilityRecord,
@@ -99,6 +118,11 @@ export type {
   ExternalHandoffAudit,
   InputMode,
   InterruptRunRequest,
+  LogCleanupPreview,
+  LogCleanupRequest,
+  LogCleanupResult,
+  LogEntry,
+  LogFilter,
   MCPServerRecord,
   MCPWrapToolRequest,
   MemoryCandidateDecisionRequest,
@@ -186,6 +210,94 @@ function bindings(): DesktopBindings {
           response: `Preview mode: ${req.message}`,
           model_calls: [],
         };
+      },
+      async ListAutomations() {
+        return {
+          automations: [
+            {
+              id: 'automation_preview_schedule',
+              kind: 'schedule',
+              slug: 'preview-schedule',
+              name: 'Preview interval check',
+              enabled: true,
+              trigger_config: { type: 'interval', every_minutes: 60 },
+              prompt_template: 'Preview {{payload}}',
+              input_mode: 'background_task',
+              permission_profile: 'read_only',
+              preferred_node: 'main-node',
+              allow_worker: false,
+              dedup_policy: {},
+              retry_policy: { max_attempts: 2, backoff_seconds: [60, 300] },
+              max_concurrency: 1,
+              notification_policy: {},
+              metadata: {},
+            },
+          ],
+        };
+      },
+      async GetAutomation(id) {
+        return (await this.ListAutomations()).automations.find((item) => item.id === id || item.slug === id) ?? (await this.ListAutomations()).automations[0];
+      },
+      async SaveAutomation(req) {
+        return {
+          id: req.id || `automation_preview_${Date.now()}`,
+          kind: req.kind,
+          slug: req.slug || 'preview-automation',
+          name: req.name,
+          enabled: req.enabled ?? true,
+          trigger_config: req.trigger_config ?? {},
+          prompt_template: req.prompt_template ?? '',
+          input_mode: req.input_mode ?? 'background_task',
+          permission_profile: req.permission_profile ?? 'read_only',
+          preferred_node: req.preferred_node ?? 'main-node',
+          allow_worker: req.allow_worker ?? false,
+          dedup_policy: req.dedup_policy ?? {},
+          retry_policy: req.retry_policy ?? {},
+          max_concurrency: req.max_concurrency ?? 1,
+          notification_policy: req.notification_policy ?? {},
+          metadata: req.metadata ?? {},
+        };
+      },
+      async DeleteAutomation() {},
+      async SetAutomationEnabled(req) {
+        return { ...(await this.GetAutomation(req.id)), enabled: req.enabled };
+      },
+      async TriggerAutomationNow(req) {
+        return {
+          trigger: {
+            id: `autotrig_preview_${Date.now()}`,
+            automation_id: req.id,
+            trigger_type: 'manual',
+            dedup_key: 'preview',
+            payload: req.payload ?? {},
+            status: 'pending',
+            attempt_count: 0,
+          },
+        };
+      },
+      async ListAutomationTriggers() {
+        return { triggers: [] };
+      },
+      async ListAutomationRuns() {
+        return { runs: [] };
+      },
+      async GetAutomationWebhookEndpoint(id) {
+        return {
+          automation_id: id,
+          slug: 'preview-webhook',
+          url: 'http://127.0.0.1:18082/automation/webhooks/preview-webhook',
+          secret_ref: `JOI_AUTOMATION_WEBHOOK_SECRET_${id}`,
+          secret_configured: true,
+        };
+      },
+      async RotateAutomationWebhookSecret(id) {
+        return {
+          ...(await this.GetAutomationWebhookEndpoint(id)),
+          secret_value_once: 'joi_whsec_preview',
+        };
+      },
+      async TestAutomationWebhook(req) {
+        return this.TriggerAutomationNow({ id: req.id, payload: req.payload });
       },
       async GetRunTrace(runID) {
         return {
@@ -488,6 +600,23 @@ function bindings(): DesktopBindings {
       async ExportDiagnostics() {
         return { path: 'preview-diagnostics.zip' };
       },
+      async ListLogs() {
+        return { logs: [] };
+      },
+      async GetLogEntry() {
+        return null;
+      },
+      async PreviewLogCleanup(req) {
+        const scopes = req?.scopes ?? [];
+        return { scopes, counts: {}, total_count: 0, safe_to_clear: true, warnings: [] };
+      },
+      async ClearLogs(req) {
+        const scopes = req?.scopes ?? [];
+        return { scopes, counts: {}, total_count: 0, safe_to_clear: true, warnings: [], cleanup_id: 'preview-cleanup', cleared_at: new Date().toISOString() };
+      },
+      async ExportLogs() {
+        return { path: 'preview-logs.json' };
+      },
       async GetSettings() {
         return {
           app_mode: 'desktop',
@@ -730,6 +859,22 @@ export const desktopApi = {
   createBackup: () => bindings().CreateBackup(),
   restoreBackup: (path: string) => bindings().RestoreBackup(path),
   exportDiagnostics: () => bindings().ExportDiagnostics(),
+  listAutomations: (filter: { kind?: 'schedule' | 'webhook'; enabled?: boolean; limit?: number } = {}) => bindings().ListAutomations(filter),
+  getAutomation: (id: string) => bindings().GetAutomation(id),
+  saveAutomation: (req: AutomationDefinitionRequest) => bindings().SaveAutomation(req),
+  deleteAutomation: (id: string) => bindings().DeleteAutomation(id),
+  setAutomationEnabled: (req: { id: string; enabled: boolean }) => bindings().SetAutomationEnabled(req),
+  triggerAutomationNow: (req: AutomationTriggerNowRequest) => bindings().TriggerAutomationNow(req),
+  listAutomationTriggers: (filter: { automation_id?: string; status?: string; limit?: number } = {}) => bindings().ListAutomationTriggers(filter),
+  listAutomationRuns: (filter: { automation_id?: string; trigger_id?: string; limit?: number } = {}) => bindings().ListAutomationRuns(filter),
+  getAutomationWebhookEndpoint: (id: string) => bindings().GetAutomationWebhookEndpoint(id),
+  rotateAutomationWebhookSecret: (id: string) => bindings().RotateAutomationWebhookSecret(id),
+  testAutomationWebhook: (req: AutomationWebhookTestRequest) => bindings().TestAutomationWebhook(req),
+  listLogs: (filter: LogFilter = {}) => bindings().ListLogs(filter),
+  getLogEntry: (id: string) => bindings().GetLogEntry(id),
+  previewLogCleanup: (req: LogCleanupRequest) => bindings().PreviewLogCleanup(req),
+  clearLogs: (req: LogCleanupRequest) => bindings().ClearLogs(req),
+  exportLogs: (filter: LogFilter = {}) => bindings().ExportLogs(filter),
   getSettings: () => bindings().GetSettings(),
   getWorkspaceSettings: () => bindings().GetWorkspaceSettings(),
   saveWorkspaceSettings: (req: WorkspaceSettings) => bindings().SaveWorkspaceSettings(req),

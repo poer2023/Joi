@@ -9,7 +9,8 @@
     "preview": "vite preview --host 127.0.0.1",
     "test:execution-actions": "node scripts/test-execution-actions.mjs",
     "test:chat-projection": "node scripts/test-chat-projection.mjs",
-    "test:task-mini-list": "node scripts/test-task-mini-list.mjs"
+    "test:task-mini-list": "node scripts/test-task-mini-list.mjs",
+    "test:automation-ui-state": "node scripts/test-automation-ui-state.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",

@@ -1,5 +1,6 @@
 import { getEventVisibility } from './eventVisibility';
 import { detailForExecutionEvent, summarizeExecutionEvent } from './executionSummary';
+import { mergeAssistantTextChunks } from './streamingText';
 import type {
   BuildConversationRenderItemsInput,
   BuildConversationRenderItemsOutput,
@@ -196,6 +197,7 @@ export function deriveRunStatus(events: NormalizedRunEvent[]): NormalizedStatus 
     || event.type === 'foreground_run.completed'
     || event.type === 'assistant.completed'
     || event.type === 'run.completed'
+    || event.type === 'automation.run_completed'
   ))) {
     return 'completed';
   }
@@ -311,6 +313,7 @@ function transcriptKind(event: NormalizedRunEvent): TranscriptLineKind {
   if (event.type.startsWith('approval.') || event.itemType === 'approval') return 'approval';
   if (event.type.startsWith('artifact.') || event.itemType === 'artifact') return 'artifact';
   if (event.type.startsWith('task.') || event.type.startsWith('worker.') || event.itemType === 'task' || event.itemType === 'worker') return 'task';
+  if (event.type.startsWith('automation.') || event.itemType === 'automation') return 'task';
   if (event.type.startsWith('run.')) return 'run';
   return 'system';
 }
@@ -345,6 +348,12 @@ function transcriptLabel(
   }
   if (kind === 'artifact') {
     return `Generated artifact · ${compactText(event.title || stringFromEvent(event, ['title', 'artifact_type', 'type']) || 'artifact')}`;
+  }
+  if (event.itemType === 'automation' || event.type.startsWith('automation.')) {
+    const target = compactText(event.summary || event.title || stringFromEvent(event, ['automation_name', 'name', 'automation_id']) || 'automation');
+    if (status === 'running' || status === 'pending') return `Automation running · ${target}`;
+    if (status === 'failed') return `Automation failed · ${target}`;
+    return `Automation updated · ${target}`;
   }
   if (kind === 'task') {
     const target = compactText(event.title || stringFromEvent(event, ['title', 'task_title', 'task_id']) || 'task');
@@ -539,12 +548,11 @@ function projectAssistantMessageFromRunEvents(runId: string, events: NormalizedR
   const sorted = sortBySeq(events);
   const assistantEvents = sorted.filter((event) => event.type === 'assistant.delta' || event.type === 'assistant.completed');
   if (assistantEvents.length === 0) return null;
-  const deltaText = assistantEvents
+  const deltaText = mergeAssistantTextChunks(assistantEvents
     .filter((event) => event.type === 'assistant.delta')
-    .map((event) => textChunkValue(event.delta.text))
-    .join('');
+    .map((event) => textChunkValue(event.delta.text)));
   const completedText = textChunkValue([...assistantEvents].reverse().find((event) => event.type === 'assistant.completed')?.delta.text);
-  const content = deltaText || completedText;
+  const content = completedText || deltaText;
   if (!content) return null;
   const firstAssistantEvent = assistantEvents[0];
   const complete = sorted.some((event) => (

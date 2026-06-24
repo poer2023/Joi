@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS models (
   context_window INTEGER,
   input_price_per_1m REAL,
   output_price_per_1m REAL,
+  cached_input_price_per_1m REAL,
   enabled INTEGER NOT NULL DEFAULT 1,
   metadata TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -307,13 +308,48 @@ CREATE TABLE IF NOT EXISTS run_events (
   phase TEXT,
   visibility TEXT,
   source TEXT,
+  level TEXT NOT NULL DEFAULT 'info',
+  risk_level TEXT NOT NULL DEFAULT 'read_only',
+  category TEXT NOT NULL DEFAULT 'runtime',
+  feature_key TEXT NOT NULL DEFAULT '',
+  message TEXT NOT NULL DEFAULT '',
   terminal INTEGER NOT NULL DEFAULT 0,
   payload TEXT NOT NULL DEFAULT '{}',
   payload_json TEXT,
   error_json TEXT,
   usage_json TEXT,
+  duration_ms INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS app_logs (
+  id TEXT PRIMARY KEY,
+  level TEXT NOT NULL DEFAULT 'info',
+  risk_level TEXT NOT NULL DEFAULT 'read_only',
+  category TEXT NOT NULL DEFAULT 'system',
+  feature_key TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'app',
+  message TEXT NOT NULL DEFAULT '',
+  run_id TEXT,
+  turn_id TEXT,
+  conversation_id TEXT,
+  item_type TEXT,
+  item_id TEXT,
+  payload TEXT NOT NULL DEFAULT '{}',
+  error TEXT,
+  duration_ms INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS log_cleanup_history (
+  id TEXT PRIMARY KEY,
+  actor TEXT NOT NULL DEFAULT 'desktop_user',
+  scopes TEXT NOT NULL DEFAULT '[]',
+  filters TEXT NOT NULL DEFAULT '{}',
+  deleted_counts TEXT NOT NULL DEFAULT '{}',
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS prompt_templates (
@@ -381,6 +417,9 @@ CREATE TABLE IF NOT EXISTS model_calls (
   cacheable_prefix_tokens INTEGER NOT NULL DEFAULT 0,
   dynamic_tail_tokens INTEGER NOT NULL DEFAULT 0,
   cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
   cost_estimate REAL,
   latency_ms INTEGER,
   status TEXT NOT NULL DEFAULT 'pending',
@@ -713,6 +752,72 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS automation_definitions (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK(kind IN ('schedule', 'webhook')),
+  slug TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  trigger_config TEXT NOT NULL DEFAULT '{}',
+  prompt_template TEXT NOT NULL DEFAULT '',
+  input_mode TEXT NOT NULL DEFAULT 'background_task',
+  permission_profile TEXT NOT NULL DEFAULT 'read_only',
+  preferred_node TEXT NOT NULL DEFAULT 'main-node',
+  allow_worker INTEGER NOT NULL DEFAULT 0,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  principal_id TEXT REFERENCES principals(id) ON DELETE SET NULL,
+  dedup_policy TEXT NOT NULL DEFAULT '{}',
+  retry_policy TEXT NOT NULL DEFAULT '{}',
+  max_concurrency INTEGER NOT NULL DEFAULT 1,
+  notification_policy TEXT NOT NULL DEFAULT '{}',
+  next_fire_at TEXT,
+  last_fire_at TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS automation_triggers (
+  id TEXT PRIMARY KEY,
+  automation_id TEXT NOT NULL REFERENCES automation_definitions(id) ON DELETE CASCADE,
+  trigger_type TEXT NOT NULL,
+  dedup_key TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending',
+  fire_at TEXT,
+  claimed_at TEXT,
+  claim_token TEXT,
+  run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  product_task_id TEXT REFERENCES product_tasks(id) ON DELETE SET NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  error_code TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(automation_id, dedup_key)
+);
+
+CREATE TABLE IF NOT EXISTS automation_runs (
+  id TEXT PRIMARY KEY,
+  automation_id TEXT NOT NULL REFERENCES automation_definitions(id) ON DELETE CASCADE,
+  trigger_id TEXT NOT NULL REFERENCES automation_triggers(id) ON DELETE CASCADE,
+  run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  product_task_id TEXT REFERENCES product_tasks(id) ON DELETE SET NULL,
+  status TEXT NOT NULL DEFAULT 'running',
+  attempt_number INTEGER NOT NULL DEFAULT 1,
+  started_at TEXT,
+  finished_at TEXT,
+  output_summary TEXT,
+  error_code TEXT,
+  error_message TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL,
@@ -832,6 +937,14 @@ CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_run_events_conversation_created ON run_events(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_run_events_type ON run_events(run_id, event_type);
 CREATE INDEX IF NOT EXISTS idx_run_events_item ON run_events(item_type, item_id);
+CREATE INDEX IF NOT EXISTS idx_run_events_level ON run_events(level, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_run_events_risk ON run_events(risk_level, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_run_events_category ON run_events(category, feature_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_logs_created ON app_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_logs_level ON app_logs(level, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_logs_risk ON app_logs(risk_level, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_logs_category ON app_logs(category, feature_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_logs_run_id ON app_logs(run_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_confirmation_requests_call_id ON confirmation_requests(call_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_lifecycle ON conversations(lifecycle_status, pinned DESC, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_group ON conversations(group_id, lifecycle_status, updated_at DESC);
@@ -883,6 +996,13 @@ CREATE INDEX IF NOT EXISTS idx_channel_identities_principal ON channel_identitie
 CREATE INDEX IF NOT EXISTS idx_conversation_entry_links_conversation ON conversation_entry_links(conversation_id, channel);
 CREATE INDEX IF NOT EXISTS idx_task_entry_links_task ON task_entry_links(product_task_id, principal_id);
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_target ON notification_deliveries(conversation_id, product_task_id, status);
+CREATE INDEX IF NOT EXISTS idx_automation_definitions_kind ON automation_definitions(kind, enabled, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_automation_definitions_enabled ON automation_definitions(enabled, deleted_at, next_fire_at);
+CREATE INDEX IF NOT EXISTS idx_automation_definitions_slug ON automation_definitions(slug);
+CREATE INDEX IF NOT EXISTS idx_automation_triggers_claim ON automation_triggers(status, next_attempt_at, fire_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_automation_triggers_definition ON automation_triggers(automation_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_automation_runs_definition ON automation_runs(automation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_automation_runs_trigger ON automation_runs(trigger_id, created_at DESC);
 
 INSERT INTO schema_migrations (version) VALUES ('001_init_schema')
 ON CONFLICT(version) DO NOTHING;
@@ -891,4 +1011,7 @@ INSERT INTO schema_migrations (version) VALUES ('002_product_task_memory_artifac
 ON CONFLICT(version) DO NOTHING;
 
 INSERT INTO schema_migrations (version) VALUES ('010_conversation_lifecycle')
+ON CONFLICT(version) DO NOTHING;
+
+INSERT INTO schema_migrations (version) VALUES ('012_automation_os')
 ON CONFLICT(version) DO NOTHING;

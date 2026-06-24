@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS models (
   context_window INTEGER,
   input_price_per_1m REAL,
   output_price_per_1m REAL,
+  cached_input_price_per_1m REAL,
   enabled INTEGER NOT NULL DEFAULT 1,
   metadata TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -279,9 +280,27 @@ CREATE TABLE IF NOT EXISTS run_events (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  schema_version INTEGER NOT NULL DEFAULT 1,
   seq INTEGER NOT NULL,
   event_type TEXT NOT NULL,
+  item_type TEXT,
+  item_id TEXT,
+  parent_item_id TEXT,
+  phase TEXT,
+  visibility TEXT,
+  source TEXT,
+  level TEXT NOT NULL DEFAULT 'info',
+  risk_level TEXT NOT NULL DEFAULT 'read_only',
+  category TEXT NOT NULL DEFAULT 'runtime',
+  feature_key TEXT NOT NULL DEFAULT '',
+  message TEXT NOT NULL DEFAULT '',
+  terminal INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER,
   payload TEXT NOT NULL DEFAULT '{}',
+  payload_json TEXT,
+  error_json TEXT,
+  usage_json TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(run_id, seq)
 );
@@ -351,6 +370,9 @@ CREATE TABLE IF NOT EXISTS model_calls (
   cacheable_prefix_tokens INTEGER NOT NULL DEFAULT 0,
   dynamic_tail_tokens INTEGER NOT NULL DEFAULT 0,
   cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
   cost_estimate REAL,
   latency_ms INTEGER,
   status TEXT NOT NULL DEFAULT 'pending',
@@ -701,6 +723,12 @@ CREATE INDEX IF NOT EXISTS idx_turns_run_id ON turns(run_id, turn_index);
 CREATE INDEX IF NOT EXISTS idx_turn_items_run_id ON turn_items(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_turn_items_call_id ON turn_items(call_id);
 CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_run_events_conversation_created ON run_events(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_run_events_type ON run_events(run_id, event_type);
+CREATE INDEX IF NOT EXISTS idx_run_events_item ON run_events(item_type, item_id);
+CREATE INDEX IF NOT EXISTS idx_run_events_level ON run_events(level, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_run_events_risk ON run_events(risk_level, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_run_events_category ON run_events(category, feature_key, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_confirmation_requests_call_id ON confirmation_requests(call_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_lifecycle ON conversations(lifecycle_status, pinned DESC, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_group ON conversations(group_id, lifecycle_status, updated_at DESC);

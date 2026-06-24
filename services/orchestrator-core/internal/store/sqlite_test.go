@@ -56,10 +56,10 @@ func TestApplySQLiteSchemaMigratesLegacyRunEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !columns["turn_id"] || !columns["payload"] {
+	if !columns["turn_id"] || !columns["payload"] || !columns["level"] || !columns["risk_level"] || !columns["category"] || !columns["feature_key"] || !columns["message"] || !columns["conversation_id"] || !columns["item_id"] || !columns["item_type"] {
 		t.Fatalf("run_events columns missing current fields: %+v", columns)
 	}
-	if columns["item_id"] || columns["snapshot"] || columns["delta"] {
+	if columns["snapshot"] || columns["delta"] {
 		t.Fatalf("run_events still has legacy columns after migration: %+v", columns)
 	}
 	if _, err := db.SQL().ExecContext(ctx, `

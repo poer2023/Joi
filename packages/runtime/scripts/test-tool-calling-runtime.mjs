@@ -34,7 +34,7 @@ const server = createServer((req, res) => {
       res.end([
         sse({ choices: [{ delta: { content: 'Streamed ' } }] }),
         sse({ choices: [{ delta: { content: 'answer.' } }] }),
-        sse({ usage: { prompt_tokens: 13, completion_tokens: 5, cached_input_tokens: 2 } }),
+        sse({ usage: { prompt_tokens: 13, completion_tokens: 5, input_tokens_details: { cached_tokens: 2 } } }),
         '',
         'data: [DONE]',
         '',
@@ -100,7 +100,14 @@ const server = createServer((req, res) => {
     assert.ok(payload.messages.at(-1).content.includes('Run Trace evidence'));
     res.end(JSON.stringify({
       choices: [{ message: { role: 'assistant', content: 'Run Trace evidence found.' } }],
-      usage: { prompt_tokens: 15, completion_tokens: 6, cached_input_tokens: 4 },
+      usage: {
+        prompt_tokens: 15,
+        completion_tokens: 6,
+        cached_input_tokens: 4,
+        prompt_tokens_details: { cache_creation_tokens: 1 },
+        completion_tokens_details: { reasoning_tokens: 2 },
+        total_tokens: 21,
+      },
     }));
   });
 });
@@ -148,6 +155,9 @@ try {
   assert.equal(result.usage.input_tokens, 25);
   assert.equal(result.usage.output_tokens, 9);
   assert.equal(result.usage.cached_input_tokens, 4);
+  assert.equal(result.usage.cache_write_input_tokens, 1);
+  assert.equal(result.usage.reasoning_tokens, 2);
+  assert.equal(result.usage.total_tokens, 34);
   assert.equal(requests.length, 2);
 
   const streamCallbackEvents = [];
@@ -203,6 +213,9 @@ try {
   assert.equal(streamed.usage.input_tokens, 21);
   assert.equal(streamed.usage.output_tokens, 9);
   assert.equal(streamed.usage.cached_input_tokens, 2);
+  assert.equal(streamed.usage.cache_write_input_tokens, 0);
+  assert.equal(streamed.usage.reasoning_tokens, 0);
+  assert.equal(streamed.usage.total_tokens, 30);
   assert.equal(streamRequests.length, 2);
   assert.ok(streamCallbackEvents.some((event) => event[0] === 'tool.call_requested' && event[1] === 'workspace_search'));
   assert.ok(streamCallbackEvents.some((event) => event[0] === 'assistant.delta' && event[1] === 'Streamed '));

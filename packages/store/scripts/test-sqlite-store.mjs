@@ -52,6 +52,42 @@ try {
   assert.equal(trace.model_calls?.[0]?.model_name, 'deepseek-v4-flash');
   assert.equal(trace.model_calls?.[0]?.provider, 'deterministic_provider');
 
+  const usageResponse = store.recordToolCallingChat({
+    message: 'usage stats ping',
+    model_name: 'deepseek-v4-flash',
+    input_mode: 'chat_assist',
+    runtime_mode: 'tool_calling',
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'deepseek-v4-flash',
+    final_message: 'usage stats pong',
+    tool_results: [],
+    usage: {
+      input_tokens: 1000,
+      output_tokens: 500,
+      cached_input_tokens: 200,
+      cache_write_input_tokens: 50,
+      reasoning_tokens: 25,
+      total_tokens: 1500,
+    },
+    usage_status: 'recorded',
+    finish_reason: 'stop',
+    model_responses: [{ usage: { prompt_tokens: 1000, completion_tokens: 500 } }],
+  });
+  const usageTrace = store.getRunTrace(usageResponse.run_id);
+  const usageCall = usageTrace.model_calls?.[0];
+  assert.equal(usageCall?.input_tokens, 1000);
+  assert.equal(usageCall?.output_tokens, 500);
+  assert.equal(usageCall?.cached_input_tokens, 200);
+  assert.equal(usageCall?.cache_write_input_tokens, 50);
+  assert.equal(usageCall?.reasoning_tokens, 25);
+  assert.equal(usageCall?.total_tokens, 1500);
+  assert.equal(usageCall?.usage_status, 'recorded');
+  assert.ok((usageCall?.cost_estimate ?? 0) > 0);
+  const usageSummaryItem = store.getModelUsage().items.find((item) => item.provider === 'openai_compatible' && item.model === 'deepseek-v4-flash');
+  assert.equal(usageSummaryItem?.total_tokens, 1500);
+  assert.ok(Number(usageSummaryItem?.estimated_cost ?? 0) > 0);
+
   const chatOnlyResponse = await store.sendDeterministicChat({
     message: '今天只做一个纯聊天检查：用一句话回复我，不要创建任务。',
     input_mode: 'auto',
@@ -111,6 +147,90 @@ try {
 
   const workflows = store.listToolWorkflows().workflows.map((workflow) => workflow.name);
   assert.ok(workflows.includes('memory_search_v1'));
+
+  const automation = store.saveAutomation({
+    kind: 'schedule',
+    name: 'Store automation interval',
+    trigger_config: { type: 'interval', every_minutes: 15 },
+    prompt_template: 'Run store automation for {{payload.subject}}',
+  });
+  assert.equal(automation.kind, 'schedule');
+  assert.equal(automation.enabled, true);
+  assert.equal(automation.permission_profile, 'read_only');
+  assert.equal(store.listAutomations({ kind: 'schedule' }).automations.some((item) => item.id === automation.id), true);
+  const triggerInsert = store.enqueueAutomationTrigger({
+    automation_id: automation.id,
+    trigger_type: 'schedule',
+    dedup_key: 'schedule:store:1',
+    payload: { subject: 'dedup' },
+    fire_at: new Date(Date.now() - 1000).toISOString(),
+  });
+  const triggerDuplicate = store.enqueueAutomationTrigger({
+    automation_id: automation.id,
+    trigger_type: 'schedule',
+    dedup_key: 'schedule:store:1',
+    payload: { subject: 'dedup duplicate' },
+    fire_at: new Date().toISOString(),
+  });
+  assert.equal(triggerDuplicate.deduped, true);
+  assert.equal(triggerDuplicate.trigger.id, triggerInsert.trigger.id);
+  const claimed = store.claimDueAutomationTrigger(new Date().toISOString());
+  assert.equal(claimed?.trigger.id, triggerInsert.trigger.id);
+  assert.equal(claimed?.trigger.attempt_count, 1);
+  assert.equal(store.claimDueAutomationTrigger(new Date().toISOString()), undefined);
+  const automationResponse = await store.sendDeterministicChat({
+    channel: 'automation',
+    message: 'store automation execution',
+    input_mode: 'background_task',
+    runtime_mode: 'tool_calling',
+    permission_profile: 'read_only',
+  });
+  const automationRun = store.recordAutomationRunStarted({
+    automation_id: automation.id,
+    trigger_id: claimed.trigger.id,
+    run_id: automationResponse.run_id,
+    product_task_id: automationResponse.product_task?.id,
+  });
+  store.recordAutomationRunCompleted({
+    automation_run_id: automationRun.id,
+    run_id: automationResponse.run_id,
+    output_summary: 'store automation completed',
+  });
+  assert.equal(store.listAutomationRuns({ automation_id: automation.id }).runs[0].status, 'succeeded');
+  assert.equal(store.listAutomationTriggers({ automation_id: automation.id }).triggers[0].status, 'succeeded');
+  assert.ok(store.getRunTrace(automationResponse.run_id).events.some((event) => event.event_type === 'automation.run_completed'));
+
+  const retryAutomation = store.saveAutomation({
+    kind: 'webhook',
+    name: 'Store automation webhook',
+    trigger_config: { dedup_json_field: 'event_id' },
+    dedup_policy: { dedup_json_field: 'event_id' },
+  });
+  const retryTrigger = store.enqueueAutomationTrigger({
+    automation_id: retryAutomation.id,
+    trigger_type: 'webhook',
+    dedup_key: 'json:event_id:retry',
+    payload: { event_id: 'retry' },
+    fire_at: new Date(Date.now() - 1000).toISOString(),
+  }).trigger;
+  const retryClaim = store.claimDueAutomationTrigger(new Date().toISOString());
+  assert.equal(retryClaim?.trigger.id, retryTrigger.id);
+  const retryAt = new Date(Date.now() + 60_000).toISOString();
+  const failedTrigger = store.recordAutomationTriggerFailed({
+    trigger_id: retryTrigger.id,
+    error_code: 'RUNTIME_FAILED',
+    error_message: 'transient failure',
+    retry_at: retryAt,
+  });
+  assert.equal(failedTrigger.status, 'retry_scheduled');
+  assert.equal(failedTrigger.next_attempt_at, retryAt);
+  store.setAutomationEnabled({ id: retryAutomation.id, enabled: false });
+  assert.throws(() => store.enqueueAutomationTrigger({
+    automation_id: retryAutomation.id,
+    trigger_type: 'webhook',
+    dedup_key: 'json:event_id:disabled',
+    payload: { event_id: 'disabled' },
+  }), /Automation is disabled/);
 
   assert.equal(store.listNodes().nodes[0].id, 'main-node');
   store.disableNode('main-node');
@@ -1176,6 +1296,92 @@ try {
     reopenedRecoveryStore.close();
   }
 
+  {
+    const automationRecoveryDbPath = join(tempDir, 'automation-recovery.db');
+    const automationRecoveryStore = new JoiSQLiteStore({
+      dbPath: automationRecoveryDbPath,
+      schemaSql: readFileSync(join(root, 'database/sqlite/001_init_schema.sql'), 'utf8'),
+      logDir: join(tempDir, 'automation-recovery-logs'),
+      backupDir: join(tempDir, 'automation-recovery-backups'),
+      version: 'test',
+    });
+    const orphanedClaimAutomation = automationRecoveryStore.saveAutomation({
+      kind: 'webhook',
+      name: 'Recover orphaned claimed automation',
+      retry_policy: { max_attempts: 2 },
+    });
+    const orphanedClaimTrigger = automationRecoveryStore.enqueueAutomationTrigger({
+      automation_id: orphanedClaimAutomation.id,
+      trigger_type: 'webhook',
+      dedup_key: 'recovery:claimed',
+      payload: { event_id: 'claimed' },
+      fire_at: new Date(Date.now() - 1000).toISOString(),
+    }).trigger;
+    const orphanedClaim = automationRecoveryStore.claimDueAutomationTrigger(new Date().toISOString());
+    assert.equal(orphanedClaim?.trigger.id, orphanedClaimTrigger.id);
+    assert.equal(orphanedClaim?.trigger.status, 'claimed');
+
+    const interruptedRunningAutomation = automationRecoveryStore.saveAutomation({
+      kind: 'schedule',
+      name: 'Recover interrupted running automation',
+      retry_policy: { max_attempts: 1 },
+    });
+    const interruptedRunningTrigger = automationRecoveryStore.enqueueAutomationTrigger({
+      automation_id: interruptedRunningAutomation.id,
+      trigger_type: 'schedule',
+      dedup_key: 'recovery:running',
+      payload: { event_id: 'running' },
+      fire_at: new Date(Date.now() - 1000).toISOString(),
+    }).trigger;
+    const interruptedClaim = automationRecoveryStore.claimDueAutomationTrigger(new Date().toISOString());
+    assert.equal(interruptedClaim?.trigger.id, interruptedRunningTrigger.id);
+    const interruptedRun = automationRecoveryStore.beginToolCallingChat({
+      message: 'This automation run will be orphaned by restart',
+      channel: 'automation',
+      input_mode: 'background_task',
+      runtime_mode: 'tool_calling',
+      model_name: 'live-tool-model',
+    }, {
+      provider: 'openai_compatible',
+      model_name: 'live-tool-model',
+      selected_agent_id: 'general_agent',
+    });
+    const interruptedAutomationRun = automationRecoveryStore.recordAutomationRunStarted({
+      automation_id: interruptedRunningAutomation.id,
+      trigger_id: interruptedRunningTrigger.id,
+      run_id: interruptedRun.run_id,
+    });
+    assert.equal(interruptedAutomationRun.status, 'running');
+    automationRecoveryStore.close();
+
+    const reopenedAutomationRecoveryStore = new JoiSQLiteStore({
+      dbPath: automationRecoveryDbPath,
+      schemaSql: readFileSync(join(root, 'database/sqlite/001_init_schema.sql'), 'utf8'),
+      logDir: join(tempDir, 'automation-recovery-logs'),
+      backupDir: join(tempDir, 'automation-recovery-backups'),
+      version: 'test',
+    });
+    const recoveredClaimedTrigger = reopenedAutomationRecoveryStore.listAutomationTriggers({ automation_id: orphanedClaimAutomation.id }).triggers[0];
+    assert.equal(recoveredClaimedTrigger.status, 'retry_scheduled');
+    assert.equal(recoveredClaimedTrigger.error_code, 'runtime_lost_on_restart');
+    assert.ok(recoveredClaimedTrigger.next_attempt_at);
+    const retryClaim = reopenedAutomationRecoveryStore.claimDueAutomationTrigger(new Date(Date.now() + 1000).toISOString());
+    assert.equal(retryClaim?.trigger.id, orphanedClaimTrigger.id);
+    assert.equal(retryClaim?.trigger.attempt_count, 2);
+
+    const recoveredRunningTrigger = reopenedAutomationRecoveryStore.listAutomationTriggers({ automation_id: interruptedRunningAutomation.id }).triggers[0];
+    assert.equal(recoveredRunningTrigger.status, 'failed');
+    assert.equal(recoveredRunningTrigger.error_code, 'runtime_lost_on_restart');
+    const recoveredRunningRun = reopenedAutomationRecoveryStore.listAutomationRuns({ automation_id: interruptedRunningAutomation.id }).runs[0];
+    assert.equal(recoveredRunningRun.status, 'failed');
+    assert.equal(recoveredRunningRun.error_code, 'runtime_lost_on_restart');
+    const interruptedTrace = reopenedAutomationRecoveryStore.getRunTrace(interruptedRun.run_id);
+    assert.equal(interruptedTrace.status, 'failed');
+    assert.ok(interruptedTrace.events.some((event) => event.event_type === 'automation.run_failed'));
+    assert.ok(!interruptedTrace.events.some((event) => event.event_type === 'automation.retry_scheduled'));
+    reopenedAutomationRecoveryStore.close();
+  }
+
   const closureReport = store.getRecentRunClosureReport({ limit: 100 });
   assert.ok(closureReport.metrics.total_runs > 0);
   assert.ok(closureReport.metrics.terminal_event_runs > 0);
@@ -1242,6 +1448,62 @@ try {
     assert.equal(diagnosticsZip.includes(Buffer.from(leaked)), false, `diagnostics leaked ${leaked}`);
   }
   assert.ok(diagnosticsZip.includes(Buffer.from('[REDACTED]')));
+
+  const longLogBody = 'x'.repeat(900);
+  const appLog = store.recordAppLog({
+    level: 'info',
+    risk_level: 'state_change',
+    category: 'settings',
+    feature_key: 'store.test.app_log',
+    source: 'store_test',
+    message: 'store test app log',
+    payload: {
+      api_key: 'log-secret-value',
+      nested: { password: 'log-password-value' },
+      note: 'token=log-token-value',
+      long_note: longLogBody,
+    },
+  });
+  assert.equal(appLog.payload.api_key, '[REDACTED]');
+  assert.equal(appLog.payload.nested.password, '[REDACTED]');
+  assert.equal(String(appLog.payload.note).includes('log-token-value'), false);
+  assert.equal(String(appLog.payload.long_note).includes(longLogBody), true);
+  const secretShapeLog = store.recordAppLog({
+    level: 'info',
+    risk_level: 'state_change',
+    category: 'ipc',
+    feature_key: 'store.test.secret_shape_log',
+    source: 'store_test',
+    message: 'secret shape log',
+    payload: {
+      method: 'SaveSecret',
+      payload: { name: 'MODEL_API_KEY', value: 'plain-local-secret-12345' },
+    },
+  });
+  assert.equal(secretShapeLog.payload.payload.value, '[REDACTED]');
+  assert.equal(JSON.stringify(secretShapeLog.payload).includes('plain-local-secret-12345'), false);
+  const logDetail = store.getLogEntry(appLog.id);
+  assert.equal(logDetail?.feature_key, 'store.test.app_log');
+  const unifiedLogs = store.listLogs({ query: 'store.test.app_log', include_trace: true, include_worker_heartbeat: true, limit: 100 }).logs;
+  assert.ok(unifiedLogs.some((log) => log.id === appLog.id && log.source_table === 'app_logs'));
+  const runLogs = store.listLogs({ run_id: response.run_id, include_trace: true, include_worker_heartbeat: true, limit: 100 }).logs;
+  assert.ok(runLogs.some((log) => log.source_table === 'run_events' && log.level && log.risk_level && log.category && log.feature_key));
+  const defaultWorkerLogs = store.listLogs({ sources: ['worker_gateway'], limit: 100 }).logs;
+  assert.ok(!defaultWorkerLogs.some((log) => ['heartbeat', 'claim'].includes(String(log.action || ''))));
+  const conversationCountBeforeLogCleanup = Number(store['get'](`SELECT COUNT(*) AS count FROM conversations`)?.count || 0);
+  const memoryCountBeforeLogCleanup = Number(store['get'](`SELECT COUNT(*) AS count FROM memories`)?.count || 0);
+  const settingsCountBeforeLogCleanup = Number(store['get'](`SELECT COUNT(*) AS count FROM desktop_settings`)?.count || 0);
+  const cleanupPreview = store.previewLogCleanup({ scopes: ['app_logs'], reason: 'store test preview' });
+  assert.ok(cleanupPreview.counts.app_logs >= 1);
+  assert.equal(cleanupPreview.safe_to_clear, true);
+  const cleanupResult = store.clearLogs({ scopes: ['app_logs'], reason: 'store test clear' });
+  assert.ok(cleanupResult.cleanup_id);
+  assert.ok(cleanupResult.counts.app_logs >= 1);
+  assert.equal(store.getLogEntry(appLog.id), null);
+  assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM conversations`)?.count || 0), conversationCountBeforeLogCleanup);
+  assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM memories`)?.count || 0), memoryCountBeforeLogCleanup);
+  assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM desktop_settings`)?.count || 0), settingsCountBeforeLogCleanup);
+  assert.ok(Number(store['get'](`SELECT COUNT(*) AS count FROM log_cleanup_history`)?.count || 0) >= 1);
 
   assert.equal(store.getOnboardingStatus().first_backup_created, true);
   store.completeOnboarding();

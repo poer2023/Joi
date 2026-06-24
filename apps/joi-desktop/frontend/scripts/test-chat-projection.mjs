@@ -75,6 +75,7 @@ try {
   assert.equal(getEventVisibility(event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'trace_only', status: 'running', step: 0 }), 'auto'), 'transcript');
   assert.equal(getEventVisibility(event('worker.started', { task_id: 'task_1', status: 'running' }), 'background_task'), 'transcript');
   assert.equal(getEventVisibility(event('run.completed', { status: 'succeeded' }), 'auto'), 'hidden');
+  assert.equal(getEventVisibility(event('automation.run_started', { status: 'running', summary: '自动化开始执行' }, { item_type: 'automation', visibility: 'inline_status' }), 'background_task'), 'transcript');
 
   {
     const expanded = normalizeRunEvents([
@@ -121,6 +122,95 @@ try {
     assert.equal(projectedAssistant.content, 'hello world');
     assert.equal(projectedAssistant.streaming, false);
     assert.equal(result.activeRunStatusByRunId.run_stream, 'completed');
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [
+        { id: 'msg_user_snapshot', conversation_id: 'conv_1', role: 'user', content: 'snapshot stream please' },
+      ],
+      activeRunId: 'run_snapshot',
+      runEventsByRunId: {
+        run_snapshot: [
+          event('run.started', { status: 'running', seq: 1 }, { run_id: 'run_snapshot' }),
+          event('assistant.delta', { text: '你今天心情怎么样', seq: 2 }, {
+            run_id: 'run_snapshot',
+            item_type: 'assistant_message',
+            item_id: 'msg_assistant_snapshot',
+            visibility: 'chat',
+          }),
+          event('assistant.delta', { text: '你今天心情怎么样？好的～那我们换个话题吧。', seq: 3 }, {
+            run_id: 'run_snapshot',
+            item_type: 'assistant_message',
+            item_id: 'msg_assistant_snapshot',
+            visibility: 'chat',
+          }),
+          event('assistant.completed', { text: '好的～那我们换个话题吧。', status: 'completed', seq: 4 }, {
+            run_id: 'run_snapshot',
+            item_type: 'assistant_message',
+            item_id: 'msg_assistant_snapshot',
+            visibility: 'chat',
+          }),
+          event('run.completed', { status: 'succeeded', seq: 5 }, { run_id: 'run_snapshot' }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const projectedAssistant = result.items.find((item) => item.type === 'message' && item.role === 'assistant');
+    assert.equal(projectedAssistant.id, 'msg_assistant_snapshot');
+    assert.equal(projectedAssistant.content, '好的～那我们换个话题吧。');
+    assert.equal(projectedAssistant.streaming, false);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [
+        { id: 'msg_user_token', conversation_id: 'conv_1', role: 'user', content: 'token stream please' },
+      ],
+      activeRunId: 'run_token',
+      runEventsByRunId: {
+        run_token: [
+          event('run.started', { status: 'running', seq: 1 }, { run_id: 'run_token' }),
+          event('assistant.delta', { text: '好', seq: 2 }, {
+            run_id: 'run_token',
+            item_type: 'assistant_message',
+            item_id: 'msg_assistant_token',
+            visibility: 'chat',
+          }),
+          event('assistant.delta', { text: '的', seq: 3 }, {
+            run_id: 'run_token',
+            item_type: 'assistant_message',
+            item_id: 'msg_assistant_token',
+            visibility: 'chat',
+          }),
+          event('run.completed', { status: 'succeeded', seq: 4 }, { run_id: 'run_token' }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const projectedAssistant = result.items.find((item) => item.type === 'message' && item.role === 'assistant');
+    assert.equal(projectedAssistant.id, 'msg_assistant_token');
+    assert.equal(projectedAssistant.content, '好的');
+    assert.equal(projectedAssistant.streaming, false);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [],
+      activeRunId: 'run_auto',
+      runEventsByRunId: {
+        run_auto: [
+          event('automation.run_started', { status: 'running', summary: 'Daily report', seq: 1 }, { run_id: 'run_auto', item_type: 'automation', item_id: 'automation_1', visibility: 'inline_status' }),
+          event('automation.run_completed', { status: 'completed', summary: 'Daily report done', seq: 2 }, { run_id: 'run_auto', item_type: 'automation', item_id: 'automation_1', visibility: 'inline_status' }),
+        ],
+      },
+      mode: 'background_task',
+    });
+    assert.equal(result.items.length, 1);
+    assert.equal(result.items[0].type, 'transcript_line');
+    assert.equal(result.items[0].label, 'Automation updated · Daily report done');
+    assert.equal(result.items[0].detail, 'Daily report done');
+    assert.equal(result.activeRunStatusByRunId.run_auto, 'completed');
   }
 
   {

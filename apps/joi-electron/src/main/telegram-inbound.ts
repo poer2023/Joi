@@ -2,7 +2,7 @@ import type { BrowserWindow } from 'electron';
 import { createHash } from 'node:crypto';
 import type { ChatRequest, ChatResponse, SettingsRecord, TelegramInboundStatus } from '../../../../packages/shared-types/src/desktop-api';
 import type { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
-import type { JoiSQLiteStore } from '../../../../packages/store/src/sqlite';
+import type { AppLogInput, JoiSQLiteStore } from '../../../../packages/store/src/sqlite';
 import { canRunRealToolCalling, emitRunEvents, resolveAPIKeyForModelEndpoint, runLiveElectronToolCallingChat } from './ipc';
 
 type TelegramInboundOptions = {
@@ -124,6 +124,14 @@ export class TelegramInboundService {
     this.polling = true;
     this.lastError = '';
     this.logger.info('telegram inbound started');
+    this.log({
+      level: 'info',
+      risk_level: 'read_only',
+      category: 'external',
+      feature_key: 'telegram.poll.started',
+      source: 'telegram_inbound',
+      message: 'Telegram inbound poll started',
+    });
     try {
       while (!signal.aborted) {
         try {
@@ -140,6 +148,15 @@ export class TelegramInboundService {
           if (!signal.aborted) {
             this.lastError = sanitizeTelegramError(error, token);
             this.logger.warn('telegram inbound poll failed', this.lastError);
+            this.log({
+              level: 'warn',
+              risk_level: 'read_only',
+              category: 'external',
+              feature_key: 'telegram.poll.failed',
+              source: 'telegram_inbound',
+              message: 'Telegram inbound poll failed',
+              error: { message: sanitizeTelegramError(error, token) },
+            });
             await sleep(retryDelayMs, signal);
           }
         }
@@ -147,6 +164,14 @@ export class TelegramInboundService {
     } finally {
       this.polling = false;
       this.logger.info('telegram inbound stopped');
+      this.log({
+        level: 'info',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'telegram.poll.stopped',
+        source: 'telegram_inbound',
+        message: 'Telegram inbound poll stopped',
+      });
     }
   }
 
@@ -168,6 +193,17 @@ export class TelegramInboundService {
     const text = message?.text?.trim() || '';
     if (!message || !text) return;
     if (message.chat.type !== 'private') {
+      this.log({
+        level: 'info',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'telegram.message.rejected',
+        source: 'telegram_inbound',
+        message: 'Telegram message rejected',
+        item_type: 'telegram_message',
+        item_id: String(message.message_id),
+        payload: { chat_id: message.chat.id, chat_type: message.chat.type, update_id: update.update_id, reason: 'non_private_chat' },
+      });
       await sendTelegramMessage(token, message.chat.id, '当前 Joi Telegram 入口只支持私聊文本消息。');
       return;
     }
@@ -175,14 +211,47 @@ export class TelegramInboundService {
     const settings = this.store.getSettings();
     const allowed = allowedUserIDs(settings.telegram_allowed_user_ids);
     if (allowed.size > 0 && (!fromID || !allowed.has(fromID))) {
+      this.log({
+        level: 'warn',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'telegram.message.rejected',
+        source: 'telegram_inbound',
+        message: 'Telegram message rejected',
+        item_type: 'telegram_message',
+        item_id: String(message.message_id),
+        payload: { chat_id: message.chat.id, from_id: fromID, update_id: update.update_id, reason: 'unauthorized_user' },
+      });
       await sendTelegramMessage(token, message.chat.id, '未授权：当前 Joi Telegram 入口只允许白名单用户使用。');
       return;
     }
     const principalID = allowed.size > 0 ? localOwnerPrincipalID : undefined;
     if (isStatusCommand(text)) {
+      this.log({
+        level: 'info',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'telegram.status.requested',
+        source: 'telegram_inbound',
+        message: 'Telegram status requested',
+        item_type: 'telegram_message',
+        item_id: String(message.message_id),
+        payload: { chat_id: message.chat.id, from_id: fromID, update_id: update.update_id },
+      });
       await sendTelegramMessage(token, message.chat.id, await this.telegramStatusReply(settings));
       return;
     }
+    this.log({
+      level: 'info',
+      risk_level: 'read_only',
+      category: 'external',
+      feature_key: 'telegram.message.received',
+      source: 'telegram_inbound',
+      message: 'Telegram message received',
+      item_type: 'telegram_message',
+      item_id: String(message.message_id),
+      payload: { chat_id: message.chat.id, from_id: fromID, update_id: update.update_id, text_length: text.length },
+    });
     await this.runJoiAndReply(token, message, settings, principalID);
   }
 
@@ -219,9 +288,29 @@ export class TelegramInboundService {
     };
     const stopTyping = startTelegramTypingLoop(token, message.chat.id, this.logger);
     try {
+      this.log({
+        level: 'info',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'telegram.run.requested',
+        source: 'telegram_inbound',
+        message: 'Telegram run requested',
+        conversation_id: req.conversation_id,
+        payload: { chat_id: message.chat.id, from_id: message.from?.id, text_length: req.message.length },
+      });
       const settings = this.store.getSettings();
       const apiKey = await resolveAPIKeyForModelEndpoint(settings, this.secrets);
       if (!canRunRealToolCalling(settings, apiKey, req)) {
+        this.log({
+          level: 'warn',
+          risk_level: 'read_only',
+          category: 'external',
+          feature_key: 'telegram.run.skipped',
+          source: 'telegram_inbound',
+          message: 'Telegram run skipped',
+          conversation_id: req.conversation_id,
+          payload: { reason: 'model_not_configured' },
+        });
         await sendTelegramMessage(token, message.chat.id, 'Joi Telegram 入口已收到消息，但模型未配置完整，无法生成回复。请先在 Joi Desktop 里完成模型设置。');
         return;
       }
@@ -232,11 +321,42 @@ export class TelegramInboundService {
       const window = this.getWindow();
       if (window && !window.isDestroyed()) emitRunEvents(window, this.store.getRunTrace(result.run_id));
       await sendTelegramMessage(token, message.chat.id, telegramReply(result));
+      this.log({
+        level: 'info',
+        risk_level: 'state_change',
+        category: 'external',
+        feature_key: 'telegram.reply.sent',
+        source: 'telegram_inbound',
+        message: 'Telegram reply sent',
+        run_id: result.run_id,
+        conversation_id: result.conversation_id,
+        item_type: 'telegram_chat',
+        item_id: String(message.chat.id),
+        payload: { response_length: result.response.length },
+      });
     } catch (error) {
       this.logger.error('telegram inbound run failed', sanitizeTelegramError(error, token));
+      this.log({
+        level: 'error',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'telegram.run.failed',
+        source: 'telegram_inbound',
+        message: 'Telegram run failed',
+        conversation_id: req.conversation_id,
+        error: { message: sanitizeTelegramError(error, token) },
+      });
       await sendTelegramMessage(token, message.chat.id, `处理失败：${compactText(safeErrorMessage(error), 260)}`);
     } finally {
       stopTyping();
+    }
+  }
+
+  private log(input: AppLogInput): void {
+    try {
+      this.store.recordAppLog(input);
+    } catch (error) {
+      this.logger.warn('telegram app log write failed', safeErrorMessage(error));
     }
   }
 }

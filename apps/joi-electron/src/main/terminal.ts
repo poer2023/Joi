@@ -22,6 +22,8 @@ type TerminalRecord = {
   pty?: IPty;
 };
 
+type TerminalLogSink = (event: TerminalSessionEvent) => void;
+
 const require = createRequire(import.meta.url);
 const MAX_BUFFER_CHARS = 80_000;
 const DEFAULT_COLS = 80;
@@ -31,6 +33,7 @@ export class TerminalSessionManager {
   private readonly sessions = new Map<string, TerminalRecord>();
   private window: BrowserWindow | null = null;
   private nodePty: NodePtyModule | null = null;
+  private logSink: TerminalLogSink | null = null;
 
   attachWindow(window: BrowserWindow) {
     this.window = window;
@@ -40,6 +43,10 @@ export class TerminalSessionManager {
     if (this.window === window) {
       this.window = null;
     }
+  }
+
+  setLogSink(sink: TerminalLogSink | null) {
+    this.logSink = sink;
   }
 
   start(payload?: TerminalSessionStartRequest): TerminalSessionInfo {
@@ -168,6 +175,7 @@ export class TerminalSessionManager {
   }
 
   private emit(event: TerminalSessionEvent) {
+    this.logSink?.(event);
     if (!this.window || this.window.isDestroyed()) return;
     this.window.webContents.send('joi:terminal:event', event);
   }

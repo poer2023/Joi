@@ -61,6 +61,9 @@ export type ToolCallingTurnResult = {
     input_tokens: number;
     output_tokens: number;
     cached_input_tokens: number;
+    cache_write_input_tokens: number;
+    reasoning_tokens: number;
+    total_tokens: number;
   };
   usage_status: UsageStatus;
   finish_reason?: string;
@@ -80,7 +83,14 @@ export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): P
   }));
   const toolResults: ToolResult[] = [];
   const modelResponses: Array<Record<string, unknown>> = [];
-  const usage = { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 };
+  const usage = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_input_tokens: 0,
+    cache_write_input_tokens: 0,
+    reasoning_tokens: 0,
+    total_tokens: 0,
+  };
   let usageStatus: UsageStatus = 'provider_missing';
   let finishReason = '';
   for (let step = 0; step < maxSteps; step++) {
@@ -362,13 +372,39 @@ function parseArguments(value: unknown): Record<string, unknown> {
 function addUsage(total: ToolCallingTurnResult['usage'], value: unknown): UsageStatus {
   if (!value || typeof value !== 'object') return 'provider_missing';
   const usage = value as Record<string, unknown>;
+  const promptDetails = objectValue(usage.prompt_tokens_details) || objectValue(usage.input_tokens_details);
+  const completionDetails = objectValue(usage.completion_tokens_details) || objectValue(usage.output_tokens_details);
   const inputTokens = numberValue(usage.prompt_tokens) || numberValue(usage.input_tokens);
   const outputTokens = numberValue(usage.completion_tokens) || numberValue(usage.output_tokens);
-  const cachedInputTokens = numberValue(usage.cached_tokens) || numberValue(usage.cached_input_tokens);
+  const cachedInputTokens = numberValue(usage.cached_tokens)
+    || numberValue(usage.cached_input_tokens)
+    || numberValue(usage.cache_read_input_tokens)
+    || numberValue(promptDetails?.cached_tokens);
+  const cacheWriteInputTokens = numberValue(usage.cache_write_input_tokens)
+    || numberValue(usage.cache_creation_input_tokens)
+    || numberValue(promptDetails?.cache_write_tokens)
+    || numberValue(promptDetails?.cache_creation_tokens)
+    || numberValue(promptDetails?.cache_creation_input_tokens);
+  const reasoningTokens = numberValue(usage.reasoning_tokens)
+    || numberValue(usage.reasoning_output_tokens)
+    || numberValue(completionDetails?.reasoning_tokens);
+  const totalTokens = numberValue(usage.total_tokens)
+    || numberValue(usage.totalTokens)
+    || inputTokens + outputTokens;
   total.input_tokens += inputTokens;
   total.output_tokens += outputTokens;
   total.cached_input_tokens += cachedInputTokens;
-  return inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0 ? 'recorded' : 'provider_missing';
+  total.cache_write_input_tokens += cacheWriteInputTokens;
+  total.reasoning_tokens += reasoningTokens;
+  total.total_tokens += totalTokens;
+  return inputTokens > 0
+    || outputTokens > 0
+    || cachedInputTokens > 0
+    || cacheWriteInputTokens > 0
+    || reasoningTokens > 0
+    || totalTokens > 0
+    ? 'recorded'
+    : 'provider_missing';
 }
 
 function mergeUsageStatus(current: UsageStatus, next: UsageStatus): UsageStatus {
@@ -427,4 +463,8 @@ function stringValue(value: unknown): string {
 function numberValue(value: unknown): number {
   const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : 0;
   return Number.isFinite(number) ? number : 0;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }

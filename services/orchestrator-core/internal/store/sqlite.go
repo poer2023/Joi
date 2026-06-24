@@ -82,6 +82,15 @@ func (db *DB) ApplySQLiteSchemaSQL(ctx context.Context, schemaSQL string) error 
 			return err
 		}
 	}
+	hasRunEvents, err := db.sqliteTableExists(ctx, "run_events")
+	if err != nil {
+		return err
+	}
+	if hasRunEvents {
+		if err := db.EnsureSQLiteRunEventLifecycle(ctx); err != nil {
+			return err
+		}
+	}
 	if _, err := db.sql.ExecContext(ctx, schemaSQL); err != nil {
 		return err
 	}
@@ -175,10 +184,59 @@ func (db *DB) EnsureSQLiteRunEventLifecycle(ctx context.Context) error {
 	}
 	needsRebuild := !columns["turn_id"] || !columns["payload"] || columns["item_id"] || columns["snapshot"] || columns["delta"]
 	if !needsRebuild {
-		_, err := db.sql.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, seq)`)
+		return db.ensureSQLiteRunEventLogColumns(ctx)
+	}
+	if err := db.rebuildSQLiteRunEvents(ctx, columns); err != nil {
 		return err
 	}
-	return db.rebuildSQLiteRunEvents(ctx, columns)
+	return db.ensureSQLiteRunEventLogColumns(ctx)
+}
+
+func (db *DB) ensureSQLiteRunEventLogColumns(ctx context.Context) error {
+	additions := []struct {
+		column string
+		sql    string
+	}{
+		{"level", `ALTER TABLE run_events ADD COLUMN level TEXT NOT NULL DEFAULT 'info'`},
+		{"risk_level", `ALTER TABLE run_events ADD COLUMN risk_level TEXT NOT NULL DEFAULT 'read_only'`},
+		{"category", `ALTER TABLE run_events ADD COLUMN category TEXT NOT NULL DEFAULT 'runtime'`},
+		{"feature_key", `ALTER TABLE run_events ADD COLUMN feature_key TEXT NOT NULL DEFAULT ''`},
+		{"message", `ALTER TABLE run_events ADD COLUMN message TEXT NOT NULL DEFAULT ''`},
+		{"duration_ms", `ALTER TABLE run_events ADD COLUMN duration_ms INTEGER`},
+		{"conversation_id", `ALTER TABLE run_events ADD COLUMN conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL`},
+		{"schema_version", `ALTER TABLE run_events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1`},
+		{"item_type", `ALTER TABLE run_events ADD COLUMN item_type TEXT`},
+		{"item_id", `ALTER TABLE run_events ADD COLUMN item_id TEXT`},
+		{"parent_item_id", `ALTER TABLE run_events ADD COLUMN parent_item_id TEXT`},
+		{"phase", `ALTER TABLE run_events ADD COLUMN phase TEXT`},
+		{"visibility", `ALTER TABLE run_events ADD COLUMN visibility TEXT`},
+		{"source", `ALTER TABLE run_events ADD COLUMN source TEXT`},
+		{"terminal", `ALTER TABLE run_events ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0`},
+		{"payload_json", `ALTER TABLE run_events ADD COLUMN payload_json TEXT`},
+		{"error_json", `ALTER TABLE run_events ADD COLUMN error_json TEXT`},
+		{"usage_json", `ALTER TABLE run_events ADD COLUMN usage_json TEXT`},
+	}
+	for _, addition := range additions {
+		exists, err := db.sqliteColumnExists(ctx, "run_events", addition.column)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			if _, err := db.sql.ExecContext(ctx, addition.sql); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := db.sql.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, seq);
+		CREATE INDEX IF NOT EXISTS idx_run_events_conversation_created ON run_events(conversation_id, created_at);
+		CREATE INDEX IF NOT EXISTS idx_run_events_type ON run_events(run_id, event_type);
+		CREATE INDEX IF NOT EXISTS idx_run_events_item ON run_events(item_type, item_id);
+		CREATE INDEX IF NOT EXISTS idx_run_events_level ON run_events(level, created_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_run_events_risk ON run_events(risk_level, created_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_run_events_category ON run_events(category, feature_key, created_at DESC);
+	`)
+	return err
 }
 
 func (db *DB) rebuildSQLiteRunEvents(ctx context.Context, columns map[string]bool) error {
@@ -205,13 +263,31 @@ func (db *DB) rebuildSQLiteRunEvents(ctx context.Context, columns map[string]boo
 	if _, err := tx.ExecContext(ctx, `
 		CREATE TABLE run_events (
 		  id TEXT PRIMARY KEY,
-		  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-		  turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
-		  seq INTEGER NOT NULL,
-		  event_type TEXT NOT NULL,
-		  payload TEXT NOT NULL DEFAULT '{}',
-		  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-		  UNIQUE(run_id, seq)
+			  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+				  turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+				  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+				  schema_version INTEGER NOT NULL DEFAULT 1,
+				  seq INTEGER NOT NULL,
+				  event_type TEXT NOT NULL,
+				  item_type TEXT,
+				  item_id TEXT,
+				  parent_item_id TEXT,
+				  phase TEXT,
+				  visibility TEXT,
+				  source TEXT,
+				  level TEXT NOT NULL DEFAULT 'info',
+				  risk_level TEXT NOT NULL DEFAULT 'read_only',
+				  category TEXT NOT NULL DEFAULT 'runtime',
+				  feature_key TEXT NOT NULL DEFAULT '',
+				  message TEXT NOT NULL DEFAULT '',
+				  terminal INTEGER NOT NULL DEFAULT 0,
+				  duration_ms INTEGER,
+				  payload TEXT NOT NULL DEFAULT '{}',
+				  payload_json TEXT,
+				  error_json TEXT,
+				  usage_json TEXT,
+				  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+				  UNIQUE(run_id, seq)
 		);
 	`); err != nil {
 		return err
@@ -221,6 +297,38 @@ func (db *DB) rebuildSQLiteRunEvents(ctx context.Context, columns map[string]boo
 		turnExpr := "NULL"
 		if columns["turn_id"] {
 			turnExpr = "NULLIF(turn_id, '')"
+		}
+		conversationExpr := "NULL"
+		if columns["conversation_id"] {
+			conversationExpr = "NULLIF(conversation_id, '')"
+		}
+		itemTypeExpr := "NULL"
+		if columns["item_type"] {
+			itemTypeExpr = "NULLIF(item_type, '')"
+		}
+		itemIDExpr := "NULL"
+		if columns["item_id"] {
+			itemIDExpr = "NULLIF(item_id, '')"
+		}
+		parentItemExpr := "NULL"
+		if columns["parent_item_id"] {
+			parentItemExpr = "NULLIF(parent_item_id, '')"
+		}
+		phaseExpr := "NULL"
+		if columns["phase"] {
+			phaseExpr = "NULLIF(phase, '')"
+		}
+		visibilityExpr := "NULL"
+		if columns["visibility"] {
+			visibilityExpr = "NULLIF(visibility, '')"
+		}
+		sourceExpr := "NULL"
+		if columns["source"] {
+			sourceExpr = "NULLIF(source, '')"
+		}
+		terminalExpr := "0"
+		if columns["terminal"] {
+			terminalExpr = "COALESCE(terminal, 0)"
 		}
 		payloadExpr := "'{}'"
 		if columns["payload"] {
@@ -232,12 +340,32 @@ func (db *DB) rebuildSQLiteRunEvents(ctx context.Context, columns map[string]boo
 		if columns["created_at"] {
 			createdExpr = "COALESCE(NULLIF(created_at, ''), datetime('now'))"
 		}
+		levelExpr := "'info'"
+		if columns["level"] {
+			levelExpr = "COALESCE(NULLIF(level, ''), 'info')"
+		}
+		riskExpr := "'read_only'"
+		if columns["risk_level"] {
+			riskExpr = "COALESCE(NULLIF(risk_level, ''), 'read_only')"
+		}
+		categoryExpr := "'runtime'"
+		if columns["category"] {
+			categoryExpr = "COALESCE(NULLIF(category, ''), 'runtime')"
+		}
+		featureExpr := "event_type"
+		if columns["feature_key"] {
+			featureExpr = "COALESCE(NULLIF(feature_key, ''), event_type)"
+		}
+		messageExpr := "event_type"
+		if columns["message"] {
+			messageExpr = "COALESCE(NULLIF(message, ''), event_type)"
+		}
 		insertSQL := `
-			INSERT OR IGNORE INTO run_events (id, run_id, turn_id, seq, event_type, payload, created_at)
-			SELECT id, run_id, ` + turnExpr + `, seq, event_type, ` + payloadExpr + `, ` + createdExpr + `
-			FROM ` + legacyTable + `
-			WHERE COALESCE(run_id, '') <> ''
-			  AND EXISTS (SELECT 1 FROM runs WHERE runs.id = ` + legacyTable + `.run_id)
+				INSERT OR IGNORE INTO run_events (id, run_id, turn_id, conversation_id, seq, event_type, item_type, item_id, parent_item_id, phase, visibility, source, terminal, level, risk_level, category, feature_key, message, payload, created_at)
+				SELECT id, run_id, ` + turnExpr + `, ` + conversationExpr + `, seq, event_type, ` + itemTypeExpr + `, ` + itemIDExpr + `, ` + parentItemExpr + `, ` + phaseExpr + `, ` + visibilityExpr + `, ` + sourceExpr + `, ` + terminalExpr + `, ` + levelExpr + `, ` + riskExpr + `, ` + categoryExpr + `, ` + featureExpr + `, ` + messageExpr + `, ` + payloadExpr + `, ` + createdExpr + `
+				FROM ` + legacyTable + `
+				WHERE COALESCE(run_id, '') <> ''
+				  AND EXISTS (SELECT 1 FROM runs WHERE runs.id = ` + legacyTable + `.run_id)
 		`
 		if _, err := tx.ExecContext(ctx, insertSQL); err != nil {
 			return err
@@ -247,7 +375,15 @@ func (db *DB) rebuildSQLiteRunEvents(ctx context.Context, columns map[string]boo
 	if _, err := tx.ExecContext(ctx, `DROP TABLE `+legacyTable); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, seq)`); err != nil {
+	if _, err := tx.ExecContext(ctx, `
+			CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, seq);
+			CREATE INDEX IF NOT EXISTS idx_run_events_conversation_created ON run_events(conversation_id, created_at);
+			CREATE INDEX IF NOT EXISTS idx_run_events_type ON run_events(run_id, event_type);
+			CREATE INDEX IF NOT EXISTS idx_run_events_item ON run_events(item_type, item_id);
+			CREATE INDEX IF NOT EXISTS idx_run_events_level ON run_events(level, created_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_run_events_risk ON run_events(risk_level, created_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_run_events_category ON run_events(category, feature_key, created_at DESC);
+		`); err != nil {
 		return err
 	}
 	return tx.Commit()

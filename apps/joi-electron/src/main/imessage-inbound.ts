@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import type { ChatRequest, ChatResponse, ConnectionTest, PhotonIMessageStatus, SettingsRecord } from '../../../../packages/shared-types/src/desktop-api';
 import type { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
-import type { JoiSQLiteStore } from '../../../../packages/store/src/sqlite';
+import type { AppLogInput, JoiSQLiteStore } from '../../../../packages/store/src/sqlite';
 import { PHOTON_PROJECT_SECRET_SECRET, testPhotonIMessageConnection } from '../../../../packages/runtime/src/imessage';
 import { canRunRealToolCalling, emitRunEvents, resolveAPIKeyForModelEndpoint, runLiveElectronToolCallingChat } from './ipc';
 
@@ -140,11 +140,30 @@ export class IMessageInboundService {
     try {
       await this.startSidecar(nextConfig, this.controller.signal);
       this.connected = true;
+      this.log({
+        level: 'info',
+        risk_level: 'state_change',
+        category: 'external',
+        feature_key: 'imessage.sidecar.started',
+        source: 'imessage_inbound',
+        message: 'iMessage sidecar started',
+        payload: { project_id: nextConfig.projectID, port: nextConfig.port, require_mention: nextConfig.requireMention },
+      });
       void this.inboundLoop(nextConfig, this.controller.signal);
     } catch (error) {
       this.connected = false;
       this.lastError = safeErrorMessage(error);
       this.logger.warn('imessage inbound start failed', this.lastError);
+      this.log({
+        level: 'error',
+        risk_level: 'state_change',
+        category: 'external',
+        feature_key: 'imessage.sidecar.start_failed',
+        source: 'imessage_inbound',
+        message: 'iMessage sidecar start failed',
+        payload: { project_id: nextConfig.projectID, port: nextConfig.port },
+        error,
+      });
       this.stopInboundOnly();
       await this.stopSidecar();
     }
@@ -212,8 +231,30 @@ export class IMessageInboundService {
         text: message || 'Joi Desktop iMessage test',
         format: 'markdown',
       });
+      this.log({
+        level: 'info',
+        risk_level: 'state_change',
+        category: 'external',
+        feature_key: 'imessage.test_message.sent',
+        source: 'imessage_inbound',
+        message: 'iMessage test message sent',
+        item_type: 'imessage_space',
+        item_id: target,
+        payload: { text_length: (message || 'Joi Desktop iMessage test').length },
+      });
       return { ok: true, status: 'succeeded' };
     } catch (error) {
+      this.log({
+        level: 'error',
+        risk_level: 'state_change',
+        category: 'external',
+        feature_key: 'imessage.test_message.failed',
+        source: 'imessage_inbound',
+        message: 'iMessage test message failed',
+        item_type: 'imessage_space',
+        item_id: target,
+        error,
+      });
       return { ok: false, status: 'failed', error_summary: safeErrorMessage(error) };
     }
   }
@@ -240,6 +281,15 @@ export class IMessageInboundService {
       PHOTON_SIDECAR_WATCH_STDIN: '1',
     };
     const nodeRuntime = sidecarNodeRuntime(baseEnv);
+    this.log({
+      level: 'debug',
+      risk_level: 'state_change',
+      category: 'external',
+      feature_key: 'imessage.sidecar.spawn_requested',
+      source: 'imessage_inbound',
+      message: 'iMessage sidecar spawn requested',
+      payload: { command: nodeRuntime.command, port: config.port },
+    });
     this.sidecar = spawn(nodeRuntime.command, nodeRuntime.args, {
       cwd: sidecarDir,
       env: nodeRuntime.env,
@@ -252,6 +302,16 @@ export class IMessageInboundService {
           this.connected = false;
           this.lastError = `sidecar spawn failed: ${safeErrorMessage(error)}`;
           this.logger.warn('imessage sidecar spawn failed', this.lastError);
+          this.log({
+            level: 'error',
+            risk_level: 'state_change',
+            category: 'external',
+            feature_key: 'imessage.sidecar.spawn_failed',
+            source: 'imessage_inbound',
+            message: 'iMessage sidecar spawn failed',
+            payload: { port: config.port },
+            error,
+          });
         }
         reject(error);
       });
@@ -267,6 +327,15 @@ export class IMessageInboundService {
         this.connected = false;
         this.lastError = `sidecar exited: ${code ?? procSignal ?? 'unknown'}`;
         this.logger.warn('imessage sidecar exited', this.lastError);
+        this.log({
+          level: 'warn',
+          risk_level: 'state_change',
+          category: 'external',
+          feature_key: 'imessage.sidecar.exited',
+          source: 'imessage_inbound',
+          message: 'iMessage sidecar exited',
+          payload: { code, signal: procSignal },
+        });
       }
     });
     await Promise.race([this.waitForHealth(config.port, signal), spawnError]);
@@ -349,6 +418,15 @@ export class IMessageInboundService {
   private async inboundLoop(config: SidecarConfig, signal: AbortSignal): Promise<void> {
     let backoff = 1;
     this.logger.info('imessage inbound started');
+    this.log({
+      level: 'info',
+      risk_level: 'read_only',
+      category: 'external',
+      feature_key: 'imessage.inbound.started',
+      source: 'imessage_inbound',
+      message: 'iMessage inbound stream started',
+      payload: { port: config.port },
+    });
     while (!signal.aborted) {
       try {
         const response = await fetch(`http://127.0.0.1:${config.port}/inbound`, {
@@ -365,12 +443,31 @@ export class IMessageInboundService {
           this.connected = false;
           this.lastError = safeErrorMessage(error);
           this.logger.warn('imessage inbound stream dropped', this.lastError);
+          this.log({
+            level: 'warn',
+            risk_level: 'read_only',
+            category: 'external',
+            feature_key: 'imessage.inbound.dropped',
+            source: 'imessage_inbound',
+            message: 'iMessage inbound stream dropped',
+            payload: { port: config.port, backoff_seconds: backoff },
+            error,
+          });
           await sleep(backoff * 1000, signal);
           backoff = Math.min(backoff * 2, 30);
         }
       }
     }
     this.logger.info('imessage inbound stopped');
+    this.log({
+      level: 'info',
+      risk_level: 'read_only',
+      category: 'external',
+      feature_key: 'imessage.inbound.stopped',
+      source: 'imessage_inbound',
+      message: 'iMessage inbound stream stopped',
+      payload: { port: config.port },
+    });
   }
 
   private async consumeInboundStream(stream: ReadableStream<Uint8Array>, config: SidecarConfig, signal: AbortSignal): Promise<void> {
@@ -426,6 +523,17 @@ export class IMessageInboundService {
     const senderID = event.sender?.id?.trim() || event.space?.phone?.trim() || '';
     if (config.allowedUsers.size > 0 && (!senderID || !config.allowedUsers.has(normalizeUserID(senderID)))) {
       this.logger.info(`imessage ignored unauthorized sender ${senderID || 'unknown'}`);
+      this.log({
+        level: 'warn',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'imessage.message.rejected',
+        source: 'imessage_inbound',
+        message: 'iMessage message rejected',
+        item_type: 'imessage_message',
+        item_id: event.messageId || spaceID,
+        payload: { space_id: spaceID, sender_id: senderID || 'unknown', reason: 'unauthorized_sender' },
+      });
       return;
     }
     const principalID = config.allowedUsers.size > 0 ? localOwnerPrincipalID : undefined;
@@ -433,6 +541,17 @@ export class IMessageInboundService {
     const text = normalizePhotonText(event.content);
     if (!text) return;
     if (isStatusCommand(text)) {
+      this.log({
+        level: 'info',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'imessage.status.requested',
+        source: 'imessage_inbound',
+        message: 'iMessage status requested',
+        item_type: 'imessage_message',
+        item_id: event.messageId || spaceID,
+        payload: { space_id: spaceID, sender_id: senderID || 'unknown' },
+      });
       await this.sidecarSend(spaceID, await this.imessageStatusReply());
       return;
     }
@@ -441,6 +560,17 @@ export class IMessageInboundService {
       if (!mentionPatterns.some((pattern) => pattern.test(messageText))) return;
       messageText = cleanMentionText(messageText);
     }
+    this.log({
+      level: 'info',
+      risk_level: 'read_only',
+      category: 'external',
+      feature_key: 'imessage.message.received',
+      source: 'imessage_inbound',
+      message: 'iMessage message received',
+      item_type: 'imessage_message',
+      item_id: event.messageId || spaceID,
+      payload: { space_id: spaceID, sender_id: senderID || 'unknown', chat_type: chatType, text_length: messageText.length },
+    });
     await this.runJoiAndReply(spaceID, senderID || spaceID, messageText, principalID);
   }
 
@@ -478,9 +608,33 @@ export class IMessageInboundService {
     };
     const stopTyping = this.startTypingLoop(spaceID);
     try {
+      this.log({
+        level: 'info',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'imessage.run.requested',
+        source: 'imessage_inbound',
+        message: 'iMessage run requested',
+        conversation_id: req.conversation_id,
+        item_type: 'imessage_space',
+        item_id: spaceID,
+        payload: { sender_id: senderID, text_length: req.message.length },
+      });
       const settings = this.store.getSettings();
       const apiKey = await resolveAPIKeyForModelEndpoint(settings, this.secrets);
       if (!canRunRealToolCalling(settings, apiKey, req)) {
+        this.log({
+          level: 'warn',
+          risk_level: 'read_only',
+          category: 'external',
+          feature_key: 'imessage.run.skipped',
+          source: 'imessage_inbound',
+          message: 'iMessage run skipped',
+          conversation_id: req.conversation_id,
+          item_type: 'imessage_space',
+          item_id: spaceID,
+          payload: { reason: 'model_not_configured' },
+        });
         await this.sidecarSend(spaceID, 'Joi iMessage received the message, but the model is not configured. Configure the model in Joi Desktop first.');
         return;
       }
@@ -491,11 +645,44 @@ export class IMessageInboundService {
       const window = this.getWindow();
       if (window && !window.isDestroyed()) emitRunEvents(window, this.store.getRunTrace(result.run_id));
       await this.sidecarSend(spaceID, imessageReply(result));
+      this.log({
+        level: 'info',
+        risk_level: 'state_change',
+        category: 'external',
+        feature_key: 'imessage.reply.sent',
+        source: 'imessage_inbound',
+        message: 'iMessage reply sent',
+        run_id: result.run_id,
+        conversation_id: result.conversation_id,
+        item_type: 'imessage_space',
+        item_id: spaceID,
+        payload: { response_length: result.response.length },
+      });
     } catch (error) {
       this.logger.error('imessage inbound run failed', error);
+      this.log({
+        level: 'error',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'imessage.run.failed',
+        source: 'imessage_inbound',
+        message: 'iMessage run failed',
+        conversation_id: req.conversation_id,
+        item_type: 'imessage_space',
+        item_id: spaceID,
+        error,
+      });
       await this.sidecarSend(spaceID, `处理失败：${compactText(safeErrorMessage(error), 260)}`).catch(() => undefined);
     } finally {
       await stopTyping();
+    }
+  }
+
+  private log(input: AppLogInput): void {
+    try {
+      this.store.recordAppLog(input);
+    } catch (error) {
+      this.logger.warn('imessage app log write failed', safeErrorMessage(error));
     }
   }
 

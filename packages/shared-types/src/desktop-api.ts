@@ -44,6 +44,206 @@ export type RuntimeMode = 'legacy_json' | 'tool_calling';
 
 export type PermissionProfile = 'read_only' | 'workspace_write' | 'danger_full_access';
 
+export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal' | string;
+
+export type LogRiskLevel =
+  | 'read_only'
+  | 'write_candidate'
+  | 'browser_interaction'
+  | 'workspace_write'
+  | 'state_change'
+  | 'destructive'
+  | 'unsafe'
+  | string;
+
+export type LogEntry = {
+  id: string;
+  source_table: 'run_events' | 'app_logs' | 'worker_gateway_audit_logs' | string;
+  level: LogLevel;
+  risk_level: LogRiskLevel;
+  category: string;
+  feature_key: string;
+  source: string;
+  message: string;
+  run_id?: string;
+  turn_id?: string;
+  conversation_id?: string;
+  item_type?: string;
+  item_id?: string;
+  event_type?: string;
+  action?: string;
+  status?: string;
+  payload?: Record<string, unknown>;
+  error?: Record<string, unknown>;
+  duration_ms?: number;
+  hidden_by_default?: boolean;
+  created_at?: string;
+};
+
+export type LogFilter = {
+  query?: string;
+  levels?: string[];
+  risk_levels?: string[];
+  categories?: string[];
+  sources?: string[];
+  run_id?: string;
+  conversation_id?: string;
+  since?: string;
+  until?: string;
+  include_trace?: boolean;
+  include_worker_heartbeat?: boolean;
+  limit?: number;
+  cursor?: string;
+};
+
+export type LogCleanupScope =
+  | 'app_logs'
+  | 'run_events'
+  | 'run_steps'
+  | 'tool_runs'
+  | 'model_calls'
+  | 'worker_gateway_audit_logs'
+  | 'log_files'
+  | string;
+
+export type LogCleanupRequest = {
+  scopes: LogCleanupScope[];
+  older_than?: string;
+  run_id?: string;
+  levels?: string[];
+  categories?: string[];
+  include_trace_delta?: boolean;
+  include_worker_heartbeat?: boolean;
+  reason?: string;
+  actor?: string;
+  dry_run?: boolean;
+};
+
+export type LogCleanupPreview = {
+  scopes: LogCleanupScope[];
+  counts: Record<string, number>;
+  log_file_paths?: string[];
+  total_count: number;
+  safe_to_clear: boolean;
+  warnings: string[];
+};
+
+export type LogCleanupResult = LogCleanupPreview & {
+  cleanup_id: string;
+  cleared_at: string;
+};
+
+export type AutomationKind = 'schedule' | 'webhook';
+
+export type AutomationTriggerStatus = 'pending' | 'claimed' | 'running' | 'retry_scheduled' | 'succeeded' | 'failed' | 'cancelled' | 'deduped' | string;
+
+export type AutomationRunStatus = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'waiting_confirmation' | string;
+
+export type AutomationDefinition = {
+  id: string;
+  kind: AutomationKind;
+  slug: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  trigger_config: Record<string, unknown>;
+  prompt_template: string;
+  input_mode: InputMode;
+  permission_profile: PermissionProfile;
+  preferred_node: string;
+  allow_worker: boolean;
+  conversation_id?: string;
+  principal_id?: string;
+  dedup_policy: Record<string, unknown>;
+  retry_policy: Record<string, unknown>;
+  max_concurrency: number;
+  notification_policy: Record<string, unknown>;
+  next_fire_at?: string;
+  last_fire_at?: string;
+  metadata: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type AutomationDefinitionRequest = {
+  id?: string;
+  kind: AutomationKind;
+  slug?: string;
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  trigger_config?: Record<string, unknown>;
+  prompt_template?: string;
+  input_mode?: InputMode;
+  permission_profile?: PermissionProfile;
+  preferred_node?: string;
+  allow_worker?: boolean;
+  conversation_id?: string;
+  principal_id?: string;
+  dedup_policy?: Record<string, unknown>;
+  retry_policy?: Record<string, unknown>;
+  max_concurrency?: number;
+  notification_policy?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+};
+
+export type AutomationTriggerRecord = {
+  id: string;
+  automation_id: string;
+  trigger_type: AutomationKind | 'manual' | string;
+  dedup_key: string;
+  payload: Record<string, unknown>;
+  status: AutomationTriggerStatus;
+  fire_at?: string;
+  claimed_at?: string;
+  claim_token?: string;
+  run_id?: string;
+  product_task_id?: string;
+  attempt_count: number;
+  next_attempt_at?: string;
+  error_code?: string;
+  error_message?: string;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type AutomationRunRecord = {
+  id: string;
+  automation_id: string;
+  trigger_id: string;
+  run_id?: string;
+  product_task_id?: string;
+  status: AutomationRunStatus;
+  attempt_number: number;
+  started_at?: string;
+  finished_at?: string;
+  output_summary?: string;
+  error_code?: string;
+  error_message?: string;
+  metadata: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type AutomationTriggerNowRequest = {
+  id: string;
+  payload?: Record<string, unknown>;
+};
+
+export type AutomationWebhookEndpoint = {
+  automation_id: string;
+  slug: string;
+  url: string;
+  secret_ref?: string;
+  secret_configured: boolean;
+  secret_value_once?: string;
+};
+
+export type AutomationWebhookTestRequest = {
+  id: string;
+  payload?: Record<string, unknown>;
+};
+
 export type TaskContract = {
   objective: string;
   deliverables: string[];
@@ -240,9 +440,15 @@ export type ModelCall = {
   input_tokens: number;
   output_tokens: number;
   cached_input_tokens: number;
+  cache_write_input_tokens?: number;
+  reasoning_tokens?: number;
+  total_tokens?: number;
   cacheable_prefix_tokens?: number;
   dynamic_tail_tokens?: number;
+  cost_estimate?: number;
   latency_ms: number;
+  usage_status?: string;
+  finish_reason?: string;
   prompt_cache_key?: string;
   prefix_hash?: string;
   dynamic_tail_hash?: string;
@@ -302,6 +508,11 @@ export type RunEvent = {
   phase?: string;
   visibility?: string;
   source?: string;
+  level?: LogLevel;
+  risk_level?: LogRiskLevel;
+  category?: string;
+  feature_key?: string;
+  message?: string;
   terminal?: boolean;
   title?: string;
   summary?: string;
@@ -859,6 +1070,7 @@ export type AvailableModel = {
   max_output_tokens?: number;
   input_price_per_1m?: number;
   output_price_per_1m?: number;
+  cached_input_price_per_1m?: number;
   supports_json_mode?: boolean;
   supports_tool_calling?: boolean;
   supports_reasoning?: boolean;
@@ -1024,6 +1236,17 @@ export type ModelListRequest = {
 
 export type DesktopBindings = {
   SendChat(req: ChatRequest): Promise<ChatResponse>;
+  ListAutomations(filter?: { kind?: AutomationKind; enabled?: boolean; limit?: number }): Promise<{ automations: AutomationDefinition[] }>;
+  GetAutomation(id: string): Promise<AutomationDefinition>;
+  SaveAutomation(req: AutomationDefinitionRequest): Promise<AutomationDefinition>;
+  DeleteAutomation(id: string): Promise<void>;
+  SetAutomationEnabled(req: { id: string; enabled: boolean }): Promise<AutomationDefinition>;
+  TriggerAutomationNow(req: AutomationTriggerNowRequest): Promise<{ trigger: AutomationTriggerRecord }>;
+  ListAutomationTriggers(filter?: { automation_id?: string; status?: string; limit?: number }): Promise<{ triggers: AutomationTriggerRecord[] }>;
+  ListAutomationRuns(filter?: { automation_id?: string; trigger_id?: string; limit?: number }): Promise<{ runs: AutomationRunRecord[] }>;
+  GetAutomationWebhookEndpoint(id: string): Promise<AutomationWebhookEndpoint>;
+  RotateAutomationWebhookSecret(id: string): Promise<AutomationWebhookEndpoint>;
+  TestAutomationWebhook(req: AutomationWebhookTestRequest): Promise<{ trigger: AutomationTriggerRecord }>;
   GetRunTrace(runID: string): Promise<RunTrace>;
   ListConversations(filter: ConversationFilter): Promise<{ conversations: ConversationSummary[] }>;
   GetConversation(conversationID: string): Promise<ConversationDetail>;
@@ -1085,6 +1308,11 @@ export type DesktopBindings = {
   CreateBackup(): Promise<{ path: string }>;
   RestoreBackup(path: string): Promise<void>;
   ExportDiagnostics(): Promise<{ path: string }>;
+  ListLogs(filter?: LogFilter): Promise<{ logs: LogEntry[]; next_cursor?: string }>;
+  GetLogEntry(id: string): Promise<LogEntry | null>;
+  PreviewLogCleanup(req: LogCleanupRequest): Promise<LogCleanupPreview>;
+  ClearLogs(req: LogCleanupRequest): Promise<LogCleanupResult>;
+  ExportLogs(filter?: LogFilter): Promise<{ path: string }>;
   GetSettings(): Promise<SettingsRecord>;
   GetWorkspaceSettings(): Promise<WorkspaceSettings>;
   SaveWorkspaceSettings(req: WorkspaceSettings): Promise<void>;
@@ -1133,21 +1361,27 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'CompleteOnboarding',
   'CorrectMemory',
   'CreateBackup',
+  'ClearLogs',
   'DecideConfirmation',
   'DecideApproval',
   'DecideMemoryCandidate',
   'DecideOpenLoop',
   'DecideProactiveMessage',
   'DeleteConversationGroup',
+  'DeleteAutomation',
   'DeleteMemory',
   'DisableNode',
   'EnableNode',
   'ExportDiagnostics',
+  'ExportLogs',
   'FetchAvailableModels',
   'GenerateWorkerToken',
   'GetArtifact',
+  'GetAutomation',
+  'GetAutomationWebhookEndpoint',
   'GetConversation',
   'GetExternalHandoffAudit',
+  'GetLogEntry',
   'GetModelUsage',
   'GetOnboardingStatus',
   'GetProductTask',
@@ -1161,11 +1395,15 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'InterruptRun',
   'ListRecoverableRuns',
   'ListArtifacts',
+  'ListAutomationRuns',
+  'ListAutomationTriggers',
+  'ListAutomations',
   'ListBackups',
   'ListCapabilities',
   'ListConfirmations',
   'ListConversationGroups',
   'ListConversations',
+  'ListLogs',
   'LoginXAIOAuth',
   'ListMCPServers',
   'ListMemories',
@@ -1187,12 +1425,15 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'ListUserStates',
   'MoveConversationToGroup',
   'PurgeConversation',
+  'PreviewLogCleanup',
   'RecordNotificationOpened',
   'ReopenProductTask',
   'RestoreBackup',
   'RestoreConversation',
+  'RotateAutomationWebhookSecret',
   'RedirectRun',
   'ResumeApprovalRun',
+  'SaveAutomation',
   'SaveConversationGroup',
   'SaveModelConfig',
   'SaveModelSettings',
@@ -1205,12 +1446,15 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'SendTestIMessageMessage',
   'SendTestTelegramMessage',
   'SetToolWorkflowEnabled',
+  'SetAutomationEnabled',
   'SetupPhotonIMessage',
   'SyncMCPServer',
+  'TestAutomationWebhook',
   'TestIMessageConnection',
   'TestModelConnection',
   'TestTelegramConnection',
   'TrashConversation',
+  'TriggerAutomationNow',
   'UpdateMemory',
   'WrapMCPTool',
 ];

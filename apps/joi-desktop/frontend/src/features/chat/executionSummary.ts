@@ -69,6 +69,15 @@ export function summarizeExecutionEvent(event: NormalizedRunEvent): string {
   if (event.itemType === 'handoff') {
     return event.summary || '跨入口继续任务';
   }
+  if (event.itemType === 'automation') {
+    if (event.type === 'automation.trigger_received') return event.summary || '自动化触发已接收';
+    if (event.type === 'automation.claimed') return event.summary || '自动化已领取';
+    if (event.type === 'automation.run_started') return event.summary || '自动化开始执行';
+    if (event.type === 'automation.run_completed') return event.summary || '自动化已完成';
+    if (event.type === 'automation.run_failed') return event.summary || event.error || '自动化执行失败';
+    if (event.type === 'automation.retry_scheduled') return event.summary || '自动化已安排重试';
+    return event.summary || '自动化状态更新';
+  }
   const toolName = toolNameFromEvent(event);
   const labels = toolLabelMap[toolName] ?? inferToolLabels(toolName);
 

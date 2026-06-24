@@ -8,7 +8,7 @@
     "dev": "electron-vite dev",
     "build": "tsc --noEmit && electron-vite build",
     "package:mac": "pnpm build && electron-builder --mac dir --arm64 --config.mac.identity=null",
-    "test:contract": "node scripts/test-preload-contract.mjs"
+    "test:contract": "node scripts/test-preload-contract.mjs && node scripts/test-automation-webhook-server.mjs"
   },
   "dependencies": {
     "@joi/shared-types": "workspace:*",

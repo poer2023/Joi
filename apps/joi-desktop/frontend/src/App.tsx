@@ -12,6 +12,10 @@ import {
   desktopApi,
   type ArtifactDetail,
   type ArtifactSummary,
+  type AutomationDefinition,
+  type AutomationRunRecord,
+  type AutomationTriggerRecord,
+  type AutomationWebhookEndpoint,
   type AvailableModel,
   type BackupRecord,
   type ChatResponse,
@@ -21,6 +25,9 @@ import {
   type ConfirmationRecord,
   type ExternalHandoffAudit,
   type InputMode,
+  type LogCleanupPreview,
+  type LogCleanupRequest,
+  type LogEntry,
   type MemoryRecord,
   type MemorySearchResult,
   type MCPServerRecord,
@@ -50,9 +57,11 @@ import { permissionProfileForPrompt } from './permissionProfile';
 import joiAvatar from './assets/joi-avatar-circle.png';
 import { ScrollArea } from './components/ScrollArea';
 import { buildConversationRenderItems, getMessageRunId, sortBySeq } from './features/chat/conversationProjector';
+import { getAutomationDetailState, getAutomationSettingsObjects } from './features/automation/automationUiState';
 import { MessageList } from './features/chat/components/MessageList';
 import { TraceDrawer } from './features/chat/components/TraceDrawer';
 import { normalizeRunEvent, normalizeRunEvents } from './features/chat/runEventNormalizer';
+import { mergeAssistantTextChunk } from './features/chat/streamingText';
 import type { NormalizedRunEvent } from './features/chat/types';
 import { visibleRecentTasksForHandoff } from './productTasks';
 import {
@@ -71,9 +80,9 @@ import '@xterm/xterm/css/xterm.css';
 
 type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
 type SettingsTab = Exclude<Tab, 'chat'>;
-type SettingsCategory = 'models' | 'chatEntrances' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
+type SettingsCategory = 'models' | 'chatEntrances' | 'automations' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
 type ExecutionTarget = 'main-node' | 'auto' | 'local-worker-1' | 'vps-la-1';
-type RightInspectorTab = 'terminal' | 'memory';
+type RightInspectorTab = 'terminal' | 'memory' | 'logs';
 type StreamingAssistantMessage = ConversationMessage & {
   role: 'assistant';
   complete?: boolean;
@@ -139,6 +148,7 @@ const settingsSections: Array<{ id: SettingsTab; label: string; description: str
 const settingsCategories: Array<{ id: SettingsCategory; label: string; description: string }> = [
   { id: 'models', label: '模型', description: '模型与服务配置' },
   { id: 'chatEntrances', label: '聊天入口', description: '聊天平台与入口管理' },
+  { id: 'automations', label: '自动化', description: '定时任务与 Webhook Hook' },
   { id: 'dataMemory', label: '数据与记忆', description: '数据存储与记忆管理' },
   { id: 'capabilities', label: '能力与工具', description: '插件、工具与能力配置' },
   { id: 'nodesExecution', label: '节点与执行', description: '工作节点与执行资源' },
@@ -148,6 +158,7 @@ const settingsCategories: Array<{ id: SettingsCategory; label: string; descripti
 const defaultSettingsObjectByCategory: Record<SettingsCategory, string> = {
   models: 'deepseek',
   chatEntrances: 'telegram',
+  automations: 'new-schedule',
   dataMemory: 'memory-inbox',
   capabilities: 'builtin',
   nodesExecution: 'main-node',
@@ -167,6 +178,10 @@ const MIN_APP_HEIGHT = 720;
 const RIGHT_INSPECTOR_TERMINAL_ID = 'joi-right-inspector-terminal';
 const TERMINAL_APPROX_CHAR_WIDTH = 7.2;
 const TERMINAL_APPROX_ROW_HEIGHT = 17;
+const logLevelOptions = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'];
+const logRiskOptions = ['read_only', 'write_candidate', 'browser_interaction', 'workspace_write', 'state_change', 'destructive', 'unsafe'];
+const logCategoryOptions = ['ipc', 'runtime', 'terminal', 'external', 'worker_gateway', 'settings', 'system', 'run', 'tool', 'model'];
+const defaultLogCleanupScopes: LogCleanupRequest['scopes'] = ['app_logs', 'run_events', 'run_steps', 'tool_runs', 'model_calls', 'worker_gateway_audit_logs', 'log_files'];
 const executionTargetOptions: Array<{ value: ExecutionTarget; label: string; preferredNode: string; allowWorker: boolean }> = [
   { value: 'main-node', label: '本机', preferredNode: 'main-node', allowWorker: false },
   { value: 'auto', label: '自动', preferredNode: 'auto', allowWorker: true },
@@ -328,6 +343,9 @@ export default function App() {
   const [artifactViewer, setArtifactViewer] = useState<ArtifactDetail | null>(null);
   const [openLoops, setOpenLoops] = useState<OpenLoop[]>([]);
   const [proactiveMessages, setProactiveMessages] = useState<ProactiveMessage[]>([]);
+  const [automations, setAutomations] = useState<AutomationDefinition[]>([]);
+  const [automationTriggers, setAutomationTriggers] = useState<AutomationTriggerRecord[]>([]);
+  const [automationRuns, setAutomationRuns] = useState<AutomationRunRecord[]>([]);
   const [memoryQuery, setMemoryQuery] = useState('');
   const [nodes, setNodes] = useState<NodeRecord[]>([]);
   const [gatewayAudit, setGatewayAudit] = useState<WorkerGatewayAuditRecord[]>([]);
@@ -583,7 +601,7 @@ export default function App() {
         id: current?.id || messageID,
         conversation_id: current?.conversation_id || conversationID,
         role: 'assistant',
-        content: `${current?.content || ''}${text}`.trimStart(),
+        content: mergeAssistantTextChunk(String(current?.content || ''), text),
         run_id: runID || current?.run_id,
         complete: false,
       }));
@@ -660,6 +678,9 @@ export default function App() {
         artifactList,
         openLoopList,
         proactiveList,
+        automationList,
+        automationTriggerList,
+        automationRunList,
         nodeList,
         gatewayAuditList,
         modelUsage,
@@ -687,6 +708,9 @@ export default function App() {
         desktopApi.listArtifacts({ limit: 50 }),
         desktopApi.listOpenLoops({ status: 'open', limit: 50 }),
         desktopApi.listProactiveMessages({ status: 'draft', limit: 50 }),
+        desktopApi.listAutomations({ limit: 100 }),
+        desktopApi.listAutomationTriggers({ limit: 100 }),
+        desktopApi.listAutomationRuns({ limit: 100 }),
         desktopApi.listNodes(),
         desktopApi.listWorkerGatewayAuditLogs(),
         desktopApi.getModelUsage(),
@@ -714,6 +738,9 @@ export default function App() {
       setArtifacts(artifactList.artifacts ?? []);
       setOpenLoops(openLoopList.open_loops ?? []);
       setProactiveMessages(proactiveList.messages ?? []);
+      setAutomations(automationList.automations ?? []);
+      setAutomationTriggers(automationTriggerList.triggers ?? []);
+      setAutomationRuns(automationRunList.runs ?? []);
       setNodes(nodeList.nodes ?? []);
       setGatewayAudit(gatewayAuditList.items ?? []);
       setUsage(modelUsage.items ?? []);
@@ -835,7 +862,7 @@ export default function App() {
           id: current?.id || result.assistant_message_id,
           conversation_id: current?.conversation_id || result.conversation_id,
           role: 'assistant',
-          content: userFacingAssistantText(current?.content || result.response),
+          content: userFacingAssistantText(result.response || String(current?.content || '')),
           run_id: result.run_id,
           complete: true,
         }));
@@ -1310,6 +1337,9 @@ export default function App() {
               activeObjectID={settingsObjectByCategory[settingsCategory]}
               archivedConversations={archivedConversations}
               audit={gatewayAudit}
+              automations={automations}
+              automationTriggers={automationTriggers}
+              automationRuns={automationRuns}
               backups={backups}
               capabilities={capabilities}
               calls={trace?.model_calls ?? []}
@@ -1580,6 +1610,52 @@ function formatNumber(value: number) {
   return new Intl.NumberFormat('en-US').format(value);
 }
 
+function numericValue(value: unknown): number {
+  const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : 0;
+  return Number.isFinite(number) ? number : 0;
+}
+
+function formatTokenCount(value: unknown): string {
+  return formatNumber(Math.max(0, Math.floor(numericValue(value))));
+}
+
+function formatRatio(value: unknown): string {
+  const ratio = numericValue(value);
+  if (ratio <= 0) return '0%';
+  return `${Math.min(100, ratio * 100).toFixed(0)}%`;
+}
+
+function formatCost(value: unknown): string {
+  const cost = numericValue(value);
+  return cost > 0 ? `$${cost.toFixed(4)}` : '$0.0000';
+}
+
+function formatMilliseconds(value: unknown): string {
+  return `${Math.round(numericValue(value))} ms`;
+}
+
+function modelCallTotalTokens(call: ModelCall): number {
+  return numericValue(call.total_tokens) || numericValue(call.input_tokens) + numericValue(call.output_tokens);
+}
+
+function summarizeModelCalls(calls: ModelCall[]) {
+  return calls.reduce((summary, call) => ({
+    total_tokens: summary.total_tokens + modelCallTotalTokens(call),
+    input_tokens: summary.input_tokens + numericValue(call.input_tokens),
+    output_tokens: summary.output_tokens + numericValue(call.output_tokens),
+    cached_input_tokens: summary.cached_input_tokens + numericValue(call.cached_input_tokens),
+    reasoning_tokens: summary.reasoning_tokens + numericValue(call.reasoning_tokens),
+    cost_estimate: summary.cost_estimate + numericValue(call.cost_estimate),
+  }), {
+    total_tokens: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_input_tokens: 0,
+    reasoning_tokens: 0,
+    cost_estimate: 0,
+  });
+}
+
 function SettingsSidebar({
   activeCategory,
   collapsed,
@@ -1625,6 +1701,9 @@ function SettingsConsole({
   activeObjectID,
   archivedConversations,
   audit,
+  automations,
+  automationTriggers,
+  automationRuns,
   backups,
   capabilities,
   calls,
@@ -1670,6 +1749,9 @@ function SettingsConsole({
   activeObjectID: string;
   archivedConversations: ConversationSummary[];
   audit: WorkerGatewayAuditRecord[];
+  automations: AutomationDefinition[];
+  automationTriggers: AutomationTriggerRecord[];
+  automationRuns: AutomationRunRecord[];
   backups: BackupRecord[];
   capabilities: CapabilityRecord[];
   calls: ModelCall[];
@@ -1712,7 +1794,7 @@ function SettingsConsole({
   workspaceSettings: WorkspaceSettings | null;
 }) {
   const activeCategoryMeta = settingsCategories.find((category) => category.id === activeCategory) ?? settingsCategories[0];
-  const objectItems = getSettingsObjects(activeCategory, nodes);
+  const objectItems = getSettingsObjects(activeCategory, nodes, automations);
   const activeObject = objectItems.find((item) => item.id === activeObjectID) ?? objectItems[0];
   const modelPreset = modelProviderPresets[activeObject.id] ?? modelProviderPresets.compatible;
   const [provider, setProvider] = useState(modelPreset.provider);
@@ -1753,6 +1835,19 @@ function SettingsConsole({
   const [secretValueVisible, setSecretValueVisible] = useState(false);
   const [workerGatewayEnabled, setWorkerGatewayEnabled] = useState(settings?.worker_gateway_enabled ?? true);
   const [restorePath, setRestorePath] = useState('');
+  const [automationName, setAutomationName] = useState('');
+  const [automationSlug, setAutomationSlug] = useState('');
+  const [automationScheduleType, setAutomationScheduleType] = useState('interval');
+  const [automationCron, setAutomationCron] = useState('0 9 * * *');
+  const [automationIntervalMinutes, setAutomationIntervalMinutes] = useState('60');
+  const [automationTime, setAutomationTime] = useState('09:00');
+  const [automationWeekday, setAutomationWeekday] = useState('1');
+  const [automationOnceAt, setAutomationOnceAt] = useState('');
+  const [automationTimezone, setAutomationTimezone] = useState('');
+  const [automationDedupField, setAutomationDedupField] = useState('event_id');
+  const [automationPrompt, setAutomationPrompt] = useState('请处理这个自动化任务。payload 摘要：{{payload}}');
+  const [automationEndpoint, setAutomationEndpoint] = useState<AutomationWebhookEndpoint | null>(null);
+  const [automationBusy, setAutomationBusy] = useState('');
   const inbox = memories.filter((memory) => memory.status !== 'rejected' && !isMemoryDisabled(memory) && (memory.status !== 'confirmed' || memory.confidence < 0.6 || Boolean(memory.conflict_group_id) || Boolean(memory.merged_into_memory_id)));
   const confirmedMemories = memories.filter((memory) => memory.status === 'confirmed' && !memory.disabled);
   const conflictedMemories = memories.filter((memory) => Boolean(memory.conflict_group_id));
@@ -1789,6 +1884,38 @@ function SettingsConsole({
     setIMessageSidecarPort(String(settings?.imessage_sidecar_port ?? 8790));
     setWorkerGatewayEnabled(settings?.worker_gateway_enabled ?? true);
   }, [settings?.imessage_allowed_users, settings?.imessage_assigned_number, settings?.imessage_enabled, settings?.imessage_home_channel, settings?.imessage_operator_phone, settings?.imessage_project_id, settings?.imessage_require_mention, settings?.imessage_sidecar_port, settings?.telegram_allowed_user_ids, settings?.telegram_enabled, settings?.worker_gateway_enabled]);
+
+  useEffect(() => {
+    setAutomationEndpoint(null);
+    const selected = automations.find((automation) => automation.id === activeObject.id);
+    if (!selected) {
+      const isWebhook = activeObject.id === 'new-webhook';
+      setAutomationName(isWebhook ? 'Webhook 自动化' : '定时自动化');
+      setAutomationSlug('');
+      setAutomationScheduleType('interval');
+      setAutomationCron('0 9 * * *');
+      setAutomationIntervalMinutes('60');
+      setAutomationTime('09:00');
+      setAutomationWeekday('1');
+      setAutomationOnceAt('');
+      setAutomationTimezone('');
+      setAutomationDedupField(isWebhook ? 'event_id' : '');
+      setAutomationPrompt(isWebhook ? '请处理这个 webhook 自动化任务。事件：{{payload.event_id}}' : '请处理这个定时自动化任务。payload 摘要：{{payload}}');
+      return;
+    }
+    const config = selected.trigger_config ?? {};
+    setAutomationName(selected.name);
+    setAutomationSlug(selected.slug);
+    setAutomationScheduleType(String(config.type || (selected.kind === 'webhook' ? 'webhook' : 'interval')));
+    setAutomationCron(String(config.expression || config.cron || '0 9 * * *'));
+    setAutomationIntervalMinutes(String(Number(config.every_minutes ?? (Number(config.every_seconds ?? config.interval_seconds ?? 3600) / 60)) || 60));
+    setAutomationTime(String(config.time || '09:00'));
+    setAutomationWeekday(String(config.weekday ?? '1'));
+    setAutomationOnceAt(String(config.run_at || config.at || ''));
+    setAutomationTimezone(String(config.timezone || ''));
+    setAutomationDedupField(String(selected.dedup_policy?.dedup_json_field || config.dedup_json_field || 'event_id'));
+    setAutomationPrompt(selected.prompt_template || '请处理这个自动化任务。payload 摘要：{{payload}}');
+  }, [activeObject.id, automations]);
 
   async function saveModelDetail() {
     await desktopApi.saveModelConfig({
@@ -2039,6 +2166,119 @@ function SettingsConsole({
     const edited = window.prompt('确认前编辑记忆', memory.content);
     if (edited === null) return;
     await updateMemory(memory.id, 'edit_confirm', { content: edited, summary: memory.summary });
+  }
+
+  function selectedAutomation(): AutomationDefinition | undefined {
+    return automations.find((automation) => automation.id === activeObject.id);
+  }
+
+  function buildAutomationTriggerConfig(kind: 'schedule' | 'webhook'): Record<string, unknown> {
+    if (kind === 'webhook') {
+      return automationDedupField.trim() ? { dedup_json_field: automationDedupField.trim() } : {};
+    }
+    const base = automationTimezone.trim() ? { timezone: automationTimezone.trim() } : {};
+    if (automationScheduleType === 'cron') return { ...base, type: 'cron', expression: automationCron.trim() || '0 9 * * *' };
+    if (automationScheduleType === 'daily') return { ...base, type: 'daily', time: automationTime || '09:00' };
+    if (automationScheduleType === 'weekly') return { ...base, type: 'weekly', weekday: Number(automationWeekday) || 1, time: automationTime || '09:00' };
+    if (automationScheduleType === 'once') return { ...base, type: 'once', run_at: automationOnceAt };
+    return { ...base, type: 'interval', every_minutes: Math.max(1, Number(automationIntervalMinutes) || 60) };
+  }
+
+  async function saveAutomation(kind: 'schedule' | 'webhook') {
+    setAutomationBusy('save');
+    try {
+      const existing = selectedAutomation();
+      const automation = await desktopApi.saveAutomation({
+        id: existing?.id,
+        kind,
+        name: automationName.trim() || (kind === 'webhook' ? 'Webhook 自动化' : '定时自动化'),
+        slug: automationSlug.trim() || undefined,
+        enabled: existing?.enabled ?? true,
+        trigger_config: buildAutomationTriggerConfig(kind),
+        prompt_template: automationPrompt,
+        input_mode: 'background_task',
+        permission_profile: 'read_only',
+        preferred_node: 'main-node',
+        allow_worker: false,
+        dedup_policy: kind === 'webhook' && automationDedupField.trim() ? { dedup_json_field: automationDedupField.trim() } : {},
+        retry_policy: { max_attempts: 2, backoff_seconds: [60, 300], no_retry_error_codes: ['POLICY_DENIED', 'INVALID_PAYLOAD', 'PENDING_CONFIRMATION'] },
+        max_concurrency: 1,
+      });
+      setNotice(`${automation.name} 已保存`);
+      selectSettingsObject('automations', automation.id);
+      await refreshAll();
+    } finally {
+      setAutomationBusy('');
+    }
+  }
+
+  async function setAutomationEnabled(id: string, enabled: boolean) {
+    setAutomationBusy(`enable:${id}`);
+    try {
+      await desktopApi.setAutomationEnabled({ id, enabled });
+      setNotice(enabled ? '自动化已启用' : '自动化已停用');
+      await refreshAll();
+    } finally {
+      setAutomationBusy('');
+    }
+  }
+
+  async function triggerAutomationNow(id: string) {
+    setAutomationBusy(`run:${id}`);
+    try {
+      await desktopApi.triggerAutomationNow({ id, payload: { manual: true, requested_from: 'desktop_settings' } });
+      setNotice('已加入自动化队列');
+      await refreshAll();
+    } finally {
+      setAutomationBusy('');
+    }
+  }
+
+  async function deleteAutomation(id: string) {
+    const ok = window.confirm('删除后会保留历史 trigger/run，但不再接受新触发。确定继续？');
+    if (!ok) return;
+    await desktopApi.deleteAutomation(id);
+    selectSettingsObject('automations', 'new-schedule');
+    setNotice('自动化已删除');
+    await refreshAll();
+  }
+
+  async function loadAutomationEndpoint(id: string) {
+    const endpoint = await desktopApi.getAutomationWebhookEndpoint(id);
+    setAutomationEndpoint(endpoint);
+    return endpoint;
+  }
+
+  async function copyAutomationEndpoint(id: string) {
+    const endpoint = automationEndpoint?.automation_id === id ? automationEndpoint : await loadAutomationEndpoint(id);
+    await navigator.clipboard?.writeText(endpoint.url);
+    setNotice('Webhook URL 已复制');
+  }
+
+  async function rotateAutomationWebhookSecret(id: string) {
+    const endpoint = await desktopApi.rotateAutomationWebhookSecret(id);
+    setAutomationEndpoint(endpoint);
+    if (endpoint.secret_value_once) {
+      await navigator.clipboard?.writeText(endpoint.secret_value_once);
+      setNotice('Webhook secret 已轮换并复制；离开此页后不会再次显示');
+      return;
+    }
+    setNotice('Webhook secret 已轮换');
+  }
+
+  async function copyAutomationSecret() {
+    if (!automationEndpoint?.secret_value_once) {
+      setNotice('Secret 只在轮换后一次性可复制；如需新值请再次轮换');
+      return;
+    }
+    await navigator.clipboard?.writeText(automationEndpoint.secret_value_once);
+    setNotice('Webhook secret 已复制');
+  }
+
+  async function testAutomationWebhook(id: string) {
+    await desktopApi.testAutomationWebhook({ id, payload: { event_id: `test_${Date.now()}`, source: 'desktop_settings' } });
+    setNotice('Webhook 测试触发已入队');
+    await refreshAll();
   }
 
   function renderModelDetail() {
@@ -2300,6 +2540,177 @@ function SettingsConsole({
           </div>
           <CollapsedData label="高级详情" value={{ enabled: telegramEnabled, allowed_user_ids: telegramAllowed }} />
         </div>
+      </section>
+    );
+  }
+
+  function renderAutomationDetail() {
+    const existing = selectedAutomation();
+    const kind = existing?.kind ?? (activeObject.id === 'new-webhook' ? 'webhook' : 'schedule');
+    const automationState = getAutomationDetailState({
+      automation: existing,
+      triggers: automationTriggers,
+      runs: automationRuns,
+      endpoint: automationEndpoint,
+    });
+    const { recentTriggers, recentRuns } = automationState;
+    return (
+      <section className="settings-detail-panel">
+        <DetailHeader title={existing ? existing.name : kind === 'webhook' ? '新建 Hook 任务' : '新建定时任务'} description={kind === 'webhook' ? '本地 HMAC Webhook 触发后台任务' : 'Joi.app 打开时运行的定时后台任务'} />
+        <div className="settings-form">
+          <label className="field-row">
+            <span>名称</span>
+            <input value={automationName} onChange={(event) => setAutomationName(event.target.value)} />
+          </label>
+          <label className="field-row">
+            <span>Slug</span>
+            <input placeholder="留空自动生成" value={automationSlug} onChange={(event) => setAutomationSlug(event.target.value)} />
+          </label>
+          {kind === 'schedule' ? (
+            <>
+              <label className="field-row">
+                <span>触发类型</span>
+                <select value={automationScheduleType} onChange={(event) => setAutomationScheduleType(event.target.value)}>
+                  <option value="interval">Interval</option>
+                  <option value="daily">Daily</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="cron">Cron</option>
+                  <option value="once">Once</option>
+                </select>
+              </label>
+              {automationScheduleType === 'interval' && (
+                <label className="field-row">
+                  <span>间隔分钟</span>
+                  <input value={automationIntervalMinutes} onChange={(event) => setAutomationIntervalMinutes(event.target.value)} />
+                </label>
+              )}
+              {automationScheduleType === 'cron' && (
+                <label className="field-row">
+                  <span>Cron</span>
+                  <input value={automationCron} onChange={(event) => setAutomationCron(event.target.value)} />
+                </label>
+              )}
+              {(automationScheduleType === 'daily' || automationScheduleType === 'weekly') && (
+                <label className="field-row">
+                  <span>时间</span>
+                  <input value={automationTime} onChange={(event) => setAutomationTime(event.target.value)} />
+                </label>
+              )}
+              {automationScheduleType === 'weekly' && (
+                <label className="field-row">
+                  <span>星期</span>
+                  <select value={automationWeekday} onChange={(event) => setAutomationWeekday(event.target.value)}>
+                    <option value="1">周一</option>
+                    <option value="2">周二</option>
+                    <option value="3">周三</option>
+                    <option value="4">周四</option>
+                    <option value="5">周五</option>
+                    <option value="6">周六</option>
+                    <option value="0">周日</option>
+                  </select>
+                </label>
+              )}
+              {automationScheduleType === 'once' && (
+                <label className="field-row">
+                  <span>运行时间</span>
+                  <input placeholder="2026-06-24T09:00:00+08:00" value={automationOnceAt} onChange={(event) => setAutomationOnceAt(event.target.value)} />
+                </label>
+              )}
+              <label className="field-row">
+                <span>时区</span>
+                <input placeholder="默认本机时区" value={automationTimezone} onChange={(event) => setAutomationTimezone(event.target.value)} />
+              </label>
+            </>
+          ) : (
+            <label className="field-row">
+              <span>Dedup JSON 字段</span>
+              <input placeholder="event_id" value={automationDedupField} onChange={(event) => setAutomationDedupField(event.target.value)} />
+            </label>
+          )}
+          <label className="field-row">
+            <span>Prompt</span>
+            <textarea value={automationPrompt} onChange={(event) => setAutomationPrompt(event.target.value)} rows={5} />
+          </label>
+          <div className="detail-actions">
+            <button type="button" onClick={() => void saveAutomation(kind)} disabled={automationBusy === 'save'}>{automationBusy === 'save' ? '保存中' : '保存'}</button>
+            {existing && (
+              <>
+                <button className="secondary-button" type="button" onClick={() => void setAutomationEnabled(existing.id, !existing.enabled)} disabled={automationBusy === `enable:${existing.id}`}>
+                  {existing.enabled ? '停用' : '启用'}
+                </button>
+                <button className="secondary-button" type="button" onClick={() => void triggerAutomationNow(existing.id)} disabled={automationBusy === `run:${existing.id}`}>立即运行</button>
+                <button className="danger" type="button" onClick={() => void deleteAutomation(existing.id)}>删除</button>
+              </>
+            )}
+          </div>
+        </div>
+        {existing && (
+          <>
+            <dl className="compact-kv">
+              <KV label="状态" value={existing.enabled ? '已启用' : '已停用'} />
+              <KV label="权限" value={existing.permission_profile} />
+              <KV label="输入模式" value={existing.input_mode} />
+              <KV label="下次触发" value={existing.next_fire_at || '未计算'} />
+              <KV label="上次触发" value={existing.last_fire_at || '无'} />
+              <KV label="最近运行" value={formatStatus(automationState.lastRunStatus)} />
+            </dl>
+            {automationState.banner && (
+              <p className={automationState.banner.tone === 'error' ? 'terminal-error' : 'logs-notice'}>
+                {automationState.banner.title} · {automationState.banner.message}
+              </p>
+            )}
+            {existing.kind === 'webhook' && (
+              <section>
+                <h3>Webhook</h3>
+                <div className="detail-actions">
+                  <button type="button" onClick={() => void loadAutomationEndpoint(existing.id)}>显示 URL</button>
+                  <button type="button" onClick={() => void copyAutomationEndpoint(existing.id)}>复制 URL</button>
+                  <button type="button" onClick={() => void rotateAutomationWebhookSecret(existing.id)}>轮换 Secret</button>
+                  {automationState.secretValueAvailable && <button type="button" onClick={() => void copyAutomationSecret()}>复制 Secret</button>}
+                  <button type="button" onClick={() => void testAutomationWebhook(existing.id)}>测试 Hook</button>
+                </div>
+                {automationEndpoint?.automation_id === existing.id && (
+                  <dl className="compact-kv">
+                    <KV label="URL" value={automationState.webhookUrl || automationEndpoint.url} />
+                    <KV label="Secret Ref" value={automationEndpoint.secret_ref || '未设置'} />
+                    <KV label="Secret" value={automationState.secretConfigured ? '已配置' : '未配置'} />
+                    {automationState.secretValueAvailable && <KV label="New Secret" value="已生成并可复制一次" />}
+                  </dl>
+                )}
+              </section>
+            )}
+            <section>
+              <h3>Recent Triggers</h3>
+              <RecordList
+                emptyText="暂无 trigger。"
+                items={recentTriggers}
+                renderItem={(trigger) => (
+                  <article key={trigger.id} className="row-card compact">
+                    <strong>{formatStatus(trigger.status)}</strong>
+                    <small>{trigger.trigger_type} · {trigger.dedup_key}</small>
+                    <small>{trigger.created_at || ''}</small>
+                    {trigger.error_message && <small>{trigger.error_code || 'ERROR'} · {trigger.error_message}</small>}
+                    <CollapsedData label="Payload" value={trigger.payload} />
+                  </article>
+                )}
+              />
+            </section>
+            <section>
+              <h3>Recent Runs</h3>
+              <RecordList
+                emptyText="暂无 run。"
+                items={recentRuns}
+                renderItem={(run) => (
+                  <article key={run.id} className="row-card compact">
+                    <strong>{formatStatus(run.status)}</strong>
+                    <small>attempt {run.attempt_number} · run {run.run_id || 'pending'}</small>
+                    <small>{run.output_summary || run.error_message || run.created_at || ''}</small>
+                  </article>
+                )}
+              />
+            </section>
+          </>
+        )}
       </section>
     );
   }
@@ -2794,6 +3205,7 @@ function SettingsConsole({
               setNotice(`诊断信息已导出：${result.path}`);
             }}>导出诊断</button>
           </div>
+          <DiagnosticsLogCleanup onNotice={setNotice} />
           <ClosureReportPanel
             continueProductTaskByID={continueProductTaskByID}
             externalHandoffAudit={externalHandoffAudit}
@@ -2878,6 +3290,7 @@ function SettingsConsole({
   function renderDetail() {
     if (activeCategory === 'models') return renderModelDetail();
     if (activeCategory === 'chatEntrances') return renderChatEntranceDetail();
+    if (activeCategory === 'automations') return renderAutomationDetail();
     if (activeCategory === 'dataMemory') return renderMemoryDetail();
     if (activeCategory === 'capabilities') return renderCapabilitiesDetail();
     if (activeCategory === 'nodesExecution') return renderNodeDetail();
@@ -2984,7 +3397,7 @@ function normalizeModelBaseURL(value: string): string {
   return value.trim().replace(/\/+$/, '');
 }
 
-function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[]) {
+function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], automations: AutomationDefinition[] = []) {
   if (category === 'models') {
     return [
       { id: 'openai', label: 'OpenAI', description: 'OpenAI API 与模型参数' },
@@ -3006,6 +3419,9 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[]) {
       { id: 'cli', label: 'CLI', description: '命令行入口' },
       { id: 'webhook', label: 'Webhook', description: '外部 HTTP 入口' },
     ];
+  }
+  if (category === 'automations') {
+    return getAutomationSettingsObjects(automations);
   }
   if (category === 'dataMemory') {
     return [
@@ -3895,11 +4311,24 @@ function CompanionInspectorPanel({
           >
             <span>Memory</span>
           </button>
+          <button
+            id="right-inspector-tab-logs"
+            aria-controls="right-inspector-logs"
+            aria-selected={activeTab === 'logs'}
+            className={activeTab === 'logs' ? 'active' : ''}
+            role="tab"
+            type="button"
+            onClick={() => setActiveTab('logs')}
+          >
+            <span>Logs</span>
+          </button>
         </div>
         <div className="right-inspector-header-drag-spacer" aria-hidden="true" />
       </header>
       {activeTab === 'terminal' ? (
         <CompanionTerminalPanel />
+      ) : activeTab === 'logs' ? (
+        <CompanionLogsPanel runID={trace?.id} />
       ) : (
         <CompanionInsightPanel
           decideProactiveMessage={decideProactiveMessage}
@@ -3925,6 +4354,320 @@ function CompanionTerminalPanel() {
       <InteractiveTerminalPanel />
     </div>
   );
+}
+
+// joi-log-coverage: covered-by Electron IPC start/success/failure app_logs for desktopApi calls; local filters are read-only UI state.
+function CompanionLogsPanel({ runID }: { runID?: string }) {
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [query, setQuery] = useState('');
+  const [level, setLevel] = useState('');
+  const [risk, setRisk] = useState('');
+  const [category, setCategory] = useState('');
+  const [source, setSource] = useState('');
+  const [runFilter, setRunFilter] = useState('');
+  const [includeTrace, setIncludeTrace] = useState(false);
+  const [includeWorkerHeartbeat, setIncludeWorkerHeartbeat] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [refreshNonce, setRefreshNonce] = useState(0);
+
+  useEffect(() => {
+    let disposed = false;
+    const filter = buildLogFilter({
+      category,
+      includeTrace,
+      includeWorkerHeartbeat,
+      level,
+      query,
+      risk,
+      runFilter,
+      source,
+    });
+    async function loadLogs() {
+      setLoading(true);
+      setError('');
+      try {
+        const result = await desktopApi.listLogs(filter);
+        if (!disposed) setLogs(result.logs ?? []);
+      } catch (logError) {
+        if (!disposed) setError(safeErrorText(logError));
+      } finally {
+        if (!disposed) setLoading(false);
+      }
+    }
+    void loadLogs();
+    return () => {
+      disposed = true;
+    };
+  }, [category, includeTrace, includeWorkerHeartbeat, level, query, refreshNonce, risk, runFilter, source]);
+
+  async function exportVisibleLogs() {
+    setError('');
+    setNotice('');
+    try {
+      const result = await desktopApi.exportLogs(buildLogFilter({
+        category,
+        includeTrace,
+        includeWorkerHeartbeat,
+        level,
+        query,
+        risk,
+        runFilter,
+        source,
+      }));
+      setNotice(`已导出：${result.path}`);
+    } catch (logError) {
+      setError(safeErrorText(logError));
+    }
+  }
+
+  return (
+    <section
+      id="right-inspector-logs"
+      className="right-panel-section logs-inspector-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-logs"
+    >
+      <header>
+        <small>Logs</small>
+        <h2>日志</h2>
+      </header>
+      <div className="logs-filter-grid">
+        <label className="field-row compact">
+          <span>搜索</span>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="message / feature / run" />
+        </label>
+        <label className="field-row compact">
+          <span>Level</span>
+          <select value={level} onChange={(event) => setLevel(event.target.value)}>
+            <option value="">全部</option>
+            {logLevelOptions.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
+        <label className="field-row compact">
+          <span>Risk</span>
+          <select value={risk} onChange={(event) => setRisk(event.target.value)}>
+            <option value="">全部</option>
+            {logRiskOptions.map((item) => <option key={item} value={item}>{formatRiskLevel(item)}</option>)}
+          </select>
+        </label>
+        <label className="field-row compact">
+          <span>Category</span>
+          <select value={category} onChange={(event) => setCategory(event.target.value)}>
+            <option value="">全部</option>
+            {logCategoryOptions.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
+        <label className="field-row compact">
+          <span>Source</span>
+          <input value={source} onChange={(event) => setSource(event.target.value)} placeholder="electron_ipc" />
+        </label>
+        <label className="field-row compact">
+          <span>Run</span>
+          <input value={runFilter} onChange={(event) => setRunFilter(event.target.value)} placeholder={runID || 'run id'} />
+        </label>
+      </div>
+      <div className="logs-toggle-row">
+        <label>
+          <input type="checkbox" checked={includeTrace} onChange={(event) => setIncludeTrace(event.target.checked)} />
+          <span>Trace delta</span>
+        </label>
+        <label>
+          <input type="checkbox" checked={includeWorkerHeartbeat} onChange={(event) => setIncludeWorkerHeartbeat(event.target.checked)} />
+          <span>Worker heartbeat</span>
+        </label>
+      </div>
+      <div className="logs-toolbar">
+        <button type="button" onClick={() => setRefreshNonce((value) => value + 1)} disabled={loading}>
+          {loading ? '刷新中' : '刷新'}
+        </button>
+        {runID ? <button type="button" onClick={() => setRunFilter(runID)}>当前 Run</button> : null}
+        <button type="button" onClick={() => void exportVisibleLogs()}>导出</button>
+      </div>
+      {error ? <p className="terminal-error">{error}</p> : null}
+      {notice ? <p className="logs-notice">{notice}</p> : null}
+      <div className="log-entry-list">
+        {logs.length === 0 ? (
+          <p className="empty">暂无日志。</p>
+        ) : logs.map((log) => (
+          <LogEntryRow key={`${log.source_table}:${log.id}`} log={log} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function LogEntryRow({ log }: { log: LogEntry }) {
+  return (
+    <article className={`log-entry-row log-level-${classToken(log.level)}`}>
+      <header>
+        <span className="log-level-pill">{log.level}</span>
+        <span>{formatRiskLevel(log.risk_level)}</span>
+        <time>{formatShortTime(log.created_at)}</time>
+      </header>
+      <strong>{log.message || log.feature_key || log.event_type || log.id}</strong>
+      <small>
+        {[log.category, log.source, log.feature_key].filter(Boolean).join(' · ')}
+        {log.run_id ? ` · ${log.run_id}` : ''}
+      </small>
+      <details>
+        <summary>详情</summary>
+        <pre>{formatRawData({
+          id: log.id,
+          source_table: log.source_table,
+          event_type: log.event_type,
+          item_type: log.item_type,
+          item_id: log.item_id,
+          duration_ms: log.duration_ms,
+          status: log.status,
+          payload: log.payload,
+          error: log.error,
+        })}</pre>
+      </details>
+    </article>
+  );
+}
+
+function DiagnosticsLogCleanup({ onNotice }: { onNotice?: (message: string) => void }) {
+  const [preview, setPreview] = useState<LogCleanupPreview | null>(null);
+  const [previewRequestKey, setPreviewRequestKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [includeTraceDelta, setIncludeTraceDelta] = useState(false);
+  const [includeWorkerHeartbeat, setIncludeWorkerHeartbeat] = useState(false);
+
+  function cleanupRequest(): LogCleanupRequest {
+    return {
+      actor: 'desktop_admin',
+      include_trace_delta: includeTraceDelta,
+      include_worker_heartbeat: includeWorkerHeartbeat,
+      reason: 'desktop_diagnostics_cleanup',
+      scopes: defaultLogCleanupScopes,
+    };
+  }
+
+  function cleanupRequestKey(request = cleanupRequest()): string {
+    return JSON.stringify(request);
+  }
+
+  function invalidatePreview() {
+    setPreview(null);
+    setPreviewRequestKey('');
+  }
+
+  async function previewCleanup() {
+    setBusy(true);
+    setError('');
+    try {
+      const request = cleanupRequest();
+      const result = await desktopApi.previewLogCleanup(request);
+      setPreview(result);
+      setPreviewRequestKey(cleanupRequestKey(request));
+    } catch (cleanupError) {
+      setError(safeErrorText(cleanupError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearLogs() {
+    const request = cleanupRequest();
+    const requestKey = cleanupRequestKey(request);
+    if (!preview || previewRequestKey !== requestKey) {
+      setError('请先 Preview 当前清理范围。');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const result = await desktopApi.clearLogs(request);
+      setPreview(result);
+      setPreviewRequestKey(requestKey);
+      onNotice?.(`日志已清理：${result.total_count} 项`);
+    } catch (cleanupError) {
+      setError(safeErrorText(cleanupError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const previewIsCurrent = Boolean(preview && previewRequestKey === cleanupRequestKey());
+
+  return (
+    <section className="diagnostics-log-cleanup">
+      <h3>日志清理</h3>
+      <dl className="metrics">
+        <KV label="范围" value="系统日志、Run Trace、tool/model、worker audit、文件日志" />
+        <KV label="保留" value="对话、记忆、设置、密钥" />
+      </dl>
+      <div className="logs-toggle-row">
+        <label>
+          <input
+            type="checkbox"
+            checked={includeTraceDelta}
+            onChange={(event) => {
+              setIncludeTraceDelta(event.target.checked);
+              invalidatePreview();
+            }}
+          />
+          <span>Trace delta</span>
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={includeWorkerHeartbeat}
+            onChange={(event) => {
+              setIncludeWorkerHeartbeat(event.target.checked);
+              invalidatePreview();
+            }}
+          />
+          <span>Worker heartbeat</span>
+        </label>
+      </div>
+      {preview ? (
+        <div className="log-cleanup-preview">
+          <strong>{preview.total_count} 项</strong>
+          <div>
+            {Object.entries(preview.counts).map(([scope, count]) => (
+              <span key={scope}>{scope}: {count}</span>
+            ))}
+          </div>
+          {preview.warnings.length > 0 ? <p>{preview.warnings.join(' · ')}</p> : null}
+        </div>
+      ) : null}
+      {error ? <p className="terminal-error">{error}</p> : null}
+      <div className="detail-actions">
+        <button type="button" onClick={() => void previewCleanup()} disabled={busy}>Preview</button>
+        <button type="button" onClick={() => void clearLogs()} disabled={busy || !previewIsCurrent || !preview?.safe_to_clear}>
+          Clear Logs
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function buildLogFilter(input: {
+  category: string;
+  includeTrace: boolean;
+  includeWorkerHeartbeat: boolean;
+  level: string;
+  query: string;
+  risk: string;
+  runFilter: string;
+  source: string;
+}) {
+  return {
+    categories: input.category ? [input.category] : undefined,
+    include_trace: input.includeTrace,
+    include_worker_heartbeat: input.includeWorkerHeartbeat,
+    levels: input.level ? [input.level] : undefined,
+    limit: 80,
+    query: input.query.trim() || undefined,
+    risk_levels: input.risk ? [input.risk] : undefined,
+    run_id: input.runFilter.trim() || undefined,
+    sources: input.source.trim() ? [input.source.trim()] : undefined,
+  };
 }
 
 function readCssVariable(name: string, fallback: string) {
@@ -5101,6 +5844,7 @@ function TraceStage({
 
 function TracePanel({ trace, stepCount, firstModelCall }: { trace: RunTrace | null; stepCount: number; firstModelCall?: ModelCall }) {
   const actions = visibleExecutionActions(projectRunTraceToActions(trace));
+  const traceUsage = summarizeModelCalls(trace?.model_calls ?? []);
   return (
     <section className="panel trace-panel">
       <h2>运行记录</h2>
@@ -5112,7 +5856,7 @@ function TracePanel({ trace, stepCount, firstModelCall }: { trace: RunTrace | nu
             <KV label="步骤" value={`${stepCount} 步`} />
             <KV label="模型" value={firstModelCall?.model_name ?? '无'} />
             <KV label="服务商" value={firstModelCall?.provider ?? '无'} />
-            <KV label="令牌" value={firstModelCall ? `${firstModelCall.input_tokens}/${firstModelCall.output_tokens}` : '0/0'} />
+            <KV label="令牌" value={`${formatTokenCount(traceUsage.total_tokens)} total`} />
           </dl>
           {actions.length > 0 ? <ExecutionActionFlow actions={actions} mode="detail" /> : <p className="empty">这次运行没有需要展示的执行动作。</p>}
         </>
@@ -5126,13 +5870,16 @@ function TracePanel({ trace, stepCount, firstModelCall }: { trace: RunTrace | nu
 function TraceDetail({ trace, stepCount, firstModelCall }: { trace: RunTrace | null; stepCount: number; firstModelCall?: ModelCall }) {
   if (!trace) return <section className="panel wide"><p className="empty">暂无运行记录。</p></section>;
   const actions = visibleExecutionActions(projectRunTraceToActions(trace));
+  const traceUsage = summarizeModelCalls(trace.model_calls ?? []);
   return (
     <section className="panel wide">
       <h2>执行过程</h2>
       <dl className="metrics">
         <KV label="状态" value={formatStatus(trace.status)} />
         <KV label="可见动作" value={`${actions.length} 个`} />
-        <KV label="耗时" value={`${firstModelCall?.latency_ms ?? 0} ms`} />
+        <KV label="耗时" value={formatMilliseconds(firstModelCall?.latency_ms ?? 0)} />
+        <KV label="本次令牌" value={`${formatTokenCount(traceUsage.total_tokens)} total`} />
+        <KV label="本次成本" value={formatCost(traceUsage.cost_estimate)} />
       </dl>
       {actions.length > 0 ? (
         <ExecutionActionFlow actions={actions} mode="detail" />
@@ -5458,26 +6205,42 @@ function NodesPanel({
 }
 
 function CostsPanel({ usage, calls, health }: { usage: Record<string, unknown>[]; calls: ModelCall[]; health: SystemHealth | null }) {
+  const today = health?.token_cost_today ?? {};
   return (
     <section className="panel wide">
       <h2>成本用量</h2>
       <dl className="metrics">
-        <KV label="今日输入令牌" value={String(health?.token_cost_today?.input_tokens ?? 0)} />
-        <KV label="今日输出令牌" value={String(health?.token_cost_today?.output_tokens ?? 0)} />
-        <KV label="今日缓存令牌" value={String(health?.token_cost_today?.cached_input_tokens ?? 0)} />
-        <KV label="预估成本" value={String(health?.token_cost_today?.estimated_cost ?? 0)} />
+        <KV label="今日总令牌" value={formatTokenCount(today.total_tokens)} />
+        <KV label="今日输入令牌" value={formatTokenCount(today.input_tokens)} />
+        <KV label="今日输出令牌" value={formatTokenCount(today.output_tokens)} />
+        <KV label="缓存命中" value={`${formatTokenCount(today.cached_input_tokens)} (${formatRatio(today.cache_hit_ratio)})`} />
+        <KV label="预估成本" value={formatCost(today.estimated_cost)} />
       </dl>
       <div className="table">
         {usage.map((item, index) => (
           <article key={`${item.provider}-${item.model}-${item.agent}-${index}`} className="row-card compact">
             <strong>{String(item.agent || '未知代理')}</strong>
-            <small>{String(item.provider)} / {String(item.model)} · 调用 {String(item.calls)} 次 · 令牌 {String(item.input_tokens)}/{String(item.output_tokens)} · 缓存命中 {String(item.cache_hit_ratio)} · 平均延迟 {String(item.avg_latency_ms)} ms</small>
+            <small>
+              {String(item.provider)} / {String(item.model)} · 调用 {formatTokenCount(item.calls)} 次 · 总 {formatTokenCount(item.total_tokens)}
+              {' '}· 输入/输出 {formatTokenCount(item.input_tokens)}/{formatTokenCount(item.output_tokens)}
+              {' '}· 缓存 {formatTokenCount(item.cached_input_tokens)} ({formatRatio(item.cache_hit_ratio)})
+              {' '}· reasoning {formatTokenCount(item.reasoning_tokens)}
+              {' '}· {formatCost(item.estimated_cost)}
+            </small>
+            <small>平均延迟 {formatMilliseconds(item.avg_latency_ms)} · 错误 {formatTokenCount(item.error_calls)} · 最近 {String(item.last_call_at || '无')}</small>
           </article>
         ))}
         {calls.map((call) => (
           <article key={call.id} className="row-card compact">
-            <strong>{formatStatus(call.status)}</strong>
-            <small>{call.provider} / {call.model_name} · 令牌 {call.input_tokens}/{call.output_tokens} · 缓存 {call.cached_input_tokens} · {call.latency_ms} ms</small>
+            <strong>{formatStatus(call.status)} · {formatUsageStatus(call.usage_status)}</strong>
+            <small>
+              {call.provider} / {call.model_name} · 总 {formatTokenCount(modelCallTotalTokens(call))}
+              {' '}· 输入/输出 {formatTokenCount(call.input_tokens)}/{formatTokenCount(call.output_tokens)}
+              {' '}· 缓存 {formatTokenCount(call.cached_input_tokens)}
+              {' '}· reasoning {formatTokenCount(call.reasoning_tokens)}
+              {' '}· {formatCost(call.cost_estimate)}
+              {' '}· {formatMilliseconds(call.latency_ms)}
+            </small>
             {call.metadata ? <CollapsedData label="高级详情" value={call.metadata} /> : null}
           </article>
         ))}
@@ -5827,6 +6590,7 @@ function InfoGroup({ title, value }: { title: string; value?: Record<string, unk
 function TraceRuntimeSummary({ trace }: { trace: RunTrace }) {
   const routeEntries = Object.entries(trace.route_result ?? {}).filter(([, value]) => typeof value !== 'object' || value === null);
   const usedMemories = extractUsedMemories(trace);
+  const traceUsage = summarizeModelCalls(trace.model_calls ?? []);
   return (
     <section className="runtime-summary">
       <h3>运行摘要</h3>
@@ -5837,6 +6601,8 @@ function TraceRuntimeSummary({ trace }: { trace: RunTrace }) {
         <KV label="提示词组装" value={`${trace.prompt_assemblies?.length ?? 0} 次`} />
         <KV label="记忆上下文" value={`${trace.memory_context_packs?.length ?? 0} 个`} />
         <KV label="本次使用记忆" value={`${usedMemories.length} 条`} />
+        <KV label="本次总令牌" value={formatTokenCount(traceUsage.total_tokens)} />
+        <KV label="本次预估成本" value={formatCost(traceUsage.cost_estimate)} />
       </dl>
       <InsightList empty="本次没有注入 confirmed memory。">
         {usedMemories.map((result) => (
@@ -5846,6 +6612,18 @@ function TraceRuntimeSummary({ trace }: { trace: RunTrace }) {
         ))}
       </InsightList>
       <div className="table">
+        {(trace.model_calls ?? []).map((call) => (
+          <article key={call.id} className="row-card compact">
+            <strong>{call.provider} / {call.model_name}</strong>
+            <small>
+              {formatUsageStatus(call.usage_status)} · 总 {formatTokenCount(modelCallTotalTokens(call))}
+              {' '}· 输入/输出 {formatTokenCount(call.input_tokens)}/{formatTokenCount(call.output_tokens)}
+              {' '}· 缓存 {formatTokenCount(call.cached_input_tokens)}
+              {' '}· reasoning {formatTokenCount(call.reasoning_tokens)}
+              {' '}· {formatCost(call.cost_estimate)}
+            </small>
+          </article>
+        ))}
         {(trace.prompt_assemblies ?? []).map((item) => (
           <article key={item.id} className="row-card compact">
             <strong>提示词组装</strong>
@@ -5897,6 +6675,10 @@ function booleanFromUnknown(value: unknown): boolean {
 
 function conversationTitle(item: ConversationSummary) {
   return item.title || item.last_message || '未命名对话';
+}
+
+function classToken(value: string) {
+  return value.replace(/[^a-z0-9_-]+/gi, '-').toLowerCase() || 'unknown';
 }
 
 function formatShortTime(value?: string) {
@@ -5977,6 +6759,16 @@ function formatStatus(status: string) {
     unknown: '未知',
   };
   return labels[status] ?? status;
+}
+
+function formatUsageStatus(status?: string) {
+  const labels: Record<string, string> = {
+    recorded: '已记录用量',
+    provider_missing: '未返回用量',
+    estimated: '估算用量',
+    failed: '用量失败',
+  };
+  return labels[status || ''] ?? (status || '用量未知');
 }
 
 function formatChannelLabel(channel?: string) {
@@ -6072,6 +6864,9 @@ function formatAction(action: string) {
 function formatRiskLevel(level: string) {
   const labels: Record<string, string> = {
     read_only: '只读',
+    write_candidate: '写入候选',
+    browser_interaction: '浏览器交互',
+    workspace_write: '工作区写入',
     state_change: '状态变更',
     destructive: '破坏性',
     unsafe: '不安全',
@@ -6110,6 +6905,10 @@ function formatFieldName(key: string) {
     input_tokens: '输入令牌',
     output_tokens: '输出令牌',
     cached_input_tokens: '缓存输入令牌',
+    cache_write_input_tokens: '缓存写入令牌',
+    reasoning_tokens: '推理令牌',
+    total_tokens: '总令牌',
+    cache_hit_ratio: '缓存命中率',
     estimated_cost: '预估成本',
     provider: '服务商',
     model: '模型',

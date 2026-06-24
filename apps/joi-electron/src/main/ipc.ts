@@ -5,11 +5,17 @@ import { desktopIpcMethods, type DesktopIpcMethod, type JoiInvokeRequest } from 
 import type {
   ApprovalDecisionRequest,
   ApprovalResumeRunRequest,
+  AutomationDefinition,
+  AutomationDefinitionRequest,
+  AutomationTriggerNowRequest,
+  AutomationWebhookTestRequest,
   ChatRequest,
   ConversationFilter,
   ConnectionTest,
   ExternalHandoffAudit,
   ExternalHandoffReadiness,
+  LogCleanupRequest,
+  LogFilter,
   ModelConnectionTestRequest,
   ModelConfigRequest,
   ModelSettingsRequest,
@@ -37,6 +43,7 @@ import { executeServerDiagnose, executeSystemHealthCheck } from '../../../../pac
 import { runChatCompletionsToolTurn } from '../../../../packages/runtime/src/tool-calling';
 import { compileElectronCapabilityTools } from '../../../../packages/runtime/src/capability-compiler';
 import { TerminalSessionManager } from './terminal';
+import { automationWebhookSecretRef, newAutomationWebhookSecret } from './automation';
 
 const invokeRequestSchema = z.object({
   method: z.enum(desktopIpcMethods),
@@ -62,6 +69,8 @@ export type RegisterIpcOptions = {
   testIMessageConnection?: () => Promise<ConnectionTest> | ConnectionTest | undefined;
   sendTestIMessageMessage?: (spaceID?: string, message?: string) => Promise<ConnectionTest> | ConnectionTest | undefined;
   deterministicChat?: boolean;
+  getAutomationWebhookURL?: (automation: AutomationDefinition) => string;
+  requestAutomationDrain?: () => void;
 };
 
 let terminalSessionManager: TerminalSessionManager | null = null;
@@ -87,6 +96,23 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
   const emittedRunSeqByRunID = new Map<string, number>();
   const terminalManager = getTerminalSessionManager();
   terminalManager.attachWindow(window);
+  terminalManager.setLogSink?.((event) => {
+    safeRecordAppLog(store, {
+      level: event.type === 'error' ? 'error' : event.type === 'output' ? 'trace' : 'info',
+      risk_level: 'state_change',
+      category: 'terminal',
+      feature_key: `terminal.${event.type}`,
+      source: 'electron_terminal',
+      message: `terminal ${event.type}`,
+      item_type: 'terminal_session',
+      item_id: event.id,
+      payload: {
+        data: event.data,
+        session: event.session,
+      },
+      error: event.error ? { message: event.error } : undefined,
+    });
+  });
   window.once('closed', () => {
     terminalManager.detachWindow(window);
     terminalManager.dispose();
@@ -113,6 +139,85 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
       const result = await runLiveElectronToolCallingChat(chatRequest, settings, apiKey, store, activeToolCallingRuns, emitNewRunEvents);
       emitNewRunEvents(result.run_id);
       return result;
+    },
+    ListAutomations(payload) {
+      return store.listAutomations(payload as { kind?: 'schedule' | 'webhook'; enabled?: boolean; limit?: number });
+    },
+    GetAutomation(payload) {
+      return store.getAutomation(String(payload ?? ''));
+    },
+    async SaveAutomation(payload) {
+      const automation = store.saveAutomation(payload as AutomationDefinitionRequest);
+      if (automation.kind === 'webhook') {
+        const secretRef = automationWebhookSecretRef(automation.id);
+        if (!(await secrets.resolve(secretRef))) {
+          await secrets.save(secretRef, newAutomationWebhookSecret());
+        }
+      }
+      return store.getAutomation(automation.id);
+    },
+    DeleteAutomation(payload) {
+      store.deleteAutomation(String(payload ?? ''));
+    },
+    SetAutomationEnabled(payload) {
+      return store.setAutomationEnabled(payload as { id: string; enabled: boolean });
+    },
+    TriggerAutomationNow(payload) {
+      const result = store.triggerAutomationNow(payload as AutomationTriggerNowRequest);
+      options.requestAutomationDrain?.();
+      return result;
+    },
+    ListAutomationTriggers(payload) {
+      return store.listAutomationTriggers(payload as { automation_id?: string; status?: string; limit?: number });
+    },
+    ListAutomationRuns(payload) {
+      return store.listAutomationRuns(payload as { automation_id?: string; trigger_id?: string; limit?: number });
+    },
+    async GetAutomationWebhookEndpoint(payload) {
+      const automation = store.getAutomation(String(payload ?? ''));
+      const secretRef = automationWebhookSecretRef(automation.id);
+      return {
+        automation_id: automation.id,
+        slug: automation.slug,
+        url: options.getAutomationWebhookURL?.(automation) || `http://127.0.0.1:18082/automation/webhooks/${encodeURIComponent(automation.slug)}`,
+        secret_ref: secretRef,
+        secret_configured: Boolean(await secrets.resolve(secretRef)),
+      };
+    },
+    async RotateAutomationWebhookSecret(payload) {
+      const automation = store.getAutomation(String(payload ?? ''));
+      if (automation.kind !== 'webhook') throw new Error('Automation is not a webhook automation');
+      const secretRef = automationWebhookSecretRef(automation.id);
+      const secret = newAutomationWebhookSecret();
+      await secrets.save(secretRef, secret);
+      return {
+        automation_id: automation.id,
+        slug: automation.slug,
+        url: options.getAutomationWebhookURL?.(automation) || `http://127.0.0.1:18082/automation/webhooks/${encodeURIComponent(automation.slug)}`,
+        secret_ref: secretRef,
+        secret_configured: true,
+        secret_value_once: secret,
+      };
+    },
+    TestAutomationWebhook(payload) {
+      const req = payload as AutomationWebhookTestRequest;
+      const automation = store.getAutomation(req.id);
+      if (automation.kind !== 'webhook') throw new Error('Automation is not a webhook automation');
+      const result = store.enqueueAutomationTrigger({
+        automation_id: automation.id,
+        trigger_type: 'webhook',
+        dedup_key: `test:${Date.now()}:${randomUUID()}`,
+        payload: {
+          ...(req.payload || {}),
+          _webhook: {
+            test: true,
+            received_at: new Date().toISOString(),
+          },
+        },
+        fire_at: new Date().toISOString(),
+      });
+      options.requestAutomationDrain?.();
+      return { trigger: result.trigger };
     },
     GetRunTrace(payload) {
       return store.getRunTrace(String(payload ?? ''));
@@ -325,6 +430,21 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     },
     ExportDiagnostics() {
       return store.exportDiagnostics();
+    },
+    ListLogs(payload) {
+      return store.listLogs((payload || {}) as LogFilter);
+    },
+    GetLogEntry(payload) {
+      return store.getLogEntry(String(payload ?? ''));
+    },
+    PreviewLogCleanup(payload) {
+      return store.previewLogCleanup((payload || { scopes: [] }) as LogCleanupRequest);
+    },
+    ClearLogs(payload) {
+      return store.clearLogs((payload || { scopes: [] }) as LogCleanupRequest);
+    },
+    ExportLogs(payload) {
+      return store.exportLogs((payload || {}) as LogFilter);
     },
     GetWorkspaceSettings() {
       return store.getWorkspaceSettings();
@@ -543,7 +663,43 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     if (!handler) {
       throw new Error(`Unsupported Joi IPC method: ${method}`);
     }
-    return handler(payload);
+    const startedAt = Date.now();
+    safeRecordAppLog(store, {
+      level: 'debug',
+      risk_level: ipcRiskLevel(method),
+      category: 'ipc',
+      feature_key: `ipc.${method}.started`,
+      source: 'electron_ipc',
+      message: `IPC ${method} started`,
+      payload: { method, payload: sanitizeIpcLogPayload(method, payload) },
+    });
+    try {
+      const result = await handler(payload);
+      safeRecordAppLog(store, {
+        level: 'debug',
+        risk_level: ipcRiskLevel(method),
+        category: 'ipc',
+        feature_key: `ipc.${method}.succeeded`,
+        source: 'electron_ipc',
+        message: `IPC ${method} succeeded`,
+        duration_ms: Date.now() - startedAt,
+        payload: { method },
+      });
+      return result;
+    } catch (error) {
+      safeRecordAppLog(store, {
+        level: 'error',
+        risk_level: ipcRiskLevel(method),
+        category: 'ipc',
+        feature_key: `ipc.${method}.failed`,
+        source: 'electron_ipc',
+        message: `IPC ${method} failed`,
+        duration_ms: Date.now() - startedAt,
+        payload: { method },
+        error,
+      });
+      throw error;
+    }
   });
 
   ipcMain.removeHandler('joi:app:getVersion');
@@ -575,6 +731,56 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
 
   ipcMain.removeHandler('joi:terminal:getStatus');
   ipcMain.handle('joi:terminal:getStatus', (_event, rawID: unknown) => terminalManager.getStatus(String(rawID ?? '')));
+}
+
+function safeRecordAppLog(store: JoiSQLiteStore, input: Parameters<JoiSQLiteStore['recordAppLog']>[0]): void {
+  try {
+    store.recordAppLog(input);
+  } catch (error) {
+    console.warn('app log write failed', error);
+  }
+}
+
+function sanitizeIpcLogPayload(method: DesktopIpcMethod, payload: unknown): unknown {
+  return sanitizeIpcLogValue(payload, ipcMethodMayCarrySecret(method));
+}
+
+function sanitizeIpcLogValue(value: unknown, redactGenericValue: boolean): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeIpcLogValue(item, redactGenericValue));
+  }
+  if (value && typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    const nameHint = String((value as Record<string, unknown>).name ?? (value as Record<string, unknown>).key ?? '');
+    const redactValueForNamedSecret = ipcSensitiveLogKey(nameHint);
+    for (const [key, item] of Object.entries(value)) {
+      const normalized = key.toLowerCase();
+      if (ipcSensitiveLogKey(key) || (normalized === 'value' && (redactGenericValue || redactValueForNamedSecret))) {
+        result[key] = '[REDACTED]';
+      } else {
+        result[key] = sanitizeIpcLogValue(item, redactGenericValue);
+      }
+    }
+    return result;
+  }
+  return value;
+}
+
+function ipcMethodMayCarrySecret(method: DesktopIpcMethod): boolean {
+  return /Secret|Token|OAuth|TelegramConfig|IMessageConfig|Photon|Worker/i.test(String(method));
+}
+
+function ipcSensitiveLogKey(key: string): boolean {
+  return /api[_-]?key|apikey|authorization|bearer|credential|password|secret|token|private[_-]?key/i.test(key);
+}
+
+function ipcRiskLevel(method: DesktopIpcMethod): string {
+  const name = String(method);
+  if (/Clear|Delete|Purge|Restore|Save|Set|Disable|Enable|Decide|Approve|Reject|Rotate|Generate|Login|Setup|Send|Trigger|Update|Close|Reopen|Archive|Trash|Move|Interrupt|Redirect|Create/i.test(name)) {
+    if (/Clear|Delete|Purge|Restore|Rotate/i.test(name)) return 'state_change';
+    if (/Save|Set|Update|Create|Generate|Login|Setup|Send|Trigger|Move|Archive|Trash|Close|Reopen|Interrupt|Redirect|Decide|Disable|Enable/i.test(name)) return 'write_candidate';
+  }
+  return 'read_only';
 }
 
 async function getExternalHandoffReadiness(

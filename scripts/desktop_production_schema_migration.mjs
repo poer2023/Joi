@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -44,10 +44,17 @@ try {
     mkdirSync(backupRoot, { recursive: true });
     backupSQLiteFiles(dbPath, backupRoot);
     applyConversationClosureSchema(db);
+    applyAutomationSchema(db);
     audit.applied = true;
     audit.after = schemaAudit(db);
   } else {
     audit.after = audit.before;
+  }
+  if (!audit.after.schema_current) {
+    audit.ok = false;
+    audit.error = apply
+      ? 'production sqlite schema is still not current after migration'
+      : 'production sqlite schema is not current; run pnpm joi:prod-schema:migrate after stopping Joi.app';
   }
 } catch (error) {
   audit.ok = false;
@@ -65,16 +72,28 @@ function finish(result) {
 }
 
 function schemaAudit(db) {
-  const requiredTables = ['principals', 'channel_identities', 'conversation_entry_links', 'task_entry_links', 'notification_deliveries'];
+  const requiredTables = ['principals', 'channel_identities', 'conversation_entry_links', 'task_entry_links', 'notification_deliveries', 'automation_definitions', 'automation_triggers', 'automation_runs'];
   const requiredColumns = {
     conversations: ['principal_id'],
     runs: ['principal_id', 'entry_channel', 'requested_mode', 'resolved_mode', 'mode_source', 'terminal_status', 'terminal_reason', 'resume_token', 'parent_run_id', 'redirected_from_run_id', 'cancel_requested_at', 'resumed_at'],
     turns: ['mode_resolution_id', 'user_intent_summary', 'assistant_message_id', 'stream_status', 'completed_at'],
     run_events: ['schema_version', 'conversation_id', 'item_type', 'item_id', 'parent_item_id', 'phase', 'visibility', 'source', 'terminal', 'payload_json', 'error_json', 'usage_json'],
-    model_calls: ['streaming_enabled', 'first_delta_at', 'completed_at', 'finish_reason', 'usage_status', 'raw_finish_json'],
+    models: ['cached_input_price_per_1m'],
+    model_calls: ['streaming_enabled', 'first_delta_at', 'completed_at', 'finish_reason', 'usage_status', 'raw_finish_json', 'cache_write_input_tokens', 'reasoning_tokens', 'total_tokens'],
     tool_runs: ['turn_id', 'tool_call_id', 'purpose', 'approval_request_id', 'side_effect_level', 'idempotency_key', 'output_summary', 'artifact_id', 'error_code', 'error_message', 'completed_at'],
     product_tasks: ['principal_id', 'source_conversation_id', 'source_run_id', 'source_turn_id', 'mode_resolution_id', 'terminal_status', 'terminal_reason', 'evidence_summary', 'verification_status', 'last_projected_at'],
+    automation_definitions: ['id', 'kind', 'slug', 'enabled', 'trigger_config', 'prompt_template', 'input_mode', 'permission_profile', 'preferred_node', 'allow_worker', 'conversation_id', 'principal_id', 'dedup_policy', 'retry_policy', 'max_concurrency', 'notification_policy', 'next_fire_at', 'last_fire_at', 'metadata'],
+    automation_triggers: ['id', 'automation_id', 'trigger_type', 'dedup_key', 'payload', 'status', 'fire_at', 'claimed_at', 'claim_token', 'run_id', 'product_task_id', 'attempt_count', 'next_attempt_at', 'error_code', 'error_message'],
+    automation_runs: ['id', 'automation_id', 'trigger_id', 'run_id', 'product_task_id', 'status', 'attempt_number', 'started_at', 'finished_at', 'output_summary', 'error_code', 'error_message', 'metadata'],
   };
+  const requiredIndexes = [
+    'idx_automation_definitions_kind',
+    'idx_automation_definitions_enabled',
+    'idx_automation_triggers_claim',
+    'idx_automation_triggers_definition',
+    'idx_automation_runs_definition',
+    'idx_automation_runs_trigger',
+  ];
   const missing = [];
   for (const table of requiredTables) {
     if (!tableExists(db, table)) missing.push(`table:${table}`);
@@ -84,10 +103,18 @@ function schemaAudit(db) {
       if (!columnExists(db, table, column)) missing.push(`${table}.${column}`);
     }
   }
+  for (const index of requiredIndexes) {
+    if (!indexExists(db, index)) missing.push(`index:${index}`);
+  }
   return {
     schema_current: missing.length === 0,
     missing_schema: missing,
   };
+}
+
+function applyAutomationSchema(db) {
+  const migrationPath = join(resolve(import.meta.dirname, '..'), 'database/migrations/012_automation_os.sql');
+  db.exec(readFileSync(migrationPath, 'utf8'));
 }
 
 function applyConversationClosureSchema(db) {
@@ -138,12 +165,19 @@ function applyConversationClosureSchema(db) {
   ]) ensure('run_events', column, definition);
 
   for (const [column, definition] of [
+    ['cached_input_price_per_1m', 'REAL'],
+  ]) ensure('models', column, definition);
+
+  for (const [column, definition] of [
     ['streaming_enabled', 'INTEGER NOT NULL DEFAULT 0'],
     ['first_delta_at', 'TEXT'],
     ['completed_at', 'TEXT'],
     ['finish_reason', 'TEXT'],
     ['usage_status', "TEXT NOT NULL DEFAULT 'provider_missing'"],
     ['raw_finish_json', "TEXT NOT NULL DEFAULT '{}'"],
+    ['cache_write_input_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+    ['reasoning_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+    ['total_tokens', 'INTEGER NOT NULL DEFAULT 0'],
   ]) ensure('model_calls', column, definition);
 
   for (const [column, definition] of [
@@ -293,6 +327,10 @@ function tableExists(db, table) {
 function columnExists(db, table, column) {
   if (!tableExists(db, table)) return false;
   return db.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all().some((row) => String(row.name) === column);
+}
+
+function indexExists(db, index) {
+  return Boolean(db.prepare(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`).get(index));
 }
 
 function quoteIdentifier(value) {

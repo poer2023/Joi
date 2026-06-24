@@ -9,6 +9,7 @@ import { startWorkerGateway, type WorkerGatewayServer } from '../../../../packag
 import schemaSql from '../../../../database/sqlite/001_init_schema.sql?raw';
 import { TelegramInboundService } from './telegram-inbound';
 import { IMessageInboundService } from './imessage-inbound';
+import { AutomationRunner, AutomationWebhookServer } from './automation';
 
 const mainDir = dirname(fileURLToPath(import.meta.url));
 
@@ -51,6 +52,8 @@ let store: JoiSQLiteStore | null = null;
 let workerGateway: WorkerGatewayServer | null = null;
 let telegramInbound: TelegramInboundService | null = null;
 let imessageInbound: IMessageInboundService | null = null;
+let automationRunner: AutomationRunner | null = null;
+let automationWebhookServer: AutomationWebhookServer | null = null;
 let isQuitting = false;
 const secrets = new KeychainSecretStore();
 
@@ -125,6 +128,7 @@ function createMainWindow() {
       void imessageInbound.start();
     }
   }
+  startAutomationServices(sqliteStore);
 
   registerIpc(mainWindow, appDirs, sqliteStore, secrets, {
     onTelegramConfigChanged: () => telegramInbound?.scheduleReconfigure(),
@@ -134,6 +138,8 @@ function createMainWindow() {
     testIMessageConnection: () => imessageInbound?.testConnection(),
     sendTestIMessageMessage: (spaceID, message) => imessageInbound?.sendTestMessage(spaceID, message),
     deterministicChat: isDesktopE2E() || envFlag('JOI_DETERMINISTIC_CHAT'),
+    getAutomationWebhookURL: (automation) => automationWebhookServer?.endpointFor(automation) || `http://127.0.0.1:18082/automation/webhooks/${encodeURIComponent(automation.slug)}`,
+    requestAutomationDrain: () => automationRunner?.requestDrain(),
   });
   void startConfiguredWorkerGateway(sqliteStore);
 
@@ -172,6 +178,33 @@ function createMainWindow() {
     void window.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
     void window.loadFile(join(mainDir, '../renderer/index.html'));
+  }
+}
+
+function startAutomationServices(sqliteStore: JoiSQLiteStore) {
+  if (envFlag('JOI_DISABLE_AUTOMATION_OS')) return;
+  if (!automationRunner) {
+    automationRunner = new AutomationRunner({
+      store: sqliteStore,
+      secrets,
+      getWindow: () => mainWindow,
+      deterministicChat: isDesktopE2E() || envFlag('JOI_DETERMINISTIC_CHAT'),
+      logger: console,
+    });
+    automationRunner.start();
+  }
+  if (!automationWebhookServer && !envFlag('JOI_DISABLE_AUTOMATION_WEBHOOKS')) {
+    automationWebhookServer = new AutomationWebhookServer({
+      store: sqliteStore,
+      secrets,
+      runner: automationRunner,
+      addr: process.env.JOI_AUTOMATION_WEBHOOK_ADDR || '127.0.0.1:18082',
+      logger: console,
+    });
+    void automationWebhookServer.start().catch((error) => {
+      console.warn('automation webhook server skipped', error);
+      automationWebhookServer = null;
+    });
   }
 }
 
@@ -229,6 +262,10 @@ if (!hasSingleInstanceLock) {
     telegramInbound = null;
     imessageInbound?.stop();
     imessageInbound = null;
+    automationRunner?.stop();
+    automationRunner = null;
+    void automationWebhookServer?.close();
+    automationWebhookServer = null;
     void workerGateway?.close();
     workerGateway = null;
     store?.close();

@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "coverage_markers": [
+    "recordAppLog",
+    "appendRunEventV2",
+    "appendSQLiteRunEvent",
+    "AppendRunEvent",
+    "setLogSink",
+    "joi-log-coverage: covered-by"
+  ],
+  "forbidden_high_risk_markers": [
+    "joi-log-coverage: not-needed"
+  ],
+  "categories": [
+    {
+      "id": "ipc_write",
+      "risk": "state_change",
+      "high_risk": true,
+      "file_patterns": ["apps/joi-electron/src/main/"],
+      "match": "\\b(Save|Set|Update|Create|Delete|Clear|Purge|Restore|Send|Setup|Login|Generate|Disable|Enable|Decide|Trigger|Rotate|Archive|Trash|Move|Interrupt|Redirect)[A-Z][A-Za-z0-9_]*\\b",
+      "suggested_events": ["feature.started", "feature.succeeded", "feature.failed"]
+    },
+    {
+      "id": "capability_executor",
+      "risk": "workspace_write",
+      "high_risk": true,
+      "file_patterns": ["packages/runtime/src/", "services/orchestrator-core/"],
+      "match": "\\b(executeCapability|execute[A-Z][A-Za-z0-9_]*|capability|executor|policy)\\b",
+      "suggested_events": ["capability.requested", "policy.allowed", "policy.denied", "capability.succeeded", "capability.failed"]
+    },
+    {
+      "id": "external_entry",
+      "risk": "state_change",
+      "high_risk": true,
+      "file_patterns": ["apps/joi-electron/src/main/"],
+      "match": "\\b(telegram|imessage|worker_gateway|sidecar|sendMessage|reply|inbound|heartbeat|claim|ack|poll)\\b",
+      "suggested_events": ["entry.received", "entry.rejected", "reply.sent", "entry.failed"]
+    },
+    {
+      "id": "terminal_process",
+      "risk": "state_change",
+      "high_risk": true,
+      "file_patterns": ["apps/joi-electron/src/main/", "packages/runtime/src/"],
+      "match": "\\b(spawn|execFile|terminal|shell|pty|kill)\\b",
+      "suggested_events": ["terminal.started", "terminal.output", "terminal.failed", "terminal.exited"]
+    },
+    {
+      "id": "database_or_file_write",
+      "risk": "workspace_write",
+      "high_risk": true,
+      "file_patterns": ["apps/joi-electron/src/main/", "packages/store/", "packages/runtime/", "services/", "scripts/"],
+      "match": "\\b(INSERT INTO|UPDATE\\s+\\w+|DELETE FROM|writeFileSync|appendFileSync|rmSync|unlinkSync|mkdirSync|renameSync|copyFileSync|db\\.exec|db\\.prepare)\\b",
+      "suggested_events": ["write.started", "write.succeeded", "write.failed"]
+    },
+    {
+      "id": "secret_or_settings",
+      "risk": "state_change",
+      "high_risk": true,
+      "file_patterns": ["apps/joi-electron/src/main/", "packages/store/", "packages/runtime/", "packages/secrets/", "services/"],
+      "match": "\\b(secret|token|password|keychain|settings|SaveSecret|Save.*Settings)\\b",
+      "suggested_events": ["settings.changed", "secret.saved", "secret.failed"]
+    },
+    {
+      "id": "cleanup_delete",
+      "risk": "destructive",
+      "high_risk": true,
+      "file_patterns": ["apps/joi-electron/src/main/", "packages/store/", "packages/runtime/", "packages/secrets/", "services/", "scripts/"],
+      "match": "\\b(Clear|Delete[A-Z][A-Za-z0-9_]*|delete[A-Z][A-Za-z0-9_]*|Purge|cleanup|destroy|truncate|rmSync|unlinkSync)\\b",
+      "suggested_events": ["cleanup.previewed", "cleanup.succeeded", "cleanup.failed"]
+    }
+  ],
+  "low_risk": {
+    "file_patterns": ["apps/joi-desktop/frontend/src/"],
+    "suggested_events": ["view.opened", "filter.changed", "action.clicked"]
+  }
+}
