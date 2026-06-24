@@ -80,7 +80,7 @@ import '@xterm/xterm/css/xterm.css';
 
 type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
 type SettingsTab = Exclude<Tab, 'chat'>;
-type SettingsCategory = 'models' | 'chatEntrances' | 'automations' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
+type SettingsCategory = 'models' | 'chatEntrances' | 'automations' | 'observability' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
 type ExecutionTarget = 'main-node' | 'auto' | 'local-worker-1' | 'vps-la-1';
 type RightInspectorTab = 'terminal' | 'memory' | 'logs';
 type StreamingAssistantMessage = ConversationMessage & {
@@ -149,6 +149,7 @@ const settingsCategories: Array<{ id: SettingsCategory; label: string; descripti
   { id: 'models', label: '模型', description: '模型与服务配置' },
   { id: 'chatEntrances', label: '聊天入口', description: '聊天平台与入口管理' },
   { id: 'automations', label: '自动化', description: '定时任务与 Webhook Hook' },
+  { id: 'observability', label: '日志与用量', description: '日志、Token 与成本统计' },
   { id: 'dataMemory', label: '数据与记忆', description: '数据存储与记忆管理' },
   { id: 'capabilities', label: '能力与工具', description: '插件、工具与能力配置' },
   { id: 'nodesExecution', label: '节点与执行', description: '工作节点与执行资源' },
@@ -159,6 +160,7 @@ const defaultSettingsObjectByCategory: Record<SettingsCategory, string> = {
   models: 'deepseek',
   chatEntrances: 'telegram',
   automations: 'new-schedule',
+  observability: 'logs',
   dataMemory: 'memory-inbox',
   capabilities: 'builtin',
   nodesExecution: 'main-node',
@@ -478,7 +480,7 @@ export default function App() {
     } else if (activeTab === 'system') {
       selectSettingsObject('advanced', 'diagnostics');
     } else if (activeTab === 'costs') {
-      selectSettingsObject('advanced', 'raw-data');
+      selectSettingsObject('observability', 'token-usage');
     } else if (activeTab === 'confirmations') {
       selectSettingsObject('privacySecurity', 'dangerous-actions');
     } else if (activeTab === 'backups') {
@@ -2715,6 +2717,26 @@ function SettingsConsole({
     );
   }
 
+  function renderObservabilityDetail() {
+    if (activeObject.id === 'token-usage') {
+      return <CostsPanel calls={calls} health={health} usage={usage} />;
+    }
+    if (activeObject.id === 'log-cleanup') {
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="日志清理" description="预览并清理日志、Run Trace、tool/model 与 worker audit 记录" />
+          <DiagnosticsLogCleanup onNotice={setNotice} />
+        </section>
+      );
+    }
+    return (
+      <section className="settings-detail-panel">
+        <DetailHeader title="日志" description="筛选本地 app logs、Run Trace 与 worker audit 记录" />
+        <CompanionLogsPanel runID={trace?.id} />
+      </section>
+    );
+  }
+
   function renderMemoryDetail() {
     if (activeObject.id === 'memory-inbox') {
       return (
@@ -3291,6 +3313,7 @@ function SettingsConsole({
     if (activeCategory === 'models') return renderModelDetail();
     if (activeCategory === 'chatEntrances') return renderChatEntranceDetail();
     if (activeCategory === 'automations') return renderAutomationDetail();
+    if (activeCategory === 'observability') return renderObservabilityDetail();
     if (activeCategory === 'dataMemory') return renderMemoryDetail();
     if (activeCategory === 'capabilities') return renderCapabilitiesDetail();
     if (activeCategory === 'nodesExecution') return renderNodeDetail();
@@ -3422,6 +3445,13 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
   }
   if (category === 'automations') {
     return getAutomationSettingsObjects(automations);
+  }
+  if (category === 'observability') {
+    return [
+      { id: 'logs', label: '日志', description: '按等级、风险、来源与 Run 筛选日志' },
+      { id: 'token-usage', label: 'Token 用量', description: '模型调用、Token、缓存命中与成本' },
+      { id: 'log-cleanup', label: '日志清理', description: '预览并清理日志与执行记录' },
+    ];
   }
   if (category === 'dataMemory') {
     return [
