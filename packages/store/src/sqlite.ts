@@ -27,6 +27,9 @@ import type {
   CapabilityRecord,
   ChatRequest,
   ChatResponse,
+  CheckpointSummary,
+  ConnectExternalMirrorRoomRequest,
+  CompleteCheckpointRequest,
   ConfirmationRecord,
   ConversationActionRequest,
   ConversationActionResponse,
@@ -36,7 +39,12 @@ import type {
   ConversationGroupRequest,
   ConversationMessage,
   ConversationSummary,
+  CreateProjectPersonaRequest,
+  CreateSharedRoomRequest,
+  EvaluateRoomPermissionsRequest,
+  ExternalConnectorEvent,
   ExternalHandoffAudit,
+  GenerateProjectPersonaCandidatesRequest,
   InputMode,
   LogCleanupPreview,
   LogCleanupRequest,
@@ -47,6 +55,11 @@ import type {
   MCPWrapToolRequest,
   MemoryRecord,
   MemorySearchResult,
+  MessengerProject,
+  MessengerRoom,
+  MessengerThread,
+  MessengerThreadEvent,
+  PersonaMessengerSnapshot,
   ModelCall,
   ModelConfigRequest,
   ModelSettingsRequest,
@@ -54,14 +67,34 @@ import type {
   OnboardingStatus,
   OpenLoop,
   PermissionProfile,
+  PersonaCandidate,
+  PersonaMessengerExportRequest,
+  PersonaMessengerExportResult,
+  PreviewExternalPersonaMessageRequest,
+  ProjectPersona,
+  PersonaVersion,
   ProactiveMessage,
   ProductTask,
   ProductTaskDetail,
   ProductTaskStep,
   RecoverableRunRecord,
+  RecordExternalConnectorFailureRequest,
+  RecordExternalConnectorInboundRequest,
+  RecordExternalConnectorOutboundRequest,
+  RollbackProjectPersonaRequest,
+  RouteLock,
+  RoomConnector,
+  RoomPermissionAudit,
+  RoutingDecision,
+  RoutingFeedbackRequest,
   RunClosureReport,
   RunEvent,
   RunTrace,
+  RunTraceSpan,
+  RunTraceSpanFilter,
+  RunTraceSpanSummary,
+  SetRouteLockRequest,
+  RetryExternalConnectorEventRequest,
   SettingsRecord,
   SkillRecord,
   SystemHealth,
@@ -69,12 +102,34 @@ import type {
   TaskVerification,
   ToolRunRecord,
   ToolWorkflowRecord,
+  UpdateProjectPersonaRequest,
   WorkerGatewayAuditRecord,
   WorkspaceSettings,
 } from '../../shared-types/src/desktop-api';
 
 type SQLiteValue = string | number | bigint | null;
 type SQLiteRow = Record<string, unknown>;
+
+type RoomRouteResolution = {
+  room: MessengerRoom;
+  speaker_persona_id?: string;
+  owner_project_id?: string;
+  executor_persona_id?: string;
+  collaborator_project_ids: string[];
+  collaborator_persona_ids?: string[];
+  execution_scope: string;
+  write_targets: string[];
+  thread_action: Record<string, unknown>;
+  confidence: number;
+  risk: string;
+  requires_confirmation: boolean;
+  reason_codes: string[];
+};
+
+type MessengerThreadLink = {
+  thread_id?: string;
+  thread_action: Record<string, unknown>;
+};
 
 export type JoiSQLiteStoreOptions = {
   dbPath: string;
@@ -409,6 +464,7 @@ export class JoiSQLiteStore {
     this.ensurePreSchemaCompatibilityColumns();
     this.db.exec(options.schemaSql);
     this.ensureConversationClosureSchema();
+    this.ensurePersonaMessengerSchema();
     this.seedDefaults();
     this.classifyRecoverableRunsOnStartup();
     this.recoverInterruptedAutomationTriggersOnStartup();
@@ -1563,6 +1619,13 @@ export class JoiSQLiteStore {
     const createdAt = nowIso();
     const message = req.message.trim();
     const plan = buildDeterministicRuntimePlan(req, message);
+    const roomRoute = this.resolveRoomKernelRoute(req, conversationID, message);
+    if (roomRoute?.executor_persona_id) {
+      plan.agentID = roomRoute.executor_persona_id;
+      plan.routeResult = { ...plan.routeResult, room_kernel: routeResolutionForTrace(roomRoute) };
+    } else if (roomRoute) {
+      plan.routeResult = { ...plan.routeResult, room_kernel: routeResolutionForTrace(roomRoute) };
+    }
     const capabilityExecution = await executePlannedCapability(plan, options.executeCapability);
     const response = capabilityExecution?.response || plan.response;
     const runtimeSteps = stepsWithCapabilityOutput(plan.extraSteps, capabilityExecution?.output);
@@ -1764,6 +1827,14 @@ export class JoiSQLiteStore {
       const productTaskID = this.applyDeterministicRuntimeArtifacts(plan, runID, conversationID, userMessageID, modelName, modeResolution.resolved_mode, response, entryIdentity, req, capabilityExecution?.output);
       this.linkTaskEntryIfNeeded(entryIdentity, conversationID, productTaskID, handoffReasonForRequest(req, entryIdentity));
       this.appendCrossEntryHandoffEvent(runID, '', entryIdentity, req, productTaskID || undefined);
+      this.recordRoomRoutingDecision(req, {
+        conversation_id: conversationID,
+        message_id: userMessageID,
+        run_id: runID,
+        agent_id: plan.agentID,
+        route_result: plan.routeResult,
+        room_route: roomRoute,
+      });
     });
 
     return {
@@ -1939,7 +2010,8 @@ export class JoiSQLiteStore {
     const promptAssemblyID = `pa_${newID()}`;
     const message = req.message.trim();
     const title = titleFromMessage(message);
-    const agentID = params.selected_agent_id?.trim() || agentIDForMessage(message);
+    const roomRoute = this.resolveRoomKernelRoute(req, conversationID, message);
+    const agentID = params.selected_agent_id?.trim() || roomRoute?.executor_persona_id || agentIDForMessage(message);
     const provider = params.provider.trim() || 'openai_compatible';
     const modelName = req.model_name?.trim() || params.model_name.trim() || 'model';
     const prompt = params.prompt_assembly || this.assembleToolCallingPrompt(req, agentID, modelName);
@@ -2075,6 +2147,14 @@ export class JoiSQLiteStore {
       this.insertRunStep(runID, 'router_selected', 'Router selected agent', { message }, { agent_id: agentID, route: 'electron_ts_tool_calling' });
       this.insertRunStep(runID, 'prompt_assembled', 'Prompt assembly finished', { run_id: runID, agent_id: agentID }, { prompt_assembly_id: promptAssemblyID, prefix_hash: prompt.prefix_hash, dynamic_tail_hash: prompt.dynamic_tail_hash, prompt_cache_key: prompt.prompt_cache_key, memory_profile_version: prompt.memory_profile_version, tool_schema_version: prompt.tool_schema_version, memory_result_count: prompt.memory_results?.length || 0 });
       this.insertTurnItem(runID, turnID, 1, 'message', 'user', '', '', {}, message, {}, 'completed', { source: 'desktop_user' });
+      this.recordRoomRoutingDecision(req, {
+        conversation_id: conversationID,
+        message_id: userMessageID,
+        run_id: runID,
+        agent_id: agentID,
+        route_result: { route: 'electron_ts_tool_calling', agent_id: agentID, model: modelName, provider, room_kernel: roomRoute ? routeResolutionForTrace(roomRoute) : undefined },
+        room_route: roomRoute,
+      });
       this.exec(
         `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
                                   prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens,
@@ -2500,7 +2580,8 @@ export class JoiSQLiteStore {
     const message = req.message.trim();
     const rawResponse = turn.final_message.trim() || '模型没有返回可展示内容。';
     const title = titleFromMessage(message);
-    const agentID = turn.selected_agent_id?.trim() || agentIDForMessage(message);
+    const roomRoute = this.resolveRoomKernelRoute(req, conversationID, message);
+    const agentID = turn.selected_agent_id?.trim() || roomRoute?.executor_persona_id || agentIDForMessage(message);
     const provider = turn.provider.trim() || 'openai_compatible';
     const modelName = req.model_name?.trim() || turn.model_name.trim() || 'model';
     const prompt = turn.prompt_assembly || this.assembleToolCallingPrompt(req, agentID, modelName);
@@ -2581,7 +2662,7 @@ export class JoiSQLiteStore {
         waitingConfirmation ? 1 : 0,
         agentID,
         modelName,
-        json({ route: 'electron_ts_tool_calling', agent_id: agentID, model: modelName, provider }),
+        json({ route: 'electron_ts_tool_calling', agent_id: agentID, model: modelName, provider, room_kernel: roomRoute ? routeResolutionForTrace(roomRoute) : undefined }),
         req.parent_run_id || '',
         req.redirected_from_run_id || '',
         waitingConfirmation ? 1 : 0,
@@ -2915,6 +2996,14 @@ export class JoiSQLiteStore {
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'turn.completed', { run_id: runID, turn_id: turnID, status: 'completed', type: 'turn.completed' });
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'run.completed', { run_id: runID, status: 'succeeded', terminal: true, type: 'run.completed' });
       }
+      this.recordRoomRoutingDecision(req, {
+        conversation_id: conversationID,
+        message_id: userMessageID,
+        run_id: runID,
+        agent_id: agentID,
+        route_result: { route: 'electron_ts_tool_calling', agent_id: agentID, model: modelName, provider, room_kernel: roomRoute ? routeResolutionForTrace(roomRoute) : undefined },
+        room_route: roomRoute,
+      });
     });
 
     return {
@@ -2965,6 +3054,865 @@ export class JoiSQLiteStore {
       limit,
     );
     return { conversations: rows.map(rowToConversationSummary) };
+  }
+
+  listPersonaMessenger(): PersonaMessengerSnapshot {
+    this.syncPersonaMessengerRooms();
+    const projects = this.all(
+      `SELECT * FROM projects
+       WHERE status != 'deleted'
+       ORDER BY
+         CASE status WHEN 'active' THEN 0 WHEN 'warm' THEN 1 WHEN 'dormant' THEN 2 WHEN 'archived' THEN 3 ELSE 4 END,
+         datetime(updated_at) DESC,
+         id ASC`,
+    ).map(rowToMessengerProject);
+    const personas = this.all(
+      `SELECT * FROM personas
+       WHERE status != 'deleted'
+       ORDER BY
+         CASE status WHEN 'active' THEN 0 WHEN 'warm' THEN 1 WHEN 'dormant' THEN 2 WHEN 'archived' THEN 3 ELSE 4 END,
+         datetime(updated_at) DESC,
+         id ASC`,
+    ).map(rowToProjectPersona);
+    const personaVersions = this.all(
+      `SELECT * FROM persona_versions
+       ORDER BY datetime(created_at) DESC, version DESC
+       LIMIT 100`,
+    ).map(rowToPersonaVersion);
+    const roomConnectors = this.all(
+      `SELECT * FROM room_connectors
+       ORDER BY datetime(updated_at) DESC, id ASC`,
+    ).map(rowToRoomConnector);
+    const recentExternalEvents = this.all(
+      `SELECT * FROM external_connector_events
+       ORDER BY datetime(created_at) DESC
+       LIMIT 50`,
+    ).map(rowToExternalConnectorEvent);
+    const threads = this.all(
+      `SELECT mt.*,
+              p.name AS project_name,
+              r.title AS room_title,
+              ps.display_name AS owner_persona_name,
+              (SELECT COUNT(*) FROM messenger_thread_events te WHERE te.thread_id=mt.id AND te.message_id IS NOT NULL) AS message_count,
+              (SELECT COUNT(DISTINCT te.run_id) FROM messenger_thread_events te WHERE te.thread_id=mt.id AND te.run_id IS NOT NULL) AS run_count,
+              (SELECT COUNT(DISTINCT te.artifact_id) FROM messenger_thread_events te WHERE te.thread_id=mt.id AND te.artifact_id IS NOT NULL) AS artifact_count,
+              (SELECT rn.status FROM runs rn WHERE rn.id IN (
+                 SELECT te.run_id FROM messenger_thread_events te WHERE te.thread_id=mt.id AND te.run_id IS NOT NULL
+               ) ORDER BY datetime(rn.created_at) DESC LIMIT 1) AS latest_run_status
+       FROM messenger_threads mt
+       LEFT JOIN projects p ON p.id=mt.project_id
+       LEFT JOIN rooms r ON r.id=mt.room_id
+       LEFT JOIN personas ps ON ps.id=mt.owner_persona_id
+       ORDER BY datetime(mt.updated_at) DESC, mt.id DESC
+       LIMIT 100`,
+    ).map(rowToMessengerThread);
+    const recentThreadEvents = this.all(
+      `SELECT * FROM messenger_thread_events
+       ORDER BY datetime(created_at) DESC, id DESC
+       LIMIT 100`,
+    ).map(rowToMessengerThreadEvent);
+    const locks = this.all(
+      `SELECT room_id, user_id, persona_id, started_at, expires_at, status
+       FROM route_locks
+       WHERE status='active'
+       ORDER BY datetime(started_at) DESC`,
+    ).map(rowToRouteLock);
+    const rooms = this.all(
+      `SELECT
+         r.*,
+         (SELECT persona_id FROM route_locks rl WHERE rl.room_id=r.id AND rl.status='active' ORDER BY datetime(rl.started_at) DESC LIMIT 1) AS route_lock_persona_id,
+         (SELECT content FROM messages m WHERE m.conversation_id = r.conversation_id ORDER BY datetime(m.created_at) DESC, m.rowid DESC LIMIT 1) AS last_message,
+         (SELECT role FROM messages m WHERE m.conversation_id = r.conversation_id ORDER BY datetime(m.created_at) DESC, m.rowid DESC LIMIT 1) AS last_role,
+         (SELECT COUNT(*) FROM confirmation_requests cr WHERE cr.status='pending') AS pending_approval_count,
+         (SELECT COUNT(*) FROM runs rn WHERE rn.conversation_id = r.conversation_id AND rn.status IN ('running','pending','queued','waiting_approval')) AS running_run_count,
+         (SELECT COUNT(*) FROM runs rn WHERE rn.conversation_id = r.conversation_id AND rn.status='failed') AS failed_run_count
+       FROM rooms r
+       WHERE r.archived_at IS NULL
+       ORDER BY
+         CASE r.type WHEN 'private_hub' THEN 0 WHEN 'project_dm' THEN 1 WHEN 'shared' THEN 2 WHEN 'human_dm' THEN 3 ELSE 4 END,
+         datetime(r.updated_at) DESC,
+         r.id ASC`,
+    ).map((row) => this.attachRoomPermissionAudit(rowToMessengerRoom(row, this.listRoomMembers(String(row.id)))));
+    const recentRouting = this.all(
+      `SELECT * FROM routing_decisions
+       ORDER BY datetime(created_at) DESC
+       LIMIT 20`,
+    ).map(rowToRoutingDecision);
+    return {
+      rooms,
+      projects,
+      personas,
+      persona_versions: personaVersions,
+      room_connectors: roomConnectors,
+      recent_external_events: recentExternalEvents,
+      route_locks: locks,
+      recent_routing_decisions: recentRouting,
+      threads,
+      recent_thread_events: recentThreadEvents,
+      checkpoint: this.buildCheckpointSummary(),
+    };
+  }
+
+  generateProjectPersonaCandidates(req: GenerateProjectPersonaCandidatesRequest): { candidates: PersonaCandidate[] } {
+    this.syncPersonaMessengerRooms();
+    return { candidates: this.buildPersonaCandidates(req) };
+  }
+
+  createProjectPersona(req: CreateProjectPersonaRequest): { project: MessengerProject; persona: ProjectPersona; room: MessengerRoom } {
+    this.syncPersonaMessengerRooms();
+    const projectName = req.project_name.trim();
+    if (!projectName) throw new Error('project_name is required');
+    const projectID = `prj_${newID()}`;
+    const personaID = `per_${newID()}`;
+    const roomID = `room_${newID()}`;
+    const conversationID = `conv_${newID()}`;
+    const candidates = this.buildPersonaCandidates(req);
+    const candidate = candidates.find((item) => item.id === req.candidate_id) ?? candidates[0];
+    const displayName = req.persona_choice?.display_name?.trim() || candidate.display_name;
+    const handle = this.uniquePersonaHandle(req.persona_choice?.handle || candidate.handle || displayName, projectName);
+    const traits = {
+      ...candidate.traits,
+      ...(req.persona_choice?.traits || {}),
+    };
+    const tagline = req.persona_choice?.tagline?.trim() || candidate.tagline;
+    const intro = req.persona_choice?.self_intro?.trim() || candidate.self_intro;
+    this.transaction(() => {
+      this.exec(
+        `INSERT INTO projects (id, name, goal, domain, phase, risk_level, status, summary, metadata, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'low', 'active', ?, ?, datetime('now'), datetime('now'))`,
+        projectID,
+        projectName,
+        req.project_goal || '',
+        req.domain || '',
+        req.phase || '',
+        req.project_goal || `${projectName} 项目工作空间`,
+        json({
+          created_from: 'persona_messenger',
+          persona_candidates: candidates,
+          selected_persona_candidate_id: candidate.id,
+        }),
+      );
+      this.exec(
+        `INSERT INTO personas (id, project_id, display_name, handle, avatar, tagline, self_intro, traits,
+                               disagreement_style, uncertainty_style, status, version, capabilities,
+                               permission_summary, model_strategy, metadata, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+        personaID,
+        projectID,
+        displayName,
+        handle,
+        req.persona_choice?.avatar || '',
+        tagline,
+        intro,
+        json(traits),
+        req.persona_choice?.disagreement_style || candidate.disagreement_style,
+        req.persona_choice?.uncertainty_style || candidate.uncertainty_style,
+        json(req.persona_choice?.capabilities || ['chat', 'memory', 'trace', 'tool_request']),
+        req.persona_choice?.permission_summary || '默认只读；高风险外部动作需要审批',
+        req.persona_choice?.model_strategy || '使用当前桌面默认模型策略',
+        json({ ai_identity_label: '项目人格', created_from: 'persona_messenger', selected_candidate_id: candidate.id }),
+      );
+      this.upsertPersonaAgent(personaID, displayName, tagline, intro, req.persona_choice?.capabilities || ['chat', 'memory', 'trace', 'tool_request']);
+      this.exec(
+        `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, active_project_id, lifecycle_status, metadata, created_at, updated_at)
+         VALUES (?, 'desktop', 'desktop_user', ?, ?, ?, 'active', ?, datetime('now'), datetime('now'))`,
+        conversationID,
+        `${displayName} · ${projectName}`,
+        personaID,
+        projectID,
+        json({ room_id: roomID, room_type: 'project_dm', persona_id: personaID, project_id: projectID }),
+      );
+      this.exec(
+        `INSERT INTO rooms (id, type, title, subtitle, owner_user_id, project_id, persona_id, conversation_id,
+                            default_ai_participation, floor_holder_persona_id, metadata, created_at, updated_at)
+         VALUES (?, 'project_dm', ?, ?, 'desktop_user', ?, ?, ?, 'moderate', ?, ?, datetime('now'), datetime('now'))`,
+        roomID,
+        displayName,
+        projectName,
+        projectID,
+        personaID,
+        conversationID,
+        personaID,
+        json({ created_from: 'persona_messenger' }),
+      );
+      this.upsertRoomMember(roomID, 'user', 'desktop_user', '你', 'owner');
+      this.upsertRoomMember(roomID, 'persona', personaID, displayName, 'persona', personaID, projectID);
+      this.upsertRoomMember('room_private_hub', 'persona', personaID, displayName, 'persona', personaID, projectID);
+      this.exec(
+        `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
+         VALUES (?, ?, 'system', ?, '[]', ?, datetime('now'))`,
+        `msg_${newID()}`,
+        'conv_private_hub',
+        `${displayName} 加入了群聊：${tagline}`,
+        json({ persona_id: personaID, project_id: projectID, room_id: 'room_private_hub', event_type: 'persona.joined' }),
+      );
+    });
+    return {
+      project: this.requireMessengerProject(projectID),
+      persona: this.requireProjectPersona(personaID),
+      room: this.requireMessengerRoom(roomID),
+    };
+  }
+
+  updateProjectPersona(req: UpdateProjectPersonaRequest): ProjectPersona {
+    const personaID = req.persona_id.trim();
+    if (!personaID) throw new Error('persona_id is required');
+    if (!req.change_reason.trim()) throw new Error('change_reason is required');
+    const before = this.requireProjectPersona(personaID);
+    if (req.base_version && req.base_version !== before.version) {
+      throw new Error(`Persona version conflict: expected ${req.base_version}, current ${before.version}`);
+    }
+    this.assertPersonaMutationAllowed(req, before);
+    const nextVersion = before.version + 1;
+    const nextHandle = req.handle ? this.uniquePersonaHandle(req.handle, before.project_id, personaID) : before.handle;
+    const after: ProjectPersona = {
+      ...before,
+      display_name: req.display_name?.trim() || before.display_name,
+      handle: nextHandle,
+      avatar: req.avatar ?? before.avatar,
+      tagline: req.tagline ?? before.tagline,
+      self_intro: req.self_intro ?? before.self_intro,
+      traits: req.traits || before.traits,
+      disagreement_style: req.disagreement_style ?? before.disagreement_style,
+      uncertainty_style: req.uncertainty_style ?? before.uncertainty_style,
+      version: nextVersion,
+    };
+    this.transaction(() => {
+      this.exec(
+        `UPDATE personas
+         SET display_name=?, handle=?, avatar=?, tagline=?, self_intro=?, traits=?,
+             disagreement_style=?, uncertainty_style=?, version=?, updated_at=datetime('now')
+         WHERE id=?`,
+        after.display_name,
+        after.handle,
+        after.avatar || '',
+        after.tagline || '',
+        after.self_intro || '',
+        json(after.traits),
+        after.disagreement_style || '',
+        after.uncertainty_style || '',
+        after.version,
+        personaID,
+      );
+      this.exec(
+        `INSERT INTO persona_versions (id, persona_id, version, changed_by, change_reason, before_json, after_json, created_at)
+         VALUES (?, ?, ?, 'desktop_user', ?, ?, ?, datetime('now'))`,
+        `pver_${newID()}`,
+        personaID,
+        nextVersion,
+        req.change_reason,
+        json(before),
+        json(after),
+      );
+      this.exec(
+        `UPDATE rooms SET title=?, subtitle=COALESCE((SELECT name FROM projects WHERE id=?), subtitle), updated_at=datetime('now') WHERE persona_id=? AND type='project_dm'`,
+        after.display_name,
+        after.project_id,
+        personaID,
+      );
+      this.upsertPersonaAgent(after.id, after.display_name, after.tagline || '', after.self_intro || '', after.capabilities);
+    });
+    return this.requireProjectPersona(personaID);
+  }
+
+  rollbackProjectPersona(req: RollbackProjectPersonaRequest): ProjectPersona {
+    const personaID = req.persona_id.trim();
+    if (!personaID) throw new Error('persona_id is required');
+    if (!req.change_reason.trim()) throw new Error('change_reason is required');
+    const before = this.requireProjectPersona(personaID);
+    const versionRow = this.get(
+      `SELECT * FROM persona_versions WHERE persona_id=? AND version=? ORDER BY datetime(created_at) DESC LIMIT 1`,
+      personaID,
+      req.target_version,
+    );
+    if (!versionRow) throw new Error(`Persona version not found: ${req.target_version}`);
+    this.assertPersonaMutationAllowed(req, before);
+    const versionSnapshot = parseObject(versionRow.after_json) as Partial<ProjectPersona>;
+    const restored: ProjectPersona = {
+      ...before,
+      ...versionSnapshot,
+      id: before.id,
+      project_id: before.project_id,
+      version: before.version + 1,
+      metadata: {
+        ...before.metadata,
+        rolled_back_from_version: before.version,
+        restored_snapshot_version: req.target_version,
+      },
+    };
+    this.transaction(() => {
+      this.exec(
+        `UPDATE personas
+         SET display_name=?, handle=?, avatar=?, tagline=?, self_intro=?, traits=?,
+             disagreement_style=?, uncertainty_style=?, version=?, metadata=?, updated_at=datetime('now')
+         WHERE id=?`,
+        restored.display_name,
+        this.uniquePersonaHandle(restored.handle, restored.project_id, personaID),
+        restored.avatar || '',
+        restored.tagline || '',
+        restored.self_intro || '',
+        json(restored.traits),
+        restored.disagreement_style || '',
+        restored.uncertainty_style || '',
+        restored.version,
+        json(restored.metadata || {}),
+        personaID,
+      );
+      this.exec(
+        `INSERT INTO persona_versions (id, persona_id, version, changed_by, change_reason, before_json, after_json, created_at)
+         VALUES (?, ?, ?, 'desktop_user', ?, ?, ?, datetime('now'))`,
+        `pver_${newID()}`,
+        personaID,
+        restored.version,
+        req.change_reason,
+        json(before),
+        json(restored),
+      );
+      this.exec(
+        `UPDATE rooms SET title=?, subtitle=COALESCE((SELECT name FROM projects WHERE id=?), subtitle), updated_at=datetime('now') WHERE persona_id=? AND type='project_dm'`,
+        restored.display_name,
+        restored.project_id,
+        personaID,
+      );
+      this.upsertPersonaAgent(restored.id, restored.display_name, restored.tagline || '', restored.self_intro || '', restored.capabilities);
+    });
+    return this.requireProjectPersona(personaID);
+  }
+
+  createSharedRoom(req: CreateSharedRoomRequest): { room: MessengerRoom } {
+    this.syncPersonaMessengerRooms();
+    const title = req.title.trim();
+    if (!title) throw new Error('title is required');
+    if (!req.persona_ids.length) throw new Error('at least one persona is required');
+    if (!req.human_members.length) throw new Error('at least one human member is required');
+    const personas = req.persona_ids.map((id) => this.requireProjectPersona(id));
+    const visibleProjectIDs = [...new Set(req.visible_project_ids?.length ? req.visible_project_ids : personas.map((persona) => persona.project_id))];
+    const roomID = `room_${newID()}`;
+    const conversationID = `conv_${newID()}`;
+    const participation = req.ai_participation || 'moderate';
+    this.transaction(() => {
+      this.exec(
+        `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, active_project_id, lifecycle_status, metadata, created_at, updated_at)
+         VALUES (?, 'desktop', 'desktop_user', ?, ?, ?, 'active', ?, datetime('now'), datetime('now'))`,
+        conversationID,
+        title,
+        personas[0]?.id || null,
+        visibleProjectIDs[0] || null,
+        json({ room_id: roomID, room_type: 'shared', visible_project_ids: visibleProjectIDs }),
+      );
+      this.exec(
+        `INSERT INTO rooms (id, type, title, subtitle, owner_user_id, project_id, persona_id, conversation_id,
+                            default_ai_participation, floor_holder_persona_id, metadata, created_at, updated_at)
+         VALUES (?, 'shared', ?, ?, 'desktop_user', NULLIF(?, ''), NULLIF(?, ''), ?, ?, NULLIF(?, ''), ?, datetime('now'), datetime('now'))`,
+        roomID,
+        title,
+        req.permission_summary || '共享房间',
+        visibleProjectIDs[0] || '',
+        personas[0]?.id || '',
+        conversationID,
+        participation,
+        participation === 'active' || participation === 'moderate' ? personas[0]?.id || '' : '',
+        json({
+          created_from: 'persona_messenger',
+          visible_project_ids: visibleProjectIDs,
+          visible_persona_ids: personas.map((persona) => persona.id),
+          permission_summary: req.permission_summary || '仅当前房间成员和授权项目人格可见',
+          tool_policy: req.tool_policy || { external_actions: { send_message: 'approval_required', publish: 'denied' } },
+          data_visibility: 'room_members',
+        }),
+      );
+      this.upsertRoomMember(roomID, 'user', 'desktop_user', '你', 'room_owner', '', '', {
+        visible_project_ids: visibleProjectIDs,
+        can_approve_high_risk: true,
+        approval_policy: 'owner_allowed',
+      }, 'selected_members');
+      for (const persona of personas) {
+        this.upsertRoomMember(roomID, 'persona', persona.id, persona.display_name, 'persona', persona.id, persona.project_id, {
+          visible_project_ids: [persona.project_id].filter((id) => visibleProjectIDs.includes(id)),
+          data_visibility: 'room_plus_own_project_grants',
+          can_approve_high_risk: false,
+        }, 'selected_members');
+      }
+      for (const [index, human] of req.human_members.entries()) {
+        const displayName = human.display_name.trim();
+        if (!displayName) throw new Error('human display_name is required');
+        const memberID = human.external_user_id?.trim() || `human_${newID()}`;
+        const humanVisibleProjects = (human.visible_project_ids ? human.visible_project_ids : visibleProjectIDs)
+          .filter((id) => visibleProjectIDs.includes(id));
+        this.upsertRoomMember(roomID, 'human', memberID, displayName, human.role || 'human_member', '', '', {
+          profile: human.profile || '',
+          invite_index: index,
+          data_visibility: 'room_members',
+          visible_project_ids: humanVisibleProjects,
+          can_approve_high_risk: Boolean(human.can_approve_high_risk),
+          approval_policy: human.can_approve_high_risk ? 'high_risk_allowed' : 'approval_denied',
+        }, 'selected_members');
+      }
+      this.exec(
+        `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
+         VALUES (?, ?, 'system', ?, '[]', ?, datetime('now'))`,
+        `msg_${newID()}`,
+        conversationID,
+        `${title} 已创建为共享房间`,
+        json({ room_id: roomID, event_type: 'shared_room.created', visible_project_ids: visibleProjectIDs }),
+      );
+    });
+    return { room: this.requireMessengerRoom(roomID) };
+  }
+
+  connectExternalMirrorRoom(req: ConnectExternalMirrorRoomRequest): { connector: RoomConnector; room: MessengerRoom } {
+    this.syncPersonaMessengerRooms();
+    const provider = req.provider.trim().toLowerCase();
+    const externalRoomID = req.external_room_id.trim();
+    if (!provider) throw new Error('provider is required');
+    if (!externalRoomID) throw new Error('external_room_id is required');
+    const visiblePersonas = req.persona_ids.map((id) => this.requireProjectPersona(id));
+    if (!visiblePersonas.length) throw new Error('at least one visible persona is required');
+    let roomID = req.room_id?.trim() || '';
+    let conversationID = '';
+    this.transaction(() => {
+      if (!roomID) {
+        roomID = `room_${newID()}`;
+        conversationID = `conv_${newID()}`;
+        this.exec(
+          `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, active_project_id, lifecycle_status, metadata, created_at, updated_at)
+           VALUES (?, ?, 'desktop_user', ?, ?, ?, 'active', ?, datetime('now'), datetime('now'))`,
+          conversationID,
+          provider,
+          req.title?.trim() || `${provider}:${externalRoomID}`,
+          visiblePersonas[0].id,
+          visiblePersonas[0].project_id,
+          json({ room_id: roomID, room_type: 'external_mirror', provider, external_room_id: externalRoomID }),
+        );
+        this.exec(
+          `INSERT INTO rooms (id, type, title, subtitle, owner_user_id, project_id, persona_id, conversation_id,
+                              default_ai_participation, floor_holder_persona_id, metadata, created_at, updated_at)
+           VALUES (?, 'external_mirror', ?, ?, 'desktop_user', ?, ?, ?, 'mention_only', ?, ?, datetime('now'), datetime('now'))`,
+          roomID,
+          req.title?.trim() || `${provider} 映射房间`,
+          `${provider} · ${externalRoomID}`,
+          visiblePersonas[0].project_id,
+          visiblePersonas[0].id,
+          conversationID,
+          visiblePersonas[0].id,
+          json({ created_from: 'external_connector', provider, external_room_id: externalRoomID }),
+        );
+        this.upsertRoomMember(roomID, 'user', 'desktop_user', '你', 'room_owner');
+      } else {
+        const existing = this.requireMessengerRoom(roomID);
+        conversationID = existing.conversation_id || '';
+      }
+      for (const persona of visiblePersonas) {
+        this.upsertRoomMember(roomID, 'persona', persona.id, persona.display_name, 'persona', persona.id, persona.project_id);
+      }
+      this.exec(
+        `INSERT INTO room_connectors (id, room_id, provider, connector_id, external_room_id, status, visible_persona_ids,
+                                     allow_temporary_invite, metadata, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(provider, external_room_id) DO UPDATE SET
+           room_id=excluded.room_id,
+           status='active',
+           visible_persona_ids=excluded.visible_persona_ids,
+           allow_temporary_invite=excluded.allow_temporary_invite,
+           metadata=excluded.metadata,
+           updated_at=datetime('now')`,
+        `rconn_${stableShortID(`${provider}:${externalRoomID}`)}`,
+        roomID,
+        provider,
+        `${provider}:${externalRoomID}`,
+        externalRoomID,
+        json(visiblePersonas.map((persona) => persona.id)),
+        req.allow_temporary_invite ? 1 : 0,
+        json({ connector_to_room: true, title: req.title || '', visible_project_ids: visiblePersonas.map((persona) => persona.project_id) }),
+      );
+    });
+    const connector = this.requireRoomConnector(provider, externalRoomID);
+    return { connector, room: this.requireMessengerRoom(connector.room_id) };
+  }
+
+  recordExternalConnectorOutbound(req: RecordExternalConnectorOutboundRequest): { event: ExternalConnectorEvent; room: MessengerRoom; message_id: string; duplicate: boolean } {
+    const connector = this.resolveConnectorForExternal(req);
+    const externalMessageID = req.external_message_id.trim();
+    if (!externalMessageID) throw new Error('external_message_id is required');
+    const persona = this.requireProjectPersona(req.persona_id.trim());
+    if (!connector.visible_persona_ids.includes(persona.id)) {
+      throw new Error('Persona is not visible in this connector');
+    }
+    const duplicateRow = this.get(
+      `SELECT * FROM external_connector_events WHERE connector_id=? AND external_event_id=?`,
+      connector.id,
+      externalMessageID,
+    );
+    if (duplicateRow) {
+      const event = rowToExternalConnectorEvent(duplicateRow);
+      return {
+        event,
+        room: this.requireMessengerRoom(event.room_id),
+        message_id: event.internal_message_id || '',
+        duplicate: true,
+      };
+    }
+    const room = this.requireMessengerRoom(connector.room_id);
+    const conversationID = room.conversation_id || `conv_${newID()}`;
+    const messageID = req.internal_message_id?.trim() || `msg_${newID()}`;
+    const text = req.text.trim();
+    if (!text) throw new Error('text is required');
+    const status = req.status?.trim() || 'sent';
+    this.transaction(() => {
+      if (!req.internal_message_id?.trim()) {
+        this.exec(
+          `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
+           VALUES (?, ?, 'assistant', ?, '[]', ?, datetime('now'))`,
+          messageID,
+          conversationID,
+          text,
+          json({
+            source: 'external_connector',
+            direction: 'outbound',
+            provider: connector.provider,
+            connector_id: connector.id,
+            external_room_id: connector.external_room_id,
+            external_message_id: externalMessageID,
+            persona_id: persona.id,
+            speaker_persona_id: persona.id,
+            project_id: persona.project_id,
+          }),
+        );
+      }
+      this.exec(
+        `INSERT INTO external_connector_events (id, connector_id, provider, external_event_id, room_id, external_user_id,
+                                               text, internal_message_id, status, retry_count, error, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, 0, '', ?, datetime('now'))`,
+        `extev_${newID()}`,
+        connector.id,
+        connector.provider,
+        externalMessageID,
+        req.room_id?.trim() || connector.room_id,
+        text,
+        messageID,
+        status,
+        json({
+          direction: 'outbound',
+          persona_id: persona.id,
+          speaker_persona_id: persona.id,
+          project_id: persona.project_id,
+          retryable: status === 'send_failed',
+          external_message_id: externalMessageID,
+        }),
+      );
+      this.exec(`UPDATE rooms SET floor_holder_persona_id=?, updated_at=datetime('now') WHERE id=?`, persona.id, connector.room_id);
+    });
+    const row = this.get(`SELECT * FROM external_connector_events WHERE connector_id=? AND external_event_id=?`, connector.id, externalMessageID);
+    return { event: rowToExternalConnectorEvent(row!), room: this.requireMessengerRoom(connector.room_id), message_id: messageID, duplicate: false };
+  }
+
+  recordExternalConnectorInbound(req: RecordExternalConnectorInboundRequest): { event: ExternalConnectorEvent; room: MessengerRoom; message_id?: string; duplicate: boolean } {
+    const provider = req.provider.trim().toLowerCase();
+    const externalRoomID = req.external_room_id.trim();
+    const externalEventID = req.external_event_id.trim();
+    if (!provider || !externalRoomID || !externalEventID) throw new Error('provider, external_room_id and external_event_id are required');
+    const connector = this.requireRoomConnector(provider, externalRoomID);
+    const duplicateRow = this.get(
+      `SELECT * FROM external_connector_events WHERE connector_id=? AND external_event_id=?`,
+      connector.id,
+      externalEventID,
+    );
+    if (duplicateRow) {
+      const event = rowToExternalConnectorEvent(duplicateRow);
+      return { event, room: this.requireMessengerRoom(event.room_id), message_id: event.internal_message_id, duplicate: true };
+    }
+    const room = this.requireMessengerRoom(connector.room_id);
+    const conversationID = room.conversation_id || `conv_${newID()}`;
+    const messageID = `msg_${newID()}`;
+    const visiblePersonas = connector.visible_persona_ids;
+    const mentionedPersona = this.findVisibleExternalMention(req.text, visiblePersonas);
+    const lockTarget = externalLockTarget(req.text, visiblePersonas, (id) => this.requireProjectPersona(id));
+    const unlock = /^\/unlock\b/i.test(req.text.trim());
+    const replyTarget = req.reply_to_external_message_id ? this.externalReplyTarget(connector.id, req.reply_to_external_message_id) : {};
+    const replyTargetPersonaID = replyTarget.persona_id && visiblePersonas.includes(replyTarget.persona_id) ? replyTarget.persona_id : '';
+    const routeTargetPersona = replyTargetPersonaID
+      ? this.requireProjectPersona(replyTargetPersonaID)
+      : mentionedPersona;
+    this.transaction(() => {
+      this.exec(
+        `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
+         VALUES (?, ?, 'user', ?, '[]', ?, datetime('now'))`,
+        messageID,
+        conversationID,
+        req.text,
+        json({
+          source: 'external_connector',
+          provider,
+          connector_id: connector.id,
+          external_room_id: externalRoomID,
+          external_event_id: externalEventID,
+          external_user_id: req.external_user_id,
+          reply_to_external_message_id: req.reply_to_external_message_id || '',
+          reply_to_message_id: replyTarget.internal_message_id || '',
+          reply_target_persona_id: replyTargetPersonaID,
+          visible_persona_ids: visiblePersonas,
+          mentioned_persona_id: routeTargetPersona?.id || '',
+        }),
+      );
+      this.exec(
+        `INSERT INTO external_connector_events (id, connector_id, provider, external_event_id, room_id, external_user_id,
+                                               reply_to_external_message_id, text, internal_message_id, status, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, datetime('now'))`,
+        `extev_${newID()}`,
+        connector.id,
+        provider,
+        externalEventID,
+        connector.room_id,
+        req.external_user_id.trim(),
+        req.reply_to_external_message_id || '',
+        req.text,
+        messageID,
+        json({
+          visible_persona_ids: visiblePersonas,
+          mentioned_persona_id: routeTargetPersona?.id || '',
+          reply_target_persona_id: replyTargetPersonaID,
+          reply_to_message_id: replyTarget.internal_message_id || '',
+          command: lockTarget ? 'lock' : unlock ? 'unlock' : '',
+        }),
+      );
+      const externalUserID = `external:${provider}:${req.external_user_id}`;
+      if (lockTarget) {
+        this.exec(`UPDATE route_locks SET status='released:' || id WHERE room_id=? AND user_id=? AND status='active'`, connector.room_id, externalUserID);
+        this.exec(
+          `INSERT INTO route_locks (id, room_id, user_id, persona_id, started_at, status, metadata)
+           VALUES (?, ?, ?, ?, datetime('now'), 'active', ?)`,
+          `lock_${newID()}`,
+          connector.room_id,
+          externalUserID,
+          lockTarget.id,
+          json({ source: 'external_connector', provider, external_room_id: externalRoomID }),
+        );
+        this.exec(`UPDATE rooms SET floor_holder_persona_id=?, updated_at=datetime('now') WHERE id=?`, lockTarget.id, connector.room_id);
+      } else if (unlock) {
+        this.exec(
+          `UPDATE route_locks SET status='released:' || id, metadata=json_set(COALESCE(metadata, '{}'), '$.released_at', ?)
+           WHERE room_id=? AND user_id=? AND status='active'`,
+          nowIso(),
+          connector.room_id,
+          externalUserID,
+        );
+      }
+      if (routeTargetPersona) {
+        const reasonCode = replyTargetPersonaID ? 'EXTERNAL_REPLY_TO_PERSONA' : 'EXTERNAL_MENTION';
+        this.exec(
+          `INSERT INTO routing_decisions (id, room_id, message_id, run_id, speaker_persona_id, owner_project_id,
+                                          executor_persona_id, collaborator_project_ids, execution_scope, write_targets,
+                                          thread_action, confidence, risk, requires_confirmation, reason_codes, metadata, created_at)
+           VALUES (?, ?, ?, NULL, ?, ?, ?, '[]', 'specified_persona', ?, ?, 1, 'low', 0, ?, ?, datetime('now'))`,
+          `rdec_${newID()}`,
+          connector.room_id,
+          messageID,
+          routeTargetPersona.id,
+          routeTargetPersona.project_id,
+          routeTargetPersona.id,
+          json([routeTargetPersona.project_id, connector.room_id]),
+          json({ type: 'external_inbound', source: reasonCode }),
+          json([reasonCode]),
+          json({
+            source: 'external_connector',
+            provider,
+            external_room_id: externalRoomID,
+            external_event_id: externalEventID,
+            reply_to_external_message_id: req.reply_to_external_message_id || '',
+            reply_to_message_id: replyTarget.internal_message_id || '',
+          }),
+        );
+        this.exec(`UPDATE rooms SET floor_holder_persona_id=?, updated_at=datetime('now') WHERE id=?`, routeTargetPersona.id, connector.room_id);
+      }
+      this.exec(`UPDATE rooms SET updated_at=datetime('now') WHERE id=?`, connector.room_id);
+    });
+    const event = this.get(
+      `SELECT * FROM external_connector_events WHERE connector_id=? AND external_event_id=?`,
+      connector.id,
+      externalEventID,
+    );
+    return { event: rowToExternalConnectorEvent(event!), room: this.requireMessengerRoom(connector.room_id), message_id: messageID, duplicate: false };
+  }
+
+  previewExternalPersonaMessage(req: PreviewExternalPersonaMessageRequest): { text: string; controls: string[]; persona_id: string; room_id: string } {
+    const room = this.requireMessengerRoom(req.room_id.trim());
+    const persona = this.requireProjectPersona(req.persona_id.trim());
+    const isMember = room.members?.some((member) => member.type === 'persona' && member.persona_id === persona.id);
+    if (!isMember) throw new Error('Persona is not visible in this room');
+    const project = this.requireMessengerProject(persona.project_id);
+    return {
+      room_id: room.id,
+      persona_id: persona.id,
+      text: `${persona.display_name} · ${project.name} ◇\n${req.text}`,
+      controls: [`回复 ${persona.display_name}`, `锁定 ${persona.display_name}`, '查看运行'],
+    };
+  }
+
+  recordExternalConnectorFailure(req: RecordExternalConnectorFailureRequest): { event: ExternalConnectorEvent } {
+    const connectorID = req.connector_id.trim();
+    if (!connectorID) throw new Error('connector_id is required');
+    const connectorRow = this.get(`SELECT * FROM room_connectors WHERE id=?`, connectorID);
+    if (!connectorRow) throw new Error(`Connector not found: ${connectorID}`);
+    const connector = rowToRoomConnector(connectorRow);
+    const eventID = req.external_event_id?.trim() || `failure_${newID()}`;
+    this.exec(
+      `INSERT INTO external_connector_events (id, connector_id, provider, external_event_id, room_id, external_user_id,
+                                             text, status, retry_count, error, metadata, created_at)
+       VALUES (?, ?, ?, ?, ?, '', '', 'send_failed', ?, ?, ?, datetime('now'))
+       ON CONFLICT(connector_id, external_event_id) DO UPDATE SET
+         status='send_failed',
+         retry_count=external_connector_events.retry_count + 1,
+         error=excluded.error,
+         metadata=excluded.metadata`,
+      `extev_${newID()}`,
+      connector.id,
+      connector.provider,
+      eventID,
+      req.room_id?.trim() || connector.room_id,
+      req.retryable === false ? 0 : 1,
+      req.error,
+      json({ retryable: req.retryable !== false, visible_in_room: true }),
+    );
+    this.exec(
+      `UPDATE room_connectors SET status='degraded', retry_count=retry_count + 1, last_error=?, updated_at=datetime('now') WHERE id=?`,
+      req.error,
+      connector.id,
+    );
+    const row = this.get(`SELECT * FROM external_connector_events WHERE connector_id=? AND external_event_id=?`, connector.id, eventID);
+    return { event: rowToExternalConnectorEvent(row!) };
+  }
+
+  retryExternalConnectorEvent(req: RetryExternalConnectorEventRequest): { event: ExternalConnectorEvent } {
+    const eventID = req.event_id?.trim() || '';
+    const connectorID = req.connector_id?.trim() || '';
+    const externalEventID = req.external_event_id?.trim() || '';
+    const row = eventID
+      ? this.get(`SELECT * FROM external_connector_events WHERE id=?`, eventID)
+      : connectorID && externalEventID
+        ? this.get(`SELECT * FROM external_connector_events WHERE connector_id=? AND external_event_id=?`, connectorID, externalEventID)
+        : null;
+    if (!row) throw new Error('External connector event not found');
+    const event = rowToExternalConnectorEvent(row);
+    if (!['send_failed', 'pending', 'retry_scheduled'].includes(event.status)) {
+      throw new Error(`External connector event is not retryable: ${event.status}`);
+    }
+    const retriedAt = nowIso();
+    this.transaction(() => {
+      this.exec(
+        `UPDATE external_connector_events
+         SET status='retry_scheduled',
+             retry_count=retry_count + 1,
+             error='',
+             metadata=json_set(COALESCE(metadata, '{}'), '$.retry_requested_at', ?, '$.retry_reason', ?, '$.retryable', 1)
+         WHERE id=?`,
+        retriedAt,
+        req.reason || '',
+        event.id,
+      );
+      this.exec(
+        `UPDATE room_connectors
+         SET status='retry_scheduled',
+             retry_count=retry_count + 1,
+             last_error='',
+             updated_at=datetime('now')
+         WHERE id=?`,
+        event.connector_id,
+      );
+      this.exec(`UPDATE rooms SET updated_at=datetime('now') WHERE id=?`, event.room_id);
+    });
+    const updated = this.get(`SELECT * FROM external_connector_events WHERE id=?`, event.id);
+    return { event: rowToExternalConnectorEvent(updated!) };
+  }
+
+  setRouteLock(req: SetRouteLockRequest): { route_lock: RouteLock | null } {
+    const roomID = req.room_id.trim();
+    const userID = req.user_id?.trim() || 'desktop_user';
+    if (!roomID) throw new Error('room_id is required');
+    if (req.action === 'unlock') {
+      this.exec(
+        `UPDATE route_locks SET status='released:' || id, metadata=json_set(COALESCE(metadata, '{}'), '$.released_at', ?)
+         WHERE room_id=? AND user_id=? AND status='active'`,
+        nowIso(),
+        roomID,
+        userID,
+      );
+      return { route_lock: null };
+    }
+    const personaID = req.persona_id?.trim();
+    if (!personaID) throw new Error('persona_id is required for route lock');
+    if (!this.get(`SELECT id FROM rooms WHERE id=?`, roomID)) throw new Error(`Room not found: ${roomID}`);
+    if (!this.get(`SELECT id FROM personas WHERE id=? AND status NOT IN ('archived','deleted')`, personaID)) throw new Error(`Persona not available: ${personaID}`);
+    this.transaction(() => {
+      this.exec(`UPDATE route_locks SET status='released:' || id WHERE room_id=? AND user_id=? AND status='active'`, roomID, userID);
+      this.exec(
+        `INSERT INTO route_locks (id, room_id, user_id, persona_id, started_at, status, metadata)
+         VALUES (?, ?, ?, ?, datetime('now'), 'active', ?)`,
+        `lock_${newID()}`,
+        roomID,
+        userID,
+        personaID,
+        json({ source: 'desktop_ui' }),
+      );
+      this.exec(`UPDATE rooms SET floor_holder_persona_id=?, updated_at=datetime('now') WHERE id=?`, personaID, roomID);
+    });
+    const row = this.get(
+      `SELECT room_id, user_id, persona_id, started_at, expires_at, status
+       FROM route_locks
+       WHERE room_id=? AND user_id=? AND status='active'
+       ORDER BY datetime(started_at) DESC
+       LIMIT 1`,
+      roomID,
+      userID,
+    );
+    return { route_lock: row ? rowToRouteLock(row) : null };
+  }
+
+  completeCheckpoint(req: CompleteCheckpointRequest = {}): CheckpointSummary {
+    const current = this.buildCheckpointSummary();
+    this.exec(
+      `INSERT INTO checkpoints (id, user_id, checked_at, covered_event_cursor, acknowledged_items, snoozed_items, metadata)
+       VALUES (?, 'desktop_user', datetime('now'), ?, ?, ?, ?)`,
+      `chk_${newID()}`,
+      current.covered_event_cursor || nowIso(),
+      json(req.acknowledged_items || current.items.map((item) => item.id)),
+      json(req.snoozed_items || []),
+      json({ completed_from: 'persona_messenger' }),
+    );
+    return this.buildCheckpointSummary();
+  }
+
+  recordRoutingFeedback(req: RoutingFeedbackRequest): void {
+    const roomID = req.room_id.trim();
+    if (!roomID) throw new Error('room_id is required');
+    const action = req.action.trim();
+    const targetPersonaID = req.target_persona_id?.trim() || '';
+    if (action === 'reroute' && targetPersonaID) {
+      const member = this.get(
+        `SELECT rm.id FROM room_members rm
+         JOIN personas p ON p.id=rm.persona_id
+         WHERE rm.room_id=? AND rm.member_type='persona' AND rm.persona_id=? AND p.status NOT IN ('archived', 'deleted')
+         LIMIT 1`,
+        roomID,
+        targetPersonaID,
+      );
+      if (!member) throw new Error('target Persona is not an active member of this room');
+    }
+    this.exec(
+      `INSERT INTO routing_feedback (id, routing_decision_id, room_id, message_id, run_id, action, target_persona_id, write_targets, comment, created_at)
+       VALUES (?, NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''), ?, NULLIF(?, ''), ?, ?, datetime('now'))`,
+      `rfb_${newID()}`,
+      req.routing_decision_id || '',
+      roomID,
+      req.message_id || '',
+      req.run_id || '',
+      action,
+      targetPersonaID,
+      json(req.write_targets || []),
+      req.comment || '',
+    );
+    if (action === 'reroute' && targetPersonaID) {
+      this.setRouteLock({ room_id: roomID, persona_id: targetPersonaID, user_id: 'desktop_user', action: 'lock' });
+    }
   }
 
   listConversationGroups(): { groups: ConversationGroup[] } {
@@ -3186,6 +4134,91 @@ export class JoiSQLiteStore {
       events,
       steps,
     };
+  }
+
+  listRunTraceSpans(filter: RunTraceSpanFilter = {}): { spans: RunTraceSpan[]; summary: RunTraceSpanSummary } {
+    const limit = clampLimit(filter.limit, 200);
+    const since = filter.since?.trim() || '';
+    const until = filter.until?.trim() || '';
+    const queryLimit = Math.max(limit * 4, 100);
+    const timeWhere = (alias: string) => {
+      const clauses: string[] = [];
+      const params: SQLiteValue[] = [];
+      if (since) {
+        clauses.push(`datetime(${alias}.created_at) >= datetime(?)`);
+        params.push(since);
+      }
+      if (until) {
+        clauses.push(`datetime(${alias}.created_at) <= datetime(?)`);
+        params.push(until);
+      }
+      return { sql: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', params };
+    };
+
+    const modelTime = timeWhere('mc');
+    const modelRows = this.all(
+      `SELECT mc.*, rn.conversation_id, rn.selected_agent_id, r.id AS room_id, r.title AS room_title,
+              COALESCE(ps.id, rn.selected_agent_id, mc.agent_id) AS persona_id,
+              ps.display_name AS persona_name,
+              COALESCE(p.id, rd.owner_project_id, r.project_id) AS project_id,
+              p.name AS project_name
+       FROM model_calls mc
+       LEFT JOIN runs rn ON rn.id=mc.run_id
+       LEFT JOIN rooms r ON r.conversation_id=rn.conversation_id
+       LEFT JOIN routing_decisions rd ON rd.run_id=rn.id
+       LEFT JOIN personas ps ON ps.id=COALESCE(rn.selected_agent_id, mc.agent_id)
+       LEFT JOIN projects p ON p.id=COALESCE(ps.project_id, rd.owner_project_id, r.project_id)
+       ${modelTime.sql}
+       ORDER BY datetime(mc.created_at) DESC, mc.id DESC
+       LIMIT ?`,
+      ...modelTime.params,
+      queryLimit,
+    ).map(rowToModelTraceSpan);
+
+    const toolTime = timeWhere('tr');
+    const toolRows = this.all(
+      `SELECT tr.*, rn.conversation_id, rn.selected_agent_id, r.id AS room_id, r.title AS room_title,
+              ps.id AS persona_id, ps.display_name AS persona_name,
+              COALESCE(p.id, rd.owner_project_id, r.project_id) AS project_id,
+              p.name AS project_name
+       FROM tool_runs tr
+       LEFT JOIN runs rn ON rn.id=tr.run_id
+       LEFT JOIN rooms r ON r.conversation_id=rn.conversation_id
+       LEFT JOIN routing_decisions rd ON rd.run_id=rn.id
+       LEFT JOIN personas ps ON ps.id=rn.selected_agent_id
+       LEFT JOIN projects p ON p.id=COALESCE(ps.project_id, rd.owner_project_id, r.project_id)
+       ${toolTime.sql}
+       ORDER BY datetime(tr.created_at) DESC, tr.id DESC
+       LIMIT ?`,
+      ...toolTime.params,
+      queryLimit,
+    ).map(rowToToolTraceSpan);
+
+    const eventTime = timeWhere('re');
+    const eventRows = this.all(
+      `SELECT re.*, rn.selected_agent_id, r.id AS room_id, r.title AS room_title,
+              COALESCE(ps.id, rd.speaker_persona_id, rd.executor_persona_id, rn.selected_agent_id) AS persona_id,
+              ps.display_name AS persona_name,
+              COALESCE(p.id, rd.owner_project_id, r.project_id) AS project_id,
+              p.name AS project_name
+       FROM run_events re
+       LEFT JOIN runs rn ON rn.id=re.run_id
+       LEFT JOIN rooms r ON r.conversation_id=COALESCE(re.conversation_id, rn.conversation_id)
+       LEFT JOIN routing_decisions rd ON rd.run_id=rn.id
+       LEFT JOIN personas ps ON ps.id=COALESCE(rd.speaker_persona_id, rd.executor_persona_id, rn.selected_agent_id)
+       LEFT JOIN projects p ON p.id=COALESCE(ps.project_id, rd.owner_project_id, r.project_id)
+       ${eventTime.sql}
+       ORDER BY datetime(re.created_at) DESC, re.run_id DESC, re.seq DESC
+       LIMIT ?`,
+      ...eventTime.params,
+      queryLimit,
+    ).map(rowToEventTraceSpan);
+
+    const spans = [...modelRows, ...toolRows, ...eventRows]
+      .filter((span) => traceSpanMatchesFilter(span, filter))
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+      .slice(0, limit);
+    return { spans, summary: summarizeRunTraceSpans(spans) };
   }
 
   listSavedModels(): { models: AvailableModel[] } {
@@ -4196,7 +5229,7 @@ export class JoiSQLiteStore {
     const existing = this.get(
       `SELECT id, COALESCE(run_id, '') AS run_id, COALESCE(turn_id, '') AS turn_id,
               COALESCE(call_id, '') AS call_id, COALESCE(capability_id, '') AS capability_id,
-              status, input
+              COALESCE(risk_level, 'read_only') AS risk_level, status, input
        FROM confirmation_requests
        WHERE id=?`,
       id,
@@ -4209,6 +5242,10 @@ export class JoiSQLiteStore {
     const turnID = optionalString(existing.turn_id) || '';
     const callID = optionalString(existing.call_id) || '';
     const capabilityID = optionalString(existing.capability_id) || '';
+    const riskLevel = optionalString(existing.risk_level) || 'read_only';
+    if (status === 'approved') {
+      this.ensureApprovalActorAllowed(id, runID, riskLevel, decidedBy);
+    }
     const editedParameters = sanitizeApprovalEditedParameters(req.edited_parameters);
     const input = editedParameters ? { ...parseObject(existing.input), ...editedParameters } : parseObject(existing.input);
     this.transaction(() => {
@@ -5374,6 +6411,180 @@ export class JoiSQLiteStore {
     return { path };
   }
 
+  exportPersonaMessengerData(req: PersonaMessengerExportRequest = {}): PersonaMessengerExportResult {
+    const filters: PersonaMessengerExportRequest = {
+      project_id: req.project_id?.trim() || undefined,
+      persona_id: req.persona_id?.trim() || undefined,
+      room_id: req.room_id?.trim() || undefined,
+      thread_id: req.thread_id?.trim() || undefined,
+      trace_run_id: req.trace_run_id?.trim() || undefined,
+      since: req.since?.trim() || undefined,
+      until: req.until?.trim() || undefined,
+      include_messages: req.include_messages !== false,
+      include_trace: req.include_trace !== false,
+    };
+    const projectIDs = new Set<string>();
+    const personaIDs = new Set<string>();
+    const roomIDs = new Set<string>();
+    const threadIDs = new Set<string>();
+    const runIDs = new Set<string>();
+    if (filters.project_id) projectIDs.add(filters.project_id);
+    if (filters.persona_id) personaIDs.add(filters.persona_id);
+    if (filters.room_id) roomIDs.add(filters.room_id);
+    if (filters.thread_id) threadIDs.add(filters.thread_id);
+    if (filters.trace_run_id) runIDs.add(filters.trace_run_id);
+
+    const addPersonaScope = (personaID: string) => {
+      const persona = this.get(`SELECT id, project_id FROM personas WHERE id=?`, personaID);
+      if (!persona) return;
+      personaIDs.add(String(persona.id));
+      if (persona.project_id) projectIDs.add(String(persona.project_id));
+    };
+    const addRoomScope = (roomID: string) => {
+      const room = this.get(`SELECT id, project_id, persona_id FROM rooms WHERE id=?`, roomID);
+      if (!room) return;
+      roomIDs.add(String(room.id));
+      if (room.project_id) projectIDs.add(String(room.project_id));
+      if (room.persona_id) addPersonaScope(String(room.persona_id));
+      for (const member of this.all(`SELECT persona_id, project_id FROM room_members WHERE room_id=? AND member_type='persona'`, roomID)) {
+        if (member.persona_id) addPersonaScope(String(member.persona_id));
+        if (member.project_id) projectIDs.add(String(member.project_id));
+      }
+    };
+    const addThreadScope = (threadID: string) => {
+      const thread = this.get(`SELECT * FROM messenger_threads WHERE id=?`, threadID);
+      if (!thread) return;
+      threadIDs.add(String(thread.id));
+      if (thread.project_id) projectIDs.add(String(thread.project_id));
+      if (thread.room_id) addRoomScope(String(thread.room_id));
+      if (thread.owner_persona_id) addPersonaScope(String(thread.owner_persona_id));
+      for (const personaID of parseArray(thread.collaborator_persona_ids).map(String)) addPersonaScope(personaID);
+      for (const runID of parseArray(thread.run_ids).map(String)) runIDs.add(runID);
+    };
+    if (filters.persona_id) addPersonaScope(filters.persona_id);
+    if (filters.room_id) addRoomScope(filters.room_id);
+    if (filters.thread_id) addThreadScope(filters.thread_id);
+
+    if (projectIDs.size > 0) {
+      for (const row of this.all(`SELECT id FROM personas WHERE project_id IN (${placeholders(projectIDs.size)})`, ...[...projectIDs])) {
+        personaIDs.add(String(row.id));
+      }
+      for (const row of this.all(`SELECT id FROM rooms WHERE project_id IN (${placeholders(projectIDs.size)})`, ...[...projectIDs])) {
+        roomIDs.add(String(row.id));
+      }
+      for (const row of this.all(`SELECT id FROM messenger_threads WHERE project_id IN (${placeholders(projectIDs.size)})`, ...[...projectIDs])) {
+        threadIDs.add(String(row.id));
+      }
+    }
+    for (const threadID of [...threadIDs]) addThreadScope(threadID);
+
+    const scoped = projectIDs.size > 0 || personaIDs.size > 0 || roomIDs.size > 0 || threadIDs.size > 0 || runIDs.size > 0;
+    const rowsForScope = (table: string, where: string[], params: SQLiteValue[], order = 'created_at DESC'): Record<string, unknown>[] => {
+      const clauses = where.length > 0 ? where : ['1=1'];
+      const timeColumn = table === 'projects' || table === 'personas' || table === 'rooms' || table === 'messenger_threads' ? 'updated_at' : 'created_at';
+      if (filters.since) {
+        clauses.push(`datetime(${timeColumn}) >= datetime(?)`);
+        params.push(filters.since);
+      }
+      if (filters.until) {
+        clauses.push(`datetime(${timeColumn}) <= datetime(?)`);
+        params.push(filters.until);
+      }
+      return this.all(`SELECT * FROM ${table} WHERE ${clauses.join(' AND ')} ORDER BY ${order}`, ...params)
+        .map((row) => sanitizePersonaExportValue(row) as Record<string, unknown>);
+    };
+    const whereIDs = (column: string, ids: Set<string>): [string[], SQLiteValue[]] => ids.size > 0
+      ? [[`${column} IN (${placeholders(ids.size)})`], [...ids]]
+      : scoped
+        ? [['1=0'], []]
+        : [['1=1'], []];
+    const [projectWhere, projectParams] = whereIDs('id', projectIDs);
+    const [personaWhere, personaParams] = whereIDs('id', personaIDs);
+    const [roomWhere, roomParams] = whereIDs('id', roomIDs);
+    const [threadWhere, threadParams] = whereIDs('id', threadIDs);
+
+    const conversationIDs = new Set(
+      (roomIDs.size > 0
+        ? this.all(`SELECT conversation_id FROM rooms WHERE id IN (${placeholders(roomIDs.size)})`, ...[...roomIDs])
+        : scoped
+          ? []
+          : this.all(`SELECT conversation_id FROM rooms WHERE conversation_id IS NOT NULL`))
+        .map((row) => optionalString(row.conversation_id))
+        .filter((id): id is string => Boolean(id)),
+    );
+    if (filters.include_trace) {
+      for (const row of conversationIDs.size > 0
+        ? this.all(`SELECT id FROM runs WHERE conversation_id IN (${placeholders(conversationIDs.size)})`, ...[...conversationIDs])
+        : scoped
+          ? []
+          : this.all(`SELECT id FROM runs ORDER BY datetime(created_at) DESC LIMIT 500`)) {
+        runIDs.add(String(row.id));
+      }
+    }
+
+    const messages = filters.include_messages && conversationIDs.size > 0
+      ? rowsForScope('messages', [`conversation_id IN (${placeholders(conversationIDs.size)})`], [...conversationIDs])
+      : [];
+    const runWhere: [string[], SQLiteValue[]] = runIDs.size > 0
+      ? [[`id IN (${placeholders(runIDs.size)})`], [...runIDs]]
+      : scoped
+        ? [['1=0'], []]
+        : [['1=1'], []];
+    const artifactWhere: [string[], SQLiteValue[]] = runIDs.size > 0
+      ? [[`source_run_id IN (${placeholders(runIDs.size)})`], [...runIDs]]
+      : conversationIDs.size > 0
+        ? [[`source_conversation_id IN (${placeholders(conversationIDs.size)})`], [...conversationIDs]]
+        : scoped
+          ? [['1=0'], []]
+          : [['1=1'], []];
+    const routeWhere: [string[], SQLiteValue[]] = roomIDs.size > 0
+      ? [[`room_id IN (${placeholders(roomIDs.size)})`], [...roomIDs]]
+      : runIDs.size > 0
+        ? [[`run_id IN (${placeholders(runIDs.size)})`], [...runIDs]]
+        : scoped
+          ? [['1=0'], []]
+          : [['1=1'], []];
+
+    const data: Record<string, unknown[]> = {
+      projects: rowsForScope('projects', projectWhere, projectParams),
+      personas: rowsForScope('personas', personaWhere, personaParams),
+      rooms: rowsForScope('rooms', roomWhere, roomParams),
+      room_members: roomIDs.size > 0
+        ? rowsForScope('room_members', [`room_id IN (${placeholders(roomIDs.size)})`], [...roomIDs])
+        : scoped ? [] : rowsForScope('room_members', ['1=1'], []),
+      threads: rowsForScope('messenger_threads', threadWhere, threadParams, 'updated_at DESC'),
+      thread_events: threadIDs.size > 0
+        ? rowsForScope('messenger_thread_events', [`thread_id IN (${placeholders(threadIDs.size)})`], [...threadIDs])
+        : scoped ? [] : rowsForScope('messenger_thread_events', ['1=1'], []),
+      routing_decisions: rowsForScope('routing_decisions', routeWhere[0], routeWhere[1]),
+      external_connector_events: roomIDs.size > 0
+        ? rowsForScope('external_connector_events', [`room_id IN (${placeholders(roomIDs.size)})`], [...roomIDs])
+        : scoped ? [] : rowsForScope('external_connector_events', ['1=1'], []),
+      messages,
+      artifacts: rowsForScope('artifacts', artifactWhere[0], artifactWhere[1]),
+    };
+    if (filters.include_trace) {
+      data.runs = rowsForScope('runs', runWhere[0], runWhere[1]);
+      data.run_events = runIDs.size > 0 ? rowsForScope('run_events', [`run_id IN (${placeholders(runIDs.size)})`], [...runIDs]) : [];
+      data.run_steps = runIDs.size > 0 ? rowsForScope('run_steps', [`run_id IN (${placeholders(runIDs.size)})`], [...runIDs]) : [];
+      data.model_calls = runIDs.size > 0 ? rowsForScope('model_calls', [`run_id IN (${placeholders(runIDs.size)})`], [...runIDs]) : [];
+      data.tool_runs = runIDs.size > 0 ? rowsForScope('tool_runs', [`run_id IN (${placeholders(runIDs.size)})`], [...runIDs]) : [];
+    }
+    const rowCounts = Object.fromEntries(Object.entries(data).map(([key, value]) => [key, value.length]));
+    const manifest = {
+      generated_at: nowIso(),
+      filters,
+      row_counts: rowCounts,
+      secrets_policy: 'message text is included with secret-pattern redaction; raw model responses, prompts, tokens and secret-like fields are redacted',
+    };
+    const payload = { manifest, data };
+    const dir = join(dirname(this.options.dbPath), 'exports');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `joi-persona-messenger-export-${timestampForFilename()}-${newID()}.json`);
+    writeFileSync(path, JSON.stringify(payload, null, 2));
+    return { path, manifest };
+  }
+
   getWorkspaceSettings(): WorkspaceSettings {
     const settings = this.desktopSettings();
     return normalizeWorkspaceSettings({
@@ -5870,6 +7081,7 @@ export class JoiSQLiteStore {
       evidence_summary: evidenceSummary,
       terminal_reason: verification.summary,
     });
+    this.attachMessengerThreadArtifacts(context.run_id, productTaskID, artifact?.id ? [artifact.id] : []);
     return artifact ? [artifact] : [];
   }
 
@@ -7666,6 +8878,7 @@ export class JoiSQLiteStore {
         terminal_reason: verification.summary,
       });
     }
+    this.attachMessengerThreadArtifacts(runID, productTaskID || undefined, artifactID ? [artifactID] : []);
     return productTaskID;
   }
 
@@ -7899,6 +9112,1494 @@ export class JoiSQLiteStore {
     `);
   }
 
+  private ensurePersonaMessengerSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        goal TEXT NOT NULL DEFAULT '',
+        domain TEXT NOT NULL DEFAULT '',
+        phase TEXT NOT NULL DEFAULT '',
+        risk_level TEXT NOT NULL DEFAULT 'low',
+        status TEXT NOT NULL DEFAULT 'active',
+        summary TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        archived_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS personas (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        display_name TEXT NOT NULL,
+        handle TEXT NOT NULL UNIQUE,
+        avatar TEXT NOT NULL DEFAULT '',
+        tagline TEXT NOT NULL DEFAULT '',
+        self_intro TEXT NOT NULL DEFAULT '',
+        traits TEXT NOT NULL DEFAULT '{}',
+        disagreement_style TEXT NOT NULL DEFAULT '',
+        uncertainty_style TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',
+        version INTEGER NOT NULL DEFAULT 1,
+        capabilities TEXT NOT NULL DEFAULT '[]',
+        permission_summary TEXT NOT NULL DEFAULT '',
+        model_strategy TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS persona_versions (
+        id TEXT PRIMARY KEY,
+        persona_id TEXT NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        changed_by TEXT NOT NULL DEFAULT 'desktop_user',
+        change_reason TEXT NOT NULL DEFAULT '',
+        before_json TEXT NOT NULL DEFAULT '{}',
+        after_json TEXT NOT NULL DEFAULT '{}',
+        applies_from_message_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(persona_id, version)
+      );
+      CREATE TABLE IF NOT EXISTS rooms (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        subtitle TEXT NOT NULL DEFAULT '',
+        owner_user_id TEXT NOT NULL DEFAULT 'desktop_user',
+        project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+        persona_id TEXT REFERENCES personas(id) ON DELETE SET NULL,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        default_ai_participation TEXT NOT NULL DEFAULT 'moderate',
+        floor_holder_persona_id TEXT REFERENCES personas(id) ON DELETE SET NULL,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        archived_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS room_members (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        member_type TEXT NOT NULL,
+        member_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'member',
+        persona_id TEXT REFERENCES personas(id) ON DELETE SET NULL,
+        project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+        visibility_scope TEXT NOT NULL DEFAULT 'room_members',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(room_id, member_type, member_id)
+      );
+      CREATE TABLE IF NOT EXISTS room_connectors (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        connector_id TEXT NOT NULL,
+        external_room_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        visible_persona_ids TEXT NOT NULL DEFAULT '[]',
+        allow_temporary_invite INTEGER NOT NULL DEFAULT 0,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(provider, external_room_id)
+      );
+      CREATE TABLE IF NOT EXISTS external_connector_events (
+        id TEXT PRIMARY KEY,
+        connector_id TEXT NOT NULL REFERENCES room_connectors(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        external_event_id TEXT NOT NULL,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        external_user_id TEXT NOT NULL DEFAULT '',
+        reply_to_external_message_id TEXT NOT NULL DEFAULT '',
+        text TEXT NOT NULL DEFAULT '',
+        internal_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        status TEXT NOT NULL DEFAULT 'received',
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        error TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(connector_id, external_event_id)
+      );
+      CREATE TABLE IF NOT EXISTS route_locks (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL DEFAULT 'desktop_user',
+        persona_id TEXT NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        UNIQUE(room_id, user_id, status)
+      );
+      CREATE TABLE IF NOT EXISTS routing_decisions (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        speaker_persona_id TEXT REFERENCES personas(id) ON DELETE SET NULL,
+        owner_project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+        executor_persona_id TEXT REFERENCES personas(id) ON DELETE SET NULL,
+        collaborator_project_ids TEXT NOT NULL DEFAULT '[]',
+        execution_scope TEXT NOT NULL DEFAULT 'room_scope',
+        write_targets TEXT NOT NULL DEFAULT '[]',
+        thread_action TEXT NOT NULL DEFAULT '{}',
+        confidence REAL NOT NULL DEFAULT 0,
+        risk TEXT NOT NULL DEFAULT 'low',
+        requires_confirmation INTEGER NOT NULL DEFAULT 0,
+        reason_codes TEXT NOT NULL DEFAULT '[]',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS messenger_threads (
+        id TEXT PRIMARY KEY,
+        project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+        room_id TEXT REFERENCES rooms(id) ON DELETE SET NULL,
+        owner_persona_id TEXT REFERENCES personas(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        goal TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',
+        priority TEXT NOT NULL DEFAULT 'normal',
+        collaborator_persona_ids TEXT NOT NULL DEFAULT '[]',
+        source_room_ids TEXT NOT NULL DEFAULT '[]',
+        source_message_ids TEXT NOT NULL DEFAULT '[]',
+        run_ids TEXT NOT NULL DEFAULT '[]',
+        artifact_ids TEXT NOT NULL DEFAULT '[]',
+        next_action TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        closed_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS messenger_thread_events (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES messenger_threads(id) ON DELETE CASCADE,
+        room_id TEXT REFERENCES rooms(id) ON DELETE SET NULL,
+        message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        artifact_id TEXT REFERENCES artifacts(id) ON DELETE SET NULL,
+        product_task_id TEXT REFERENCES product_tasks(id) ON DELETE SET NULL,
+        event_type TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS routing_feedback (
+        id TEXT PRIMARY KEY,
+        routing_decision_id TEXT REFERENCES routing_decisions(id) ON DELETE SET NULL,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        action TEXT NOT NULL,
+        target_persona_id TEXT REFERENCES personas(id) ON DELETE SET NULL,
+        write_targets TEXT NOT NULL DEFAULT '[]',
+        comment TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS checkpoints (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL DEFAULT 'desktop_user',
+        checked_at TEXT NOT NULL DEFAULT (datetime('now')),
+        covered_event_cursor TEXT NOT NULL DEFAULT '',
+        acknowledged_items TEXT NOT NULL DEFAULT '[]',
+        snoozed_items TEXT NOT NULL DEFAULT '[]',
+        metadata TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_personas_project ON personas(project_id, status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_rooms_type_activity ON rooms(type, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_rooms_conversation ON rooms(conversation_id);
+      CREATE INDEX IF NOT EXISTS idx_rooms_project ON rooms(project_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_room_members_room ON room_members(room_id, member_type);
+      CREATE INDEX IF NOT EXISTS idx_room_connectors_room ON room_connectors(room_id, provider);
+      CREATE INDEX IF NOT EXISTS idx_external_connector_events_room ON external_connector_events(room_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_external_connector_events_external ON external_connector_events(provider, external_event_id);
+      CREATE INDEX IF NOT EXISTS idx_route_locks_room_user ON route_locks(room_id, user_id, status);
+      CREATE INDEX IF NOT EXISTS idx_routing_decisions_room ON routing_decisions(room_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_routing_decisions_run ON routing_decisions(run_id);
+      CREATE INDEX IF NOT EXISTS idx_messenger_threads_project ON messenger_threads(project_id, status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_messenger_threads_room ON messenger_threads(room_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_messenger_thread_events_thread ON messenger_thread_events(thread_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_messenger_thread_events_message ON messenger_thread_events(message_id);
+      CREATE INDEX IF NOT EXISTS idx_messenger_thread_events_run ON messenger_thread_events(run_id);
+      CREATE INDEX IF NOT EXISTS idx_routing_feedback_room ON routing_feedback(room_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_checkpoints_user ON checkpoints(user_id, checked_at DESC);
+    `);
+  }
+
+  private syncPersonaMessengerRooms(): void {
+    const defaultProjectID = 'prj_joi_desktop';
+    const defaultPersonaID = 'per_joi_desktop';
+    this.transaction(() => {
+      this.exec(
+        `INSERT INTO projects (id, name, goal, domain, phase, risk_level, status, summary, metadata, created_at, updated_at)
+         VALUES (?, 'Joi Desktop', '管理本地 Joi 桌面端工作', 'desktop_agent_os', 'mvp', 'low', 'active', 'Joi 本地桌面项目人格工作空间', ?, datetime('now'), datetime('now'))
+         ON CONFLICT(id) DO NOTHING`,
+        defaultProjectID,
+        json({ system_seed: true }),
+      );
+      this.exec(
+        `INSERT INTO personas (id, project_id, display_name, handle, avatar, tagline, self_intro, traits,
+                               disagreement_style, uncertainty_style, status, version, capabilities,
+                               permission_summary, model_strategy, metadata, created_at, updated_at)
+         VALUES (?, ?, 'Joi', '@joi-desktop', '', '本地桌面 Agent OS 项目人格',
+                 '我负责把本地 Joi 的消息、任务、记忆和运行日志组织成可验证的工作空间。',
+                 ?, '直接指出风险，并给出可执行替代路径', '说明不确定来源和验证路径',
+                 'active', 1, ?, '默认只读；写入工作区和外部动作需按能力策略审批', '使用桌面当前模型设置', ?, datetime('now'), datetime('now'))
+         ON CONFLICT(id) DO NOTHING`,
+        defaultPersonaID,
+        defaultProjectID,
+        json({ directness: 0.78, warmth: 0.5, humor: 0.12, verbosity: 0.46, initiative: 0.7, risk_sensitivity: 0.84, divergence: 0.32 }),
+        json(['chat', 'memory', 'trace', 'terminal', 'tool_request']),
+        json({ system_seed: true, ai_identity_label: '项目人格' }),
+      );
+      this.upsertPersonaAgent(
+        defaultPersonaID,
+        'Joi',
+        '本地桌面 Agent OS 项目人格',
+        '我负责把本地 Joi 的消息、任务、记忆和运行日志组织成可验证的工作空间。',
+        ['chat', 'memory', 'trace', 'terminal', 'tool_request'],
+      );
+      this.exec(
+        `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, active_project_id, lifecycle_status, metadata, created_at, updated_at)
+         VALUES ('conv_private_hub', 'desktop', 'desktop_user', '私人总群', ?, ?, 'active', ?, datetime('now'), datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET title='私人总群', active_agent_id=excluded.active_agent_id, active_project_id=excluded.active_project_id, updated_at=conversations.updated_at`,
+        defaultPersonaID,
+        defaultProjectID,
+        json({ room_id: 'room_private_hub', room_type: 'private_hub' }),
+      );
+      this.exec(
+        `INSERT INTO rooms (id, type, title, subtitle, owner_user_id, project_id, persona_id, conversation_id,
+                            default_ai_participation, floor_holder_persona_id, metadata, created_at, updated_at)
+         VALUES ('room_private_hub', 'private_hub', '私人总群', '你和所有项目人格', 'desktop_user', NULL, ?, 'conv_private_hub',
+                 'moderate', ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(id) DO NOTHING`,
+        defaultPersonaID,
+        defaultPersonaID,
+        json({ system_seed: true }),
+      );
+      this.upsertRoomMember('room_private_hub', 'user', 'desktop_user', '你', 'owner');
+      this.upsertRoomMember('room_private_hub', 'persona', defaultPersonaID, 'Joi', 'persona', defaultPersonaID, defaultProjectID);
+      const conversations = this.all(
+        `SELECT c.id, COALESCE(NULLIF(c.title, ''), 'Joi 项目私聊') AS title
+         FROM conversations c
+         LEFT JOIN rooms r ON r.conversation_id = c.id
+         WHERE r.id IS NULL
+           AND COALESCE(c.lifecycle_status, 'active') = 'active'
+           AND c.id != 'conv_private_hub'
+         ORDER BY datetime(c.updated_at) DESC
+         LIMIT 200`,
+      );
+      for (const conversation of conversations) {
+        const conversationID = String(conversation.id);
+        const roomID = stableRoomIDForConversation(conversationID);
+        const title = cleanMessengerTitle(optionalString(conversation.title) || 'Joi 项目私聊');
+        this.exec(
+          `INSERT INTO rooms (id, type, title, subtitle, owner_user_id, project_id, persona_id, conversation_id,
+                              default_ai_participation, floor_holder_persona_id, metadata, created_at, updated_at)
+           VALUES (?, 'project_dm', ?, 'Joi Desktop', 'desktop_user', ?, ?, ?, 'moderate', ?, ?, datetime('now'), datetime('now'))
+           ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id`,
+          roomID,
+          title,
+          defaultProjectID,
+          defaultPersonaID,
+          conversationID,
+          defaultPersonaID,
+          json({ mapped_from_conversation: true }),
+        );
+        this.upsertRoomMember(roomID, 'user', 'desktop_user', '你', 'owner');
+        this.upsertRoomMember(roomID, 'persona', defaultPersonaID, 'Joi', 'persona', defaultPersonaID, defaultProjectID);
+        this.exec(
+          `UPDATE conversations
+           SET active_project_id=COALESCE(active_project_id, ?),
+               active_agent_id=COALESCE(active_agent_id, ?),
+               metadata=json_set(COALESCE(metadata, '{}'), '$.room_id', ?, '$.room_type', 'project_dm')
+           WHERE id=?`,
+          defaultProjectID,
+          defaultPersonaID,
+          roomID,
+          conversationID,
+        );
+      }
+    });
+  }
+
+  private upsertRoomMember(
+    roomID: string,
+    memberType: string,
+    memberID: string,
+    displayName: string,
+    role = 'member',
+    personaID = '',
+    projectID = '',
+    metadata: Record<string, unknown> = {},
+    visibilityScope = 'room_members',
+  ): void {
+    this.exec(
+      `INSERT INTO room_members (id, room_id, member_type, member_id, display_name, role, persona_id, project_id, visibility_scope, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, datetime('now'), datetime('now'))
+       ON CONFLICT(room_id, member_type, member_id) DO UPDATE SET
+         display_name=excluded.display_name,
+         role=excluded.role,
+         persona_id=excluded.persona_id,
+         project_id=excluded.project_id,
+         visibility_scope=excluded.visibility_scope,
+         metadata=excluded.metadata,
+         updated_at=datetime('now')`,
+      `rm_${newID()}`,
+      roomID,
+      memberType,
+      memberID,
+      displayName,
+      role,
+      personaID,
+      projectID,
+      visibilityScope,
+      json(metadata),
+    );
+  }
+
+  private upsertPersonaAgent(
+    personaID: string,
+    name: string,
+    description: string,
+    systemPrompt: string,
+    capabilities: string[],
+  ): void {
+    this.exec(
+      `INSERT INTO agents (id, name, description, system_prompt, capabilities, metadata, enabled, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+       ON CONFLICT(id) DO UPDATE SET
+         name=excluded.name,
+         description=excluded.description,
+         system_prompt=excluded.system_prompt,
+         capabilities=excluded.capabilities,
+         enabled=1,
+         updated_at=datetime('now')`,
+      personaID,
+      name,
+      description,
+      systemPrompt,
+      json(capabilities),
+      json({ source: 'persona_messenger', ai_identity_label: '项目人格' }),
+    );
+  }
+
+  private listRoomMembers(roomID: string): MessengerRoom['members'] {
+    return this.all(
+      `SELECT id, member_type, member_id, display_name, role, persona_id, project_id, visibility_scope, metadata
+       FROM room_members
+       WHERE room_id=?
+       ORDER BY CASE member_type WHEN 'user' THEN 0 WHEN 'human' THEN 1 WHEN 'persona' THEN 2 ELSE 3 END, display_name ASC`,
+      roomID,
+    ).map((row) => {
+      const metadata = parseObject(row.metadata);
+      return {
+        id: String(row.member_id),
+        type: optionalString(row.member_type) || 'member',
+        display_name: optionalString(row.display_name) || String(row.member_id),
+        role: optionalString(row.role),
+        persona_id: optionalString(row.persona_id),
+        project_id: optionalString(row.project_id),
+        visibility_scope: optionalString(row.visibility_scope) || 'room_members',
+        visible_project_ids: parseStringArray(metadata.visible_project_ids),
+        can_approve_high_risk: Boolean(metadata.can_approve_high_risk),
+        metadata,
+      };
+    });
+  }
+
+  private requireMessengerProject(projectID: string): MessengerProject {
+    const row = this.get(`SELECT * FROM projects WHERE id=?`, projectID);
+    if (!row) throw new Error(`Project not found: ${projectID}`);
+    return rowToMessengerProject(row);
+  }
+
+  private requireProjectPersona(personaID: string): ProjectPersona {
+    const row = this.get(`SELECT * FROM personas WHERE id=?`, personaID);
+    if (!row) throw new Error(`Persona not found: ${personaID}`);
+    return rowToProjectPersona(row);
+  }
+
+  private requireMessengerRoom(roomID: string): MessengerRoom {
+    return this.attachRoomPermissionAudit(this.requireMessengerRoomRaw(roomID));
+  }
+
+  private requireMessengerRoomRaw(roomID: string): MessengerRoom {
+    const row = this.get(
+      `SELECT
+         r.*,
+         (SELECT persona_id FROM route_locks rl WHERE rl.room_id=r.id AND rl.status='active' ORDER BY datetime(rl.started_at) DESC LIMIT 1) AS route_lock_persona_id,
+         (SELECT content FROM messages m WHERE m.conversation_id = r.conversation_id ORDER BY datetime(m.created_at) DESC, m.rowid DESC LIMIT 1) AS last_message,
+         (SELECT role FROM messages m WHERE m.conversation_id = r.conversation_id ORDER BY datetime(m.created_at) DESC, m.rowid DESC LIMIT 1) AS last_role,
+         0 AS pending_approval_count,
+         0 AS running_run_count,
+         0 AS failed_run_count
+       FROM rooms r
+       WHERE r.id=?`,
+      roomID,
+    );
+    if (!row) throw new Error(`Room not found: ${roomID}`);
+    return rowToMessengerRoom(row, this.listRoomMembers(roomID));
+  }
+
+  private requireRoomConnector(provider: string, externalRoomID: string): RoomConnector {
+    const row = this.get(
+      `SELECT * FROM room_connectors WHERE provider=? AND external_room_id=?`,
+      provider,
+      externalRoomID,
+    ) || this.get(`SELECT * FROM room_connectors WHERE id=?`, externalRoomID);
+    if (!row) throw new Error(`Room connector not found: ${provider}:${externalRoomID}`);
+    return rowToRoomConnector(row);
+  }
+
+  private requireRoomConnectorByID(connectorID: string): RoomConnector {
+    const row = this.get(`SELECT * FROM room_connectors WHERE id=?`, connectorID);
+    if (!row) throw new Error(`Room connector not found: ${connectorID}`);
+    return rowToRoomConnector(row);
+  }
+
+  private resolveConnectorForExternal(req: {
+    connector_id?: string;
+    provider?: string;
+    external_room_id?: string;
+  }): RoomConnector {
+    const connectorID = req.connector_id?.trim();
+    if (connectorID) return this.requireRoomConnectorByID(connectorID);
+    const provider = req.provider?.trim().toLowerCase() || '';
+    const externalRoomID = req.external_room_id?.trim() || '';
+    if (!provider || !externalRoomID) throw new Error('connector_id or provider/external_room_id is required');
+    return this.requireRoomConnector(provider, externalRoomID);
+  }
+
+  private externalReplyTarget(connectorID: string, externalMessageID: string): { internal_message_id?: string; persona_id?: string } {
+    const externalID = externalMessageID.trim();
+    if (!externalID) return {};
+    const row = this.get(
+      `SELECT e.internal_message_id, e.metadata, m.metadata AS message_metadata
+       FROM external_connector_events e
+       LEFT JOIN messages m ON m.id=e.internal_message_id
+       WHERE e.connector_id=? AND e.external_event_id=?
+       ORDER BY datetime(e.created_at) DESC
+       LIMIT 1`,
+      connectorID,
+      externalID,
+    );
+    if (!row) return {};
+    const eventMetadata = parseObject(row.metadata);
+    const messageMetadata = parseObject(row.message_metadata);
+    return {
+      internal_message_id: optionalString(row.internal_message_id),
+      persona_id: optionalString(eventMetadata.persona_id) || optionalString(eventMetadata.speaker_persona_id) || optionalString(messageMetadata.persona_id) || optionalString(messageMetadata.speaker_persona_id),
+    };
+  }
+
+  evaluateRoomPermissions(req: EvaluateRoomPermissionsRequest): RoomPermissionAudit {
+    const room = this.requireMessengerRoomRaw(req.room_id.trim());
+    const actorID = req.actor_id?.trim() || 'desktop_user';
+    const member = (room.members ?? []).find((item) => item.id === actorID || item.persona_id === actorID);
+    const actorType = req.actor_type?.trim() || member?.type || (actorID === 'desktop_user' ? 'user' : 'human');
+    const actorRole = member?.role || (actorID === room.owner_user_id || actorID === 'desktop_user' ? 'room_owner' : 'guest');
+    const roomMetadata = room.metadata || {};
+    const visibleProjectIDs = parseStringArray(roomMetadata.visible_project_ids);
+    const roomProjectIDs = visibleProjectIDs.length > 0 ? visibleProjectIDs : [room.project_id].filter(Boolean) as string[];
+    const requestedProjectID = req.project_id?.trim() || room.project_id || '';
+    const memberVisibleProjectIDs = parseStringArray(member?.metadata?.visible_project_ids).filter((id) => roomProjectIDs.length === 0 || roomProjectIDs.includes(id));
+    const actorProjectID = member?.project_id || (req.persona_id ? this.requireProjectPersona(req.persona_id).project_id : '');
+    const authorizedProjectIDs = actorType === 'persona'
+      ? [actorProjectID].filter((id) => id && (roomProjectIDs.length === 0 || roomProjectIDs.includes(id)))
+      : actorRole === 'guest'
+        ? memberVisibleProjectIDs
+        : memberVisibleProjectIDs.length > 0
+          ? memberVisibleProjectIDs
+          : roomProjectIDs;
+    const deniedProjectIDs = requestedProjectID && !authorizedProjectIDs.includes(requestedProjectID) ? [requestedProjectID] : [];
+    const personaID = req.persona_id?.trim() || (actorType === 'persona' ? actorID : member?.persona_id || '');
+    const ownsPrivateDM = Boolean(room.type === 'project_dm' && personaID && room.persona_id === personaID);
+    const canReadPrivatePersonaDM = room.type !== 'project_dm'
+      || actorType === 'user'
+      || ownsPrivateDM;
+    const isProjectOwner = actorRole === 'project_owner' || (actorType === 'user' && (actorID === room.owner_user_id || actorID === 'desktop_user'));
+    const canModifyCorePersona = isProjectOwner && deniedProjectIDs.length === 0;
+    const canApproveHighRisk = actorType === 'user'
+      || actorRole === 'project_owner'
+      || actorRole === 'room_owner'
+      || (actorRole !== 'guest' && Boolean(member?.can_approve_high_risk));
+    const humanCount = (room.members ?? []).filter((item) => item.type === 'human' || item.type === 'user').length;
+    const multiHumanThrottle = room.type === 'shared'
+      && humanCount > 1
+      && !['active', 'temporary'].includes(room.default_ai_participation);
+    const reasonCodes = [
+      actorType === 'persona' ? 'PERSONA_MINIMUM_PROJECT_SCOPE' : '',
+      actorRole === 'guest' ? 'GUEST_LIMITED_SCOPE' : '',
+      canReadPrivatePersonaDM ? '' : 'PRIVATE_PERSONA_DM_DENIED',
+      canModifyCorePersona ? 'CORE_PERSONA_EDIT_ALLOWED' : 'CORE_PERSONA_EDIT_PROJECT_OWNER_REQUIRED',
+      canApproveHighRisk ? 'HIGH_RISK_APPROVER' : 'HIGH_RISK_APPROVER_REQUIRED',
+      multiHumanThrottle ? 'MULTI_HUMAN_MODERATE_AI_THROTTLE' : '',
+      deniedProjectIDs.length ? 'PROJECT_SCOPE_DENIED' : '',
+    ].filter(Boolean);
+    return {
+      room_id: room.id,
+      actor_id: actorID,
+      actor_type: actorType,
+      actor_role: actorRole,
+      authorized_project_ids: authorizedProjectIDs,
+      visible_project_ids: roomProjectIDs,
+      denied_project_ids: deniedProjectIDs,
+      can_read_room_history: Boolean(member) || actorType === 'user',
+      can_read_private_persona_dm: canReadPrivatePersonaDM,
+      can_modify_core_persona: canModifyCorePersona,
+      can_approve_high_risk: canApproveHighRisk,
+      ai_participation: room.default_ai_participation,
+      multi_human_ai_throttle: multiHumanThrottle,
+      reason_codes: reasonCodes,
+      summary: permissionAuditSummary(actorType, actorRole, authorizedProjectIDs, canApproveHighRisk, multiHumanThrottle),
+    };
+  }
+
+  private attachRoomPermissionAudit(room: MessengerRoom): MessengerRoom {
+    return {
+      ...room,
+      permission_audit: this.evaluateRoomPermissions({ room_id: room.id }),
+    };
+  }
+
+  private assertPersonaMutationAllowed(req: UpdateProjectPersonaRequest | RollbackProjectPersonaRequest, persona: ProjectPersona): void {
+    const actorRole = req.actor_role?.trim();
+    if (!req.actor_id && !actorRole && !req.room_id) return;
+    const roomID = req.room_id?.trim() || this.get(
+      `SELECT id FROM rooms WHERE persona_id=? AND type='project_dm' ORDER BY datetime(updated_at) DESC LIMIT 1`,
+      persona.id,
+    )?.id;
+    if (!roomID) {
+      if (actorRole === 'project_owner') return;
+      throw new Error('Project permission is required to modify core Persona');
+    }
+    const audit = this.evaluateRoomPermissions({
+      room_id: String(roomID),
+      actor_id: req.actor_id,
+      actor_type: actorRole === 'project_owner' ? 'user' : undefined,
+      project_id: persona.project_id,
+      persona_id: persona.id,
+    });
+    if (actorRole === 'project_owner') return;
+    if (!audit.can_modify_core_persona) {
+      throw new Error('Room Owner cannot modify core Persona without Project permission');
+    }
+  }
+
+  private ensureApprovalActorAllowed(approvalID: string, runID: string, riskLevel: string, actorID: string): void {
+    if (!isHighRiskApproval(riskLevel)) return;
+    const roomRow = this.get(
+      `SELECT r.id AS room_id
+       FROM runs rn
+       LEFT JOIN rooms r ON r.conversation_id=rn.conversation_id
+       WHERE rn.id=?
+       LIMIT 1`,
+      runID,
+    );
+    const roomID = optionalString(roomRow?.room_id);
+    if (!roomID) {
+      if (['desktop_user', 'desktop_ui', 'test', 'system'].includes(actorID)) return;
+      throw new Error(`High-risk approval ${approvalID} requires a permitted room or project approver`);
+    }
+    const audit = this.evaluateRoomPermissions({ room_id: roomID, actor_id: actorID });
+    if (!audit.can_approve_high_risk) {
+      throw new Error(`High-risk approval ${approvalID} requires a permitted approver`);
+    }
+  }
+
+  private findVisibleExternalMention(text: string, visiblePersonaIDs: string[]): ProjectPersona | null {
+    for (const personaID of visiblePersonaIDs) {
+      const persona = this.requireProjectPersona(personaID);
+      if (messageMentionsPersona(text, persona, [])) return persona;
+    }
+    return null;
+  }
+
+  private uniquePersonaHandle(seed: string, projectName: string, existingPersonaID = ''): string {
+    const base = normalizePersonaHandle(seed || projectName);
+    let candidate = base;
+    let index = 2;
+    while (this.get(
+      `SELECT id FROM personas WHERE handle=? AND (?='' OR id != ?)`,
+      candidate,
+      existingPersonaID,
+      existingPersonaID,
+    )) {
+      candidate = `${base}-${index}`;
+      index += 1;
+    }
+    return candidate;
+  }
+
+  private buildPersonaCandidates(req: GenerateProjectPersonaCandidatesRequest): PersonaCandidate[] {
+    const projectName = req.project_name.trim();
+    if (!projectName) throw new Error('project_name is required');
+    const baseName = personaNameFromProject(projectName);
+    const domain = req.domain?.trim() || 'general';
+    const goal = req.project_goal?.trim() || `${projectName} 项目`;
+    const templates = [
+      {
+        suffix: '',
+        tagline: `负责 ${projectName} 的项目人格`,
+        self_intro: '我会先厘清约束，再推进可验证的下一步。',
+        traits: { directness: 0.72, warmth: 0.55, humor: 0.18, verbosity: 0.42, initiative: 0.68, risk_sensitivity: 0.81, divergence: 0.35 },
+        disagreement_style: '明确指出风险，并提供替代方案',
+        uncertainty_style: '说明不确定来源和验证路径',
+        rationale: '均衡型项目人格，适合作为默认长期私聊对象。',
+      },
+      {
+        suffix: 'Pilot',
+        tagline: `推动 ${projectName} 从计划进入执行`,
+        self_intro: '我会把目标拆成可执行步骤，并持续检查阻塞和验收证据。',
+        traits: { directness: 0.82, warmth: 0.44, humor: 0.1, verbosity: 0.36, initiative: 0.78, risk_sensitivity: 0.72, divergence: 0.28 },
+        disagreement_style: '直接指出会拖慢交付的假设，并给出更短路径',
+        uncertainty_style: '先给当前判断，再列出需要补证的点',
+        rationale: '推进型项目人格，适合实现、排期和验收压力较高的项目。',
+      },
+      {
+        suffix: 'Scout',
+        tagline: `为 ${projectName} 发现风险、机会和外部信息`,
+        self_intro: '我会先扩展信息面，再把不确定性收束成可行动的判断。',
+        traits: { directness: 0.58, warmth: 0.62, humor: 0.2, verbosity: 0.5, initiative: 0.74, risk_sensitivity: 0.88, divergence: 0.64 },
+        disagreement_style: '用证据指出盲区，并保留多个候选方案',
+        uncertainty_style: '标明信息来源强弱和下一步验证路径',
+        rationale: '探索型项目人格，适合研究、发现风险和跨项目协作。',
+      },
+    ];
+    return templates.map((template, index) => {
+      const displayName = template.suffix ? `${baseName} ${template.suffix}` : baseName;
+      return {
+        id: `pcand_${index + 1}`,
+        display_name: displayName,
+        handle: this.uniquePersonaHandle(displayName, projectName),
+        avatar: '',
+        tagline: template.tagline,
+        self_intro: `${template.self_intro} 当前目标：${goal}。`,
+        traits: template.traits,
+        disagreement_style: template.disagreement_style,
+        uncertainty_style: template.uncertainty_style,
+        rationale: `${template.rationale} 领域：${domain}。`,
+      };
+    });
+  }
+
+  private buildCheckpointSummary(): CheckpointSummary {
+    const lastCheckpoint = this.get(
+      `SELECT id, checked_at, covered_event_cursor
+       FROM checkpoints
+       WHERE user_id='desktop_user'
+       ORDER BY datetime(checked_at) DESC
+       LIMIT 1`,
+    );
+    const since = optionalString(lastCheckpoint?.checked_at) || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const completedRows = this.all(
+      `SELECT rn.id, rn.terminal_reason, COALESCE(rn.finished_at, rn.created_at) AS occurred_at,
+              r.id AS room_id, r.title AS room_title, p.id AS project_id, p.name AS project_name, ps.display_name AS persona_name
+       FROM runs rn
+       LEFT JOIN rooms r ON r.conversation_id=rn.conversation_id
+       LEFT JOIN personas ps ON ps.id=rn.selected_agent_id
+       LEFT JOIN projects p ON p.id=ps.project_id
+       WHERE (rn.status IN ('completed', 'succeeded') OR rn.terminal_status IN ('completed', 'succeeded'))
+         AND datetime(COALESCE(rn.finished_at, rn.created_at)) > datetime(?)
+       ORDER BY datetime(COALESCE(rn.finished_at, rn.created_at)) DESC
+       LIMIT 5`,
+      since,
+    );
+    const failedRows = this.all(
+      `SELECT rn.id, rn.error_message, rn.terminal_reason, COALESCE(rn.finished_at, rn.created_at) AS occurred_at,
+              r.id AS room_id, r.title AS room_title, p.id AS project_id, p.name AS project_name, ps.display_name AS persona_name
+       FROM runs rn
+       LEFT JOIN rooms r ON r.conversation_id=rn.conversation_id
+       LEFT JOIN personas ps ON ps.id=rn.selected_agent_id
+       LEFT JOIN projects p ON p.id=ps.project_id
+       WHERE (rn.status='failed' OR rn.terminal_status='failed')
+         AND datetime(COALESCE(rn.finished_at, rn.created_at)) > datetime(?)
+       ORDER BY datetime(COALESCE(rn.finished_at, rn.created_at)) DESC
+       LIMIT 5`,
+      since,
+    );
+    const completedRuns = Number(this.get(
+      `SELECT COUNT(*) AS count
+       FROM runs
+       WHERE (status IN ('completed', 'succeeded') OR terminal_status IN ('completed', 'succeeded'))
+         AND datetime(COALESCE(finished_at, created_at)) > datetime(?)`,
+      since,
+    )?.count ?? 0);
+    const failedRuns = Number(this.get(
+      `SELECT COUNT(*) AS count
+       FROM runs
+       WHERE (status='failed' OR terminal_status='failed')
+         AND datetime(COALESCE(finished_at, created_at)) > datetime(?)`,
+      since,
+    )?.count ?? 0);
+    const waitingRuns = Number(this.get(
+      `SELECT COUNT(*) AS count
+       FROM runs
+       WHERE (status='waiting_approval' OR terminal_status='waiting_approval')
+         AND datetime(created_at) > datetime(?)`,
+      since,
+    )?.count ?? 0);
+    const pendingApprovals = Number(this.get(`SELECT COUNT(*) AS count FROM confirmation_requests WHERE status='pending'`)?.count ?? 0);
+    const pendingApprovalRows = this.all(
+      `SELECT cr.id, cr.run_id, cr.requested_action, cr.risk_level, cr.created_at, r.id AS room_id, r.title AS room_title
+       FROM confirmation_requests cr
+       LEFT JOIN runs rn ON rn.id=cr.run_id
+       LEFT JOIN rooms r ON r.conversation_id=rn.conversation_id
+       WHERE cr.status='pending'
+       ORDER BY datetime(cr.created_at) DESC
+       LIMIT 5`,
+    );
+    const artifactRows = this.all(
+      `SELECT a.id, a.title, a.type, a.source_run_id, a.created_at, r.id AS room_id, r.title AS room_title
+       FROM artifacts a
+       LEFT JOIN runs rn ON rn.id=a.source_run_id
+       LEFT JOIN rooms r ON r.conversation_id=rn.conversation_id
+       WHERE datetime(a.created_at) > datetime(?)
+       ORDER BY datetime(a.created_at) DESC
+       LIMIT 5`,
+      since,
+    );
+    const artifacts = Number(this.get(`SELECT COUNT(*) AS count FROM artifacts WHERE datetime(created_at) > datetime(?)`, since)?.count ?? 0);
+    const cost = Number(this.get(`SELECT COALESCE(SUM(cost_estimate), 0) AS cost FROM model_calls WHERE datetime(created_at) > datetime(?)`, since)?.cost ?? 0);
+    const externalRows = this.all(
+      `SELECT e.id, e.provider, e.external_event_id, e.status, e.error, e.room_id, e.created_at, r.title AS room_title
+       FROM external_connector_events e
+       LEFT JOIN rooms r ON r.id=e.room_id
+       WHERE e.status IN ('send_failed', 'pending', 'retry_scheduled')
+         AND datetime(e.created_at) > datetime(?)
+       ORDER BY datetime(e.created_at) DESC
+       LIMIT 5`,
+      since,
+    );
+    const externalUnhandled = Number(this.get(
+      `SELECT COUNT(*) AS count
+       FROM external_connector_events
+       WHERE status IN ('send_failed', 'pending', 'retry_scheduled')
+         AND datetime(created_at) > datetime(?)`,
+      since,
+    )?.count ?? 0);
+    const sinceMs = Date.parse(since.includes('T') ? since : `${since.replace(' ', 'T')}Z`);
+    const includeNoProgress = Number.isFinite(sinceMs) && Date.now() - sinceMs >= 8 * 60 * 60 * 1000;
+    const noProgressRows = includeNoProgress ? this.all(
+      `SELECT p.id, p.name
+       FROM projects p
+       WHERE p.status='active'
+         AND datetime(p.created_at) <= datetime(?)
+         AND NOT EXISTS (
+           SELECT 1 FROM routing_decisions rd
+           WHERE rd.owner_project_id=p.id AND datetime(rd.created_at) > datetime(?)
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM rooms r
+           JOIN messages m ON m.conversation_id=r.conversation_id
+           WHERE r.project_id=p.id AND datetime(m.created_at) > datetime(?)
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM personas ps
+           JOIN rooms r ON r.persona_id=ps.id
+           JOIN messages m ON m.conversation_id=r.conversation_id
+           WHERE ps.project_id=p.id AND datetime(m.created_at) > datetime(?)
+         )
+       ORDER BY p.name ASC
+       LIMIT 5`,
+      since,
+      since,
+      since,
+      since,
+    ) : [];
+    const noProgressProjects = includeNoProgress ? Number(this.get(
+      `SELECT COUNT(*) AS count
+       FROM projects p
+       WHERE p.status='active'
+         AND datetime(p.created_at) <= datetime(?)
+         AND NOT EXISTS (
+           SELECT 1 FROM routing_decisions rd
+           WHERE rd.owner_project_id=p.id AND datetime(rd.created_at) > datetime(?)
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM rooms r
+           JOIN messages m ON m.conversation_id=r.conversation_id
+           WHERE r.project_id=p.id AND datetime(m.created_at) > datetime(?)
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM personas ps
+           JOIN rooms r ON r.persona_id=ps.id
+           JOIN messages m ON m.conversation_id=r.conversation_id
+           WHERE ps.project_id=p.id AND datetime(m.created_at) > datetime(?)
+         )`,
+      since,
+      since,
+      since,
+      since,
+    )?.count ?? 0) : 0;
+    const cursor = optionalString(this.get(`SELECT MAX(created_at) AS cursor FROM run_events`)?.cursor) || nowIso();
+    const items: CheckpointSummary['items'] = [];
+    for (const row of completedRows) {
+      const label = optionalString(row.persona_name) || optionalString(row.project_name) || optionalString(row.room_title) || 'Joi';
+      items.push({
+        id: `chk_completed_${row.id}`,
+        kind: 'completed',
+        title: `${label} 完成了一次运行`,
+        body: optionalString(row.terminal_reason) || optionalString(row.room_title),
+        severity: 'success',
+        room_id: optionalString(row.room_id),
+        project_id: optionalString(row.project_id),
+        run_id: optionalString(row.id),
+      });
+    }
+    if (completedRuns > 0) {
+      items.push({ id: `chk_completed_total_${since}`, kind: 'completed_total', title: `${completedRuns} 个 Run 已完成`, severity: 'success' });
+    }
+    for (const row of failedRows) {
+      const label = optionalString(row.persona_name) || optionalString(row.project_name) || optionalString(row.room_title) || 'Joi';
+      items.push({
+        id: `chk_failed_${row.id}`,
+        kind: 'failed',
+        title: `${label} 有运行失败`,
+        body: optionalString(row.error_message) || optionalString(row.terminal_reason) || optionalString(row.room_title),
+        severity: 'error',
+        room_id: optionalString(row.room_id),
+        project_id: optionalString(row.project_id),
+        run_id: optionalString(row.id),
+      });
+    }
+    if (failedRuns > 0) {
+      items.push({ id: `chk_failed_total_${since}`, kind: 'failed_total', title: `${failedRuns} 个 Run 失败`, severity: 'error' });
+    }
+    for (const row of pendingApprovalRows) {
+      items.push({
+        id: `chk_approval_${row.id}`,
+        kind: 'approval_required',
+        title: optionalString(row.requested_action) || '有高风险动作等待审批',
+        body: `${optionalString(row.risk_level) || 'unknown'}${row.room_title ? ` · ${row.room_title}` : ''}`,
+        severity: 'warning',
+        room_id: optionalString(row.room_id),
+        run_id: optionalString(row.run_id),
+      });
+    }
+    if (pendingApprovals > 0) {
+      items.push({ id: `chk_approval_total_${pendingApprovals}`, kind: 'approval_required_total', title: `${pendingApprovals} 个高风险动作等待审批`, severity: 'warning' });
+    }
+    for (const row of noProgressRows) {
+      items.push({
+        id: `chk_no_progress_${row.id}`,
+        kind: 'no_progress_project',
+        title: `${optionalString(row.name) || '未命名项目'} 没有新推进`,
+        severity: 'info',
+        project_id: optionalString(row.id),
+      });
+    }
+    if (noProgressProjects > 0) {
+      items.push({ id: `chk_no_progress_total_${since}`, kind: 'no_progress_total', title: `${noProgressProjects} 个项目没有新推进`, severity: 'info' });
+    }
+    for (const row of artifactRows) {
+      items.push({
+        id: `chk_artifact_${row.id}`,
+        kind: 'artifact_created',
+        title: optionalString(row.title) || `${optionalString(row.type) || '产物'} 已新增`,
+        body: optionalString(row.room_title),
+        severity: 'info',
+        room_id: optionalString(row.room_id),
+        run_id: optionalString(row.source_run_id),
+      });
+    }
+    if (artifacts > 0) {
+      items.push({ id: `chk_artifacts_total_${since}`, kind: 'artifact_total', title: `${artifacts} 个新产物`, severity: 'info' });
+    }
+    for (const row of externalRows) {
+      items.push({
+        id: `chk_external_${row.id}`,
+        kind: 'external_unhandled',
+        title: `${optionalString(row.provider) || '外部渠道'} 同步需要处理`,
+        body: optionalString(row.error) || `${optionalString(row.status)} · ${optionalString(row.room_title)}`,
+        severity: optionalString(row.status) === 'send_failed' ? 'error' : 'warning',
+        room_id: optionalString(row.room_id),
+      });
+    }
+    if (externalUnhandled > 0) {
+      items.push({ id: `chk_external_total_${since}`, kind: 'external_unhandled_total', title: `${externalUnhandled} 条外部渠道消息需要处理`, severity: 'warning' });
+    }
+    if (items.length === 0) {
+      items.push({ id: `chk_quiet_${since}`, kind: 'quiet', title: '自上次检查后没有需要处理的变化', severity: 'info' });
+    }
+    return {
+      checkpoint_id: optionalString(lastCheckpoint?.id),
+      checked_at: optionalString(lastCheckpoint?.checked_at),
+      covered_event_cursor: cursor,
+      since,
+      completed_count: completedRuns,
+      failed_count: failedRuns,
+      pending_approval_count: pendingApprovals,
+      waiting_user_count: waitingRuns + pendingApprovals,
+      new_artifact_count: artifacts,
+      no_progress_project_count: noProgressProjects,
+      model_cost_estimate: Math.round(cost * 1000000) / 1000000,
+      external_unhandled_count: externalUnhandled,
+      items,
+    };
+  }
+
+  private recordRoomRoutingDecision(req: ChatRequest, context: {
+    conversation_id: string;
+    message_id: string;
+    run_id: string;
+    agent_id: string;
+    route_result: Record<string, unknown>;
+    room_route?: RoomRouteResolution | null;
+  }): void {
+    const resolution = context.room_route ?? this.resolveRoomKernelRoute(req, context.conversation_id, req.message || '');
+    const room = resolution?.room ?? this.resolveRoomForChat(req, context.conversation_id);
+    if (!room) return;
+    const hasResolution = Boolean(resolution);
+    const speakerPersonaID = hasResolution ? resolution?.speaker_persona_id || '' : room.persona_id || context.agent_id;
+    const ownerProjectID = hasResolution ? resolution?.owner_project_id || '' : room.project_id || '';
+    const executorPersonaID = hasResolution ? resolution?.executor_persona_id || '' : speakerPersonaID;
+    const reasonCodes = resolution?.reason_codes?.length ? resolution.reason_codes : [
+      room.type === 'project_dm' ? 'PROJECT_DM_DEFAULT' : 'ROOM_KERNEL_DEFAULT',
+      req.scope_override ? `SCOPE_${String(req.scope_override).toUpperCase()}` : '',
+    ].filter(Boolean);
+    const threadLink = this.resolveMessengerThreadLink(req, {
+      room,
+      conversation_id: context.conversation_id,
+      message_id: context.message_id,
+      run_id: context.run_id,
+      speaker_persona_id: speakerPersonaID,
+      owner_project_id: ownerProjectID,
+      executor_persona_id: executorPersonaID,
+      collaborator_persona_ids: resolution?.collaborator_persona_ids || [],
+      base_thread_action: resolution?.thread_action || { type: 'continue_or_create', source: 'room_kernel_foundation' },
+    });
+    this.exec(
+      `INSERT INTO routing_decisions (id, room_id, message_id, run_id, speaker_persona_id, owner_project_id,
+                                      executor_persona_id, collaborator_project_ids, execution_scope, write_targets,
+                                      thread_action, confidence, risk, requires_confirmation, reason_codes, metadata, created_at)
+       VALUES (?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+      `rdec_${newID()}`,
+      room.id,
+      context.message_id,
+      context.run_id,
+      speakerPersonaID,
+      ownerProjectID,
+      executorPersonaID,
+      json(resolution?.collaborator_project_ids || []),
+      resolution?.execution_scope || req.scope_override || (room.type === 'project_dm' ? 'current_project' : 'auto_route'),
+      json(resolution?.write_targets || (ownerProjectID ? [ownerProjectID, room.id] : [room.id])),
+      json(threadLink.thread_action),
+      resolution?.confidence ?? (room.type === 'project_dm' ? 1 : 0.74),
+      resolution?.risk || permissionProfileRisk(req.permission_profile),
+      resolution?.requires_confirmation ? 1 : 0,
+      json(reasonCodes),
+      json({
+        route_result: context.route_result,
+        room_type: room.type,
+        room_kernel: resolution ? routeResolutionForTrace({ ...resolution, thread_action: threadLink.thread_action }) : undefined,
+        collaborator_persona_ids: resolution?.collaborator_persona_ids || [],
+      }),
+    );
+    this.exec(`UPDATE rooms SET floor_holder_persona_id=NULLIF(?, ''), updated_at=datetime('now') WHERE id=?`, speakerPersonaID, room.id);
+    if (resolution?.requires_confirmation) {
+      this.ensureRouteConfirmationRequest(req, {
+        run_id: context.run_id,
+        room,
+        resolution: { ...resolution, thread_action: threadLink.thread_action },
+        reason_codes: reasonCodes,
+      });
+    }
+  }
+
+  private ensureRouteConfirmationRequest(req: ChatRequest, context: {
+    run_id: string;
+    room: MessengerRoom;
+    resolution: RoomRouteResolution;
+    reason_codes: string[];
+  }): void {
+    const existing = this.get(
+      `SELECT id FROM confirmation_requests
+       WHERE run_id=? AND requested_action='确认消息归属与执行范围' AND status='pending'
+       LIMIT 1`,
+      context.run_id,
+    );
+    if (existing) return;
+    const confirmationID = `confirm_route_${newID()}`;
+    const approvalKey = `route:${context.run_id}`;
+    const input = {
+      operation_id: approvalKey,
+      room_id: context.room.id,
+      room_title: context.room.title,
+      room_type: context.room.type,
+      message: req.message || '',
+      input_mode: req.input_mode || 'auto',
+      permission_profile: req.permission_profile || 'read_only',
+      speaker_persona_id: context.resolution.speaker_persona_id || '',
+      owner_project_id: context.resolution.owner_project_id || '',
+      executor_persona_id: context.resolution.executor_persona_id || '',
+      execution_scope: context.resolution.execution_scope,
+      confidence: context.resolution.confidence,
+      risk: context.resolution.risk,
+      reason_codes: context.reason_codes,
+      thread_action: context.resolution.thread_action,
+      reversible: true,
+    };
+    this.exec(
+      `INSERT INTO confirmation_requests (id, run_id, capability_id, requested_action, risk_level, status, input, approval_scope, approval_key)
+       VALUES (?, ?, NULL, '确认消息归属与执行范围', ?, 'pending', ?, 'one_call', ?)`,
+      confirmationID,
+      context.run_id,
+      context.resolution.risk,
+      json(input),
+      approvalKey,
+    );
+    this.insertRunEvent(context.run_id, '', this.nextRunEventSeq(context.run_id), 'route.confirmation_required', {
+      item_type: 'routing_decision',
+      item_id: confirmationID,
+      confirmation_id: confirmationID,
+      status: 'waiting_confirmation',
+      visibility: 'approval',
+      source: 'room_kernel',
+      risk: context.resolution.risk,
+      room_id: context.room.id,
+      owner_project_id: context.resolution.owner_project_id || '',
+      speaker_persona_id: context.resolution.speaker_persona_id || '',
+      reason_codes: context.reason_codes,
+    });
+  }
+
+  private resolveMessengerThreadLink(req: ChatRequest, context: {
+    room: MessengerRoom;
+    conversation_id: string;
+    message_id: string;
+    run_id: string;
+    speaker_persona_id: string;
+    owner_project_id: string;
+    executor_persona_id: string;
+    collaborator_persona_ids?: string[];
+    base_thread_action: Record<string, unknown>;
+  }): MessengerThreadLink {
+    const message = req.message || '';
+    const mode = effectiveInputMode(req, message);
+    const baseType = optionalString(context.base_thread_action.type) || 'continue_or_create';
+    const roomScope = req.scope_override === 'room_scope' || req.scope_override === 'temporary' || baseType === 'none';
+    if (!context.owner_project_id || roomScope || isExplicitChatOnlyIntent(message) || isMemoryOrReflectionOnlyIntent(message)) {
+      return {
+        thread_action: {
+          type: 'none',
+          source: 'thread_manager',
+          reason: !context.owner_project_id ? 'no_owner_project' : roomScope ? 'room_scope' : 'non_project_chat',
+        },
+      };
+    }
+    const shouldTrack = shouldCreateProductTask(req, message, mode)
+      || isTaskContinuationIntent(message)
+      || Boolean(req.product_task_id?.trim())
+      || context.room.type === 'project_dm';
+    if (!shouldTrack) {
+      return {
+        thread_action: {
+          type: 'none',
+          source: 'thread_manager',
+          reason: 'chat_assist_without_task',
+        },
+      };
+    }
+    const replyThreadID = req.reply_to_message_id ? this.threadIDForMessage(req.reply_to_message_id) : '';
+    const explicitTaskThreadID = req.product_task_id ? this.threadIDForProductTask(req.product_task_id) : '';
+    const continuationThreadID = replyThreadID
+      || explicitTaskThreadID
+      || (isTaskContinuationIntent(message) ? this.latestOpenMessengerThreadID(context.owner_project_id, context.room.id, context.speaker_persona_id) : '');
+    const actionType = continuationThreadID ? 'continue' : 'create';
+    const threadID = continuationThreadID || `mthread_${newID()}`;
+    const artifactIDs = this.artifactIDsForRun(context.run_id);
+    const productTaskID = optionalString(req.product_task_id) || this.productTaskIDForRun(context.run_id) || '';
+    const title = actionType === 'create' ? titleFromMessage(message) : '';
+    const goal = message.trim();
+    const metadata = {
+      source: 'thread_manager',
+      mode,
+      product_task_id: productTaskID,
+      base_thread_action: context.base_thread_action,
+    };
+    if (actionType === 'create') {
+      this.exec(
+        `INSERT INTO messenger_threads (id, project_id, room_id, owner_persona_id, title, goal, status, priority,
+                                       collaborator_persona_ids, source_room_ids, source_message_ids, run_ids,
+                                       artifact_ids, next_action, metadata, created_at, updated_at)
+         VALUES (?, ?, ?, NULLIF(?, ''), ?, ?, 'active', 'normal', ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+        threadID,
+        context.owner_project_id,
+        context.room.id,
+        context.speaker_persona_id || context.executor_persona_id,
+        title || 'Project Thread',
+        goal,
+        json(context.collaborator_persona_ids || []),
+        json([context.room.id]),
+        json([context.message_id]),
+        json([context.run_id]),
+        json(artifactIDs),
+        '等待下一步',
+        json(metadata),
+      );
+    } else {
+      this.mergeMessengerThreadReferences(threadID, {
+        room_id: context.room.id,
+        message_id: context.message_id,
+        run_id: context.run_id,
+        artifact_ids: artifactIDs,
+        collaborator_persona_ids: context.collaborator_persona_ids || [],
+        next_action: '继续当前目标',
+        metadata,
+      });
+    }
+    this.exec(
+      `INSERT INTO messenger_thread_events (id, thread_id, room_id, message_id, run_id, artifact_id, product_task_id,
+                                            event_type, summary, metadata, created_at)
+       VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, datetime('now'))`,
+      `thev_${newID()}`,
+      threadID,
+      context.room.id,
+      context.message_id,
+      context.run_id,
+      artifactIDs[0] || '',
+      productTaskID,
+      actionType === 'create' ? 'thread.created' : 'thread.continued',
+      actionType === 'create' ? (title || 'New project thread') : 'Continued existing thread',
+      json(metadata),
+    );
+    return {
+      thread_id: threadID,
+      thread_action: {
+        type: actionType,
+        thread_id: threadID,
+        source: 'thread_manager',
+        mode,
+        product_task_id: productTaskID,
+        artifact_ids: artifactIDs,
+      },
+    };
+  }
+
+  private mergeMessengerThreadReferences(threadID: string, refs: {
+    room_id?: string;
+    message_id?: string;
+    run_id?: string;
+    artifact_ids?: string[];
+    collaborator_persona_ids?: string[];
+    next_action?: string;
+    metadata?: Record<string, unknown>;
+  }): void {
+    const row = this.get(`SELECT source_room_ids, source_message_ids, run_ids, artifact_ids, collaborator_persona_ids, metadata FROM messenger_threads WHERE id=?`, threadID);
+    if (!row) return;
+    const roomIDs = mergeStringIDs(parseArray(row.source_room_ids), refs.room_id ? [refs.room_id] : []);
+    const messageIDs = mergeStringIDs(parseArray(row.source_message_ids), refs.message_id ? [refs.message_id] : []);
+    const runIDs = mergeStringIDs(parseArray(row.run_ids), refs.run_id ? [refs.run_id] : []);
+    const artifactIDs = mergeStringIDs(parseArray(row.artifact_ids), refs.artifact_ids || []);
+    const collaboratorPersonaIDs = mergeStringIDs(parseArray(row.collaborator_persona_ids), refs.collaborator_persona_ids || []);
+    const metadata = { ...parseObject(row.metadata), ...(refs.metadata || {}) };
+    this.exec(
+      `UPDATE messenger_threads
+       SET source_room_ids=?, source_message_ids=?, run_ids=?, artifact_ids=?, collaborator_persona_ids=?, next_action=?, metadata=?,
+           status=CASE WHEN status IN ('completed', 'archived') THEN status ELSE 'active' END,
+           updated_at=datetime('now')
+       WHERE id=?`,
+      json(roomIDs),
+      json(messageIDs),
+      json(runIDs),
+      json(artifactIDs),
+      json(collaboratorPersonaIDs),
+      refs.next_action || '继续当前目标',
+      json(metadata),
+      threadID,
+    );
+  }
+
+  private threadIDForMessage(messageID: string): string {
+    const row = this.get(
+      `SELECT thread_id FROM messenger_thread_events WHERE message_id=? ORDER BY datetime(created_at) DESC LIMIT 1`,
+      messageID,
+    );
+    return optionalString(row?.thread_id) || '';
+  }
+
+  private threadIDForProductTask(productTaskID: string): string {
+    const row = this.get(
+      `SELECT thread_id FROM messenger_thread_events WHERE product_task_id=? ORDER BY datetime(created_at) DESC LIMIT 1`,
+      productTaskID.trim(),
+    );
+    return optionalString(row?.thread_id) || '';
+  }
+
+  private latestOpenMessengerThreadID(projectID: string, roomID: string, personaID: string): string {
+    const row = this.get(
+      `SELECT id FROM messenger_threads
+       WHERE project_id=?
+         AND status IN ('active', 'waiting_user', 'waiting_external', 'paused')
+         AND (?='' OR room_id=? OR instr(source_room_ids, ?) > 0)
+         AND (?='' OR owner_persona_id=?)
+       ORDER BY datetime(updated_at) DESC, id DESC
+       LIMIT 1`,
+      projectID,
+      roomID,
+      roomID,
+      roomID,
+      personaID,
+      personaID,
+    );
+    return optionalString(row?.id) || '';
+  }
+
+  private routeFromActiveThread(roomID: string, message: string, personas: ProjectPersona[]): ProjectPersona | null {
+    if (!isTaskContinuationIntent(message)) return null;
+    const row = this.get(
+      `SELECT owner_persona_id FROM messenger_threads
+       WHERE status IN ('active', 'waiting_user', 'waiting_external', 'paused')
+         AND (room_id=? OR instr(source_room_ids, ?) > 0)
+         AND owner_persona_id IS NOT NULL
+       ORDER BY datetime(updated_at) DESC, id DESC
+       LIMIT 1`,
+      roomID,
+      roomID,
+    );
+    const personaID = optionalString(row?.owner_persona_id);
+    return personaID ? personas.find((persona) => persona.id === personaID) ?? null : null;
+  }
+
+  private productTaskIDForRun(runID: string): string {
+    const runMetadata = parseObject(this.get(`SELECT metadata FROM runs WHERE id=?`, runID)?.metadata);
+    return optionalString(runMetadata.product_task_id)
+      || optionalString(this.get(`SELECT id FROM product_tasks WHERE latest_run_id=? OR source_run_id=? ORDER BY datetime(updated_at) DESC LIMIT 1`, runID, runID)?.id)
+      || '';
+  }
+
+  private artifactIDsForRun(runID: string): string[] {
+    return this.all(
+      `SELECT id FROM artifacts WHERE source_run_id=? ORDER BY datetime(created_at) ASC`,
+      runID,
+    ).map((row) => String(row.id));
+  }
+
+  private attachMessengerThreadArtifacts(runID: string, productTaskID: string | undefined, artifactIDs: string[]): void {
+    if (artifactIDs.length === 0 && !productTaskID) return;
+    const row = this.get(
+      `SELECT thread_id FROM messenger_thread_events
+       WHERE run_id=?
+       ORDER BY datetime(created_at) DESC
+       LIMIT 1`,
+      runID,
+    );
+    const threadID = optionalString(row?.thread_id);
+    if (!threadID) return;
+    this.mergeMessengerThreadReferences(threadID, {
+      run_id: runID,
+      artifact_ids: artifactIDs,
+      metadata: { product_task_id: productTaskID || '' },
+      next_action: '检查产物或继续推进',
+    });
+    for (const artifactID of artifactIDs) {
+      const existing = this.get(
+        `SELECT id FROM messenger_thread_events WHERE thread_id=? AND artifact_id=? LIMIT 1`,
+        threadID,
+        artifactID,
+      );
+      if (existing) continue;
+      this.exec(
+        `INSERT INTO messenger_thread_events (id, thread_id, run_id, artifact_id, product_task_id, event_type, summary, metadata, created_at)
+         VALUES (?, ?, ?, ?, NULLIF(?, ''), 'artifact.linked', 'Artifact linked to thread', ?, datetime('now'))`,
+        `thev_${newID()}`,
+        threadID,
+        runID,
+        artifactID,
+        productTaskID || '',
+        json({ source: 'thread_manager' }),
+      );
+    }
+  }
+
+  private resolveRoomKernelRoute(req: ChatRequest, conversationID: string, message: string): RoomRouteResolution | null {
+    const room = this.resolveRoomForChat(req, conversationID);
+    if (!room) return null;
+    const risk = permissionProfileRisk(req.permission_profile);
+    const roomPersonas = (room.members ?? [])
+      .filter((member) => member.type === 'persona' && member.persona_id)
+      .map((member) => this.requireProjectPersona(member.persona_id!));
+    const projectCache = new Map<string, MessengerProject | null>();
+    const projectForID = (projectID?: string): MessengerProject | null => {
+      const normalizedProjectID = projectID?.trim();
+      if (!normalizedProjectID) return null;
+      if (!projectCache.has(normalizedProjectID)) {
+        const row = this.get(`SELECT * FROM projects WHERE id=?`, normalizedProjectID);
+        projectCache.set(normalizedProjectID, row ? rowToMessengerProject(row) : null);
+      }
+      return projectCache.get(normalizedProjectID) ?? null;
+    };
+    const projectForPersona = (persona: ProjectPersona): MessengerProject | null => projectForID(persona.project_id);
+    const projectIsRouteable = (projectID?: string): boolean => {
+      const project = projectForID(projectID);
+      return Boolean(project && project.status !== 'archived' && project.status !== 'deleted');
+    };
+    const allAvailablePersonas = this.all(`SELECT * FROM personas WHERE status NOT IN ('archived', 'deleted')`)
+      .map(rowToProjectPersona)
+      .filter((persona) => projectIsRouteable(persona.project_id));
+    const routeablePersonas = roomPersonas.filter((persona) => (
+      persona.status !== 'archived'
+      && persona.status !== 'deleted'
+      && projectIsRouteable(persona.project_id)
+    ));
+    const collaboratorCandidatePersonas = room.type === 'project_dm' ? allAvailablePersonas : routeablePersonas;
+    const messageEntityMatchesPersona = (persona: ProjectPersona): boolean => {
+      const project = projectForPersona(persona);
+      const projectName = project?.name || '';
+      const directProjectHit = Boolean(projectName && message.includes(projectName));
+      const directHandleHit = Boolean(persona.handle && message.includes(persona.handle));
+      const activeDisplayHit = persona.status !== 'dormant' && Boolean(persona.display_name && message.includes(persona.display_name));
+      const activeRoomSubtitleHit = persona.project_id === room.project_id
+        && persona.status !== 'dormant'
+        && Boolean(room.subtitle && message.includes(room.subtitle));
+      return directProjectHit || directHandleHit || activeDisplayHit || activeRoomSubtitleHit;
+    };
+    const activePersonas = routeablePersonas.filter((persona) => persona.status !== 'dormant');
+    const excludedArchivedProject = roomPersonas.some((persona) => !routeablePersonas.some((candidate) => candidate.id === persona.id));
+    const explicitMentionPersonas = routeablePersonas.filter((persona) => messageMentionsPersona(message, persona, req.mentions));
+    const explicitMention = explicitMentionPersonas[0] || null;
+    const replyRoute = req.reply_to_message_id ? this.routeFromReply(req.reply_to_message_id, routeablePersonas) : null;
+    const activeLock = this.get(
+      `SELECT persona_id FROM route_locks WHERE room_id=? AND user_id=? AND status='active' ORDER BY datetime(started_at) DESC LIMIT 1`,
+      room.id,
+      req.user_id?.trim() || 'desktop_user',
+    );
+    const lockedPersona = activeLock?.persona_id
+      ? routeablePersonas.find((persona) => persona.id === String(activeLock.persona_id))
+      : null;
+    const entityHitPersonas = routeablePersonas.filter(messageEntityMatchesPersona);
+    const entityHit = entityHitPersonas[0] || null;
+    const activeThreadRoute = this.routeFromActiveThread(room.id, message, activePersonas);
+    const humanCount = (room.members ?? []).filter((member) => member.type === 'human' || member.type === 'user').length;
+    const throttleMultiHumanAI = room.type === 'shared'
+      && humanCount > 1
+      && !['active', 'temporary'].includes(room.default_ai_participation)
+      && !replyRoute
+      && !explicitMention
+      && !lockedPersona
+      && !entityHit;
+    const scope = req.scope_override || defaultScopeForRoomType(room.type);
+    const forceRoomScope = scope === 'room_scope' || scope === 'temporary';
+    const selectedPersona = room.type === 'project_dm'
+      ? routeablePersonas.find((persona) => persona.id === room.persona_id) || null
+      : throttleMultiHumanAI
+        ? null
+        : replyRoute || explicitMention || lockedPersona || entityHit || activeThreadRoute || activePersonas.find((persona) => persona.id === room.floor_holder_persona_id) || null;
+    const dormantWake = Boolean(
+      selectedPersona?.status === 'dormant'
+      && (replyRoute || explicitMention || lockedPersona || entityHit),
+    );
+    if (dormantWake && selectedPersona) {
+      this.exec(
+        `UPDATE personas
+         SET status='active',
+             metadata=json_set(COALESCE(metadata, '{}'), '$.last_dormant_wake_at', ?, '$.last_dormant_wake_reason', 'route_direct_hit'),
+             updated_at=datetime('now')
+         WHERE id=?`,
+        nowIso(),
+        selectedPersona.id,
+      );
+    }
+    const roomProjectID = projectIsRouteable(room.project_id) ? room.project_id || '' : '';
+    const ownerProjectID = forceRoomScope || throttleMultiHumanAI ? '' : selectedPersona?.project_id || roomProjectID;
+    const collaboratorPersonas = selectedPersona && ownerProjectID && !forceRoomScope && !throttleMultiHumanAI
+      ? collaboratorCandidatePersonas.filter((persona) => (
+        persona.id !== selectedPersona.id
+        && persona.project_id !== ownerProjectID
+        && (messageMentionsPersona(message, persona, req.mentions) || messageEntityMatchesPersona(persona))
+      ))
+      : [];
+    const collaboratorPersonaIDs = mergeStringIDs([], collaboratorPersonas.map((persona) => persona.id));
+    const collaboratorProjectIDs = mergeStringIDs([], collaboratorPersonas.map((persona) => persona.project_id).filter((projectID) => projectID && projectID !== ownerProjectID));
+    const dormantCollaboratorWake = collaboratorPersonas.some((persona) => persona.status === 'dormant');
+    for (const persona of collaboratorPersonas) {
+      if (persona.status !== 'dormant') continue;
+      this.exec(
+        `UPDATE personas
+         SET status='active',
+             metadata=json_set(COALESCE(metadata, '{}'), '$.last_dormant_wake_at', ?, '$.last_dormant_wake_reason', 'collaborator_direct_hit'),
+             updated_at=datetime('now')
+         WHERE id=?`,
+        nowIso(),
+        persona.id,
+      );
+    }
+    const reasonCodes = [
+      room.type === 'project_dm' ? 'PROJECT_DM_DEFAULT' : '',
+      replyRoute ? 'REPLY_TO_PERSONA' : '',
+      explicitMention ? 'EXPLICIT_MENTION' : '',
+      lockedPersona && !explicitMention && !replyRoute ? 'ROUTE_LOCK_ACTIVE' : '',
+      entityHit && !explicitMention && !replyRoute ? 'PROJECT_ENTITY_MATCH' : '',
+      activeThreadRoute && selectedPersona?.id === activeThreadRoute.id && !entityHit && !explicitMention && !replyRoute && !lockedPersona ? 'ACTIVE_THREAD_CONTINUITY' : '',
+      room.floor_holder_persona_id && selectedPersona?.id === room.floor_holder_persona_id ? 'FLOOR_CONTINUITY' : '',
+      collaboratorProjectIDs.length > 0 ? 'CROSS_PROJECT_REFERENCE' : '',
+      collaboratorPersonaIDs.length > 0 ? 'COLLABORATOR_PERSONA_INVITED' : '',
+      dormantWake || dormantCollaboratorWake ? 'DORMANT_PERSONA_WOKEN' : '',
+      excludedArchivedProject ? 'ARCHIVED_PROJECT_EXCLUDED' : '',
+      forceRoomScope ? 'ROOM_SCOPE_OVERRIDE' : '',
+      throttleMultiHumanAI ? 'MULTI_HUMAN_MODERATE_AI_THROTTLE' : '',
+      risk !== 'low' ? `RISK_${risk.toUpperCase()}` : '',
+    ].filter(Boolean);
+    const confidence = room.type === 'project_dm' || explicitMention || replyRoute || lockedPersona
+      ? 1
+      : entityHit
+        ? 0.86
+        : selectedPersona
+          ? 0.72
+          : 0.42;
+    const requiresConfirmation = risk !== 'low' && (!ownerProjectID || confidence < 0.8);
+    return {
+      room,
+      speaker_persona_id: selectedPersona?.id,
+      owner_project_id: ownerProjectID,
+      executor_persona_id: forceRoomScope && room.type !== 'project_dm' ? undefined : selectedPersona?.id,
+      collaborator_project_ids: collaboratorProjectIDs,
+      collaborator_persona_ids: collaboratorPersonaIDs,
+      execution_scope: forceRoomScope || !ownerProjectID ? 'room_scope' : collaboratorProjectIDs.length > 0 ? 'cross_project' : room.type === 'project_dm' ? 'current_project' : scope,
+      write_targets: ownerProjectID ? [ownerProjectID, room.id] : [room.id],
+      thread_action: { type: forceRoomScope || !ownerProjectID ? 'none' : 'continue_or_create', source: 'room_kernel' },
+      confidence,
+      risk,
+      requires_confirmation: requiresConfirmation,
+      reason_codes: reasonCodes.length ? reasonCodes : ['ROOM_SCOPE_LOW_CONFIDENCE'],
+    };
+  }
+
+  private routeFromReply(messageID: string, personas: ProjectPersona[]): ProjectPersona | null {
+    const direct = this.get(
+      `SELECT speaker_persona_id FROM routing_decisions WHERE message_id=? AND speaker_persona_id IS NOT NULL ORDER BY datetime(created_at) DESC LIMIT 1`,
+      messageID,
+    );
+    const directPersonaID = optionalString(direct?.speaker_persona_id);
+    if (directPersonaID) return personas.find((persona) => persona.id === directPersonaID) ?? null;
+    const messageRow = this.get(`SELECT json_extract(metadata, '$.run_id') AS run_id FROM messages WHERE id=?`, messageID);
+    const runID = optionalString(messageRow?.run_id);
+    if (!runID) return null;
+    const byRun = this.get(
+      `SELECT speaker_persona_id FROM routing_decisions WHERE run_id=? AND speaker_persona_id IS NOT NULL ORDER BY datetime(created_at) DESC LIMIT 1`,
+      runID,
+    );
+    const personaID = optionalString(byRun?.speaker_persona_id);
+    return personaID ? personas.find((persona) => persona.id === personaID) ?? null : null;
+  }
+
+  private resolveRoomForChat(req: ChatRequest, conversationID: string): MessengerRoom | null {
+    const roomID = req.room_id?.trim();
+    if (roomID) {
+      const row = this.get(`SELECT * FROM rooms WHERE id=?`, roomID);
+      if (row) return rowToMessengerRoom(row, this.listRoomMembers(roomID));
+    }
+    const row = this.get(`SELECT * FROM rooms WHERE conversation_id=? ORDER BY datetime(updated_at) DESC LIMIT 1`, conversationID);
+    if (row) return rowToMessengerRoom(row, this.listRoomMembers(String(row.id)));
+    return null;
+  }
+
   private transaction(fn: () => void): void {
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -8102,6 +10803,207 @@ function rowToConversationMessage(row: SQLiteRow): ConversationMessage {
   };
 }
 
+function rowToMessengerProject(row: SQLiteRow): MessengerProject {
+  return {
+    id: String(row.id),
+    name: optionalString(row.name) || 'Joi Project',
+    goal: optionalString(row.goal),
+    domain: optionalString(row.domain),
+    phase: optionalString(row.phase),
+    risk_level: optionalString(row.risk_level) || 'low',
+    status: optionalString(row.status) || 'active',
+    summary: optionalString(row.summary),
+    metadata: parseObject(row.metadata),
+    created_at: optionalString(row.created_at),
+    updated_at: optionalString(row.updated_at),
+    archived_at: optionalString(row.archived_at),
+  };
+}
+
+function rowToProjectPersona(row: SQLiteRow): ProjectPersona {
+  const traitsRaw = parseObject(row.traits);
+  const traits: Record<string, number> = {};
+  for (const [key, value] of Object.entries(traitsRaw)) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) traits[key] = numeric;
+  }
+  return {
+    id: String(row.id),
+    project_id: String(row.project_id),
+    display_name: optionalString(row.display_name) || 'Joi',
+    handle: optionalString(row.handle) || '@joi',
+    avatar: optionalString(row.avatar),
+    tagline: optionalString(row.tagline),
+    self_intro: optionalString(row.self_intro),
+    traits,
+    disagreement_style: optionalString(row.disagreement_style),
+    uncertainty_style: optionalString(row.uncertainty_style),
+    status: optionalString(row.status) || 'active',
+    version: Number(row.version ?? 1),
+    capabilities: parseArray(row.capabilities).map(String),
+    permission_summary: optionalString(row.permission_summary),
+    model_strategy: optionalString(row.model_strategy),
+    metadata: parseObject(row.metadata),
+    created_at: optionalString(row.created_at),
+    updated_at: optionalString(row.updated_at),
+  };
+}
+
+function rowToMessengerRoom(row: SQLiteRow, members: MessengerRoom['members'] = []): MessengerRoom {
+  return {
+    id: String(row.id),
+    type: optionalString(row.type) || 'project_dm',
+    title: cleanMessengerTitle(optionalString(row.title) || 'Joi 项目私聊'),
+    subtitle: optionalString(row.subtitle),
+    owner_user_id: optionalString(row.owner_user_id) || 'desktop_user',
+    project_id: optionalString(row.project_id),
+    persona_id: optionalString(row.persona_id),
+    conversation_id: optionalString(row.conversation_id),
+    default_ai_participation: optionalString(row.default_ai_participation) || 'moderate',
+    floor_holder_persona_id: optionalString(row.floor_holder_persona_id),
+    route_lock_persona_id: optionalString(row.route_lock_persona_id),
+    unread_count: Number(row.unread_count ?? 0),
+    pending_approval_count: Number(row.pending_approval_count ?? 0),
+    failed_run_count: Number(row.failed_run_count ?? 0),
+    running_run_count: Number(row.running_run_count ?? 0),
+    last_message: optionalString(row.last_message),
+    last_role: optionalString(row.last_role),
+    last_activity_at: optionalString(row.updated_at) || optionalString(row.created_at),
+    archived_at: optionalString(row.archived_at),
+    metadata: parseObject(row.metadata),
+    members,
+  };
+}
+
+function rowToRoomConnector(row: SQLiteRow): RoomConnector {
+  return {
+    id: String(row.id),
+    room_id: String(row.room_id),
+    provider: optionalString(row.provider) || 'external',
+    connector_id: optionalString(row.connector_id) || String(row.id),
+    external_room_id: optionalString(row.external_room_id) || '',
+    status: optionalString(row.status) || 'active',
+    visible_persona_ids: parseArray(row.visible_persona_ids).map(String),
+    allow_temporary_invite: Boolean(Number(row.allow_temporary_invite ?? 0)),
+    retry_count: Number(row.retry_count ?? 0),
+    last_error: optionalString(row.last_error),
+    metadata: parseObject(row.metadata),
+    created_at: optionalString(row.created_at),
+    updated_at: optionalString(row.updated_at),
+  };
+}
+
+function rowToExternalConnectorEvent(row: SQLiteRow): ExternalConnectorEvent {
+  return {
+    id: String(row.id),
+    connector_id: String(row.connector_id),
+    provider: optionalString(row.provider) || 'external',
+    external_event_id: optionalString(row.external_event_id) || '',
+    room_id: String(row.room_id),
+    external_user_id: optionalString(row.external_user_id) || '',
+    reply_to_external_message_id: optionalString(row.reply_to_external_message_id),
+    text: optionalString(row.text) || '',
+    internal_message_id: optionalString(row.internal_message_id),
+    status: optionalString(row.status) || 'received',
+    retry_count: Number(row.retry_count ?? 0),
+    error: optionalString(row.error),
+    metadata: parseObject(row.metadata),
+    created_at: optionalString(row.created_at),
+  };
+}
+
+function rowToRouteLock(row: SQLiteRow): RouteLock {
+  return {
+    room_id: String(row.room_id),
+    user_id: optionalString(row.user_id) || 'desktop_user',
+    persona_id: String(row.persona_id),
+    started_at: optionalString(row.started_at),
+    expires_at: optionalString(row.expires_at),
+    status: optionalString(row.status) || 'active',
+  };
+}
+
+function rowToRoutingDecision(row: SQLiteRow): RoutingDecision {
+  return {
+    id: String(row.id),
+    room_id: String(row.room_id),
+    message_id: optionalString(row.message_id),
+    run_id: optionalString(row.run_id),
+    speaker_persona_id: optionalString(row.speaker_persona_id),
+    owner_project_id: optionalString(row.owner_project_id),
+    executor_persona_id: optionalString(row.executor_persona_id),
+    collaborator_project_ids: parseArray(row.collaborator_project_ids).map(String),
+    execution_scope: optionalString(row.execution_scope) || 'room_scope',
+    write_targets: parseArray(row.write_targets).map(String),
+    thread_action: parseObject(row.thread_action),
+    confidence: Number(row.confidence ?? 0),
+    risk: optionalString(row.risk) || 'low',
+    requires_confirmation: Boolean(Number(row.requires_confirmation ?? 0)),
+    reason_codes: parseArray(row.reason_codes).map(String),
+    created_at: optionalString(row.created_at),
+  };
+}
+
+function rowToMessengerThread(row: SQLiteRow): MessengerThread {
+  return {
+    id: String(row.id),
+    project_id: optionalString(row.project_id),
+    project_name: optionalString(row.project_name),
+    room_id: optionalString(row.room_id),
+    room_title: optionalString(row.room_title),
+    owner_persona_id: optionalString(row.owner_persona_id),
+    owner_persona_name: optionalString(row.owner_persona_name),
+    title: optionalString(row.title) || 'Untitled Thread',
+    goal: optionalString(row.goal),
+    status: optionalString(row.status) || 'active',
+    priority: optionalString(row.priority) || 'normal',
+    collaborator_persona_ids: parseArray(row.collaborator_persona_ids).map(String),
+    source_room_ids: parseArray(row.source_room_ids).map(String),
+    source_message_ids: parseArray(row.source_message_ids).map(String),
+    run_ids: parseArray(row.run_ids).map(String),
+    artifact_ids: parseArray(row.artifact_ids).map(String),
+    next_action: optionalString(row.next_action),
+    message_count: Number(row.message_count ?? 0),
+    run_count: Number(row.run_count ?? 0),
+    artifact_count: Number(row.artifact_count ?? 0),
+    latest_run_status: optionalString(row.latest_run_status),
+    metadata: parseObject(row.metadata),
+    created_at: optionalString(row.created_at),
+    updated_at: optionalString(row.updated_at),
+    closed_at: optionalString(row.closed_at),
+  };
+}
+
+function rowToMessengerThreadEvent(row: SQLiteRow): MessengerThreadEvent {
+  return {
+    id: String(row.id),
+    thread_id: String(row.thread_id),
+    room_id: optionalString(row.room_id),
+    message_id: optionalString(row.message_id),
+    run_id: optionalString(row.run_id),
+    artifact_id: optionalString(row.artifact_id),
+    product_task_id: optionalString(row.product_task_id),
+    event_type: optionalString(row.event_type) || 'message_linked',
+    summary: optionalString(row.summary),
+    metadata: parseObject(row.metadata),
+    created_at: optionalString(row.created_at),
+  };
+}
+
+function rowToPersonaVersion(row: SQLiteRow): PersonaVersion {
+  return {
+    id: String(row.id),
+    persona_id: String(row.persona_id),
+    version: Number(row.version ?? 1),
+    changed_by: optionalString(row.changed_by) || 'desktop_user',
+    change_reason: optionalString(row.change_reason) || '',
+    before: parseObject(row.before_json) as ProjectPersona,
+    after: parseObject(row.after_json) as ProjectPersona,
+    applies_from_message_id: optionalString(row.applies_from_message_id),
+    created_at: optionalString(row.created_at),
+  };
+}
+
 function rowToRunEvent(row: SQLiteRow): RunEvent {
   const payload = {
     ...parseObject(row.payload),
@@ -8199,6 +11101,172 @@ function rowToModelCall(row: SQLiteRow): ModelCall {
     dynamic_tail_hash: optionalString(row.dynamic_tail_hash),
     metadata: parseObject(row.metadata),
   };
+}
+
+function rowToModelTraceSpan(row: SQLiteRow): RunTraceSpan {
+  const inputTokens = Number(row.input_tokens ?? 0);
+  const outputTokens = Number(row.output_tokens ?? 0);
+  const cachedTokens = Number(row.cached_input_tokens ?? 0);
+  const totalTokens = Number(row.total_tokens ?? 0) || inputTokens + outputTokens;
+  const status = optionalString(row.status) || 'succeeded';
+  const error = optionalString(row.error_message) || optionalString(row.error_code);
+  const provider = optionalString(row.provider) || 'openai_compatible';
+  const modelName = optionalString(row.model_name) || 'model';
+  return {
+    id: `model:${String(row.id)}`,
+    run_id: optionalString(row.run_id) || '',
+    span_type: 'model_span',
+    event_type: status === 'failed' || error ? 'model_failed' : 'model_completed',
+    title: `${provider}/${modelName}`,
+    status,
+    room_id: optionalString(row.room_id),
+    room_title: optionalString(row.room_title),
+    project_id: optionalString(row.project_id),
+    project_name: optionalString(row.project_name),
+    persona_id: optionalString(row.persona_id),
+    persona_name: optionalString(row.persona_name),
+    model_provider: provider,
+    model_name: modelName,
+    duration_ms: optionalNumber(row.latency_ms),
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cached_input_tokens: cachedTokens,
+    total_tokens: totalTokens,
+    cost_estimate: optionalNumber(row.cost_estimate),
+    error,
+    has_error: hasErrorStatus(status, error),
+    has_external_side_effect: false,
+    created_at: optionalString(row.created_at),
+    metadata: {
+      prompt_cache_key: optionalString(row.prompt_cache_key),
+      prefix_hash: optionalString(row.prefix_hash),
+      dynamic_tail_hash: optionalString(row.dynamic_tail_hash),
+      usage_status: optionalString(row.usage_status),
+      finish_reason: optionalString(row.finish_reason),
+    },
+  };
+}
+
+function rowToToolTraceSpan(row: SQLiteRow): RunTraceSpan {
+  const status = optionalString(row.status) || 'pending';
+  const error = optionalString(row.error_message) || optionalString(row.error_code) || optionalString(row.error);
+  const sideEffectLevel = optionalString(row.side_effect_level) || 'none';
+  const riskLevel = optionalString(row.risk_level) || 'read_only';
+  const toolName = optionalString(row.tool_name) || optionalString(row.capability_id) || 'tool';
+  return {
+    id: `tool:${String(row.id)}`,
+    run_id: optionalString(row.run_id) || '',
+    span_type: 'tool_span',
+    event_type: hasErrorStatus(status, error) ? 'tool_failed' : 'tool_completed',
+    title: toolName,
+    status,
+    room_id: optionalString(row.room_id),
+    room_title: optionalString(row.room_title),
+    project_id: optionalString(row.project_id),
+    project_name: optionalString(row.project_name),
+    persona_id: optionalString(row.persona_id),
+    persona_name: optionalString(row.persona_name),
+    tool_name: toolName,
+    risk_level: riskLevel,
+    duration_ms: optionalNumber(row.duration_ms),
+    error: error ? redactSensitiveText(error) : undefined,
+    has_error: hasErrorStatus(status, error),
+    has_external_side_effect: sideEffectLevel !== 'none' && sideEffectLevel !== 'read_only' || !['read_only', 'low'].includes(riskLevel),
+    created_at: optionalString(row.created_at) || optionalString(row.started_at),
+    metadata: {
+      capability_id: optionalString(row.capability_id),
+      workflow_name: optionalString(row.workflow_name),
+      node_id: optionalString(row.node_id),
+      side_effect_level: sideEffectLevel,
+      approval_request_id: optionalString(row.approval_request_id),
+      output_summary: optionalString(row.output_summary),
+      artifact_id: optionalString(row.artifact_id),
+    },
+  };
+}
+
+function rowToEventTraceSpan(row: SQLiteRow): RunTraceSpan {
+  const payloadJson = parseObject(row.payload_json);
+  const payload = Object.keys(payloadJson).length > 0 ? payloadJson : parseObject(row.payload);
+  const eventType = optionalString(row.event_type) || 'run_event';
+  const status = optionalString(payload.status) || optionalString(row.status) || statusFromEventType(eventType);
+  const error = optionalString(row.error_json) || optionalString(payload.error) || optionalString(payload.message && status === 'failed' ? payload.message : '');
+  return {
+    id: `event:${String(row.id)}`,
+    run_id: optionalString(row.run_id) || '',
+    span_type: 'run_event',
+    event_type: eventType,
+    title: optionalString(row.message) || optionalString(payload.title) || optionalString(payload.summary) || eventType,
+    status,
+    room_id: optionalString(row.room_id),
+    room_title: optionalString(row.room_title),
+    project_id: optionalString(row.project_id),
+    project_name: optionalString(row.project_name),
+    persona_id: optionalString(row.persona_id),
+    persona_name: optionalString(row.persona_name),
+    risk_level: optionalString(row.risk_level),
+    duration_ms: optionalNumber(row.duration_ms),
+    error: error ? redactSensitiveText(error) : undefined,
+    has_error: hasErrorStatus(status, error) || eventType.endsWith('.failed') || eventType.endsWith('_failed'),
+    has_external_side_effect: eventType.includes('external') || eventType.includes('handoff'),
+    created_at: optionalString(row.created_at),
+    metadata: {
+      seq: optionalNumber(row.seq),
+      item_type: optionalString(row.item_type),
+      item_id: optionalString(row.item_id),
+      visibility: optionalString(row.visibility),
+      source: optionalString(row.source),
+      category: optionalString(row.category),
+      feature_key: optionalString(row.feature_key),
+    },
+  };
+}
+
+function traceSpanMatchesFilter(span: RunTraceSpan, filter: RunTraceSpanFilter): boolean {
+  if (filter.room_id && span.room_id !== filter.room_id) return false;
+  if (filter.project_id && span.project_id !== filter.project_id) return false;
+  if (filter.persona_id && span.persona_id !== filter.persona_id) return false;
+  if (filter.model_provider && span.model_provider !== filter.model_provider) return false;
+  if (filter.model_name && span.model_name !== filter.model_name) return false;
+  if (filter.span_type && span.span_type !== filter.span_type) return false;
+  if (filter.status && span.status !== filter.status) return false;
+  if (typeof filter.has_error === 'boolean' && span.has_error !== filter.has_error) return false;
+  if (typeof filter.has_external_side_effect === 'boolean' && span.has_external_side_effect !== filter.has_external_side_effect) return false;
+  return true;
+}
+
+function summarizeRunTraceSpans(spans: RunTraceSpan[]): RunTraceSpanSummary {
+  return spans.reduce<RunTraceSpanSummary>((summary, span) => {
+    summary.total += 1;
+    if (span.span_type === 'model_span') summary.model_count += 1;
+    if (span.span_type === 'tool_span') summary.tool_count += 1;
+    if (span.has_error) summary.error_count += 1;
+    if (span.has_external_side_effect) summary.external_side_effect_count += 1;
+    summary.total_tokens += Number(span.total_tokens ?? 0);
+    summary.total_cost_estimate += Number(span.cost_estimate ?? 0);
+    return summary;
+  }, {
+    total: 0,
+    model_count: 0,
+    tool_count: 0,
+    error_count: 0,
+    external_side_effect_count: 0,
+    total_tokens: 0,
+    total_cost_estimate: 0,
+  });
+}
+
+function statusFromEventType(eventType: string): string {
+  if (eventType.endsWith('.failed') || eventType.endsWith('_failed') || eventType === 'run.failed') return 'failed';
+  if (eventType.endsWith('.started') || eventType.endsWith('_started') || eventType === 'run.started') return 'running';
+  if (eventType.includes('approval') && (eventType.endsWith('.requested') || eventType.endsWith('.required'))) return 'waiting_approval';
+  if (eventType.endsWith('.completed') || eventType.endsWith('_completed') || eventType === 'run.completed') return 'completed';
+  return 'completed';
+}
+
+function hasErrorStatus(status: string, error?: string): boolean {
+  const normalized = status.toLowerCase();
+  return Boolean(error) || ['failed', 'error', 'blocked', 'policy_blocked'].includes(normalized);
 }
 
 function rowToMCPServer(row: SQLiteRow): MCPServerRecord {
@@ -9718,6 +12786,112 @@ function titleFromMessage(message: string): string {
   return trimmed.length > 36 ? `${trimmed.slice(0, 36)}...` : trimmed;
 }
 
+function cleanMessengerTitle(value: string): string {
+  const trimmed = value.trim().replace(/\s+/g, ' ');
+  if (!trimmed || /^new chat|new conversation|untitled|无标题会话|新聊天\s*\d*$/iu.test(trimmed)) {
+    return 'Joi 项目私聊';
+  }
+  return trimmed;
+}
+
+function stableRoomIDForConversation(conversationID: string): string {
+  return `room_${hashText(conversationID).slice(0, 16)}`;
+}
+
+function personaNameFromProject(projectName: string): string {
+  const compact = projectName
+    .replace(/项目|Project|工作区|workspace/giu, ' ')
+    .trim()
+    .split(/\s+/u)
+    .filter(Boolean)[0];
+  if (!compact) return 'Mira';
+  const cleaned = compact.replace(/[^\p{L}\p{N}_-]/gu, '');
+  if (!cleaned) return 'Mira';
+  return cleaned.length > 16 ? cleaned.slice(0, 16) : cleaned;
+}
+
+function normalizePersonaHandle(seed: string): string {
+  const normalized = seed
+    .trim()
+    .replace(/^@/u, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/gu, '-')
+    .replace(/^-+|-+$/gu, '');
+  return `@${normalized || 'persona'}`;
+}
+
+function permissionProfileRisk(profile?: PermissionProfile): string {
+  if (profile === 'danger_full_access') return 'high';
+  if (profile === 'workspace_write') return 'medium';
+  return 'low';
+}
+
+function isHighRiskApproval(riskLevel: string): boolean {
+  return ['high', 'destructive', 'unsafe', 'external_write', 'workspace_write', 'browser_interaction'].includes(riskLevel.trim().toLowerCase());
+}
+
+function permissionAuditSummary(
+  actorType: string,
+  actorRole: string,
+  projectIDs: string[],
+  canApproveHighRisk: boolean,
+  multiHumanThrottle: boolean,
+): string {
+  const scope = projectIDs.length > 0 ? `${projectIDs.length} 个授权项目` : '仅当前房间上下文';
+  const approval = canApproveHighRisk ? '可审批高风险动作' : '不可审批高风险动作';
+  const throttle = multiHumanThrottle ? '；多真人房间默认节制 AI 主动发言' : '';
+  return `${actorType}/${actorRole} · ${scope} · ${approval}${throttle}`;
+}
+
+function defaultScopeForRoomType(roomType?: string): string {
+  if (roomType === 'project_dm') return 'current_project';
+  if (roomType === 'private_hub' || roomType === 'shared' || roomType === 'external_mirror') return 'auto_route';
+  return 'room_scope';
+}
+
+function messageMentionsPersona(message: string, persona: ProjectPersona, explicitMentions?: string[]): boolean {
+  const mentions = (explicitMentions || []).map((item) => item.trim()).filter(Boolean);
+  if (mentions.some((item) => item === persona.id || item === persona.handle || item.replace(/^@/u, '') === persona.handle.replace(/^@/u, ''))) {
+    return true;
+  }
+  const normalizedHandle = persona.handle.startsWith('@') ? persona.handle : `@${persona.handle}`;
+  if (message.includes(normalizedHandle)) return true;
+  const escapedDisplay = persona.display_name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|\\s)@${escapedDisplay}(?=\\s|$|[，。,.!?！？:：])`, 'u').test(message);
+}
+
+function routeResolutionForTrace(resolution: RoomRouteResolution): Record<string, unknown> {
+  return {
+    room_id: resolution.room.id,
+    room_type: resolution.room.type,
+    speaker_persona_id: resolution.speaker_persona_id,
+    owner_project_id: resolution.owner_project_id,
+    executor_persona_id: resolution.executor_persona_id,
+    collaborator_project_ids: resolution.collaborator_project_ids,
+    collaborator_persona_ids: resolution.collaborator_persona_ids || [],
+    execution_scope: resolution.execution_scope,
+    write_targets: resolution.write_targets,
+    thread_action: resolution.thread_action,
+    confidence: resolution.confidence,
+    risk: resolution.risk,
+    requires_confirmation: resolution.requires_confirmation,
+    reason_codes: resolution.reason_codes,
+  };
+}
+
+function externalLockTarget(text: string, visiblePersonaIDs: string[], personaForID: (id: string) => ProjectPersona): ProjectPersona | null {
+  const trimmed = text.trim();
+  const match = /^\/lock\s+(.+)$/i.exec(trimmed);
+  if (!match) return null;
+  const target = match[1].trim().replace(/^@/u, '').toLowerCase();
+  for (const personaID of visiblePersonaIDs) {
+    const persona = personaForID(personaID);
+    const handle = persona.handle.replace(/^@/u, '').toLowerCase();
+    if (handle === target || persona.display_name.toLowerCase() === target) return persona;
+  }
+  return null;
+}
+
 function agentIDForMessage(message: string): string {
   const normalized = message.toLowerCase();
   if (message.includes('记忆') || normalized.includes('memory') || message.includes('偏好')) return 'memory_agent';
@@ -10159,6 +13333,23 @@ function parseArray(value: unknown): unknown[] {
   }
 }
 
+function mergeStringIDs(current: unknown[], additions: string[]): string[] {
+  const merged = new Set<string>();
+  for (const value of current) {
+    const text = optionalString(value);
+    if (text) merged.add(text);
+  }
+  for (const value of additions) {
+    const text = value.trim();
+    if (text) merged.add(text);
+  }
+  return [...merged];
+}
+
+function placeholders(count: number): string {
+  return Array.from({ length: Math.max(1, count) }, () => '?').join(', ');
+}
+
 function jsonText(value: unknown): string {
   if (!value) return '';
   if (typeof value === 'string') return value;
@@ -10325,6 +13516,56 @@ function sanitizeDiagnosticValue(value: unknown): unknown {
     return redacted.length > 600 ? `${redacted.slice(0, 600)}...[truncated]` : redacted;
   }
   return value;
+}
+
+function sanitizePersonaExportValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizePersonaExportValue(item));
+  }
+  if (value && typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    const redactNamedValue = objectHasSensitiveNameHint(value as Record<string, unknown>);
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = personaExportSensitiveKey(key) || (key.toLowerCase() === 'value' && redactNamedValue)
+        ? '[REDACTED]'
+        : sanitizePersonaExportValue(item);
+    }
+    return result;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        return sanitizePersonaExportValue(JSON.parse(trimmed));
+      } catch {
+        // Keep non-JSON strings on the normal redaction path.
+      }
+    }
+    return redactSensitiveText(value);
+  }
+  return value;
+}
+
+function personaExportSensitiveKey(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return [
+    'api_key',
+    'apikey',
+    'authorization',
+    'bearer',
+    'token',
+    'secret',
+    'password',
+    'node_secret',
+    'worker_token',
+    'telegram_bot_token',
+    'model_api_key',
+    'cacheable_prefix',
+    'dynamic_tail',
+    'raw_response',
+    'prompt',
+    'keychain',
+  ].some((marker) => normalized.includes(marker));
 }
 
 function diagnosticSensitiveKey(key: string): boolean {

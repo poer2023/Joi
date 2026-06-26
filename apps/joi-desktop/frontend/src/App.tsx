@@ -30,17 +30,23 @@ import {
   type LogEntry,
   type MemoryRecord,
   type MemorySearchResult,
+  type MessengerRoom,
   type MCPServerRecord,
   type ModelCall,
   type NodeRecord,
   type OnboardingStatus,
   type OpenLoop,
   type PhotonIMessageStatus,
+  type PersonaCandidate,
+  type PersonaMessengerSnapshot,
   type ProactiveMessage,
   type ProductTask,
   type ProductTaskDetail,
+  type ProjectPersona,
   type RunClosureReport,
   type RunTrace,
+  type RunTraceSpan,
+  type RunTraceSpanSummary,
   type SecretStatus,
   type SettingsRecord,
   type SkillRecord,
@@ -82,7 +88,7 @@ type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirm
 type SettingsTab = Exclude<Tab, 'chat'>;
 type SettingsCategory = 'models' | 'chatEntrances' | 'automations' | 'observability' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
 type ExecutionTarget = 'main-node' | 'auto' | 'local-worker-1' | 'vps-la-1';
-type RightInspectorTab = 'terminal' | 'memory' | 'logs';
+type RightInspectorTab = 'overview' | 'runs' | 'threads' | 'assets' | 'memory' | 'identity';
 type StreamingAssistantMessage = ConversationMessage & {
   role: 'assistant';
   complete?: boolean;
@@ -167,7 +173,7 @@ const defaultSettingsObjectByCategory: Record<SettingsCategory, string> = {
   privacySecurity: 'secrets',
   advanced: 'diagnostics',
 };
-const DEFAULT_SIDEBAR_WIDTH = 224;
+const DEFAULT_SIDEBAR_WIDTH = 250;
 const MIN_SIDEBAR_WIDTH = 192;
 const MAX_SIDEBAR_WIDTH = 560;
 const CHAT_MAIN_MIN_WIDTH = 560;
@@ -317,17 +323,39 @@ export default function App() {
   const [activeExecutionActions, setActiveExecutionActions] = useState<ExecutionAction[]>([]);
   const [activeExecutionStatus, setActiveExecutionStatus] = useState<ExecutionRunStatus>('pending');
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [executionTarget, setExecutionTarget] = useState<ExecutionTarget>('main-node');
+  const executionTarget: ExecutionTarget = 'main-node';
   const [inputMode, setInputMode] = useState<InputMode>('auto');
   const [selectedModelName, setSelectedModelName] = useState('');
   const [chat, setChat] = useState<ChatResponse | null>(null);
   const [trace, setTrace] = useState<RunTrace | null>(null);
+  const [traceSpanAudit, setTraceSpanAudit] = useState<{ spans: RunTraceSpan[]; summary: RunTraceSpanSummary }>({
+    spans: [],
+    summary: {
+      total: 0,
+      model_count: 0,
+      tool_count: 0,
+      error_count: 0,
+      external_side_effect_count: 0,
+      total_tokens: 0,
+      total_cost_estimate: 0,
+    },
+  });
   const [runEventsByRunId, setRunEventsByRunId] = useState<Record<string, NormalizedRunEvent[]>>({});
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [archivedConversations, setArchivedConversations] = useState<ConversationSummary[]>([]);
   const [trashedConversations, setTrashedConversations] = useState<ConversationSummary[]>([]);
   const [currentConversationID, setCurrentConversationID] = useState('');
   const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([]);
+  const [messenger, setMessenger] = useState<PersonaMessengerSnapshot | null>(null);
+  const [currentRoomID, setCurrentRoomID] = useState('room_private_hub');
+  const [composerScope, setComposerScope] = useState('auto_route');
+  const [projectCreatorOpen, setProjectCreatorOpen] = useState(false);
+  const [projectDraft, setProjectDraft] = useState({ name: '', goal: '', domain: '', phase: '' });
+  const [personaCandidates, setPersonaCandidates] = useState<PersonaCandidate[]>([]);
+  const [selectedPersonaCandidateID, setSelectedPersonaCandidateID] = useState('');
+  const [projectCreatorBusy, setProjectCreatorBusy] = useState(false);
+  const [todayPanelOpen, setTodayPanelOpen] = useState(false);
+  const [checkpointBusy, setCheckpointBusy] = useState(false);
   const [capabilities, setCapabilities] = useState<CapabilityRecord[]>([]);
   const [workflows, setWorkflows] = useState<ToolWorkflowRecord[]>([]);
   const [mcpServers, setMCPServers] = useState<MCPServerRecord[]>([]);
@@ -388,6 +416,20 @@ export default function App() {
     Math.min(RIGHT_PANEL_MAX_WIDTH, windowWidth - activeSidebarWidth - COMPANION_MAIN_MIN_WIDTH),
   );
   const activeRightPanelWidth = Math.min(rightPanelWidth, maxRightPanelWidth);
+  const activeRoom = useMemo(() => {
+    if (!messenger?.rooms.length) return null;
+    return messenger.rooms.find((room) => room.id === currentRoomID)
+      ?? messenger.rooms.find((room) => room.conversation_id === currentConversationID)
+      ?? messenger.rooms[0];
+  }, [currentConversationID, currentRoomID, messenger]);
+  const activePersona = useMemo(() => {
+    if (!messenger || !activeRoom?.persona_id) return null;
+    return messenger.personas.find((persona) => persona.id === activeRoom.persona_id) ?? null;
+  }, [activeRoom?.persona_id, messenger]);
+  const roomRouteLock = useMemo(() => {
+    if (!messenger || !activeRoom) return null;
+    return messenger.route_locks.find((lock) => lock.room_id === activeRoom.id && lock.status === 'active') ?? null;
+  }, [activeRoom, messenger]);
   const autoRightPanelCollapsed = windowWidth < activeSidebarWidth + CHAT_MAIN_MIN_WIDTH + RIGHT_PANEL_MIN_WIDTH;
   const shellStyle = {
     '--sidebar-width': `${activeSidebarWidth}px`,
@@ -506,6 +548,102 @@ export default function App() {
     setNotice('');
     setError(value);
     setErrorKey((current) => current + 1);
+  }
+
+  function openProjectCreator() {
+    setProjectCreatorOpen(true);
+    setProjectDraft({ name: '', goal: '', domain: '', phase: '' });
+    setPersonaCandidates([]);
+    setSelectedPersonaCandidateID('');
+  }
+
+  async function generateProjectCandidates() {
+    const projectName = projectDraft.name.trim();
+    if (!projectName) {
+      showError('请输入项目名称');
+      return;
+    }
+    setProjectCreatorBusy(true);
+    try {
+      const result = await desktopApi.generateProjectPersonaCandidates({
+        project_name: projectName,
+        project_goal: projectDraft.goal.trim(),
+        domain: projectDraft.domain.trim(),
+        phase: projectDraft.phase.trim(),
+      });
+      setPersonaCandidates(result.candidates);
+      setSelectedPersonaCandidateID(result.candidates[0]?.id || '');
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setProjectCreatorBusy(false);
+    }
+  }
+
+  async function createProjectFromSelectedCandidate() {
+    const projectName = projectDraft.name.trim();
+    if (!projectName) {
+      showError('请输入项目名称');
+      return;
+    }
+    setProjectCreatorBusy(true);
+    try {
+      const selected = personaCandidates.find((candidate) => candidate.id === selectedPersonaCandidateID) ?? personaCandidates[0];
+      const result = await desktopApi.createProjectPersona({
+        project_name: projectName,
+        project_goal: projectDraft.goal.trim(),
+        domain: projectDraft.domain.trim(),
+        phase: projectDraft.phase.trim(),
+        candidate_id: selected?.id,
+        persona_choice: selected ? {
+          display_name: selected.display_name,
+          handle: selected.handle,
+          avatar: selected.avatar,
+          tagline: selected.tagline,
+          self_intro: selected.self_intro,
+          traits: selected.traits,
+          disagreement_style: selected.disagreement_style,
+          uncertainty_style: selected.uncertainty_style,
+        } : undefined,
+      });
+      setProjectCreatorOpen(false);
+      setPersonaCandidates([]);
+      setSelectedPersonaCandidateID('');
+      showNotice(`${result.persona.display_name} 已加入私人总群`);
+      await refreshAll();
+      await loadRoom(result.room);
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setProjectCreatorBusy(false);
+    }
+  }
+
+  async function rollbackPersonaVersion(personaID: string, targetVersion: number) {
+    try {
+      const persona = await desktopApi.rollbackProjectPersona({
+        persona_id: personaID,
+        target_version: targetVersion,
+        change_reason: `Rollback to version ${targetVersion}`,
+      });
+      showNotice(`${persona.display_name} 已回滚到版本快照 ${targetVersion}`);
+      await refreshAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function retryExternalConnectorEvent(eventID: string) {
+    try {
+      await desktopApi.retryExternalConnectorEvent({
+        event_id: eventID,
+        reason: 'manual retry from connector inspector',
+      });
+      showNotice('外部消息已加入重试队列');
+      await refreshAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   function dispatchExecutionEvent(event: ExecutionEvent) {
@@ -670,6 +808,7 @@ export default function App() {
     setError('');
     try {
       const [
+        messengerSnapshot,
         conversationList,
         archivedConversationList,
         trashedConversationList,
@@ -690,6 +829,7 @@ export default function App() {
         automationList,
         automationTriggerList,
         automationRunList,
+        traceSpanList,
         nodeList,
         gatewayAuditList,
         modelUsage,
@@ -700,6 +840,7 @@ export default function App() {
         secrets,
         onboardingStatus,
       ] = await Promise.all([
+        desktopApi.listPersonaMessenger(),
         desktopApi.listConversations({ view: 'active', limit: 100 }),
         desktopApi.listConversations({ view: 'archived', limit: 100 }),
         desktopApi.listConversations({ view: 'trash', limit: 100 }),
@@ -720,6 +861,7 @@ export default function App() {
         desktopApi.listAutomations({ limit: 100 }),
         desktopApi.listAutomationTriggers({ limit: 100 }),
         desktopApi.listAutomationRuns({ limit: 100 }),
+        desktopApi.listRunTraceSpans({ limit: 200 }),
         desktopApi.listNodes(),
         desktopApi.listWorkerGatewayAuditLogs(),
         desktopApi.getModelUsage(),
@@ -730,6 +872,10 @@ export default function App() {
         desktopApi.getSecretStatus(),
         desktopApi.getOnboardingStatus(),
       ]);
+      setMessenger(messengerSnapshot);
+      if (messengerSnapshot.rooms.length > 0 && !messengerSnapshot.rooms.some((room) => room.id === currentRoomID)) {
+        setCurrentRoomID(messengerSnapshot.rooms[0].id);
+      }
       setConversations(conversationList.conversations ?? []);
       setArchivedConversations(archivedConversationList.conversations ?? []);
       setTrashedConversations(trashedConversationList.conversations ?? []);
@@ -750,6 +896,7 @@ export default function App() {
       setAutomations(automationList.automations ?? []);
       setAutomationTriggers(automationTriggerList.triggers ?? []);
       setAutomationRuns(automationRunList.runs ?? []);
+      setTraceSpanAudit(traceSpanList);
       setNodes(nodeList.nodes ?? []);
       setGatewayAudit(gatewayAuditList.items ?? []);
       setUsage(modelUsage.items ?? []);
@@ -837,7 +984,8 @@ export default function App() {
     setActiveExecutionStatus('pending');
     if (isSubmitting) return;
     const optimisticActions = createOptimisticExecutionActions(prompt);
-    const pendingConversationID = currentConversationID || 'pending-conversation';
+    const roomConversationID = activeRoom?.conversation_id || '';
+    const pendingConversationID = currentConversationID || roomConversationID || 'pending-conversation';
     pendingConversationIDRef.current = pendingConversationID;
     pendingAssistantIDRef.current = '';
     receivedAssistantDeltaRef.current = false;
@@ -859,10 +1007,14 @@ export default function App() {
     try {
       await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
       const result = await desktopApi.sendChat({
-        conversation_id: currentConversationID || undefined,
+        conversation_id: currentConversationID || roomConversationID || undefined,
+        room_id: activeRoom?.id,
         channel: 'desktop',
         user_id: 'desktop_user',
         message: prompt,
+        mentions: extractPersonaMentions(prompt, messenger?.personas ?? []),
+        scope_override: composerScope,
+        route_lock_action: roomRouteLock ? 'lock' : 'none',
         preferred_node: routing.preferredNode,
         allow_worker: routing.allowWorker,
         model_name: modelName,
@@ -986,6 +1138,36 @@ export default function App() {
     }
   }
 
+  async function loadRoom(room: MessengerRoom) {
+    setCurrentRoomID(room.id);
+    setComposerScope(defaultScopeForRoom(room));
+    if (room.conversation_id) {
+      await loadConversation(room.conversation_id);
+      return;
+    }
+    setCurrentConversationID('');
+    setConversationMessages([]);
+    setChat(null);
+    setTrace(null);
+    setActiveTab('chat');
+  }
+
+  async function toggleActiveRouteLock() {
+    if (!activeRoom) return;
+    if (roomRouteLock) {
+      await desktopApi.setRouteLock({ room_id: activeRoom.id, action: 'unlock' });
+      await refreshAll();
+      return;
+    }
+    const personaID = activeRoom.persona_id || activeRoom.floor_holder_persona_id || activePersona?.id || '';
+    if (!personaID) {
+      showNotice('当前房间没有可锁定的项目人格');
+      return;
+    }
+    await desktopApi.setRouteLock({ room_id: activeRoom.id, persona_id: personaID, action: 'lock' });
+    await refreshAll();
+  }
+
   async function archiveConversation(conversationID: string) {
     await desktopApi.archiveConversation({ id: conversationID, reason: 'desktop_ui' });
     if (currentConversationID === conversationID) {
@@ -1066,6 +1248,51 @@ export default function App() {
   async function decideProactiveMessage(id: string, action: string, feedback?: string) {
     await desktopApi.decideProactiveMessage({ id, action, feedback });
     await refreshAll();
+  }
+
+  async function openRunTrace(runID: string, destination: 'panel' | 'stage' = 'stage') {
+    if (!runID) return;
+    try {
+      const runTrace = await desktopApi.getRunTrace(runID);
+      setTrace(runTrace);
+      setRunEventsByRunId((current) => mergeRunEvents(current, runID, normalizeTraceEvents(runTrace)));
+      if (destination === 'stage') setActiveTab('trace');
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function completeTodayCheckpoint() {
+    const items = messenger?.checkpoint.items ?? [];
+    setCheckpointBusy(true);
+    try {
+      const checkpoint = await desktopApi.completeCheckpoint({
+        acknowledged_items: items.map((item) => item.id),
+      });
+      setMessenger((current) => current ? { ...current, checkpoint } : current);
+      showNotice('今日检查已建立新基线');
+      setTodayPanelOpen(false);
+      await refreshAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCheckpointBusy(false);
+    }
+  }
+
+  async function exportCurrentMessengerData() {
+    try {
+      const result = await desktopApi.exportPersonaMessengerData({
+        room_id: activeRoom?.id,
+        project_id: activeRoom?.project_id || activePersona?.project_id,
+        persona_id: activePersona?.id,
+        include_messages: true,
+        include_trace: true,
+      });
+      showNotice(`Persona Messenger 数据已导出：${result.path}`);
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function decideConfirmation(id: string, approve: boolean, scope: 'one_call' | 'current_run' = 'one_call') {
@@ -1270,14 +1497,14 @@ export default function App() {
   }
 
   return (
-    <main ref={shellRef} className={`im-app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${inSettingsArea ? 'settings-mode' : ''}`} style={shellStyle}>
+    <main ref={shellRef} data-theme="light" className={`im-app-shell app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${inSettingsArea ? 'settings-mode' : ''}`} style={shellStyle}>
       {inSettingsArea ? (
         <SettingsTopControls collapsed={sidebarCollapsed} goBack={() => setActiveTab('chat')} toggleCollapsed={toggleSidebarCollapsed} />
       ) : (
         <SidebarTopControls
           collapsed={sidebarCollapsed}
+          openProjectCreator={openProjectCreator}
           setActiveTab={setActiveTab}
-          startNewChat={startNewChat}
           toggleCollapsed={toggleSidebarCollapsed}
         />
       )}
@@ -1285,7 +1512,6 @@ export default function App() {
         <SettingsSidebar
           activeCategory={settingsCategory}
           collapsed={sidebarCollapsed}
-          health={health}
           selectSettingsObject={selectSettingsObject}
         />
       ) : (
@@ -1295,16 +1521,18 @@ export default function App() {
           chat={chat}
           collapsed={sidebarCollapsed}
           conversations={conversations}
+          currentRoomID={currentRoomID}
           currentConversationID={currentConversationID}
-          health={health}
           loadConversation={loadConversation}
+          loadRoom={loadRoom}
+          messenger={messenger}
           setActiveTab={setActiveTab}
           trace={trace}
         />
       )}
       {!sidebarCollapsed && <div aria-label="调整侧边栏宽度" className="sidebar-resizer" role="separator" onPointerDown={startSidebarResize} />}
 
-      <section className="im-workspace">
+      <section className="im-workspace app__editor tk-content-panel">
         <NotificationStack
           chatOffset={activeTab === 'chat' && !onboarding?.required}
           error={error}
@@ -1324,7 +1552,9 @@ export default function App() {
             surface="chat"
           >
             <ChatHome
+              activePersona={activePersona}
               activeProductTask={activeProductTaskDetail}
+              activeRoom={activeRoom}
               artifacts={artifacts}
               activeExecutionActions={activeExecutionActions}
               autoRightPanelCollapsed={autoRightPanelCollapsed}
@@ -1334,13 +1564,15 @@ export default function App() {
               continueProductTask={continueProductTask}
               decideConfirmation={decideConfirmation}
               decideProactiveMessage={decideProactiveMessage}
-              executionTarget={executionTarget}
+              exportCurrentMessengerData={exportCurrentMessengerData}
               health={health}
               inputMode={inputMode}
               isSubmitting={isSubmitting}
               memories={memories}
+              messenger={messenger}
               openArtifact={openArtifact}
               openLoops={openLoops}
+              openRunTrace={openRunTrace}
               lastPrompt={lastPrompt}
               message={message}
               pendingUserMessage={pendingUserMessage}
@@ -1351,8 +1583,8 @@ export default function App() {
               savedModels={savedModels}
               selectProductTask={selectProductTask}
               selectedModelName={selectedModelName || settings?.model_name || 'deepseek-v4-flash'}
+              roomRouteLock={roomRouteLock}
               setActiveTab={setActiveTab}
-              setExecutionTarget={setExecutionTarget}
               setInputMode={setInputMode}
               setMessage={setMessage}
               setSelectedModelName={setSelectedModelName}
@@ -1361,11 +1593,38 @@ export default function App() {
               updateMemory={updateMemory}
               submit={submit}
               trace={trace}
+              traceSpanAudit={traceSpanAudit}
+              rollbackPersonaVersion={rollbackPersonaVersion}
+              retryExternalConnectorEvent={retryExternalConnectorEvent}
+              toggleRouteLock={toggleActiveRouteLock}
             />
           </RenderCrashBoundary>
         )}
         {artifactViewer && activeTab === 'chat' && (
           <ArtifactViewer artifact={artifactViewer} close={() => setArtifactViewer(null)} />
+        )}
+
+        {todayPanelOpen && (
+          <TodayCheckpointPanel
+            busy={checkpointBusy}
+            checkpoint={messenger?.checkpoint ?? null}
+            onClose={() => setTodayPanelOpen(false)}
+            onComplete={() => void completeTodayCheckpoint()}
+          />
+        )}
+
+        {projectCreatorOpen && (
+          <ProjectPersonaCreatorModal
+            busy={projectCreatorBusy}
+            candidates={personaCandidates}
+            draft={projectDraft}
+            onClose={() => setProjectCreatorOpen(false)}
+            onCreate={() => void createProjectFromSelectedCandidate()}
+            onDraftChange={setProjectDraft}
+            onGenerate={() => void generateProjectCandidates()}
+            onSelectCandidate={setSelectedPersonaCandidateID}
+            selectedCandidateID={selectedPersonaCandidateID}
+          />
         )}
 
         {!onboarding?.required && activeTab === 'trace' && (
@@ -1706,21 +1965,19 @@ function summarizeModelCalls(calls: ModelCall[]) {
 function SettingsSidebar({
   activeCategory,
   collapsed,
-  health,
   selectSettingsObject,
 }: {
   activeCategory: SettingsCategory;
   collapsed: boolean;
-  health: SystemHealth | null;
   selectSettingsObject: (category: SettingsCategory, objectID?: string) => void;
 }) {
   if (collapsed) {
-    return <aside aria-hidden="true" className="im-sidebar sidebar-placeholder" />;
+    return <aside aria-hidden="true" className="im-sidebar sidebar-placeholder app__sidebar tk-sidebar" />;
   }
 
   return (
-    <aside className="im-sidebar settings-sidebar">
-      <ScrollArea className="settings-menu" aria-label="设置菜单">
+    <aside className="im-sidebar settings-sidebar app__sidebar tk-sidebar">
+      <ScrollArea className="settings-menu tk-sidebar-scroll" aria-label="设置菜单">
         {settingsCategories.map((section) => (
           <button
             key={section.id}
@@ -1734,11 +1991,6 @@ function SettingsSidebar({
           </button>
         ))}
       </ScrollArea>
-
-      <div className="settings-sidebar-footer">
-        <span className={`sidebar-status-dot live-dot ${health?.service_status?.sqlite ? 'on' : ''}`} />
-        <span>{health?.service_status?.sqlite ? '本地服务在线' : '需要刷新状态'}</span>
-      </div>
     </aside>
   );
 }
@@ -2764,7 +3016,11 @@ function SettingsConsole({
 
   function renderObservabilityDetail() {
     if (activeObject.id === 'token-usage') {
-      return <CostsPanel calls={calls} health={health} usage={usage} />;
+      return (
+        <section className="settings-detail-panel">
+          <CostsPanel calls={calls} health={health} usage={usage} />
+        </section>
+      );
     }
     if (activeObject.id === 'log-cleanup') {
       return (
@@ -3383,9 +3639,6 @@ function SettingsConsole({
         </div>
       </ScrollArea>
       <ScrollArea as="main" className="settings-detail">
-        <header className="settings-detail-topbar">
-          <span>{activeCategoryMeta.label}</span>
-        </header>
         {renderDetail()}
       </ScrollArea>
     </div>
@@ -3687,9 +3940,11 @@ function ConversationSidebar({
   chat,
   collapsed,
   conversations,
+  currentRoomID,
   currentConversationID,
-  health,
   loadConversation,
+  loadRoom,
+  messenger,
   setActiveTab,
   trace,
 }: {
@@ -3698,27 +3953,61 @@ function ConversationSidebar({
   chat: ChatResponse | null;
   collapsed: boolean;
   conversations: ConversationSummary[];
+  currentRoomID: string;
   currentConversationID: string;
-  health: SystemHealth | null;
   loadConversation: (conversationID: string) => Promise<void>;
+  loadRoom: (room: MessengerRoom) => Promise<void>;
+  messenger: PersonaMessengerSnapshot | null;
   setActiveTab: (tab: Tab) => void;
   trace: RunTrace | null;
 }) {
   if (collapsed) {
-    return <aside aria-hidden="true" className="im-sidebar sidebar-placeholder" />;
+    return <aside aria-hidden="true" className="im-sidebar sidebar-placeholder app__sidebar tk-sidebar" />;
   }
 
+  const rooms = messenger?.rooms ?? [];
+  const groupedRooms = groupMessengerRooms(rooms);
+  const isRoomContext = activeTab === 'chat' || activeTab === 'trace';
+
   return (
-    <aside className="im-sidebar">
-      <ScrollArea className="conversation-list">
-        <RailSectionTitle label="会话" />
-        {conversations.length ? conversations.map((item) => {
+    <aside className="im-sidebar app__sidebar tk-sidebar">
+      <ScrollArea className="conversation-list tk-sidebar-scroll">
+        {rooms.length ? (
+          <>
+            {groupedRooms.map((group) => (
+              <section key={group.id} className="messenger-room-section">
+                {group.rooms.map((room) => {
+                  const active = currentRoomID === room.id || (!currentRoomID && currentConversationID && room.conversation_id === currentConversationID);
+                  return (
+                    <div key={room.id} className={`conversation-row-wrap messenger-room-wrap ${active && isRoomContext ? 'active' : ''}`}>
+                      <button
+                        className={`conversation-item conversation-chat-item messenger-room-item ${active && isRoomContext ? 'active' : ''}`}
+                        type="button"
+                        onClick={() => void loadRoom(room)}
+                      >
+                        <RoomAvatar room={room} personas={messenger?.personas ?? []} />
+                        <span className="room-list-copy">
+                          <strong>{room.title}</strong>
+                          <em>{compactRoomLastMessage(room.last_message)}</em>
+                        </span>
+                      </button>
+                      {room.conversation_id && room.type === 'project_dm' ? (
+                        <div className="conversation-row-actions">
+                          <button type="button" onClick={() => void archiveConversation(room.conversation_id!)}>归档</button>
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </section>
+            ))}
+          </>
+        ) : conversations.length ? conversations.map((item) => {
           const active = currentConversationID === item.id || (!currentConversationID && chat?.conversation_id === item.id);
-          const isConversationContext = activeTab === 'chat' || activeTab === 'trace';
           return (
-            <div key={item.id} className={`conversation-row-wrap ${active && isConversationContext ? 'active' : ''}`}>
+            <div key={item.id} className={`conversation-row-wrap ${active && isRoomContext ? 'active' : ''}`}>
               <button
-                className={`conversation-item conversation-chat-item ${active && isConversationContext ? 'active' : ''}`}
+                className={`conversation-item conversation-chat-item ${active && isRoomContext ? 'active' : ''}`}
                 type="button"
                 onClick={() => loadConversation(item.id)}
               >
@@ -3741,79 +4030,125 @@ function ConversationSidebar({
           </button>
         )}
       </ScrollArea>
-
-      <div className="sidebar-footer">
-        <div className="user-avatar user-avatar-self">你</div>
-        <strong className="sidebar-user-name">你</strong>
-        <span className={`sidebar-status-dot live-dot ${health?.service_status?.sqlite ? 'on' : ''}`} title={health?.service_status?.sqlite ? 'SQLite OK' : 'SQLite 未连接'} />
-        <button className="footer-settings-button" title="设置" type="button" onClick={() => setActiveTab('settings')}>
+      <footer className="sidebar-footer">
+        <span aria-hidden="true" className="user-avatar user-avatar-self">你</span>
+        <span className="sidebar-user-name">你</span>
+        <button
+          aria-label="设置"
+          className="footer-settings-button"
+          title="设置"
+          type="button"
+          onClick={() => setActiveTab('settings')}
+        >
           <SidebarIcon name="settings" />
         </button>
-      </div>
+      </footer>
     </aside>
   );
 }
 
-function RailSectionTitle({ label }: { label: string }) {
-  return <div className="rail-section-title">{label}</div>;
+function groupMessengerRooms(rooms: MessengerRoom[]) {
+  const groups = [
+    { id: 'hub', label: '私人总群', rooms: rooms.filter((room) => room.type === 'private_hub') },
+    { id: 'project_dm', label: '项目人格私聊', rooms: rooms.filter((room) => room.type === 'project_dm') },
+    { id: 'shared', label: '共享与外部房间', rooms: rooms.filter((room) => room.type === 'shared' || room.type === 'external_mirror') },
+    { id: 'human', label: '真人私聊', rooms: rooms.filter((room) => room.type === 'human_dm') },
+  ];
+  const known = new Set(groups.flatMap((group) => group.rooms.map((room) => room.id)));
+  const other = rooms.filter((room) => !known.has(room.id));
+  if (other.length) groups.push({ id: 'other', label: '其他房间', rooms: other });
+  return groups
+    .map((group) => ({
+      ...group,
+      rooms: [...group.rooms].sort(compareMessengerRooms),
+    }))
+    .filter((group) => group.rooms.length > 0);
 }
 
-function handleTopControlPointerAction(
-  event: ReactPointerEvent<HTMLButtonElement>,
-  action: () => void,
-  suppressClickRef: { current: boolean },
-) {
-  if (event.button !== 0) {
-    return;
-  }
-  event.preventDefault();
-  event.stopPropagation();
-  suppressClickRef.current = true;
-  window.setTimeout(() => {
-    suppressClickRef.current = false;
-  }, 350);
-  action();
+function compareMessengerRooms(a: MessengerRoom, b: MessengerRoom) {
+  const priority = roomPriorityScore(b) - roomPriorityScore(a);
+  if (priority !== 0) return priority;
+  return Date.parse(b.last_activity_at || '') - Date.parse(a.last_activity_at || '');
+}
+
+function roomPriorityScore(room: MessengerRoom) {
+  return (room.pending_approval_count > 0 ? 1000 : 0)
+    + (room.unread_count > 0 ? 600 : 0)
+    + (room.failed_run_count > 0 ? 400 : 0)
+    + (room.running_run_count > 0 ? 200 : 0);
+}
+
+function defaultScopeForRoom(room: MessengerRoom) {
+  if (room.type === 'project_dm') return 'current_project';
+  if (room.type === 'private_hub' || room.type === 'shared' || room.type === 'external_mirror') return 'auto_route';
+  return 'room_scope';
+}
+
+function extractPersonaMentions(message: string, personas: ProjectPersona[]) {
+  return personas
+    .filter((persona) => {
+      const handle = persona.handle.startsWith('@') ? persona.handle : `@${persona.handle}`;
+      if (message.includes(handle)) return true;
+      return message.includes(`@${persona.display_name}`);
+    })
+    .map((persona) => persona.id);
+}
+
+function composerPlaceholder(room: MessengerRoom | null, persona: ProjectPersona | null) {
+  if (!room) return '输入消息...';
+  if (room.type === 'project_dm') return `和 ${persona?.display_name || room.title} 说项目任务...`;
+  if (room.type === 'private_hub') return '发到私人总群，或 @ 指定项目人格...';
+  if (room.type === 'shared') return '发到共享房间，项目人格会按参与策略回复...';
+  return '输入消息...';
+}
+
+function compactRoomLastMessage(value?: string) {
+  const text = value?.trim().replace(/\s+/g, ' ') || '暂无消息';
+  return text.length > 42 ? `${text.slice(0, 42)}...` : text;
+}
+
+function RoomAvatar({ room, personas }: { room: MessengerRoom; personas: ProjectPersona[] }) {
+  const persona = room.persona_id ? personas.find((item) => item.id === room.persona_id) : undefined;
+  const label = room.type === 'private_hub' ? '总' : (persona?.display_name || room.title || '房').slice(0, 1);
+  const showPersonaIndicator = Boolean(persona) && room.type === 'project_dm';
+  return (
+    <span className={`room-avatar room-avatar-${classToken(room.type)}`}>
+      {label}
+      {showPersonaIndicator ? <i aria-label="项目人格" title="项目人格" /> : null}
+    </span>
+  );
 }
 
 function handleTopControlClickAction(
   event: ReactMouseEvent<HTMLButtonElement>,
   action: () => void,
-  suppressClickRef: { current: boolean },
 ) {
   event.preventDefault();
   event.stopPropagation();
-  if (suppressClickRef.current) {
-    suppressClickRef.current = false;
-    return;
-  }
   action();
 }
 
 function SidebarTopControls({
   collapsed,
+  openProjectCreator,
   setActiveTab,
-  startNewChat,
   toggleCollapsed,
 }: {
   collapsed: boolean;
+  openProjectCreator: () => void;
   setActiveTab: (tab: Tab) => void;
-  startNewChat: () => void;
   toggleCollapsed: () => void;
 }) {
-  const suppressNewClickRef = useRef(false);
-  const suppressSearchClickRef = useRef(false);
-  const suppressToggleClickRef = useRef(false);
   const openSearch = () => setActiveTab('memory');
 
   return (
     <div className="sidebar-top-controls">
       <button
-        aria-label="新建对话"
+        aria-label="新建项目人格"
         className="round-icon-button"
-        title="新建对话"
+        title="新建项目人格"
         type="button"
-        onClick={(event) => handleTopControlClickAction(event, startNewChat, suppressNewClickRef)}
-        onPointerDown={(event) => handleTopControlPointerAction(event, startNewChat, suppressNewClickRef)}
+        onClick={(event) => handleTopControlClickAction(event, openProjectCreator)}
       >
         <SidebarIcon name="plus" />
       </button>
@@ -3822,8 +4157,7 @@ function SidebarTopControls({
         className="round-icon-button"
         title="搜索"
         type="button"
-        onClick={(event) => handleTopControlClickAction(event, openSearch, suppressSearchClickRef)}
-        onPointerDown={(event) => handleTopControlPointerAction(event, openSearch, suppressSearchClickRef)}
+        onClick={(event) => handleTopControlClickAction(event, openSearch)}
       >
         <SidebarIcon name="search" />
       </button>
@@ -3832,11 +4166,86 @@ function SidebarTopControls({
         className="round-icon-button collapse-sidebar-button"
         title={collapsed ? '展开侧边栏' : '折叠侧边栏'}
         type="button"
-        onClick={(event) => handleTopControlClickAction(event, toggleCollapsed, suppressToggleClickRef)}
-        onPointerDown={(event) => handleTopControlPointerAction(event, toggleCollapsed, suppressToggleClickRef)}
+        onClick={(event) => handleTopControlClickAction(event, toggleCollapsed)}
       >
         <SidebarIcon name={collapsed ? 'expand' : 'collapse'} />
       </button>
+    </div>
+  );
+}
+
+function ProjectPersonaCreatorModal({
+  busy,
+  candidates,
+  draft,
+  onClose,
+  onCreate,
+  onDraftChange,
+  onGenerate,
+  onSelectCandidate,
+  selectedCandidateID,
+}: {
+  busy: boolean;
+  candidates: PersonaCandidate[];
+  draft: { name: string; goal: string; domain: string; phase: string };
+  onClose: () => void;
+  onCreate: () => void;
+  onDraftChange: (draft: { name: string; goal: string; domain: string; phase: string }) => void;
+  onGenerate: () => void;
+  onSelectCandidate: (id: string) => void;
+  selectedCandidateID: string;
+}) {
+  const canCreate = Boolean(draft.name.trim()) && candidates.length > 0 && Boolean(selectedCandidateID);
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="project-persona-modal" role="dialog" aria-modal="true" aria-labelledby="project-persona-modal-title">
+        <header>
+          <h2 id="project-persona-modal-title">新建项目人格</h2>
+          <button type="button" onClick={onClose}>关闭</button>
+        </header>
+        <div className="project-persona-form">
+          <label>
+            <span>项目名称</span>
+            <input value={draft.name} onChange={(event) => onDraftChange({ ...draft, name: event.target.value })} />
+          </label>
+          <label>
+            <span>目标</span>
+            <textarea value={draft.goal} onChange={(event) => onDraftChange({ ...draft, goal: event.target.value })} />
+          </label>
+          <div className="project-persona-form-grid">
+            <label>
+              <span>领域</span>
+              <input value={draft.domain} onChange={(event) => onDraftChange({ ...draft, domain: event.target.value })} />
+            </label>
+            <label>
+              <span>阶段</span>
+              <input value={draft.phase} onChange={(event) => onDraftChange({ ...draft, phase: event.target.value })} />
+            </label>
+          </div>
+        </div>
+        <div className="candidate-toolbar">
+          <button type="button" disabled={busy || !draft.name.trim()} onClick={onGenerate}>生成 3 个候选</button>
+        </div>
+        <div className="persona-candidate-grid">
+          {candidates.map((candidate) => (
+            <button
+              key={candidate.id}
+              className={candidate.id === selectedCandidateID ? 'selected' : ''}
+              type="button"
+              onClick={() => onSelectCandidate(candidate.id)}
+            >
+              <strong>{candidate.display_name}</strong>
+              <small>{candidate.handle}</small>
+              <span>{candidate.tagline}</span>
+              <em>{candidate.rationale}</em>
+            </button>
+          ))}
+        </div>
+        <footer>
+          <button type="button" onClick={onClose}>取消</button>
+          <button type="button" disabled={busy || !canCreate} onClick={onCreate}>创建项目私聊</button>
+        </footer>
+      </section>
     </div>
   );
 }
@@ -3850,9 +4259,6 @@ function SettingsTopControls({
   goBack: () => void;
   toggleCollapsed: () => void;
 }) {
-  const suppressBackClickRef = useRef(false);
-  const suppressToggleClickRef = useRef(false);
-
   const toggleLabel = collapsed ? '展开设置菜单' : '折叠设置菜单';
 
   return (
@@ -3862,8 +4268,7 @@ function SettingsTopControls({
         className="round-icon-button"
         title="返回对话"
         type="button"
-        onClick={(event) => handleTopControlClickAction(event, goBack, suppressBackClickRef)}
-        onPointerDown={(event) => handleTopControlPointerAction(event, goBack, suppressBackClickRef)}
+        onClick={(event) => handleTopControlClickAction(event, goBack)}
       >
         <SidebarIcon name="back" />
       </button>
@@ -3872,8 +4277,7 @@ function SettingsTopControls({
         className="round-icon-button collapse-sidebar-button"
         title={toggleLabel}
         type="button"
-        onClick={(event) => handleTopControlClickAction(event, toggleCollapsed, suppressToggleClickRef)}
-        onPointerDown={(event) => handleTopControlPointerAction(event, toggleCollapsed, suppressToggleClickRef)}
+        onClick={(event) => handleTopControlClickAction(event, toggleCollapsed)}
       >
         <SidebarIcon name={collapsed ? 'expand' : 'collapse'} />
       </button>
@@ -3916,7 +4320,9 @@ function SidebarIcon({ name }: { name: 'plus' | 'search' | 'collapse' | 'expand'
 }
 
 function ChatHome({
+  activePersona,
   activeProductTask,
+  activeRoom,
   activeExecutionActions,
   artifacts,
   autoRightPanelCollapsed,
@@ -3926,15 +4332,17 @@ function ChatHome({
   continueProductTask,
   decideConfirmation,
   decideProactiveMessage,
-  executionTarget,
+  exportCurrentMessengerData,
   health,
   inputMode,
   isSubmitting,
   lastPrompt,
   message,
   memories,
+  messenger,
   openArtifact,
   openLoops,
+  openRunTrace,
   pendingUserMessage,
   streamingAssistantMessage,
   proactiveMessages,
@@ -3943,8 +4351,10 @@ function ChatHome({
   savedModels,
   selectProductTask,
   selectedModelName,
+  roomRouteLock,
+  rollbackPersonaVersion,
+  retryExternalConnectorEvent,
   setActiveTab,
-  setExecutionTarget,
   setInputMode,
   setMessage,
   setSelectedModelName,
@@ -3953,8 +4363,12 @@ function ChatHome({
   updateMemory,
   submit,
   trace,
+  traceSpanAudit,
+  toggleRouteLock,
 }: {
+  activePersona: ProjectPersona | null;
   activeProductTask: ProductTaskDetail | null;
+  activeRoom: MessengerRoom | null;
   activeExecutionActions: ExecutionAction[];
   artifacts: ArtifactSummary[];
   autoRightPanelCollapsed: boolean;
@@ -3964,15 +4378,17 @@ function ChatHome({
   continueProductTask: (task: ProductTask) => Promise<void>;
   decideConfirmation: (id: string, approve: boolean, scope?: 'one_call' | 'current_run') => Promise<void>;
   decideProactiveMessage: (id: string, action: string, feedback?: string) => Promise<void>;
-  executionTarget: ExecutionTarget;
+  exportCurrentMessengerData: () => Promise<void>;
   health: SystemHealth | null;
   inputMode: InputMode;
   isSubmitting: boolean;
   lastPrompt: string;
   message: string;
   memories: MemoryRecord[];
+  messenger: PersonaMessengerSnapshot | null;
   openArtifact: (id: string) => Promise<void>;
   openLoops: OpenLoop[];
+  openRunTrace: (runID: string, destination?: 'panel' | 'stage') => Promise<void>;
   pendingUserMessage: ConversationMessage | null;
   streamingAssistantMessage: StreamingAssistantMessage | null;
   proactiveMessages: ProactiveMessage[];
@@ -3981,8 +4397,10 @@ function ChatHome({
   savedModels: AvailableModel[];
   selectProductTask: (id: string) => Promise<void>;
   selectedModelName: string;
+  roomRouteLock: PersonaMessengerSnapshot['route_locks'][number] | null;
+  rollbackPersonaVersion: (personaID: string, targetVersion: number) => Promise<void>;
+  retryExternalConnectorEvent: (eventID: string) => Promise<void>;
   setActiveTab: (tab: Tab) => void;
-  setExecutionTarget: (value: ExecutionTarget) => void;
   setInputMode: (value: InputMode) => void;
   setMessage: (value: string) => void;
   setSelectedModelName: (value: string) => void;
@@ -3991,6 +4409,8 @@ function ChatHome({
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
   submit: (event?: FormEvent) => Promise<void>;
   trace: RunTrace | null;
+  traceSpanAudit: { spans: RunTraceSpan[]; summary: RunTraceSpanSummary };
+  toggleRouteLock: () => Promise<void>;
 }) {
   const settledMessages: ConversationMessage[] = conversationMessages.length
     ? conversationMessages
@@ -4029,20 +4449,13 @@ function ChatHome({
   const visibleTraceActions = useMemo(() => visibleExecutionActions(executionActions), [executionActions]);
   const liveExecutionActions = activeExecutionActions.length > 0 ? activeExecutionActions : visibleTraceActions;
   const showInlineTaskCard = false;
+  const runSummaries = useMemo(() => buildRunSummaryLabels(traceSpanAudit.spans), [traceSpanAudit.spans]);
   const [manualRightPanelCollapsed, setManualRightPanelCollapsed] = useState(true);
-  const [rightInspectorTab, setRightInspectorTab] = useState<RightInspectorTab>('terminal');
-  const [executionTargetOpen, setExecutionTargetOpen] = useState(false);
+  const [rightInspectorTab, setRightInspectorTab] = useState<RightInspectorTab>('overview');
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const modelControlRef = useRef<HTMLDivElement | null>(null);
   const modelOptions = composerModelOptions(settings, selectedModelName, savedModels);
   const rightPanelCollapsed = manualRightPanelCollapsed || autoRightPanelCollapsed;
-  const rightPanelToggleLabel = autoRightPanelCollapsed
-    ? '窗口宽度不足，右侧内容已自动收起'
-    : rightPanelCollapsed
-      ? '展开右侧内容'
-      : '收起右侧内容';
-  const selectedExecutionTarget = executionTargetOptions.find((item) => item.value === executionTarget) ?? executionTargetOptions[0];
-  const executionStatusLabel = executionTargetLabelFromTrace(trace, selectedExecutionTarget.label);
 
   useEffect(() => {
     if (!modelMenuOpen) return;
@@ -4067,15 +4480,6 @@ function ChatHome({
     };
   }, [modelMenuOpen]);
 
-  function fillSuggestion(next: string) {
-    setMessage(next);
-  }
-
-  function fillSeriousTaskSuggestion() {
-    setInputMode('serious_task');
-    setMessage('认真执行：根据这个方向，给我整理一份开发 spec。');
-  }
-
   function handleComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
 
@@ -4084,68 +4488,17 @@ function ChatHome({
   }
 
   return (
-    <section className={`chat-home companion-layout${rightPanelCollapsed ? ' companion-layout-right-collapsed' : ''}`}>
-      <section className="chat-main-column">
-        <header className="chat-statusbar">
-          {!hasThread && <small>本地运行 · 可检查</small>}
-          {!hasThread ? (
-            <div
-              className="execution-target-control"
-              title="选择本轮任务的执行位置；Worker 选项会自动启用工作节点派发。"
-              onBlur={(event) => {
-                const nextFocus = event.relatedTarget;
-                if (!(nextFocus instanceof Node) || !event.currentTarget.contains(nextFocus)) {
-                  setExecutionTargetOpen(false);
-                }
-              }}
-            >
-              <button
-                aria-expanded={executionTargetOpen}
-                aria-haspopup="menu"
-                className="execution-target-trigger"
-                type="button"
-                onClick={() => setExecutionTargetOpen((current) => !current)}
-              >
-                <span>执行位置</span>
-                <strong>{selectedExecutionTarget.label}</strong>
-                <SidebarIcon name="down" />
-              </button>
-              {executionTargetOpen && (
-                <div className="execution-target-menu" role="menu">
-                  {executionTargetOptions.map((item) => (
-                    <button
-                      key={item.value}
-                      className={item.value === executionTarget ? 'active' : ''}
-                      role="menuitemradio"
-                      aria-checked={item.value === executionTarget}
-                      type="button"
-                      onClick={() => {
-                        setExecutionTarget(item.value);
-                        setExecutionTargetOpen(false);
-                      }}
-                    >
-                      {item.label}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          ) : (
-            <span className="execution-target-status" title="本轮会话的执行位置已固定">
-              执行位置 <strong>{executionStatusLabel}</strong>
-            </span>
-          )}
-          <button
-            aria-expanded={!rightPanelCollapsed}
-            className="round-icon-button collapse-sidebar-button right-panel-collapse-button"
-            title={rightPanelToggleLabel}
-            type="button"
-            disabled={autoRightPanelCollapsed}
-            onClick={() => setManualRightPanelCollapsed((current) => !current)}
-          >
-            <SidebarIcon name={rightPanelCollapsed ? 'expand' : 'collapse'} />
-          </button>
-        </header>
+    <section className={`chat-home companion-layout tk-workspace${rightPanelCollapsed ? ' companion-layout-right-collapsed' : ''}`}>
+      <section className="chat-main-column tk-content-panel">
+        <MessengerChatHeader
+          room={activeRoom}
+          persona={activePersona}
+          personas={messenger?.personas ?? []}
+          project={activeRoom?.project_id ? messenger?.projects.find((item) => item.id === activeRoom.project_id) ?? null : null}
+          routeLock={roomRouteLock}
+          toggleRouteLock={toggleRouteLock}
+          onOpenInspector={() => setManualRightPanelCollapsed((current) => !current)}
+        />
 
         <ScrollArea
           className={hasThread ? 'chat-thread' : 'chat-empty-state'}
@@ -4160,8 +4513,9 @@ function ChatHome({
                 items={renderItems}
                 onOpenArtifact={(artifactId) => void openArtifact(artifactId)}
                 onOpenTask={(taskId) => void selectProductTask(taskId)}
-                onOpenTrace={() => setActiveTab('trace')}
+                onOpenTrace={(runID) => void openRunTrace(runID, 'stage')}
                 onResolveApproval={(approvalId, approve, scope) => void decideConfirmation(approvalId, approve, scope)}
+                runSummaries={runSummaries}
               />
               {isSubmitting && !streamingAssistantMessage && !renderItems.some((item) => item.type === 'message' && item.role === 'assistant') && (
                 <article className="message-row assistant-message pending-message">
@@ -4174,25 +4528,13 @@ function ChatHome({
               {showInlineTaskCard && <TaskCard detail={latestTask!} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />}
             </>
           ) : (
-            <>
-              <div className="hero-brand-lockup">
-                <img className="hero-avatar" src={joiAvatar} alt="Joi" />
-              </div>
-              <h1>想聊点什么?</h1>
-              <p>Joi 随时准备好帮你思考、写作、执行任务。</p>
-              <div className="quick-actions">
-                <button type="button" onClick={() => fillSuggestion('帮我总结这个网页，并提炼核心观点。')}>◎ 总结网页</button>
-                <button type="button" onClick={() => fillSuggestion('记住：')}>□ 写入记忆</button>
-                <button type="button" onClick={() => setActiveTab('trace')}>◴ 查看最近任务</button>
-                <button type="button" onClick={fillSeriousTaskSuggestion}>▤ 认真执行</button>
-              </div>
-            </>
+            null
           )}
         </ScrollArea>
 
-        <form className="composer" aria-busy={isSubmitting} onSubmit={submit}>
+        <form className="composer tk-floating-panel" aria-busy={isSubmitting} onSubmit={submit}>
           <textarea
-            placeholder={isSubmitting ? '补充或修改当前任务...' : '输入任务，或直接和 Joi 说你想做什么...'}
+            placeholder={isSubmitting ? '补充或修改当前任务...' : composerPlaceholder(activeRoom, activePersona)}
             value={message}
             onChange={(event) => setMessage(event.target.value)}
             onKeyDown={handleComposerKeyDown}
@@ -4284,24 +4626,85 @@ function ChatHome({
           />
           <ScrollArea
             as="aside"
-            className="companion-right-panel"
-            contentClassName="companion-right-panel-content"
+            className="companion-right-panel tk-right-panel"
+            contentClassName="companion-right-panel-content tk-panel-body"
             aria-label="Joi 右侧检查器"
           >
             <CompanionInspectorPanel
               activeTab={rightInspectorTab}
+              activeRoom={activeRoom}
+              activePersona={activePersona}
+              artifacts={artifacts}
               decideProactiveMessage={decideProactiveMessage}
+              messenger={messenger}
               memories={memories}
               openLoops={openLoops}
               proactiveMessages={proactiveMessages}
+              rollbackPersonaVersion={rollbackPersonaVersion}
+              retryExternalConnectorEvent={retryExternalConnectorEvent}
               setActiveTab={setRightInspectorTab}
               trace={trace}
+              traceSpanAudit={traceSpanAudit}
+              exportCurrentMessengerData={exportCurrentMessengerData}
+              openRunTrace={openRunTrace}
               updateMemory={updateMemory}
             />
           </ScrollArea>
         </>
       )}
     </section>
+  );
+}
+
+function MessengerChatHeader({
+  onOpenInspector,
+  persona,
+  personas,
+  project,
+  room,
+  routeLock,
+  toggleRouteLock,
+}: {
+  onOpenInspector: () => void;
+  persona: ProjectPersona | null;
+  personas: ProjectPersona[];
+  project: PersonaMessengerSnapshot['projects'][number] | null;
+  room: MessengerRoom | null;
+  routeLock: PersonaMessengerSnapshot['route_locks'][number] | null;
+  toggleRouteLock: () => Promise<void>;
+}) {
+  const activePersonas = room?.members?.filter((member) => member.type === 'persona') ?? [];
+  const lockedPersona = routeLock ? personas.find((item) => item.id === routeLock.persona_id) : null;
+  return (
+    <header className="messenger-chat-header breadcrumb-bar">
+      <div className="messenger-chat-identity">
+        {room ? <RoomAvatar room={room} personas={personas} /> : <span className="room-avatar">J</span>}
+        <div>
+          <strong>{room?.title || '私人总群'}</strong>
+          <small>
+            {room?.type === 'project_dm'
+              ? `${project?.name || room.subtitle || 'Project'} · ${persona?.status || 'active'}`
+              : `${room?.members?.filter((member) => member.type !== 'persona').length ?? 1} 位真人 · ${activePersonas.length} 个项目人格 · ${room?.running_run_count ?? 0} 个活跃任务`}
+          </small>
+        </div>
+      </div>
+      {room?.type !== 'project_dm' && activePersonas.length > 0 ? (
+        <div className="active-persona-stack" aria-label="活跃项目人格">
+          {activePersonas.slice(0, 4).map((member) => (
+            <span key={member.id} title={`${member.display_name} · 项目人格`}>{member.display_name.slice(0, 1)}</span>
+          ))}
+        </div>
+      ) : null}
+      {lockedPersona ? (
+        <span className="route-lock-chip">@{lockedPersona.display_name} 已锁定</span>
+      ) : null}
+      {room?.persona_id || lockedPersona ? (
+        <button className="route-lock-button" type="button" onClick={() => void toggleRouteLock()}>
+          {lockedPersona ? '解除锁定' : '锁定'}
+        </button>
+      ) : null}
+      <button className="observe-button" type="button" onClick={onOpenInspector}>观察</button>
+    </header>
   );
 }
 
@@ -4346,67 +4749,96 @@ function dedupeConversationMessages(messages: ConversationMessage[]) {
 
 function CompanionInspectorPanel({
   activeTab,
+  activeRoom,
+  activePersona,
+  artifacts,
   decideProactiveMessage,
+  messenger,
   memories,
   openLoops,
   proactiveMessages,
+  rollbackPersonaVersion,
+  exportCurrentMessengerData,
+  retryExternalConnectorEvent,
   setActiveTab,
   trace,
+  traceSpanAudit,
+  openRunTrace,
   updateMemory,
 }: {
   activeTab: RightInspectorTab;
+  activeRoom: MessengerRoom | null;
+  activePersona: ProjectPersona | null;
+  artifacts: ArtifactSummary[];
   decideProactiveMessage: (id: string, action: string, feedback?: string) => Promise<void>;
+  messenger: PersonaMessengerSnapshot | null;
   memories: MemoryRecord[];
   openLoops: OpenLoop[];
   proactiveMessages: ProactiveMessage[];
+  rollbackPersonaVersion: (personaID: string, targetVersion: number) => Promise<void>;
+  exportCurrentMessengerData: () => Promise<void>;
+  retryExternalConnectorEvent: (eventID: string) => Promise<void>;
   setActiveTab: (tab: RightInspectorTab) => void;
   trace: RunTrace | null;
+  traceSpanAudit: { spans: RunTraceSpan[]; summary: RunTraceSpanSummary };
+  openRunTrace: (runID: string, destination?: 'panel' | 'stage') => Promise<void>;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
 }) {
+  const identityLabel = activeRoom?.type === 'project_dm' ? '身份' : '成员';
   return (
-    <section className="right-inspector-shell">
-      <header className="right-inspector-header">
-        <div className="right-inspector-tabs" role="tablist" aria-label="右侧栏视图">
-          <button
-            id="right-inspector-tab-terminal"
-            aria-controls="right-inspector-terminal"
-            aria-selected={activeTab === 'terminal'}
-            className={activeTab === 'terminal' ? 'active' : ''}
-            role="tab"
-            type="button"
-            onClick={() => setActiveTab('terminal')}
-          >
-            <span>Terminal</span>
-          </button>
-          <button
-            id="right-inspector-tab-memory"
-            aria-controls="right-inspector-memory"
-            aria-selected={activeTab === 'memory'}
-            className={activeTab === 'memory' ? 'active' : ''}
-            role="tab"
-            type="button"
-            onClick={() => setActiveTab('memory')}
-          >
-            <span>Memory</span>
-          </button>
-          <button
-            id="right-inspector-tab-logs"
-            aria-controls="right-inspector-logs"
-            aria-selected={activeTab === 'logs'}
-            className={activeTab === 'logs' ? 'active' : ''}
-            role="tab"
-            type="button"
-            onClick={() => setActiveTab('logs')}
-          >
-            <span>Logs</span>
-          </button>
+    <section className="right-inspector-shell tk-right-panel">
+      <header className="right-inspector-header tk-panel-header">
+        <div className="right-inspector-tabs tk-tabs-list" role="tablist" aria-label="右侧栏视图">
+          {([
+            ['overview', '概览'],
+            ['runs', '运行'],
+            ['threads', '线程'],
+            ['assets', '资产'],
+            ['memory', '记忆'],
+            ['identity', identityLabel],
+          ] as Array<[RightInspectorTab, string]>).map(([tab, label]) => (
+            <button
+              key={tab}
+              id={`right-inspector-tab-${tab}`}
+              aria-controls={`right-inspector-${tab}`}
+              aria-selected={activeTab === tab}
+              className={`tk-tab ${activeTab === tab ? 'active' : ''}`}
+              role="tab"
+              type="button"
+              onClick={() => setActiveTab(tab)}
+            >
+              <span>{label}</span>
+            </button>
+          ))}
         </div>
         <div className="right-inspector-header-drag-spacer" aria-hidden="true" />
       </header>
-      {activeTab === 'terminal' ? (
-        <CompanionTerminalPanel />
-      ) : activeTab === 'logs' ? (
-        <CompanionLogsPanel runID={trace?.id} />
+      {activeTab === 'overview' ? (
+        <MessengerOverviewPanel
+          checkpoint={messenger?.checkpoint ?? null}
+          exportCurrentMessengerData={exportCurrentMessengerData}
+          room={activeRoom}
+          trace={trace}
+        />
+      ) : activeTab === 'runs' ? (
+        <MessengerRunsPanel
+          messenger={messenger}
+          openRunTrace={openRunTrace}
+          trace={trace}
+          traceSpanAudit={traceSpanAudit}
+        />
+      ) : activeTab === 'threads' ? (
+        <MessengerThreadsPanel messenger={messenger} room={activeRoom} trace={trace} />
+      ) : activeTab === 'assets' ? (
+        <MessengerAssetsPanel artifacts={artifacts} room={activeRoom} />
+      ) : activeTab === 'identity' ? (
+        <MessengerIdentityPanel
+          messenger={messenger}
+          persona={activePersona}
+          rollbackPersonaVersion={rollbackPersonaVersion}
+          retryExternalConnectorEvent={retryExternalConnectorEvent}
+          room={activeRoom}
+        />
       ) : (
         <CompanionInsightPanel
           decideProactiveMessage={decideProactiveMessage}
@@ -4430,6 +4862,573 @@ function CompanionTerminalPanel() {
       aria-labelledby="right-inspector-tab-terminal"
     >
       <InteractiveTerminalPanel />
+    </div>
+  );
+}
+
+function MessengerOverviewPanel({
+  checkpoint,
+  exportCurrentMessengerData,
+  room,
+  trace,
+}: {
+  checkpoint: PersonaMessengerSnapshot['checkpoint'] | null;
+  exportCurrentMessengerData: () => Promise<void>;
+  room: MessengerRoom | null;
+  trace: RunTrace | null;
+}) {
+  return (
+    <section
+      id="right-inspector-overview"
+      className="right-panel-section messenger-overview-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-overview"
+    >
+      <header>
+        <small>Overview</small>
+        <h2>{room?.title || '当前聊天'}</h2>
+      </header>
+      <div className="inspector-metric-grid">
+        <KV label="当前运行" value={trace?.status || '空闲'} />
+        <KV label="待审批" value={String(room?.pending_approval_count ?? checkpoint?.pending_approval_count ?? 0)} />
+        <KV label="失败" value={String(room?.failed_run_count ?? checkpoint?.failed_count ?? 0)} />
+        <KV label="成本" value={checkpoint ? `¥${checkpoint.model_cost_estimate.toFixed(4)}` : '¥0.0000'} />
+      </div>
+      <div className="messenger-overview-actions">
+        <button type="button" onClick={() => void exportCurrentMessengerData()}>
+          导出数据
+        </button>
+      </div>
+      <div className="checkpoint-list">
+        {(checkpoint?.items ?? []).map((item) => (
+          <article key={item.id} className={`checkpoint-item checkpoint-${classToken(item.severity || item.kind)}`}>
+            <strong>{item.title}</strong>
+            {item.body ? <p>{item.body}</p> : null}
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function TodayCheckpointPanel({
+  busy,
+  checkpoint,
+  onClose,
+  onComplete,
+}: {
+  busy: boolean;
+  checkpoint: PersonaMessengerSnapshot['checkpoint'] | null;
+  onClose: () => void;
+  onComplete: () => void;
+}) {
+  const items = checkpoint?.items ?? [];
+  const meaningfulItems = items.filter((item) => item.kind !== 'quiet');
+  const itemCount = meaningfulItems.length;
+  const sinceLabel = checkpoint?.since ? formatShortTime(checkpoint.since) : '最近 24 小时';
+  return (
+    <div className="today-checkpoint-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        aria-label="今日检查"
+        className="today-checkpoint-panel"
+        role="dialog"
+        aria-modal="true"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="today-checkpoint-header">
+          <div>
+            <small>Today</small>
+            <h2>今日检查</h2>
+            <p>自 {sinceLabel} 后有 {itemCount} 项需要看一眼</p>
+          </div>
+          <button className="round-icon-button" type="button" aria-label="关闭今日检查" title="关闭" onClick={onClose}>
+            <span aria-hidden="true">×</span>
+          </button>
+        </header>
+        <div className="today-checkpoint-metrics">
+          <KV label="完成" value={String(checkpoint?.completed_count ?? 0)} />
+          <KV label="失败" value={String(checkpoint?.failed_count ?? 0)} />
+          <KV label="待审批" value={String(checkpoint?.pending_approval_count ?? 0)} />
+          <KV label="无进展" value={String(checkpoint?.no_progress_project_count ?? 0)} />
+          <KV label="新产物" value={String(checkpoint?.new_artifact_count ?? 0)} />
+          <KV label="外部" value={String(checkpoint?.external_unhandled_count ?? 0)} />
+          <KV label="成本" value={formatCost(checkpoint?.model_cost_estimate ?? 0)} />
+        </div>
+        <div className="today-checkpoint-list">
+          {items.map((item) => (
+            <article key={item.id} className={`today-checkpoint-item checkpoint-${classToken(item.severity || item.kind)}`}>
+              <span className="today-checkpoint-mark">{checkpointItemMark(item.severity || item.kind)}</span>
+              <div>
+                <strong>{item.title}</strong>
+                {item.body ? <p>{item.body}</p> : null}
+              </div>
+            </article>
+          ))}
+        </div>
+        <footer className="today-checkpoint-actions">
+          <button type="button" onClick={onClose}>稍后</button>
+          <button type="button" disabled={busy} onClick={onComplete}>
+            {busy ? '写入中...' : '全部已读'}
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function checkpointItemMark(kind: string) {
+  if (kind === 'success' || kind.includes('completed')) return '✓';
+  if (kind === 'error' || kind.includes('failed')) return '!';
+  if (kind === 'warning' || kind.includes('approval') || kind.includes('external')) return '●';
+  return '○';
+}
+
+function buildRunSummaryLabels(spans: RunTraceSpan[]): Record<string, string> {
+  const grouped = new Map<string, RunTraceSpan[]>();
+  for (const span of spans) {
+    if (!span.run_id) continue;
+    grouped.set(span.run_id, [...(grouped.get(span.run_id) ?? []), span]);
+  }
+  const labels: Record<string, string> = {};
+  for (const [runID, runSpans] of grouped) {
+    const summary = summarizeTraceSpansForDisplay(runSpans);
+    const parts = [
+      `${summary.model_count} 次模型`,
+      `${summary.tool_count} 个工具`,
+      formatTokenCount(summary.total_tokens),
+      formatCost(summary.total_cost_estimate),
+    ];
+    if (summary.error_count > 0) parts.push(`${summary.error_count} 个错误`);
+    labels[runID] = parts.join(' · ');
+  }
+  return labels;
+}
+
+function summarizeTraceSpansForDisplay(spans: RunTraceSpan[]): RunTraceSpanSummary {
+  return spans.reduce<RunTraceSpanSummary>((summary, span) => {
+    summary.total += 1;
+    if (span.span_type === 'model_span') summary.model_count += 1;
+    if (span.span_type === 'tool_span') summary.tool_count += 1;
+    if (span.has_error) summary.error_count += 1;
+    if (span.has_external_side_effect) summary.external_side_effect_count += 1;
+    summary.total_tokens += Number(span.total_tokens ?? 0);
+    summary.total_cost_estimate += Number(span.cost_estimate ?? 0);
+    return summary;
+  }, {
+    total: 0,
+    model_count: 0,
+    tool_count: 0,
+    error_count: 0,
+    external_side_effect_count: 0,
+    total_tokens: 0,
+    total_cost_estimate: 0,
+  });
+}
+
+function formatSpanTypeLabel(type: string) {
+  if (type === 'model_span') return 'Model Span';
+  if (type === 'tool_span') return 'Tool Span';
+  if (type === 'run_event') return 'Run Event';
+  return type;
+}
+
+function MessengerRunsPanel({
+  messenger,
+  openRunTrace,
+  trace,
+  traceSpanAudit,
+}: {
+  messenger: PersonaMessengerSnapshot | null;
+  openRunTrace: (runID: string, destination?: 'panel' | 'stage') => Promise<void>;
+  trace: RunTrace | null;
+  traceSpanAudit: { spans: RunTraceSpan[]; summary: RunTraceSpanSummary };
+}) {
+  const [roomFilter, setRoomFilter] = useState('');
+  const [projectFilter, setProjectFilter] = useState('');
+  const [personaFilter, setPersonaFilter] = useState('');
+  const [modelFilter, setModelFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [spanTypeFilter, setSpanTypeFilter] = useState('');
+  const [errorOnly, setErrorOnly] = useState(false);
+  const [sideEffectOnly, setSideEffectOnly] = useState(false);
+  const modelOptions = useMemo(() => Array.from(new Set(traceSpanAudit.spans.map((span) => span.model_name).filter(Boolean) as string[])).sort(), [traceSpanAudit.spans]);
+  const statusOptions = useMemo(() => Array.from(new Set(traceSpanAudit.spans.map((span) => span.status).filter(Boolean))).sort(), [traceSpanAudit.spans]);
+  const filteredSpans = useMemo(() => traceSpanAudit.spans.filter((span) => (
+    (!roomFilter || span.room_id === roomFilter)
+    && (!projectFilter || span.project_id === projectFilter)
+    && (!personaFilter || span.persona_id === personaFilter)
+    && (!modelFilter || span.model_name === modelFilter)
+    && (!statusFilter || span.status === statusFilter)
+    && (!spanTypeFilter || span.span_type === spanTypeFilter)
+    && (!errorOnly || span.has_error)
+    && (!sideEffectOnly || span.has_external_side_effect)
+  )), [errorOnly, modelFilter, personaFilter, projectFilter, roomFilter, sideEffectOnly, spanTypeFilter, statusFilter, traceSpanAudit.spans]);
+  const filteredSummary = useMemo(() => summarizeTraceSpansForDisplay(filteredSpans), [filteredSpans]);
+  return (
+    <section
+      id="right-inspector-runs"
+      className="right-panel-section messenger-runs-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-runs"
+    >
+      <header>
+        <small>Runs</small>
+        <h2>运行</h2>
+      </header>
+      {trace ? (
+        <>
+          <div className="inspector-metric-grid">
+            <KV label="Run" value={trace.id} />
+            <KV label="状态" value={formatStatus(trace.status)} />
+            <KV label="模型调用" value={String(trace.model_calls?.length ?? 0)} />
+            <KV label="步骤" value={String(trace.steps?.length ?? 0)} />
+          </div>
+          <TraceDrawer events={sortBySeq(normalizeTraceEvents(trace))} />
+        </>
+      ) : <p className="empty">当前聊天还没有 Run。</p>}
+      <section className="run-audit-panel">
+        <header>
+          <small>Audit</small>
+          <h3>可观测审计</h3>
+        </header>
+        <div className="inspector-metric-grid">
+          <KV label="Span" value={String(filteredSummary.total)} />
+          <KV label="模型" value={String(filteredSummary.model_count)} />
+          <KV label="工具" value={String(filteredSummary.tool_count)} />
+          <KV label="错误" value={String(filteredSummary.error_count)} />
+          <KV label="Token" value={formatTokenCount(filteredSummary.total_tokens)} />
+          <KV label="成本" value={formatCost(filteredSummary.total_cost_estimate)} />
+        </div>
+        <div className="run-audit-filters">
+          <label>
+            <span>Room</span>
+            <select value={roomFilter} onChange={(event) => setRoomFilter(event.target.value)}>
+              <option value="">全部</option>
+              {(messenger?.rooms ?? []).map((room) => <option key={room.id} value={room.id}>{room.title}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>Project</span>
+            <select value={projectFilter} onChange={(event) => setProjectFilter(event.target.value)}>
+              <option value="">全部</option>
+              {(messenger?.projects ?? []).map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>Persona</span>
+            <select value={personaFilter} onChange={(event) => setPersonaFilter(event.target.value)}>
+              <option value="">全部</option>
+              {(messenger?.personas ?? []).map((persona) => <option key={persona.id} value={persona.id}>{persona.display_name}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>Model</span>
+            <select value={modelFilter} onChange={(event) => setModelFilter(event.target.value)}>
+              <option value="">全部</option>
+              {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>Status</span>
+            <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+              <option value="">全部</option>
+              {statusOptions.map((status) => <option key={status} value={status}>{formatStatus(status)}</option>)}
+            </select>
+          </label>
+          <label>
+            <span>Type</span>
+            <select value={spanTypeFilter} onChange={(event) => setSpanTypeFilter(event.target.value)}>
+              <option value="">全部</option>
+              <option value="model_span">Model Span</option>
+              <option value="tool_span">Tool Span</option>
+              <option value="run_event">Run Event</option>
+            </select>
+          </label>
+          <button className={errorOnly ? 'active' : ''} type="button" onClick={() => setErrorOnly((value) => !value)}>只看错误</button>
+          <button className={sideEffectOnly ? 'active' : ''} type="button" onClick={() => setSideEffectOnly((value) => !value)}>外部副作用</button>
+        </div>
+        <div className="run-audit-list">
+          {filteredSpans.slice(0, 80).map((span) => (
+            <article key={span.id} className={`run-audit-row ${span.has_error ? 'has-error' : ''}`}>
+              <div>
+                <strong>{span.title}</strong>
+                <small>
+                  {formatSpanTypeLabel(span.span_type)} · {formatStatus(span.status)}
+                  {span.model_name ? ` · ${span.model_provider || 'model'} / ${span.model_name}` : ''}
+                  {span.tool_name ? ` · ${span.tool_name}` : ''}
+                </small>
+                <small>
+                  {span.persona_name || span.persona_id || '无 Persona'}
+                  {span.project_name ? ` · ${span.project_name}` : ''}
+                  {span.room_title ? ` · ${span.room_title}` : ''}
+                </small>
+                {span.error ? <p>{span.error}</p> : null}
+              </div>
+              <div className="run-audit-meta">
+                <time>{formatShortTime(span.created_at)}</time>
+                <span>{formatTokenCount(span.total_tokens ?? 0)}</span>
+                <span>{formatCost(span.cost_estimate ?? 0)}</span>
+                <button type="button" onClick={() => void openRunTrace(span.run_id, 'panel')}>查看 Run</button>
+              </div>
+            </article>
+          ))}
+          {filteredSpans.length === 0 ? <p className="empty">没有匹配当前过滤条件的 Span。</p> : null}
+        </div>
+      </section>
+      <details className="inspector-subtool" open={false}>
+        <summary>Terminal</summary>
+        <CompanionTerminalPanel />
+      </details>
+      <details className="inspector-subtool">
+        <summary>Logs</summary>
+        <CompanionLogsPanel runID={trace?.id} />
+      </details>
+    </section>
+  );
+}
+
+function MessengerThreadsPanel({ messenger, room, trace }: { messenger: PersonaMessengerSnapshot | null; room: MessengerRoom | null; trace: RunTrace | null }) {
+  const threadAction = trace?.route_result && typeof trace.route_result === 'object'
+    ? trace.route_result
+    : {};
+  const visibleThreads = (messenger?.threads ?? [])
+    .filter((thread) => !room || thread.room_id === room.id || thread.source_room_ids.includes(room.id))
+    .slice(0, 8);
+  const eventsByThread = new Map<string, PersonaMessengerSnapshot['recent_thread_events']>();
+  for (const event of messenger?.recent_thread_events ?? []) {
+    eventsByThread.set(event.thread_id, [...(eventsByThread.get(event.thread_id) ?? []), event]);
+  }
+  return (
+    <section
+      id="right-inspector-threads"
+      className="right-panel-section messenger-thread-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-threads"
+    >
+      <header>
+        <small>Threads</small>
+        <h2>线程</h2>
+      </header>
+      <article className="thread-observer-card">
+        <strong>{room?.subtitle || room?.title || 'Room Scope'}</strong>
+        <p>聊天不被线程拥有；这里展示由消息、Run 和产物组织出的工作视图。</p>
+        <CollapsedData label="路由/线程依据" value={threadAction} />
+      </article>
+      <div className="thread-observer-list">
+        {visibleThreads.length === 0 ? <p className="empty">当前房间还没有项目线程。</p> : visibleThreads.map((thread) => {
+          const events = (eventsByThread.get(thread.id) ?? []).slice(0, 3);
+          return (
+            <article key={thread.id} className={`thread-observer-card thread-status-${classToken(thread.status)}`}>
+              <div className="thread-observer-row">
+                <div>
+                  <strong>{thread.title}</strong>
+                  <small>{thread.project_name || thread.project_id || 'Room Scope'} · {formatStatus(thread.status)}</small>
+                </div>
+                <span>{thread.priority}</span>
+              </div>
+              {thread.goal ? <p>{compactRoomLastMessage(thread.goal)}</p> : null}
+              <div className="inspector-metric-grid">
+                <KV label="消息" value={String(thread.message_count || thread.source_message_ids.length)} />
+                <KV label="Run" value={String(thread.run_count || thread.run_ids.length)} />
+                <KV label="产物" value={String(thread.artifact_count || thread.artifact_ids.length)} />
+                <KV label="最近 Run" value={formatStatus(thread.latest_run_status || 'none')} />
+              </div>
+              {thread.next_action ? <small>{thread.next_action}</small> : null}
+              {events.length ? (
+                <div className="thread-event-list">
+                  {events.map((event) => (
+                    <small key={event.id}>
+                      {event.event_type}
+                      {event.run_id ? ` · ${event.run_id}` : ''}
+                      {event.artifact_id ? ` · ${event.artifact_id}` : ''}
+                    </small>
+                  ))}
+                </div>
+              ) : null}
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function MessengerAssetsPanel({ artifacts, room }: { artifacts: ArtifactSummary[]; room: MessengerRoom | null }) {
+  const visible = artifacts.slice(0, 12);
+  return (
+    <section
+      id="right-inspector-assets"
+      className="right-panel-section messenger-assets-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-assets"
+    >
+      <header>
+        <small>Assets</small>
+        <h2>资产</h2>
+      </header>
+      {visible.length === 0 ? <p className="empty">{room?.title || '当前房间'} 暂无产物。</p> : (
+        <div className="asset-mini-list">
+          {visible.map((artifact) => (
+            <article key={artifact.id} className="asset-mini-row">
+              <strong>{artifact.title}</strong>
+              <small>{artifact.type} · {artifact.source_run_id || '无 Run'}</small>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function MessengerIdentityPanel({
+  messenger,
+  persona,
+  rollbackPersonaVersion,
+  retryExternalConnectorEvent,
+  room,
+}: {
+  messenger: PersonaMessengerSnapshot | null;
+  persona: ProjectPersona | null;
+  rollbackPersonaVersion: (personaID: string, targetVersion: number) => Promise<void>;
+  retryExternalConnectorEvent: (eventID: string) => Promise<void>;
+  room: MessengerRoom | null;
+}) {
+  const project = persona ? messenger?.projects.find((item) => item.id === persona.project_id) : null;
+  const versions = persona
+    ? (messenger?.persona_versions ?? []).filter((version) => version.persona_id === persona.id).sort((a, b) => b.version - a.version)
+    : [];
+  const roomConnectors = room ? (messenger?.room_connectors ?? []).filter((connector) => connector.room_id === room.id) : [];
+  const externalEvents = room ? (messenger?.recent_external_events ?? []).filter((event) => event.room_id === room.id).slice(0, 5) : [];
+  return (
+    <section
+      id="right-inspector-identity"
+      className="right-panel-section messenger-identity-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-identity"
+    >
+      <header>
+        <small>{room?.type === 'project_dm' ? 'Identity' : 'Members'}</small>
+        <h2>{persona?.display_name || room?.title || '成员'}</h2>
+      </header>
+      {persona ? (
+        <>
+          <div className="persona-card">
+            <strong>{persona.display_name} <span>{persona.handle}</span></strong>
+            <p>{persona.tagline}</p>
+            <small>项目人格 · {project?.name || persona.project_id}</small>
+          </div>
+          <PermissionAuditCard room={room} />
+          <div className="inspector-metric-grid">
+            <KV label="版本" value={String(persona.version)} />
+            <KV label="状态" value={persona.status} />
+            <KV label="权限" value={persona.permission_summary || '按项目权限'} />
+            <KV label="模型策略" value={persona.model_strategy || '默认'} />
+          </div>
+          <CollapsedData label="性格维度" value={persona.traits} />
+          <RoomConnectorList connectors={roomConnectors} events={externalEvents} onRetry={retryExternalConnectorEvent} />
+          <div className="persona-version-list">
+            <h3>身份版本</h3>
+            {versions.length === 0 ? <p className="empty">暂无版本记录。</p> : versions.map((version) => (
+              <article key={version.id} className="persona-version-row">
+                <div>
+                  <strong>v{version.version}</strong>
+                  <small>{version.change_reason || '身份更新'} · {formatShortTime(version.created_at)}</small>
+                </div>
+                <button
+                  type="button"
+                  disabled={version.version === persona.version}
+                  onClick={() => void rollbackPersonaVersion(persona.id, version.version)}
+                >
+                  回滚
+                </button>
+              </article>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+          <PermissionAuditCard room={room} />
+          <div className="member-list">
+            {(room?.members ?? []).map((member) => (
+              <article key={`${member.type}:${member.id}`} className="member-row">
+                <strong>{member.display_name}</strong>
+                <small>
+                  {member.type} · {member.role || 'member'}
+                  {member.visible_project_ids?.length ? ` · ${member.visible_project_ids.length} 个授权项目` : ''}
+                  {member.can_approve_high_risk ? ' · 可批高风险' : ''}
+                </small>
+              </article>
+            ))}
+          </div>
+          <RoomConnectorList connectors={roomConnectors} events={externalEvents} onRetry={retryExternalConnectorEvent} />
+        </>
+      )}
+    </section>
+  );
+}
+
+function PermissionAuditCard({ room }: { room: MessengerRoom | null }) {
+  const audit = room?.permission_audit;
+  if (!audit) return null;
+  return (
+    <div className="permission-audit-card">
+      <h3>权限摘要</h3>
+      <div className="inspector-metric-grid">
+        <KV label="可见项目" value={audit.visible_project_ids.join('、') || '仅房间上下文'} />
+        <KV label="审批" value={audit.can_approve_high_risk ? '可批高风险' : '不可批高风险'} />
+        <KV label="私聊隔离" value={audit.can_read_private_persona_dm ? '允许当前上下文' : '禁止读取其他私聊'} />
+        <KV label="AI 参与" value={audit.multi_human_ai_throttle ? `${audit.ai_participation} · 多真人节制` : audit.ai_participation} />
+      </div>
+      <small>{audit.summary}</small>
+      {audit.reason_codes.length ? <small>{audit.reason_codes.join('、')}</small> : null}
+    </div>
+  );
+}
+
+function RoomConnectorList({
+  connectors,
+  events,
+  onRetry,
+}: {
+  connectors: PersonaMessengerSnapshot['room_connectors'];
+  events: PersonaMessengerSnapshot['recent_external_events'];
+  onRetry: (eventID: string) => Promise<void>;
+}) {
+  return (
+    <div className="room-connector-list">
+      <h3>连接器</h3>
+      {connectors.length === 0 ? <p className="empty">暂无外部映射。</p> : connectors.map((connector) => (
+        <article key={connector.id} className="connector-row">
+          <div>
+            <strong>{connector.provider}</strong>
+            <small>{connector.external_room_id} · {connector.status}</small>
+          </div>
+          <span>{connector.visible_persona_ids.length} 个项目人格</span>
+        </article>
+      ))}
+      {events.length > 0 ? (
+        <div className="external-event-list">
+          {events.map((event) => {
+            const retryable = ['send_failed', 'pending', 'retry_scheduled'].includes(event.status);
+            return (
+              <article key={event.id} className={`external-event-row event-${classToken(event.status)}`}>
+                <div className="external-event-row-header">
+                  <div>
+                    <strong>{event.status}</strong>
+                    <small>{event.provider} · {event.external_event_id}</small>
+                  </div>
+                  {retryable ? (
+                    <button className="external-event-retry" type="button" onClick={() => void onRetry(event.id)}>
+                      重试
+                    </button>
+                  ) : null}
+                </div>
+                {event.error ? <p>{event.error}</p> : <p>{compactRoomLastMessage(event.text)}</p>}
+              </article>
+            );
+          })}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -4971,10 +5970,6 @@ function CompanionInsightPanel({
       role="tabpanel"
       aria-labelledby="right-inspector-tab-memory"
     >
-      <header>
-        <small>Memory</small>
-        <h2>记忆</h2>
-      </header>
       <h3>本次使用了这些记忆</h3>
       <InsightList empty="本轮没有召回 confirmed memory。">
         {usedMemories.map((result) => (
@@ -5730,14 +6725,6 @@ function preferredReasoningModel(models: AvailableModel[]) {
     || models.find((model) => model.id.toLowerCase().includes('pro'))?.id
     || models[0]?.id
     || '';
-}
-
-function executionTargetLabelFromTrace(trace: RunTrace | null, fallback: string) {
-  const preferredNode = String(trace?.metadata?.preferred_node || trace?.route_result?.preferred_node || '');
-  const allowWorker = Boolean(trace?.metadata?.allow_worker ?? trace?.route_result?.allow_worker);
-  const match = executionTargetOptions.find((item) => item.preferredNode === preferredNode && item.allowWorker === allowWorker)
-    ?? executionTargetOptions.find((item) => item.preferredNode === preferredNode);
-  return match?.label || fallback;
 }
 
 function OnboardingPanel({

@@ -32,6 +32,7 @@ export function MessageList({
   onOpenTask,
   onOpenTrace,
   onResolveApproval,
+  runSummaries,
 }: {
   assistantAvatarSrc?: string;
   emptyState?: ReactNode;
@@ -41,6 +42,7 @@ export function MessageList({
   onOpenTask?: (taskId: string) => void;
   onOpenTrace?: (runId: string) => void;
   onResolveApproval?: (approvalId: string, approve: boolean, scope?: 'one_call' | 'current_run') => void;
+  runSummaries?: Record<string, string>;
 }) {
   if (items.length === 0) {
     return <>{emptyState}</>;
@@ -50,7 +52,16 @@ export function MessageList({
     <>
       {groupProcessItems(items).map((item) => {
         if (item.type === 'message') {
-          return <MessageBubble key={item.id} assistantAvatarSrc={assistantAvatarSrc} formatAssistantContent={formatAssistantContent} item={item} />;
+          return (
+            <MessageBubble
+              key={item.id}
+              assistantAvatarSrc={assistantAvatarSrc}
+              formatAssistantContent={formatAssistantContent}
+              item={item}
+              onOpenTrace={onOpenTrace}
+              traceSummary={item.runId ? runSummaries?.[item.runId] : undefined}
+            />
+          );
         }
         if (item.type === 'assistant_response') {
           return (
@@ -61,6 +72,7 @@ export function MessageList({
               item={item}
               onOpenTrace={onOpenTrace}
               onResolveApproval={onResolveApproval}
+              runSummaries={runSummaries}
             />
           );
         }
@@ -165,14 +177,17 @@ function AssistantResponse({
   item,
   onOpenTrace,
   onResolveApproval,
+  runSummaries,
 }: {
   assistantAvatarSrc?: string;
   formatAssistantContent?: (content: string) => string;
   item: AssistantResponseItem;
   onOpenTrace?: (runId: string) => void;
   onResolveApproval?: (approvalId: string, approve: boolean, scope?: 'one_call' | 'current_run') => void;
+  runSummaries?: Record<string, string>;
 }) {
   const content = formatAssistantContent ? formatAssistantContent(item.message.content) : item.message.content;
+  const showTraceLink = item.message.runId && onOpenTrace;
   return (
     <article className={`message-row assistant-message assistant-response-row${item.message.streaming ? ' streaming-message' : ''}`}>
       {assistantAvatarSrc ? <img className="message-avatar assistant" src={assistantAvatarSrc} alt="Joi" /> : <div className="message-avatar assistant">J</div>}
@@ -183,6 +198,11 @@ function AssistantResponse({
         <div className="message-bubble">
           {content ? <MarkdownContent content={content} /> : <p className="message-skeleton">正在组织回复...</p>}
         </div>
+        {showTraceLink ? (
+          <button className="message-run-summary" type="button" onClick={() => onOpenTrace(item.message.runId!)}>
+            {runSummaries?.[item.message.runId!] || '查看 Run'}
+          </button>
+        ) : null}
         {item.tailGroups.map((group) => (
           <ProcessGroupContent key={group.id} group={group} onOpenTrace={onOpenTrace} onResolveApproval={onResolveApproval} />
         ))}

@@ -18,6 +18,9 @@ import {
   type CapabilityRecord,
   type ChatRequest,
   type ChatResponse,
+  type CheckpointSummary,
+  type ConnectExternalMirrorRoomRequest,
+  type CompleteCheckpointRequest,
   type ConfirmationRecord,
   type ConversationActionRequest,
   type ConversationActionResponse,
@@ -28,7 +31,11 @@ import {
   type ConversationMessage,
   type ConversationSummary,
   type ConnectionTest,
+  type CreateProjectPersonaRequest,
+  type CreateSharedRoomRequest,
+  type EvaluateRoomPermissionsRequest,
   type ExternalHandoffAudit,
+  type GenerateProjectPersonaCandidatesRequest,
   type InputMode,
   type InterruptRunRequest,
   type LogCleanupPreview,
@@ -44,6 +51,8 @@ import {
   type MemoryDeleteRequest,
   type MemoryRecord,
   type MemorySearchResult,
+  type MessengerProject,
+  type MessengerRoom,
   type ModelCall,
   type ModelConfigRequest,
   type ModelConnectionTestRequest,
@@ -54,6 +63,10 @@ import {
   type OnboardingStatus,
   type OpenLoop,
   type PermissionProfile,
+  type PersonaCandidate,
+  type PersonaMessengerExportRequest,
+  type PersonaMessengerExportResult,
+  type PersonaMessengerSnapshot,
   type PhotonIMessageSetupRequest,
   type PhotonIMessageSetupResult,
   type PhotonIMessageStatus,
@@ -63,16 +76,29 @@ import {
   type ProductTaskDetail,
   type ProductTaskFilter,
   type ProductTaskReopenRequest,
+  type ProjectPersona,
+  type PreviewExternalPersonaMessageRequest,
   type ReflectionResult,
+  type RecordExternalConnectorFailureRequest,
+  type RecordExternalConnectorInboundRequest,
+  type RecordExternalConnectorOutboundRequest,
   type RecordNotificationOpenedRequest,
   type RecoverableRunRecord,
   type RedirectRunRequest,
   type RedirectRunResponse,
+  type RollbackProjectPersonaRequest,
+  type RoomPermissionAudit,
+  type RetryExternalConnectorEventRequest,
   type RunClosureReport,
   type RunEvent,
   type RunTrace,
+  type RunTraceSpan,
+  type RunTraceSpanFilter,
+  type RunTraceSpanSummary,
   type RuntimeMode,
+  type RoutingFeedbackRequest,
   type SecretStatus,
+  type SetRouteLockRequest,
   type SettingsRecord,
   type SkillRecord,
   type SystemHealth,
@@ -85,6 +111,7 @@ import {
   type TerminalSessionStartRequest,
   type ToolRunRecord,
   type ToolWorkflowRecord,
+  type UpdateProjectPersonaRequest,
   type WorkerGatewayAuditRecord,
   type WorkspaceSettings,
 } from '../../../../../packages/shared-types/src/desktop-api';
@@ -105,6 +132,9 @@ export type {
   CapabilityRecord,
   ChatRequest,
   ChatResponse,
+  CheckpointSummary,
+  ConnectExternalMirrorRoomRequest,
+  CompleteCheckpointRequest,
   ConfirmationRecord,
   ConversationActionRequest,
   ConversationActionResponse,
@@ -115,7 +145,11 @@ export type {
   ConversationMessage,
   ConversationSummary,
   ConnectionTest,
+  CreateProjectPersonaRequest,
+  CreateSharedRoomRequest,
+  EvaluateRoomPermissionsRequest,
   ExternalHandoffAudit,
+  GenerateProjectPersonaCandidatesRequest,
   InputMode,
   InterruptRunRequest,
   LogCleanupPreview,
@@ -131,6 +165,8 @@ export type {
   MemoryDeleteRequest,
   MemoryRecord,
   MemorySearchResult,
+  MessengerProject,
+  MessengerRoom,
   ModelCall,
   ModelConfigRequest,
   ModelConnectionTestRequest,
@@ -141,6 +177,10 @@ export type {
   OnboardingStatus,
   OpenLoop,
   PermissionProfile,
+  PersonaCandidate,
+  PersonaMessengerExportRequest,
+  PersonaMessengerExportResult,
+  PersonaMessengerSnapshot,
   PhotonIMessageSetupRequest,
   PhotonIMessageSetupResult,
   PhotonIMessageStatus,
@@ -150,15 +190,28 @@ export type {
   ProductTaskDetail,
   ProductTaskFilter,
   ProductTaskReopenRequest,
+  ProjectPersona,
+  PreviewExternalPersonaMessageRequest,
   ReflectionResult,
+  RecordExternalConnectorFailureRequest,
+  RecordExternalConnectorInboundRequest,
+  RecordExternalConnectorOutboundRequest,
   RecoverableRunRecord,
   RedirectRunRequest,
   RedirectRunResponse,
+  RollbackProjectPersonaRequest,
+  RoomPermissionAudit,
+  RetryExternalConnectorEventRequest,
   RunClosureReport,
   RunEvent,
   RunTrace,
+  RunTraceSpan,
+  RunTraceSpanFilter,
+  RunTraceSpanSummary,
   RuntimeMode,
+  RoutingFeedbackRequest,
   SecretStatus,
+  SetRouteLockRequest,
   SettingsRecord,
   SkillRecord,
   SystemHealth,
@@ -171,6 +224,7 @@ export type {
   TerminalSessionStartRequest,
   ToolRunRecord,
   ToolWorkflowRecord,
+  UpdateProjectPersonaRequest,
   WorkerGatewayAuditRecord,
   WorkspaceSettings,
 } from '../../../../../packages/shared-types/src/desktop-api';
@@ -209,6 +263,285 @@ function bindings(): DesktopBindings {
           selected_agent_id: 'general_agent',
           response: `Preview mode: ${req.message}`,
           model_calls: [],
+        };
+      },
+      async ListPersonaMessenger() {
+        const now = new Date().toISOString();
+        return {
+          projects: [{
+            id: 'prj_preview',
+            name: 'Joi Desktop',
+            goal: '预览 Persona Messenger',
+            domain: 'desktop_agent_os',
+            phase: 'mvp',
+            risk_level: 'low',
+            status: 'active',
+            summary: '浏览器预览中的 Joi 项目人格工作空间。',
+            created_at: now,
+            updated_at: now,
+          }],
+          personas: [{
+            id: 'per_preview',
+            project_id: 'prj_preview',
+            display_name: 'Joi',
+            handle: '@joi-desktop',
+            tagline: '本地桌面 Agent OS 项目人格',
+            self_intro: '我负责把消息、任务、记忆和运行日志组织成可验证的工作空间。',
+            traits: { directness: 0.78, warmth: 0.5, humor: 0.12, verbosity: 0.46, initiative: 0.7, risk_sensitivity: 0.84, divergence: 0.32 },
+            disagreement_style: '直接指出风险，并给出替代路径',
+            uncertainty_style: '说明不确定来源和验证路径',
+            status: 'active',
+            version: 1,
+            capabilities: ['chat', 'memory', 'trace', 'terminal'],
+            permission_summary: '默认只读；高风险动作需要审批',
+            model_strategy: '使用桌面默认模型策略',
+          }],
+          rooms: [{
+            id: 'room_private_hub',
+            type: 'private_hub',
+            title: '私人总群',
+            subtitle: '你和所有项目人格',
+            owner_user_id: 'desktop_user',
+            persona_id: 'per_preview',
+            conversation_id: 'conv_preview',
+            default_ai_participation: 'moderate',
+            floor_holder_persona_id: 'per_preview',
+            unread_count: 0,
+            pending_approval_count: 0,
+            failed_run_count: 0,
+            running_run_count: 0,
+            last_message: 'Joi 加入了群聊',
+            last_activity_at: now,
+            members: [
+              { id: 'desktop_user', type: 'user', display_name: '你', role: 'owner' },
+              { id: 'per_preview', type: 'persona', display_name: 'Joi', role: 'persona', persona_id: 'per_preview', project_id: 'prj_preview' },
+            ],
+          }, {
+            id: 'room_preview_dm',
+            type: 'project_dm',
+            title: 'Joi',
+            subtitle: 'Joi Desktop',
+            owner_user_id: 'desktop_user',
+            project_id: 'prj_preview',
+            persona_id: 'per_preview',
+            conversation_id: 'conv_preview',
+            default_ai_participation: 'moderate',
+            floor_holder_persona_id: 'per_preview',
+            unread_count: 0,
+            pending_approval_count: 0,
+            failed_run_count: 0,
+            running_run_count: 0,
+            last_message: '浏览器预览中的 Project DM',
+            last_activity_at: now,
+            members: [
+              { id: 'desktop_user', type: 'user', display_name: '你', role: 'owner' },
+              { id: 'per_preview', type: 'persona', display_name: 'Joi', role: 'persona', persona_id: 'per_preview', project_id: 'prj_preview' },
+            ],
+          }],
+          persona_versions: [{
+            id: 'pver_preview_1',
+            persona_id: 'per_preview',
+            version: 1,
+            changed_by: 'desktop_user',
+            change_reason: '预览初始身份',
+            created_at: now,
+          }],
+	          room_connectors: [],
+	          recent_external_events: [],
+	          route_locks: [],
+	          recent_routing_decisions: [],
+	          threads: [],
+	          recent_thread_events: [],
+	          checkpoint: {
+            since: now,
+            completed_count: 0,
+            failed_count: 0,
+            pending_approval_count: 0,
+            waiting_user_count: 0,
+            new_artifact_count: 0,
+            no_progress_project_count: 0,
+            model_cost_estimate: 0,
+            external_unhandled_count: 0,
+            items: [{ id: 'preview_quiet', kind: 'quiet', title: '预览模式暂无需要检查的变化', severity: 'info' }],
+          },
+        };
+      },
+      async GenerateProjectPersonaCandidates(req) {
+        const name = req.project_name?.trim() || 'New Project';
+        return {
+          candidates: ['Builder', 'Pilot', 'Scout'].map((suffix, index) => ({
+            id: `pcand_preview_${index + 1}`,
+            display_name: `${name} ${suffix}`,
+            handle: `@${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${suffix.toLowerCase()}`,
+            tagline: `负责 ${name} 的项目人格`,
+            self_intro: '我会把目标拆成可验证的下一步。',
+            traits: { directness: 0.7 + index * 0.04, warmth: 0.5, humor: 0.15, verbosity: 0.42, initiative: 0.7, risk_sensitivity: 0.8, divergence: 0.35 + index * 0.1 },
+            disagreement_style: '明确指出风险，并提供替代方案',
+            uncertainty_style: '说明不确定来源和验证路径',
+            rationale: '浏览器预览候选。',
+          })),
+        };
+      },
+      async CreateProjectPersona(req) {
+        const snapshot = await this.ListPersonaMessenger();
+        return { project: snapshot.projects[0], persona: snapshot.personas[0], room: snapshot.rooms[1] };
+      },
+      async UpdateProjectPersona(req) {
+        const snapshot = await this.ListPersonaMessenger();
+        return { ...snapshot.personas[0], ...req, id: req.persona_id, version: snapshot.personas[0].version + 1 };
+      },
+      async RollbackProjectPersona(req) {
+        const snapshot = await this.ListPersonaMessenger();
+        return { ...snapshot.personas[0], id: req.persona_id, version: snapshot.personas[0].version + 1 };
+      },
+      async CreateSharedRoom(req) {
+        const snapshot = await this.ListPersonaMessenger();
+        return {
+          room: {
+            ...snapshot.rooms[0],
+            id: 'room_preview_shared',
+            type: 'shared',
+            title: req.title,
+            subtitle: req.permission_summary || '共享房间',
+            members: [
+              { id: 'desktop_user', type: 'user', display_name: '你', role: 'room_owner' },
+              ...req.human_members.map((member, index) => ({ id: member.external_user_id || `human_preview_${index}`, type: 'human', display_name: member.display_name, role: member.role || 'human_member' })),
+              ...snapshot.personas.filter((persona) => req.persona_ids.includes(persona.id)).map((persona) => ({ id: persona.id, type: 'persona', display_name: persona.display_name, role: 'persona', persona_id: persona.id, project_id: persona.project_id })),
+            ],
+          },
+        };
+      },
+      async ConnectExternalMirrorRoom(req) {
+        const snapshot = await this.ListPersonaMessenger();
+        const room = snapshot.rooms.find((item) => item.id === req.room_id) ?? snapshot.rooms[0];
+        return {
+          room,
+          connector: {
+            id: `rconn_preview_${req.provider}_${req.external_room_id}`,
+            room_id: room.id,
+            provider: req.provider,
+            connector_id: `${req.provider}:${req.external_room_id}`,
+            external_room_id: req.external_room_id,
+            status: 'active',
+            visible_persona_ids: req.persona_ids,
+            allow_temporary_invite: Boolean(req.allow_temporary_invite),
+            retry_count: 0,
+            metadata: {},
+          },
+        };
+      },
+      async RecordExternalConnectorInbound(req) {
+        const snapshot = await this.ListPersonaMessenger();
+        return {
+          room: snapshot.rooms[0],
+          message_id: 'msg_preview_external',
+          duplicate: false,
+          event: {
+            id: 'extev_preview',
+            connector_id: `rconn_preview_${req.provider}_${req.external_room_id}`,
+            provider: req.provider,
+            external_event_id: req.external_event_id,
+            room_id: snapshot.rooms[0].id,
+            external_user_id: req.external_user_id,
+            reply_to_external_message_id: req.reply_to_external_message_id,
+            text: req.text,
+            internal_message_id: 'msg_preview_external',
+            status: 'received',
+            retry_count: 0,
+            metadata: {},
+          },
+        };
+      },
+      async RecordExternalConnectorOutbound(req) {
+        const snapshot = await this.ListPersonaMessenger();
+        const room = snapshot.rooms.find((item) => item.id === req.room_id) ?? snapshot.rooms[0];
+        return {
+          room,
+          message_id: req.internal_message_id || 'msg_preview_external_outbound',
+          duplicate: false,
+          event: {
+            id: 'extev_preview_outbound',
+            connector_id: req.connector_id || `rconn_preview_${req.provider}_${req.external_room_id}`,
+            provider: req.provider || 'preview',
+            external_event_id: req.external_message_id,
+            room_id: room.id,
+            external_user_id: '',
+            text: req.text,
+            internal_message_id: req.internal_message_id || 'msg_preview_external_outbound',
+            status: req.status || 'sent',
+            retry_count: 0,
+            metadata: { direction: 'outbound', persona_id: req.persona_id },
+          },
+        };
+      },
+      async PreviewExternalPersonaMessage(req) {
+        const snapshot = await this.ListPersonaMessenger();
+        const persona = snapshot.personas.find((item) => item.id === req.persona_id) ?? snapshot.personas[0];
+        const project = snapshot.projects.find((item) => item.id === persona.project_id);
+        return { room_id: req.room_id, persona_id: persona.id, text: `${persona.display_name} · ${project?.name || persona.project_id} ◇\n${req.text}`, controls: [`回复 ${persona.display_name}`, `锁定 ${persona.display_name}`, '查看运行'] };
+      },
+      async RecordExternalConnectorFailure(req) {
+        return {
+          event: {
+            id: 'extev_preview_failure',
+            connector_id: req.connector_id,
+            provider: 'preview',
+            external_event_id: req.external_event_id || 'failure_preview',
+            room_id: req.room_id || 'room_private_hub',
+            external_user_id: '',
+            text: '',
+            status: 'send_failed',
+            retry_count: req.retryable === false ? 0 : 1,
+            error: req.error,
+            metadata: { retryable: req.retryable !== false },
+          },
+        };
+      },
+      async RetryExternalConnectorEvent(req) {
+        return {
+          event: {
+            id: req.event_id || 'extev_preview_retry',
+            connector_id: req.connector_id || 'rconn_preview',
+            provider: 'preview',
+            external_event_id: req.external_event_id || 'retry_preview',
+            room_id: 'room_private_hub',
+            external_user_id: '',
+            text: '',
+            status: 'retry_scheduled',
+            retry_count: 1,
+            metadata: { retry_reason: req.reason || '', retryable: true },
+          },
+        };
+      },
+      async SetRouteLock(req) {
+        if (req.action === 'unlock' || !req.persona_id) return { route_lock: null };
+        return { route_lock: { room_id: req.room_id, user_id: req.user_id || 'desktop_user', persona_id: req.persona_id, status: 'active', started_at: new Date().toISOString() } };
+      },
+      async CompleteCheckpoint() {
+        const snapshot = await this.ListPersonaMessenger();
+        return { ...snapshot.checkpoint, checkpoint_id: 'chk_preview', checked_at: new Date().toISOString(), items: [] };
+      },
+      async RecordRoutingFeedback() {},
+      async EvaluateRoomPermissions(req) {
+        const snapshot = await this.ListPersonaMessenger();
+        const room = snapshot.rooms.find((item) => item.id === req.room_id) ?? snapshot.rooms[0];
+        const actorID = req.actor_id || 'desktop_user';
+        return room.permission_audit ?? {
+          room_id: room.id,
+          actor_id: actorID,
+          actor_type: req.actor_type || 'user',
+          actor_role: actorID === 'desktop_user' ? 'room_owner' : 'guest',
+          authorized_project_ids: room.project_id ? [room.project_id] : [],
+          visible_project_ids: room.project_id ? [room.project_id] : [],
+          denied_project_ids: [],
+          can_read_room_history: true,
+          can_read_private_persona_dm: true,
+          can_modify_core_persona: actorID === 'desktop_user',
+          can_approve_high_risk: actorID === 'desktop_user',
+          ai_participation: room.default_ai_participation,
+          multi_human_ai_throttle: room.type === 'shared',
+          reason_codes: ['PREVIEW_PERMISSION_AUDIT'],
+          summary: 'preview permission audit',
         };
       },
       async ListAutomations() {
@@ -309,6 +642,20 @@ function bindings(): DesktopBindings {
             { id: 'step_preview_1', step_type: 'input_received', title: 'Input received', status: 'succeeded' },
             { id: 'step_preview_2', step_type: 'response_generated', title: 'Response generated', status: 'succeeded' },
           ],
+        };
+      },
+      async ListRunTraceSpans() {
+        return {
+          spans: [],
+          summary: {
+            total: 0,
+            model_count: 0,
+            tool_count: 0,
+            error_count: 0,
+            external_side_effect_count: 0,
+            total_tokens: 0,
+            total_cost_estimate: 0,
+          },
         };
       },
       async ListConversations(filter: ConversationFilter = { view: 'active', limit: 100 }) {
@@ -600,6 +947,18 @@ function bindings(): DesktopBindings {
       async ExportDiagnostics() {
         return { path: 'preview-diagnostics.zip' };
       },
+      async ExportPersonaMessengerData(req?: PersonaMessengerExportRequest): Promise<PersonaMessengerExportResult> {
+        const generated_at = new Date().toISOString();
+        return {
+          path: 'preview-persona-messenger-export.json',
+          manifest: {
+            generated_at,
+            filters: req ?? {},
+            row_counts: {},
+            secrets_policy: 'preview export uses mock data only',
+          },
+        };
+      },
       async ListLogs() {
         return { logs: [] };
       },
@@ -798,7 +1157,24 @@ function bindings(): DesktopBindings {
 
 export const desktopApi = {
   sendChat: (req: ChatRequest) => bindings().SendChat(req),
+  listPersonaMessenger: () => bindings().ListPersonaMessenger(),
+  generateProjectPersonaCandidates: (req: GenerateProjectPersonaCandidatesRequest) => bindings().GenerateProjectPersonaCandidates(req),
+  createProjectPersona: (req: CreateProjectPersonaRequest) => bindings().CreateProjectPersona(req),
+  updateProjectPersona: (req: UpdateProjectPersonaRequest) => bindings().UpdateProjectPersona(req),
+  rollbackProjectPersona: (req: RollbackProjectPersonaRequest) => bindings().RollbackProjectPersona(req),
+  createSharedRoom: (req: CreateSharedRoomRequest) => bindings().CreateSharedRoom(req),
+  connectExternalMirrorRoom: (req: ConnectExternalMirrorRoomRequest) => bindings().ConnectExternalMirrorRoom(req),
+  recordExternalConnectorInbound: (req: RecordExternalConnectorInboundRequest) => bindings().RecordExternalConnectorInbound(req),
+  recordExternalConnectorOutbound: (req: RecordExternalConnectorOutboundRequest) => bindings().RecordExternalConnectorOutbound(req),
+  previewExternalPersonaMessage: (req: PreviewExternalPersonaMessageRequest) => bindings().PreviewExternalPersonaMessage(req),
+  recordExternalConnectorFailure: (req: RecordExternalConnectorFailureRequest) => bindings().RecordExternalConnectorFailure(req),
+  retryExternalConnectorEvent: (req: RetryExternalConnectorEventRequest) => bindings().RetryExternalConnectorEvent(req),
+  setRouteLock: (req: SetRouteLockRequest) => bindings().SetRouteLock(req),
+  completeCheckpoint: (req: CompleteCheckpointRequest = {}) => bindings().CompleteCheckpoint(req),
+  recordRoutingFeedback: (req: RoutingFeedbackRequest) => bindings().RecordRoutingFeedback(req),
+  evaluateRoomPermissions: (req: EvaluateRoomPermissionsRequest) => bindings().EvaluateRoomPermissions(req),
   getRunTrace: (runID: string) => bindings().GetRunTrace(runID),
+  listRunTraceSpans: (filter: RunTraceSpanFilter = {}) => bindings().ListRunTraceSpans(filter),
   listConversations: (filter: ConversationFilter = { view: 'active', limit: 100 }) => bindings().ListConversations(filter),
   getConversation: (conversationID: string) => bindings().GetConversation(conversationID),
   listConversationGroups: () => bindings().ListConversationGroups(),
@@ -859,6 +1235,7 @@ export const desktopApi = {
   createBackup: () => bindings().CreateBackup(),
   restoreBackup: (path: string) => bindings().RestoreBackup(path),
   exportDiagnostics: () => bindings().ExportDiagnostics(),
+  exportPersonaMessengerData: (req: PersonaMessengerExportRequest = {}) => bindings().ExportPersonaMessengerData(req),
   listAutomations: (filter: { kind?: 'schedule' | 'webhook'; enabled?: boolean; limit?: number } = {}) => bindings().ListAutomations(filter),
   getAutomation: (id: string) => bindings().GetAutomation(id),
   saveAutomation: (req: AutomationDefinitionRequest) => bindings().SaveAutomation(req),

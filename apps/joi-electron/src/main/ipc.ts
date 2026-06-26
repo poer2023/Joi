@@ -10,17 +10,31 @@ import type {
   AutomationTriggerNowRequest,
   AutomationWebhookTestRequest,
   ChatRequest,
+  ConnectExternalMirrorRoomRequest,
+  CreateProjectPersonaRequest,
+  CreateSharedRoomRequest,
+  EvaluateRoomPermissionsRequest,
   ConversationFilter,
   ConnectionTest,
   ExternalHandoffAudit,
   ExternalHandoffReadiness,
+  GenerateProjectPersonaCandidatesRequest,
   LogCleanupRequest,
   LogFilter,
   ModelConnectionTestRequest,
   ModelConfigRequest,
   ModelSettingsRequest,
   PhotonIMessageStatus,
+  PreviewExternalPersonaMessageRequest,
+  RecordExternalConnectorFailureRequest,
+  RecordExternalConnectorInboundRequest,
+  RecordExternalConnectorOutboundRequest,
   RedirectRunRequest,
+  RetryExternalConnectorEventRequest,
+  RollbackProjectPersonaRequest,
+  RoutingFeedbackRequest,
+  RunTraceSpanFilter,
+  SetRouteLockRequest,
   SettingsRecord,
   TelegramInboundStatus,
   TerminalSessionInputRequest,
@@ -28,6 +42,7 @@ import type {
   TerminalSessionResizeRequest,
   TerminalSessionStartRequest,
   WorkspaceSettings,
+  UpdateProjectPersonaRequest,
 } from '../../../../packages/shared-types/src/desktop-api';
 import type { JoiSQLiteStore, PersistedToolResult, StartedToolCallingChat, ToolCallingPromptAssembly, ToolCallingResumeRequest } from '../../../../packages/store/src/sqlite';
 import type { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
@@ -140,6 +155,54 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
       emitNewRunEvents(result.run_id);
       return result;
     },
+    ListPersonaMessenger() {
+      return store.listPersonaMessenger();
+    },
+    GenerateProjectPersonaCandidates(payload) {
+      return store.generateProjectPersonaCandidates(payload as GenerateProjectPersonaCandidatesRequest);
+    },
+    CreateProjectPersona(payload) {
+      return store.createProjectPersona(payload as CreateProjectPersonaRequest);
+    },
+    UpdateProjectPersona(payload) {
+      return store.updateProjectPersona(payload as UpdateProjectPersonaRequest);
+    },
+    RollbackProjectPersona(payload) {
+      return store.rollbackProjectPersona(payload as RollbackProjectPersonaRequest);
+    },
+    CreateSharedRoom(payload) {
+      return store.createSharedRoom(payload as CreateSharedRoomRequest);
+    },
+    ConnectExternalMirrorRoom(payload) {
+      return store.connectExternalMirrorRoom(payload as ConnectExternalMirrorRoomRequest);
+    },
+    RecordExternalConnectorInbound(payload) {
+      return store.recordExternalConnectorInbound(payload as RecordExternalConnectorInboundRequest);
+    },
+    RecordExternalConnectorOutbound(payload) {
+      return store.recordExternalConnectorOutbound(payload as RecordExternalConnectorOutboundRequest);
+    },
+    PreviewExternalPersonaMessage(payload) {
+      return store.previewExternalPersonaMessage(payload as PreviewExternalPersonaMessageRequest);
+    },
+    RecordExternalConnectorFailure(payload) {
+      return store.recordExternalConnectorFailure(payload as RecordExternalConnectorFailureRequest);
+    },
+    RetryExternalConnectorEvent(payload) {
+      return store.retryExternalConnectorEvent(payload as RetryExternalConnectorEventRequest);
+    },
+    SetRouteLock(payload) {
+      return store.setRouteLock(payload as SetRouteLockRequest);
+    },
+    CompleteCheckpoint(payload) {
+      return store.completeCheckpoint(payload as Parameters<typeof store.completeCheckpoint>[0]);
+    },
+    RecordRoutingFeedback(payload) {
+      store.recordRoutingFeedback(payload as RoutingFeedbackRequest);
+    },
+    EvaluateRoomPermissions(payload) {
+      return store.evaluateRoomPermissions(payload as EvaluateRoomPermissionsRequest);
+    },
     ListAutomations(payload) {
       return store.listAutomations(payload as { kind?: 'schedule' | 'webhook'; enabled?: boolean; limit?: number });
     },
@@ -221,6 +284,9 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     },
     GetRunTrace(payload) {
       return store.getRunTrace(String(payload ?? ''));
+    },
+    ListRunTraceSpans(payload) {
+      return store.listRunTraceSpans(payload as RunTraceSpanFilter);
     },
     GetRecentRunClosureReport(payload) {
       return store.getRecentRunClosureReport(payload as { limit?: number });
@@ -430,6 +496,9 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     },
     ExportDiagnostics() {
       return store.exportDiagnostics();
+    },
+    ExportPersonaMessengerData(payload) {
+      return store.exportPersonaMessengerData(payload || {});
     },
     ListLogs(payload) {
       return store.listLogs((payload || {}) as LogFilter);

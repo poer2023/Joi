@@ -1,9 +1,14 @@
 export type ChatRequest = {
   conversation_id?: string;
+  room_id?: string;
   channel?: string;
   user_id?: string;
   principal_id?: string;
   message: string;
+  reply_to_message_id?: string;
+  mentions?: string[];
+  scope_override?: MessengerScopeOverride;
+  route_lock_action?: 'lock' | 'unlock' | 'none';
   preferred_node?: string;
   allow_worker?: boolean;
   model_name?: string;
@@ -13,6 +18,432 @@ export type ChatRequest = {
   redirected_from_run_id?: string;
   runtime_mode?: RuntimeMode;
   permission_profile?: PermissionProfile;
+};
+
+export type MessengerRoomType = 'private_hub' | 'project_dm' | 'shared' | 'human_dm' | 'external_mirror' | string;
+
+export type MessengerPersonaStatus = 'active' | 'warm' | 'dormant' | 'archived' | 'deleted' | string;
+
+export type MessengerScopeOverride = 'current_project' | 'temporary' | 'other_project' | 'cross_project' | 'auto_route' | 'specified_persona' | 'locked_persona' | 'room_scope' | 'multi_project' | string;
+
+export type MessengerProject = {
+  id: string;
+  name: string;
+  goal?: string;
+  domain?: string;
+  phase?: string;
+  risk_level?: string;
+  status: string;
+  summary?: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+  archived_at?: string;
+};
+
+export type ProjectPersona = {
+  id: string;
+  project_id: string;
+  display_name: string;
+  handle: string;
+  avatar?: string;
+  tagline?: string;
+  self_intro?: string;
+  traits: Record<string, number>;
+  disagreement_style?: string;
+  uncertainty_style?: string;
+  status: MessengerPersonaStatus;
+  version: number;
+  capabilities: string[];
+  permission_summary?: string;
+  model_strategy?: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type PersonaCandidate = {
+  id: string;
+  display_name: string;
+  handle: string;
+  avatar?: string;
+  tagline: string;
+  self_intro: string;
+  traits: Record<string, number>;
+  disagreement_style: string;
+  uncertainty_style: string;
+  rationale: string;
+};
+
+export type PersonaVersion = {
+  id: string;
+  persona_id: string;
+  version: number;
+  changed_by: string;
+  change_reason: string;
+  before?: ProjectPersona;
+  after?: ProjectPersona;
+  applies_from_message_id?: string;
+  created_at?: string;
+};
+
+export type MessengerRoom = {
+  id: string;
+  type: MessengerRoomType;
+  title: string;
+  subtitle?: string;
+  owner_user_id: string;
+  project_id?: string;
+  persona_id?: string;
+  conversation_id?: string;
+  default_ai_participation: string;
+  floor_holder_persona_id?: string;
+  route_lock_persona_id?: string;
+  unread_count: number;
+  pending_approval_count: number;
+  failed_run_count: number;
+  running_run_count: number;
+  last_message?: string;
+  last_role?: string;
+  last_activity_at?: string;
+  archived_at?: string;
+  metadata?: Record<string, unknown>;
+  members?: Array<{
+    id: string;
+    type: 'user' | 'human' | 'persona' | string;
+    display_name: string;
+    role?: string;
+    persona_id?: string;
+    project_id?: string;
+    visibility_scope?: string;
+    visible_project_ids?: string[];
+    can_approve_high_risk?: boolean;
+    metadata?: Record<string, unknown>;
+  }>;
+  permission_audit?: RoomPermissionAudit;
+};
+
+export type RoomConnector = {
+  id: string;
+  room_id: string;
+  provider: string;
+  connector_id: string;
+  external_room_id: string;
+  status: string;
+  visible_persona_ids: string[];
+  allow_temporary_invite: boolean;
+  retry_count: number;
+  last_error?: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ExternalConnectorEvent = {
+  id: string;
+  connector_id: string;
+  provider: string;
+  external_event_id: string;
+  room_id: string;
+  external_user_id: string;
+  reply_to_external_message_id?: string;
+  text: string;
+  internal_message_id?: string;
+  status: string;
+  retry_count: number;
+  error?: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+};
+
+export type RouteLock = {
+  room_id: string;
+  user_id: string;
+  persona_id: string;
+  started_at?: string;
+  expires_at?: string;
+  status: string;
+};
+
+export type RoutingDecision = {
+  id: string;
+  room_id: string;
+  message_id?: string;
+  run_id?: string;
+  speaker_persona_id?: string;
+  owner_project_id?: string;
+  executor_persona_id?: string;
+  collaborator_project_ids: string[];
+  execution_scope: string;
+  write_targets: string[];
+  thread_action: Record<string, unknown>;
+  confidence: number;
+  risk: string;
+  requires_confirmation: boolean;
+  reason_codes: string[];
+  created_at?: string;
+};
+
+export type MessengerThread = {
+  id: string;
+  project_id?: string;
+  project_name?: string;
+  room_id?: string;
+  room_title?: string;
+  owner_persona_id?: string;
+  owner_persona_name?: string;
+  title: string;
+  goal?: string;
+  status: string;
+  priority: string;
+  collaborator_persona_ids: string[];
+  source_room_ids: string[];
+  source_message_ids: string[];
+  run_ids: string[];
+  artifact_ids: string[];
+  next_action?: string;
+  message_count: number;
+  run_count: number;
+  artifact_count: number;
+  latest_run_status?: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+  closed_at?: string;
+};
+
+export type MessengerThreadEvent = {
+  id: string;
+  thread_id: string;
+  room_id?: string;
+  message_id?: string;
+  run_id?: string;
+  artifact_id?: string;
+  product_task_id?: string;
+  event_type: string;
+  summary?: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+};
+
+export type CheckpointSummary = {
+  checkpoint_id?: string;
+  checked_at?: string;
+  covered_event_cursor?: string;
+  since?: string;
+  completed_count: number;
+  failed_count: number;
+  pending_approval_count: number;
+  waiting_user_count: number;
+  new_artifact_count: number;
+  no_progress_project_count: number;
+  model_cost_estimate: number;
+  external_unhandled_count: number;
+  items: Array<{
+    id: string;
+    kind: string;
+    title: string;
+    body?: string;
+    severity?: 'info' | 'success' | 'warning' | 'error' | string;
+    room_id?: string;
+    project_id?: string;
+    run_id?: string;
+  }>;
+};
+
+export type PersonaMessengerSnapshot = {
+  rooms: MessengerRoom[];
+  projects: MessengerProject[];
+  personas: ProjectPersona[];
+  persona_versions: PersonaVersion[];
+  room_connectors: RoomConnector[];
+  recent_external_events: ExternalConnectorEvent[];
+  route_locks: RouteLock[];
+  recent_routing_decisions: RoutingDecision[];
+  threads: MessengerThread[];
+  recent_thread_events: MessengerThreadEvent[];
+  checkpoint: CheckpointSummary;
+};
+
+export type GenerateProjectPersonaCandidatesRequest = {
+  project_name: string;
+  project_goal?: string;
+  domain?: string;
+  phase?: string;
+};
+
+export type CreateProjectPersonaRequest = {
+  project_name: string;
+  project_goal?: string;
+  domain?: string;
+  phase?: string;
+  candidate_id?: string;
+  persona_choice?: Partial<ProjectPersona>;
+};
+
+export type UpdateProjectPersonaRequest = {
+  persona_id: string;
+  base_version?: number;
+  actor_id?: string;
+  actor_role?: 'project_owner' | 'room_owner' | 'human_member' | 'guest' | string;
+  room_id?: string;
+  display_name?: string;
+  handle?: string;
+  avatar?: string;
+  tagline?: string;
+  self_intro?: string;
+  traits?: Record<string, number>;
+  disagreement_style?: string;
+  uncertainty_style?: string;
+  change_reason: string;
+};
+
+export type RollbackProjectPersonaRequest = {
+  persona_id: string;
+  target_version: number;
+  actor_id?: string;
+  actor_role?: 'project_owner' | 'room_owner' | 'human_member' | 'guest' | string;
+  room_id?: string;
+  change_reason: string;
+};
+
+export type CreateSharedRoomRequest = {
+  title: string;
+  persona_ids: string[];
+  human_members: Array<{
+    display_name: string;
+    external_user_id?: string;
+    role?: 'human_member' | 'guest' | string;
+    profile?: string;
+    visible_project_ids?: string[];
+    can_approve_high_risk?: boolean;
+  }>;
+  ai_participation?: 'active' | 'moderate' | 'mention_only' | 'silent' | 'temporary' | string;
+  visible_project_ids?: string[];
+  permission_summary?: string;
+  tool_policy?: Record<string, unknown>;
+};
+
+export type ConnectExternalMirrorRoomRequest = {
+  room_id?: string;
+  provider: string;
+  external_room_id: string;
+  title?: string;
+  persona_ids: string[];
+  allow_temporary_invite?: boolean;
+};
+
+export type RecordExternalConnectorInboundRequest = {
+  provider: string;
+  external_room_id: string;
+  external_event_id: string;
+  external_user_id: string;
+  text: string;
+  reply_to_external_message_id?: string;
+};
+
+export type RecordExternalConnectorOutboundRequest = {
+  connector_id?: string;
+  provider?: string;
+  external_room_id?: string;
+  external_message_id: string;
+  room_id?: string;
+  persona_id: string;
+  text: string;
+  internal_message_id?: string;
+  status?: 'sent' | 'pending' | 'send_failed' | string;
+};
+
+export type PreviewExternalPersonaMessageRequest = {
+  room_id: string;
+  persona_id: string;
+  text: string;
+};
+
+export type RecordExternalConnectorFailureRequest = {
+  connector_id: string;
+  external_event_id?: string;
+  room_id?: string;
+  error: string;
+  retryable?: boolean;
+};
+
+export type RetryExternalConnectorEventRequest = {
+  event_id?: string;
+  connector_id?: string;
+  external_event_id?: string;
+  reason?: string;
+};
+
+export type SetRouteLockRequest = {
+  room_id: string;
+  persona_id?: string;
+  user_id?: string;
+  action: 'lock' | 'unlock';
+};
+
+export type CompleteCheckpointRequest = {
+  acknowledged_items?: string[];
+  snoozed_items?: string[];
+};
+
+export type RoutingFeedbackRequest = {
+  routing_decision_id?: string;
+  room_id: string;
+  message_id?: string;
+  run_id?: string;
+  action: 'reroute' | 'adjust_write_scope' | 'confirm' | 'reject' | string;
+  target_persona_id?: string;
+  write_targets?: string[];
+  comment?: string;
+};
+
+export type PersonaMessengerExportRequest = {
+  project_id?: string;
+  persona_id?: string;
+  room_id?: string;
+  thread_id?: string;
+  trace_run_id?: string;
+  since?: string;
+  until?: string;
+  include_messages?: boolean;
+  include_trace?: boolean;
+};
+
+export type PersonaMessengerExportResult = {
+  path: string;
+  manifest: {
+    generated_at: string;
+    filters: PersonaMessengerExportRequest;
+    row_counts: Record<string, number>;
+    secrets_policy: string;
+  };
+};
+
+export type RoomPermissionAudit = {
+  room_id: string;
+  actor_id: string;
+  actor_type: 'user' | 'human' | 'persona' | string;
+  actor_role: string;
+  authorized_project_ids: string[];
+  visible_project_ids: string[];
+  denied_project_ids: string[];
+  can_read_room_history: boolean;
+  can_read_private_persona_dm: boolean;
+  can_modify_core_persona: boolean;
+  can_approve_high_risk: boolean;
+  ai_participation: string;
+  multi_human_ai_throttle: boolean;
+  reason_codes: string[];
+  summary: string;
+};
+
+export type EvaluateRoomPermissionsRequest = {
+  room_id: string;
+  actor_id?: string;
+  actor_type?: 'user' | 'human' | 'persona' | string;
+  project_id?: string;
+  persona_id?: string;
 };
 
 export type ChatResponse = {
@@ -454,6 +885,63 @@ export type ModelCall = {
   prefix_hash?: string;
   dynamic_tail_hash?: string;
   metadata?: Record<string, unknown>;
+};
+
+export type RunTraceSpanType = 'run_event' | 'model_span' | 'tool_span' | string;
+
+export type RunTraceSpan = {
+  id: string;
+  run_id: string;
+  span_type: RunTraceSpanType;
+  event_type: string;
+  title: string;
+  status: string;
+  room_id?: string;
+  room_title?: string;
+  project_id?: string;
+  project_name?: string;
+  persona_id?: string;
+  persona_name?: string;
+  model_provider?: string;
+  model_name?: string;
+  tool_name?: string;
+  risk_level?: string;
+  duration_ms?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cached_input_tokens?: number;
+  total_tokens?: number;
+  cost_estimate?: number;
+  error?: string;
+  has_error: boolean;
+  has_external_side_effect: boolean;
+  created_at?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type RunTraceSpanFilter = {
+  since?: string;
+  until?: string;
+  room_id?: string;
+  project_id?: string;
+  persona_id?: string;
+  model_provider?: string;
+  model_name?: string;
+  span_type?: string;
+  status?: string;
+  has_error?: boolean;
+  has_external_side_effect?: boolean;
+  limit?: number;
+};
+
+export type RunTraceSpanSummary = {
+  total: number;
+  model_count: number;
+  tool_count: number;
+  error_count: number;
+  external_side_effect_count: number;
+  total_tokens: number;
+  total_cost_estimate: number;
 };
 
 export type RunTrace = {
@@ -1237,6 +1725,23 @@ export type ModelListRequest = {
 
 export type DesktopBindings = {
   SendChat(req: ChatRequest): Promise<ChatResponse>;
+  ListPersonaMessenger(): Promise<PersonaMessengerSnapshot>;
+  GenerateProjectPersonaCandidates(req: GenerateProjectPersonaCandidatesRequest): Promise<{ candidates: PersonaCandidate[] }>;
+  CreateProjectPersona(req: CreateProjectPersonaRequest): Promise<{ project: MessengerProject; persona: ProjectPersona; room: MessengerRoom }>;
+  UpdateProjectPersona(req: UpdateProjectPersonaRequest): Promise<ProjectPersona>;
+  RollbackProjectPersona(req: RollbackProjectPersonaRequest): Promise<ProjectPersona>;
+  CreateSharedRoom(req: CreateSharedRoomRequest): Promise<{ room: MessengerRoom }>;
+  ConnectExternalMirrorRoom(req: ConnectExternalMirrorRoomRequest): Promise<{ connector: RoomConnector; room: MessengerRoom }>;
+  RecordExternalConnectorInbound(req: RecordExternalConnectorInboundRequest): Promise<{ event: ExternalConnectorEvent; room: MessengerRoom; message_id?: string; duplicate: boolean }>;
+  RecordExternalConnectorOutbound(req: RecordExternalConnectorOutboundRequest): Promise<{ event: ExternalConnectorEvent; room: MessengerRoom; message_id: string; duplicate: boolean }>;
+  PreviewExternalPersonaMessage(req: PreviewExternalPersonaMessageRequest): Promise<{ text: string; controls: string[]; persona_id: string; room_id: string }>;
+  RecordExternalConnectorFailure(req: RecordExternalConnectorFailureRequest): Promise<{ event: ExternalConnectorEvent }>;
+  RetryExternalConnectorEvent(req: RetryExternalConnectorEventRequest): Promise<{ event: ExternalConnectorEvent }>;
+  SetRouteLock(req: SetRouteLockRequest): Promise<{ route_lock: RouteLock | null }>;
+  CompleteCheckpoint(req: CompleteCheckpointRequest): Promise<CheckpointSummary>;
+  RecordRoutingFeedback(req: RoutingFeedbackRequest): Promise<void>;
+  ExportPersonaMessengerData(req?: PersonaMessengerExportRequest): Promise<PersonaMessengerExportResult>;
+  EvaluateRoomPermissions(req: EvaluateRoomPermissionsRequest): Promise<RoomPermissionAudit>;
   ListAutomations(filter?: { kind?: AutomationKind; enabled?: boolean; limit?: number }): Promise<{ automations: AutomationDefinition[] }>;
   GetAutomation(id: string): Promise<AutomationDefinition>;
   SaveAutomation(req: AutomationDefinitionRequest): Promise<AutomationDefinition>;
@@ -1249,6 +1754,7 @@ export type DesktopBindings = {
   RotateAutomationWebhookSecret(id: string): Promise<AutomationWebhookEndpoint>;
   TestAutomationWebhook(req: AutomationWebhookTestRequest): Promise<{ trigger: AutomationTriggerRecord }>;
   GetRunTrace(runID: string): Promise<RunTrace>;
+  ListRunTraceSpans(filter?: RunTraceSpanFilter): Promise<{ spans: RunTraceSpan[]; summary: RunTraceSpanSummary }>;
   ListConversations(filter: ConversationFilter): Promise<{ conversations: ConversationSummary[] }>;
   GetConversation(conversationID: string): Promise<ConversationDetail>;
   ListConversationGroups(): Promise<{ groups: ConversationGroup[] }>;
@@ -1360,7 +1866,11 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'ArchiveConversation',
   'CloseProductTask',
   'CompleteOnboarding',
+  'CompleteCheckpoint',
+  'ConnectExternalMirrorRoom',
   'CorrectMemory',
+  'CreateProjectPersona',
+  'CreateSharedRoom',
   'CreateBackup',
   'ClearLogs',
   'DecideConfirmation',
@@ -1373,9 +1883,12 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'DeleteMemory',
   'DisableNode',
   'EnableNode',
+  'EvaluateRoomPermissions',
   'ExportDiagnostics',
   'ExportLogs',
+  'ExportPersonaMessengerData',
   'FetchAvailableModels',
+  'GenerateProjectPersonaCandidates',
   'GenerateWorkerToken',
   'GetArtifact',
   'GetAutomation',
@@ -1395,6 +1908,8 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'GetWorkspaceSettings',
   'InterruptRun',
   'ListRecoverableRuns',
+  'ListRunTraceSpans',
+  'ListPersonaMessenger',
   'ListArtifacts',
   'ListAutomationRuns',
   'ListAutomationTriggers',
@@ -1426,14 +1941,21 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'ListUserStates',
   'MoveConversationToGroup',
   'PurgeConversation',
+  'PreviewExternalPersonaMessage',
   'PreviewLogCleanup',
+  'RecordExternalConnectorFailure',
+  'RecordExternalConnectorInbound',
+  'RecordExternalConnectorOutbound',
   'RecordNotificationOpened',
+  'RecordRoutingFeedback',
   'ReopenProductTask',
+  'RollbackProjectPersona',
   'RestoreBackup',
   'RestoreConversation',
   'RotateAutomationWebhookSecret',
   'RedirectRun',
   'ResumeApprovalRun',
+  'RetryExternalConnectorEvent',
   'SaveAutomation',
   'SaveConversationGroup',
   'SaveModelConfig',
@@ -1446,6 +1968,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'SendChat',
   'SendTestIMessageMessage',
   'SendTestTelegramMessage',
+  'SetRouteLock',
   'SetToolWorkflowEnabled',
   'SetAutomationEnabled',
   'SetupPhotonIMessage',
@@ -1457,5 +1980,6 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'TrashConversation',
   'TriggerAutomationNow',
   'UpdateMemory',
+  'UpdateProjectPersona',
   'WrapMCPTool',
 ];
