@@ -48,15 +48,9 @@ rm -f "$PACKAGE" "$MANIFEST"
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR"
 
-APP_VERSION="$VERSION" /bin/bash "$ROOT_DIR/scripts/build_desktop_macos.sh"
-test -x "$BUILT_APP/Contents/MacOS/Joi"
-
-ditto "$BUILT_APP" "$APP_BUNDLE"
-xattr -cr "$APP_BUNDLE" || true
-
 BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-PROVENANCE="$APP_BUNDLE/Contents/Resources/joi-build-provenance.json"
-cat > "$PROVENANCE" <<JSON
+PROVENANCE_SOURCE="$STAGE_DIR/joi-build-provenance.json"
+cat > "$PROVENANCE_SOURCE" <<JSON
 {
   "git_commit": "$GIT_COMMIT",
   "git_branch": "$GIT_BRANCH",
@@ -67,6 +61,16 @@ cat > "$PROVENANCE" <<JSON
   "canonical_main_guard_bypassed": $([[ "$ALLOW_NON_MAIN_INSTALL" == "1" ]] && echo true || echo false)
 }
 JSON
+
+APP_VERSION="$VERSION" JOI_BUILD_PROVENANCE_FILE="$PROVENANCE_SOURCE" \
+  /bin/bash "$ROOT_DIR/scripts/build_desktop_macos.sh"
+test -x "$BUILT_APP/Contents/MacOS/Joi"
+
+ditto "$BUILT_APP" "$APP_BUNDLE"
+xattr -cr "$APP_BUNDLE" || true
+PROVENANCE="$APP_BUNDLE/Contents/Resources/joi-build-provenance.json"
+test -f "$PROVENANCE"
+codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
 EXISTING_PIDS="$(
   /bin/ps -axo pid=,args= | /usr/bin/awk -v app="$INSTALL_APP" '
@@ -87,6 +91,8 @@ fi
 ditto "$APP_BUNDLE" "$INSTALL_APP"
 xattr -cr "$INSTALL_APP" || true
 touch "$INSTALL_APP"
+codesign --verify --deep --strict --verbose=2 "$INSTALL_APP"
+cmp "$PROVENANCE" "$INSTALL_APP/Contents/Resources/joi-build-provenance.json"
 JOI_APP_BUNDLE="$INSTALL_APP" /bin/bash "$ROOT_DIR/scripts/install_joi_cli.sh"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 if [[ -x "$LSREGISTER" ]]; then

@@ -21,6 +21,12 @@ pnpm --filter @joi/electron exec electron-builder --mac dir --arm64 --config.dir
 test -d "$APP_BUNDLE"
 test -x "$APP_BUNDLE/Contents/MacOS/Joi"
 
+if [[ -n "${JOI_BUILD_PROVENANCE_FILE:-}" ]]; then
+  test -f "$JOI_BUILD_PROVENANCE_FILE"
+  install -m 0644 "$JOI_BUILD_PROVENANCE_FILE" \
+    "$APP_BUNDLE/Contents/Resources/joi-build-provenance.json"
+fi
+
 SIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 if [[ -z "$SIGN_IDENTITY" ]] && command -v security >/dev/null 2>&1; then
   SIGN_IDENTITY="$(
