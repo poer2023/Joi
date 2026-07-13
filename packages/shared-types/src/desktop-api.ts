@@ -18,6 +18,7 @@ export type ChatRequest = {
   redirected_from_run_id?: string;
   runtime_mode?: RuntimeMode;
   permission_profile?: PermissionProfile;
+  attachments?: unknown[];
 };
 
 export type MessengerRoomType = 'private_hub' | 'project_dm' | 'shared' | 'human_dm' | 'external_mirror' | string;
@@ -91,6 +92,7 @@ export type MessengerRoom = {
   id: string;
   type: MessengerRoomType;
   title: string;
+  avatar?: string;
   subtitle?: string;
   owner_user_id: string;
   project_id?: string;
@@ -295,6 +297,8 @@ export type UpdateProjectPersonaRequest = {
   traits?: Record<string, number>;
   disagreement_style?: string;
   uncertainty_style?: string;
+  permission_summary?: string;
+  model_strategy?: string;
   change_reason: string;
 };
 
@@ -322,6 +326,20 @@ export type CreateSharedRoomRequest = {
   visible_project_ids?: string[];
   permission_summary?: string;
   tool_policy?: Record<string, unknown>;
+};
+
+export type UpdateMessengerRoomRequest = {
+  room_id: string;
+  title?: string;
+  avatar?: string;
+  actor_id?: string;
+};
+
+export type UpdateMessengerProjectRequest = {
+  project_id: string;
+  name?: string;
+  local_path?: string;
+  actor_id?: string;
 };
 
 export type ConnectExternalMirrorRoomRequest = {
@@ -1731,6 +1749,8 @@ export type DesktopBindings = {
   UpdateProjectPersona(req: UpdateProjectPersonaRequest): Promise<ProjectPersona>;
   RollbackProjectPersona(req: RollbackProjectPersonaRequest): Promise<ProjectPersona>;
   CreateSharedRoom(req: CreateSharedRoomRequest): Promise<{ room: MessengerRoom }>;
+  UpdateMessengerRoom(req: UpdateMessengerRoomRequest): Promise<{ room: MessengerRoom }>;
+  UpdateMessengerProject(req: UpdateMessengerProjectRequest): Promise<{ project: MessengerProject }>;
   ConnectExternalMirrorRoom(req: ConnectExternalMirrorRoomRequest): Promise<{ connector: RoomConnector; room: MessengerRoom }>;
   RecordExternalConnectorInbound(req: RecordExternalConnectorInboundRequest): Promise<{ event: ExternalConnectorEvent; room: MessengerRoom; message_id?: string; duplicate: boolean }>;
   RecordExternalConnectorOutbound(req: RecordExternalConnectorOutboundRequest): Promise<{ event: ExternalConnectorEvent; room: MessengerRoom; message_id: string; duplicate: boolean }>;
@@ -1757,6 +1777,7 @@ export type DesktopBindings = {
   ListRunTraceSpans(filter?: RunTraceSpanFilter): Promise<{ spans: RunTraceSpan[]; summary: RunTraceSpanSummary }>;
   ListConversations(filter: ConversationFilter): Promise<{ conversations: ConversationSummary[] }>;
   GetConversation(conversationID: string): Promise<ConversationDetail>;
+  GetConversationForMessage(messageID: string): Promise<ConversationDetail>;
   ListConversationGroups(): Promise<{ groups: ConversationGroup[] }>;
   SaveConversationGroup(req: ConversationGroupRequest): Promise<ConversationGroup>;
   DeleteConversationGroup(id: string): Promise<void>;
@@ -1894,6 +1915,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'GetAutomation',
   'GetAutomationWebhookEndpoint',
   'GetConversation',
+  'GetConversationForMessage',
   'GetExternalHandoffAudit',
   'GetLogEntry',
   'GetModelUsage',
@@ -1980,6 +2002,8 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'TrashConversation',
   'TriggerAutomationNow',
   'UpdateMemory',
+  'UpdateMessengerProject',
   'UpdateProjectPersona',
+  'UpdateMessengerRoom',
   'WrapMCPTool',
 ];

@@ -102,6 +102,8 @@ import type {
   TaskVerification,
   ToolRunRecord,
   ToolWorkflowRecord,
+  UpdateMessengerProjectRequest,
+  UpdateMessengerRoomRequest,
   UpdateProjectPersonaRequest,
   WorkerGatewayAuditRecord,
   WorkspaceSettings,
@@ -1656,10 +1658,11 @@ export class JoiSQLiteStore {
 
       this.exec(
         `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
-         VALUES (?, ?, 'user', ?, '[]', ?, datetime('now'))`,
+         VALUES (?, ?, 'user', ?, ?, ?, datetime('now'))`,
         userMessageID,
         conversationID,
         message,
+        json(Array.isArray(req.attachments) ? req.attachments : []),
         json({ source: 'electron_sqlite_store' }),
       );
 
@@ -2035,10 +2038,11 @@ export class JoiSQLiteStore {
       this.linkChannelIdentity(entryIdentity, conversationID);
       this.exec(
         `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
-         VALUES (?, ?, 'user', ?, '[]', ?, datetime('now'))`,
+         VALUES (?, ?, 'user', ?, ?, ?, datetime('now'))`,
         userMessageID,
         conversationID,
         message,
+        json(Array.isArray(req.attachments) ? req.attachments : []),
         json({ source: 'electron_ts_tool_calling' }),
       );
       this.exec(
@@ -2622,10 +2626,11 @@ export class JoiSQLiteStore {
 
       this.exec(
         `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
-         VALUES (?, ?, 'user', ?, '[]', ?, datetime('now'))`,
+         VALUES (?, ?, 'user', ?, ?, ?, datetime('now'))`,
         userMessageID,
         conversationID,
         message,
+        json(Array.isArray(req.attachments) ? req.attachments : []),
         json({ source: 'electron_ts_tool_calling' }),
       );
 
@@ -3104,7 +3109,7 @@ export class JoiSQLiteStore {
        LEFT JOIN rooms r ON r.id=mt.room_id
        LEFT JOIN personas ps ON ps.id=mt.owner_persona_id
        ORDER BY datetime(mt.updated_at) DESC, mt.id DESC
-       LIMIT 100`,
+       LIMIT 200`,
     ).map(rowToMessengerThread);
     const recentThreadEvents = this.all(
       `SELECT * FROM messenger_thread_events
@@ -3128,8 +3133,29 @@ export class JoiSQLiteStore {
          (SELECT COUNT(*) FROM runs rn WHERE rn.conversation_id = r.conversation_id AND rn.status='failed') AS failed_run_count
        FROM rooms r
        WHERE r.archived_at IS NULL
+         AND (
+           r.type != 'project_dm'
+           OR COALESCE(json_extract(r.metadata, '$.mapped_from_conversation'), 0) != 1
+         )
+         AND (
+           r.project_id IS NULL
+           OR EXISTS (
+             SELECT 1 FROM projects p
+             WHERE p.id=r.project_id
+               AND p.archived_at IS NULL
+               AND p.status NOT IN ('deleted', 'archived')
+           )
+         )
        ORDER BY
-         CASE r.type WHEN 'private_hub' THEN 0 WHEN 'project_dm' THEN 1 WHEN 'shared' THEN 2 WHEN 'human_dm' THEN 3 ELSE 4 END,
+         CASE
+           WHEN r.id='room_private_hub' THEN 0
+           WHEN r.id='room_joi_dm' THEN 1
+           WHEN r.type='project_dm' THEN 2
+           WHEN r.type='shared' THEN 3
+           WHEN r.type='external_mirror' THEN 4
+           WHEN r.type='human_dm' THEN 5
+           ELSE 6
+         END,
          datetime(r.updated_at) DESC,
          r.id ASC`,
     ).map((row) => this.attachRoomPermissionAudit(rowToMessengerRoom(row, this.listRoomMembers(String(row.id)))));
@@ -3275,13 +3301,15 @@ export class JoiSQLiteStore {
       traits: req.traits || before.traits,
       disagreement_style: req.disagreement_style ?? before.disagreement_style,
       uncertainty_style: req.uncertainty_style ?? before.uncertainty_style,
+      permission_summary: req.permission_summary ?? before.permission_summary,
+      model_strategy: req.model_strategy ?? before.model_strategy,
       version: nextVersion,
     };
     this.transaction(() => {
       this.exec(
         `UPDATE personas
          SET display_name=?, handle=?, avatar=?, tagline=?, self_intro=?, traits=?,
-             disagreement_style=?, uncertainty_style=?, version=?, updated_at=datetime('now')
+             disagreement_style=?, uncertainty_style=?, permission_summary=?, model_strategy=?, version=?, updated_at=datetime('now')
          WHERE id=?`,
         after.display_name,
         after.handle,
@@ -3291,6 +3319,8 @@ export class JoiSQLiteStore {
         json(after.traits),
         after.disagreement_style || '',
         after.uncertainty_style || '',
+        after.permission_summary || '',
+        after.model_strategy || '',
         after.version,
         personaID,
       );
@@ -3344,7 +3374,7 @@ export class JoiSQLiteStore {
       this.exec(
         `UPDATE personas
          SET display_name=?, handle=?, avatar=?, tagline=?, self_intro=?, traits=?,
-             disagreement_style=?, uncertainty_style=?, version=?, metadata=?, updated_at=datetime('now')
+             disagreement_style=?, uncertainty_style=?, permission_summary=?, model_strategy=?, version=?, metadata=?, updated_at=datetime('now')
          WHERE id=?`,
         restored.display_name,
         this.uniquePersonaHandle(restored.handle, restored.project_id, personaID),
@@ -3354,6 +3384,8 @@ export class JoiSQLiteStore {
         json(restored.traits),
         restored.disagreement_style || '',
         restored.uncertainty_style || '',
+        restored.permission_summary || '',
+        restored.model_strategy || '',
         restored.version,
         json(restored.metadata || {}),
         personaID,
@@ -3458,6 +3490,83 @@ export class JoiSQLiteStore {
       );
     });
     return { room: this.requireMessengerRoom(roomID) };
+  }
+
+  updateMessengerRoom(req: UpdateMessengerRoomRequest): { room: MessengerRoom } {
+    this.syncPersonaMessengerRooms();
+    const roomID = req.room_id.trim();
+    if (!roomID) throw new Error('room_id is required');
+    const row = this.get(`SELECT id, title, conversation_id, metadata FROM rooms WHERE id=?`, roomID);
+    if (!row) throw new Error(`Room not found: ${roomID}`);
+    const currentTitle = optionalString(row.title) || '未命名群聊';
+    const title = req.title?.trim() || currentTitle;
+    const metadata = parseObject(row.metadata);
+    if (req.avatar !== undefined) {
+      const avatar = req.avatar.trim();
+      if (avatar) {
+        metadata.avatar = avatar;
+      } else {
+        delete metadata.avatar;
+      }
+    }
+    this.transaction(() => {
+      this.exec(
+        `UPDATE rooms SET title=?, metadata=?, updated_at=datetime('now') WHERE id=?`,
+        title,
+        json(metadata),
+        roomID,
+      );
+      const conversationID = optionalString(row.conversation_id);
+      if (conversationID) {
+        this.exec(
+          `UPDATE conversations SET title=?, updated_at=datetime('now') WHERE id=?`,
+          title,
+          conversationID,
+        );
+      }
+    });
+    return { room: this.requireMessengerRoom(roomID) };
+  }
+
+  updateMessengerProject(req: UpdateMessengerProjectRequest): { project: MessengerProject } {
+    this.syncPersonaMessengerRooms();
+    const projectID = req.project_id.trim();
+    if (!projectID) throw new Error('project_id is required');
+    const before = this.requireMessengerProject(projectID);
+    const nextName = req.name?.trim() || before.name;
+    const metadata = {
+      ...(before.metadata || {}),
+    };
+    if (req.local_path !== undefined) {
+      const localPath = req.local_path.trim();
+      if (localPath) {
+        metadata.local_path = localPath;
+      } else {
+        delete metadata.local_path;
+      }
+    }
+    this.transaction(() => {
+      this.exec(
+        `UPDATE projects SET name=?, metadata=?, updated_at=datetime('now') WHERE id=?`,
+        nextName,
+        json(metadata),
+        projectID,
+      );
+      this.exec(
+        `UPDATE rooms SET subtitle=?, updated_at=datetime('now') WHERE project_id=? AND type='project_dm'`,
+        nextName,
+        projectID,
+      );
+      this.exec(
+        `UPDATE conversations
+         SET title=COALESCE((SELECT display_name || ' · ' || ? FROM personas WHERE personas.id=conversations.active_agent_id LIMIT 1), title),
+             updated_at=datetime('now')
+         WHERE id IN (SELECT conversation_id FROM rooms WHERE project_id=? AND type='project_dm')`,
+        nextName,
+        projectID,
+      );
+    });
+    return { project: this.requireMessengerProject(projectID) };
   }
 
   connectExternalMirrorRoom(req: ConnectExternalMirrorRoomRequest): { connector: RoomConnector; room: MessengerRoom } {
@@ -4037,6 +4146,15 @@ export class JoiSQLiteStore {
       conversation: rowToConversationSummary(conversation),
       messages,
     };
+  }
+
+  getConversationForMessage(messageID: string): ConversationDetail {
+    const row = this.get(`SELECT conversation_id FROM messages WHERE id = ?`, messageID);
+    const conversationID = optionalString(row?.conversation_id);
+    if (!conversationID) {
+      throw new Error(`Message not found: ${messageID}`);
+    }
+    return this.getConversation(conversationID);
   }
 
   getRunTrace(runID: string): RunTrace {
@@ -9333,6 +9451,10 @@ export class JoiSQLiteStore {
   private syncPersonaMessengerRooms(): void {
     const defaultProjectID = 'prj_joi_desktop';
     const defaultPersonaID = 'per_joi_desktop';
+    const hubConversationID = 'conv_private_hub';
+    const hubRoomID = 'room_private_hub';
+    const joiConversationID = 'conv_joi_dm';
+    const joiRoomID = 'room_joi_dm';
     this.transaction(() => {
       this.exec(
         `INSERT INTO projects (id, name, goal, domain, phase, risk_level, status, summary, metadata, created_at, updated_at)
@@ -9365,62 +9487,201 @@ export class JoiSQLiteStore {
       );
       this.exec(
         `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, active_project_id, lifecycle_status, metadata, created_at, updated_at)
-         VALUES ('conv_private_hub', 'desktop', 'desktop_user', '私人总群', ?, ?, 'active', ?, datetime('now'), datetime('now'))
-         ON CONFLICT(id) DO UPDATE SET title='私人总群', active_agent_id=excluded.active_agent_id, active_project_id=excluded.active_project_id, updated_at=conversations.updated_at`,
+         VALUES (?, 'desktop', 'desktop_user', '私人总群', ?, ?, 'active', ?, datetime('now'), datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET
+           active_agent_id=excluded.active_agent_id,
+           active_project_id=excluded.active_project_id,
+           metadata=json_set(COALESCE(conversations.metadata, '{}'), '$.room_id', ?, '$.room_type', 'private_hub'),
+           updated_at=conversations.updated_at`,
+        hubConversationID,
         defaultPersonaID,
         defaultProjectID,
-        json({ room_id: 'room_private_hub', room_type: 'private_hub' }),
+        json({ room_id: hubRoomID, room_type: 'private_hub' }),
+        hubRoomID,
       );
       this.exec(
         `INSERT INTO rooms (id, type, title, subtitle, owner_user_id, project_id, persona_id, conversation_id,
                             default_ai_participation, floor_holder_persona_id, metadata, created_at, updated_at)
-         VALUES ('room_private_hub', 'private_hub', '私人总群', '你和所有项目人格', 'desktop_user', NULL, ?, 'conv_private_hub',
+         VALUES (?, 'private_hub', '私人总群', '你和所有项目人格', 'desktop_user', NULL, ?, ?,
                  'moderate', ?, ?, datetime('now'), datetime('now'))
-         ON CONFLICT(id) DO NOTHING`,
+         ON CONFLICT(id) DO UPDATE SET
+           title=CASE WHEN rooms.title='' OR rooms.title='开发测试' THEN excluded.title ELSE rooms.title END,
+           conversation_id=excluded.conversation_id,
+           persona_id=excluded.persona_id,
+           floor_holder_persona_id=COALESCE(rooms.floor_holder_persona_id, excluded.floor_holder_persona_id)`,
+        hubRoomID,
         defaultPersonaID,
+        hubConversationID,
         defaultPersonaID,
         json({ system_seed: true }),
       );
-      this.upsertRoomMember('room_private_hub', 'user', 'desktop_user', '你', 'owner');
-      this.upsertRoomMember('room_private_hub', 'persona', defaultPersonaID, 'Joi', 'persona', defaultPersonaID, defaultProjectID);
-      const conversations = this.all(
-        `SELECT c.id, COALESCE(NULLIF(c.title, ''), 'Joi 项目私聊') AS title
-         FROM conversations c
-         LEFT JOIN rooms r ON r.conversation_id = c.id
-         WHERE r.id IS NULL
-           AND COALESCE(c.lifecycle_status, 'active') = 'active'
-           AND c.id != 'conv_private_hub'
-         ORDER BY datetime(c.updated_at) DESC
-         LIMIT 200`,
+      this.exec(
+        `UPDATE conversations
+         SET title='私人总群',
+             updated_at=conversations.updated_at
+         WHERE id=?
+           AND (title='' OR title='开发测试')`,
+        hubConversationID,
       );
-      for (const conversation of conversations) {
+      this.exec(
+        `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, active_project_id, lifecycle_status, metadata, created_at, updated_at)
+         VALUES (?, 'desktop', 'desktop_user', 'Joi', ?, ?, 'active', ?, datetime('now'), datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET
+           active_agent_id=excluded.active_agent_id,
+           active_project_id=excluded.active_project_id,
+           lifecycle_status='active',
+           metadata=json_set(COALESCE(conversations.metadata, '{}'), '$.room_id', ?, '$.room_type', 'joi_private_dm'),
+           updated_at=conversations.updated_at`,
+        joiConversationID,
+        defaultPersonaID,
+        defaultProjectID,
+        json({ room_id: joiRoomID, room_type: 'joi_private_dm', private_persona_id: defaultPersonaID }),
+        joiRoomID,
+      );
+      this.exec(
+        `INSERT INTO rooms (id, type, title, subtitle, owner_user_id, project_id, persona_id, conversation_id,
+                            default_ai_participation, floor_holder_persona_id, metadata, created_at, updated_at)
+         VALUES (?, 'project_dm', 'Joi', 'Joi 私聊', 'desktop_user', ?, ?, ?,
+                 'moderate', ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET
+           project_id=excluded.project_id,
+           persona_id=excluded.persona_id,
+           conversation_id=excluded.conversation_id,
+           floor_holder_persona_id=COALESCE(rooms.floor_holder_persona_id, excluded.floor_holder_persona_id)`,
+        joiRoomID,
+        defaultProjectID,
+        defaultPersonaID,
+        joiConversationID,
+        defaultPersonaID,
+        json({ system_seed: true, private_persona_chat: true }),
+      );
+      this.upsertRoomMember(hubRoomID, 'user', 'desktop_user', '你', 'owner');
+      this.upsertRoomMember(hubRoomID, 'persona', defaultPersonaID, 'Joi', 'persona', defaultPersonaID, defaultProjectID);
+      this.upsertRoomMember(joiRoomID, 'user', 'desktop_user', '你', 'owner');
+      this.upsertRoomMember(joiRoomID, 'persona', defaultPersonaID, 'Joi', 'persona', defaultPersonaID, defaultProjectID);
+      const historicalConversations = this.all(
+        `SELECT c.id,
+                COALESCE(NULLIF(c.title, ''), 'Joi 项目私聊') AS title,
+                c.created_at,
+                c.updated_at,
+                (SELECT content FROM messages m WHERE m.conversation_id = c.id ORDER BY datetime(m.created_at) DESC, m.rowid DESC LIMIT 1) AS last_message
+         FROM conversations c
+         WHERE COALESCE(c.lifecycle_status, 'active') = 'active'
+           AND c.id NOT IN (?, ?)
+           AND NOT EXISTS (
+             SELECT 1 FROM rooms existing_room
+             WHERE existing_room.conversation_id = c.id
+           )
+         ORDER BY datetime(c.updated_at) DESC
+         LIMIT 500`,
+        hubConversationID,
+        joiConversationID,
+      );
+      for (const conversation of historicalConversations) {
         const conversationID = String(conversation.id);
-        const roomID = stableRoomIDForConversation(conversationID);
+        const threadID = stableThreadIDForConversation(conversationID);
+        const legacyRoomID = stableRoomIDForConversation(conversationID);
         const title = cleanMessengerTitle(optionalString(conversation.title) || 'Joi 项目私聊');
-        this.exec(
-          `INSERT INTO rooms (id, type, title, subtitle, owner_user_id, project_id, persona_id, conversation_id,
-                              default_ai_participation, floor_holder_persona_id, metadata, created_at, updated_at)
-           VALUES (?, 'project_dm', ?, 'Joi Desktop', 'desktop_user', ?, ?, ?, 'moderate', ?, ?, datetime('now'), datetime('now'))
-           ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id`,
-          roomID,
-          title,
-          defaultProjectID,
-          defaultPersonaID,
+        const messages = this.all(
+          `SELECT id, content, created_at
+           FROM messages
+           WHERE conversation_id=?
+           ORDER BY datetime(created_at) ASC, rowid ASC
+           LIMIT 1000`,
           conversationID,
-          defaultPersonaID,
-          json({ mapped_from_conversation: true }),
         );
-        this.upsertRoomMember(roomID, 'user', 'desktop_user', '你', 'owner');
-        this.upsertRoomMember(roomID, 'persona', defaultPersonaID, 'Joi', 'persona', defaultPersonaID, defaultProjectID);
+        const runs = this.all(
+          `SELECT id, status, created_at
+           FROM runs
+           WHERE conversation_id=?
+           ORDER BY datetime(created_at) ASC, id ASC
+           LIMIT 300`,
+          conversationID,
+        );
+        const messageIDs = messages.map((message) => String(message.id));
+        const runIDs = runs.map((run) => String(run.id));
+        const artifactIDs = runIDs.length
+          ? this.all(
+            `SELECT id FROM artifacts WHERE source_run_id IN (${placeholders(runIDs.length)}) ORDER BY datetime(created_at) ASC, id ASC`,
+            ...runIDs,
+          ).map((artifact) => String(artifact.id))
+          : [];
+        const goal = optionalString(conversation.last_message) || title;
+        const updatedAt = optionalString(conversation.updated_at) || optionalString(conversation.created_at) || '';
+        this.exec(
+          `INSERT INTO messenger_threads (id, project_id, room_id, owner_persona_id, title, goal, status, priority,
+                                           collaborator_persona_ids, source_room_ids, source_message_ids, run_ids,
+                                           artifact_ids, next_action, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'active', 'normal', ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')), COALESCE(NULLIF(?, ''), datetime('now')))
+           ON CONFLICT(id) DO UPDATE SET
+             project_id=excluded.project_id,
+             room_id=excluded.room_id,
+             owner_persona_id=excluded.owner_persona_id,
+             title=excluded.title,
+             goal=excluded.goal,
+             source_room_ids=excluded.source_room_ids,
+             source_message_ids=excluded.source_message_ids,
+             run_ids=excluded.run_ids,
+             artifact_ids=excluded.artifact_ids,
+             next_action=excluded.next_action,
+             metadata=excluded.metadata,
+             updated_at=excluded.updated_at`,
+          threadID,
+          defaultProjectID,
+          joiRoomID,
+          defaultPersonaID,
+          title,
+          goal,
+          json([defaultPersonaID]),
+          json([joiRoomID]),
+          json(messageIDs),
+          json(runIDs),
+          json(artifactIDs),
+          '历史会话已归入 Joi 私聊',
+          json({ mapped_from_conversation: true, source_conversation_id: conversationID, legacy_room_id: legacyRoomID }),
+          optionalString(conversation.created_at) || '',
+          updatedAt,
+        );
+        for (const message of messages) {
+          const messageID = String(message.id);
+          this.exec(
+            `INSERT OR IGNORE INTO messenger_thread_events (id, thread_id, room_id, message_id, run_id, artifact_id, product_task_id,
+                                                            event_type, summary, metadata, created_at)
+             VALUES (?, ?, ?, ?, NULL, NULL, NULL, 'history.message', ?, ?, COALESCE(NULLIF(?, ''), datetime('now')))`,
+            stableThreadEventID(threadID, `message:${messageID}`),
+            threadID,
+            joiRoomID,
+            messageID,
+            optionalString(message.content)?.slice(0, 160) || '历史消息',
+            json({ source_conversation_id: conversationID }),
+            optionalString(message.created_at) || '',
+          );
+        }
+        for (const run of runs) {
+          const runID = String(run.id);
+          this.exec(
+            `INSERT OR IGNORE INTO messenger_thread_events (id, thread_id, room_id, message_id, run_id, artifact_id, product_task_id,
+                                                            event_type, summary, metadata, created_at)
+             VALUES (?, ?, ?, NULL, ?, NULL, NULL, 'history.run', ?, ?, COALESCE(NULLIF(?, ''), datetime('now')))`,
+            stableThreadEventID(threadID, `run:${runID}`),
+            threadID,
+            joiRoomID,
+            runID,
+            `历史 Run · ${optionalString(run.status) || 'unknown'}`,
+            json({ source_conversation_id: conversationID }),
+            optionalString(run.created_at) || '',
+          );
+        }
         this.exec(
           `UPDATE conversations
            SET active_project_id=COALESCE(active_project_id, ?),
                active_agent_id=COALESCE(active_agent_id, ?),
-               metadata=json_set(COALESCE(metadata, '{}'), '$.room_id', ?, '$.room_type', 'project_dm')
+               metadata=json_set(COALESCE(metadata, '{}'), '$.room_id', ?, '$.room_type', 'joi_private_thread', '$.thread_id', ?)
            WHERE id=?`,
           defaultProjectID,
           defaultPersonaID,
-          roomID,
+          joiRoomID,
+          threadID,
           conversationID,
         );
       }
@@ -10195,8 +10456,7 @@ export class JoiSQLiteStore {
     }
     const shouldTrack = shouldCreateProductTask(req, message, mode)
       || isTaskContinuationIntent(message)
-      || Boolean(req.product_task_id?.trim())
-      || context.room.type === 'project_dm';
+      || Boolean(req.product_task_id?.trim());
     if (!shouldTrack) {
       return {
         thread_action: {
@@ -10850,10 +11110,12 @@ function rowToProjectPersona(row: SQLiteRow): ProjectPersona {
 }
 
 function rowToMessengerRoom(row: SQLiteRow, members: MessengerRoom['members'] = []): MessengerRoom {
+  const metadata = parseObject(row.metadata);
   return {
     id: String(row.id),
     type: optionalString(row.type) || 'project_dm',
     title: cleanMessengerTitle(optionalString(row.title) || 'Joi 项目私聊'),
+    avatar: optionalString(metadata.avatar),
     subtitle: optionalString(row.subtitle),
     owner_user_id: optionalString(row.owner_user_id) || 'desktop_user',
     project_id: optionalString(row.project_id),
@@ -10870,7 +11132,7 @@ function rowToMessengerRoom(row: SQLiteRow, members: MessengerRoom['members'] = 
     last_role: optionalString(row.last_role),
     last_activity_at: optionalString(row.updated_at) || optionalString(row.created_at),
     archived_at: optionalString(row.archived_at),
-    metadata: parseObject(row.metadata),
+    metadata,
     members,
   };
 }
@@ -12796,6 +13058,14 @@ function cleanMessengerTitle(value: string): string {
 
 function stableRoomIDForConversation(conversationID: string): string {
   return `room_${hashText(conversationID).slice(0, 16)}`;
+}
+
+function stableThreadIDForConversation(conversationID: string): string {
+  return `mthread_${hashText(conversationID).slice(0, 24)}`;
+}
+
+function stableThreadEventID(threadID: string, itemID: string): string {
+  return `thev_${hashText(`${threadID}:${itemID}`).slice(0, 24)}`;
 }
 
 function personaNameFromProject(projectName: string): string {

@@ -7,6 +7,7 @@ export type ConversationMessage = {
   conversation_id: string;
   role: 'user' | 'assistant' | string;
   content: unknown;
+  attachments?: unknown[];
   created_at?: string;
   metadata?: Record<string, unknown>;
   run_id?: string;
@@ -62,9 +63,26 @@ export type ChatMessageRenderItem = {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  attachments?: ChatMessageAttachment[];
   runId?: string;
   streaming?: boolean;
   createdAt?: string;
+};
+
+export type MessageThreadAnnotation = {
+  threadId: string;
+  kind: 'created' | 'continued' | 'linked';
+  label: string;
+  title: string;
+};
+
+export type ChatMessageAttachment = {
+  id: string;
+  name: string;
+  kind: 'image' | 'video' | 'file';
+  mimeType: string;
+  size: number;
+  previewUrl?: string;
 };
 
 export type TranscriptLineKind =

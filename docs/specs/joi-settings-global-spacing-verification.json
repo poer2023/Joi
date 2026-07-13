@@ -1,0 +1,295 @@
+{
+  "desktopResults": [
+    {
+      "badGaps": [],
+      "horizontalOverflow": false,
+      "label": "DeepSeek",
+      "measures": [
+        {
+          "backgroundColor": "rgba(0, 0, 0, 0)",
+          "borderTopWidth": "0px",
+          "className": "model-settings-stack",
+          "gaps": [
+            {
+              "className": "detail-actions model-settings-actions",
+              "gap": 12,
+              "rect": {
+                "bottom": 379,
+                "height": 32,
+                "left": 526,
+                "right": 1520,
+                "top": 347,
+                "width": 994
+              }
+            },
+            {
+              "className": "settings-advanced model-settings-advanced",
+              "gap": 12,
+              "rect": {
+                "bottom": 427,
+                "height": 36,
+                "left": 526,
+                "right": 1520,
+                "top": 391,
+                "width": 994
+              }
+            }
+          ],
+          "rect": {
+            "bottom": 427,
+            "height": 326,
+            "left": 526,
+            "right": 1520,
+            "top": 101,
+            "width": 994
+          }
+        }
+      ],
+      "minGap": 12,
+      "title": "DeepSeek",
+      "viewport": {
+        "height": 1314,
+        "width": 1560
+      }
+    },
+    {
+      "badGaps": [],
+      "horizontalOverflow": false,
+      "label": "Telegram",
+      "measures": [
+        {
+          "backgroundColor": "rgba(0, 0, 0, 0)",
+          "borderTopWidth": "0px",
+          "className": "settings-form",
+          "gaps": [
+            {
+              "className": "detail-actions",
+              "gap": 12,
+              "rect": {
+                "bottom": 429,
+                "height": 30,
+                "left": 526,
+                "right": 1520,
+                "top": 399,
+                "width": 994
+              }
+            },
+            {
+              "className": "json-details",
+              "gap": 12,
+              "rect": {
+                "bottom": 479,
+                "height": 38,
+                "left": 526,
+                "right": 1520,
+                "top": 441,
+                "width": 994
+              }
+            }
+          ],
+          "rect": {
+            "bottom": 479,
+            "height": 378,
+            "left": 526,
+            "right": 1520,
+            "top": 101,
+            "width": 994
+          }
+        }
+      ],
+      "minGap": 12,
+      "title": "Telegram",
+      "viewport": {
+        "height": 1314,
+        "width": 1560
+      }
+    },
+    {
+      "badGaps": [],
+      "horizontalOverflow": false,
+      "label": "Worker Gateway",
+      "measures": [
+        {
+          "backgroundColor": "rgba(0, 0, 0, 0)",
+          "borderTopWidth": "0px",
+          "className": "settings-form",
+          "gaps": [
+            {
+              "className": "detail-actions",
+              "gap": 12,
+              "rect": {
+                "bottom": 246,
+                "height": 30,
+                "left": 526,
+                "right": 1520,
+                "top": 216,
+                "width": 994
+              }
+            }
+          ],
+          "rect": {
+            "bottom": 246,
+            "height": 145,
+            "left": 526,
+            "right": 1520,
+            "top": 101,
+            "width": 994
+          }
+        }
+      ],
+      "minGap": 12,
+      "title": "Worker Gateway",
+      "viewport": {
+        "height": 1314,
+        "width": 1560
+      }
+    },
+    {
+      "badGaps": [],
+      "horizontalOverflow": false,
+      "label": "Automation",
+      "measures": [
+        {
+          "backgroundColor": "rgba(0, 0, 0, 0)",
+          "borderTopWidth": "0px",
+          "className": "settings-form",
+          "gaps": [
+            {
+              "className": "detail-actions",
+              "gap": 12,
+              "rect": {
+                "bottom": 576,
+                "height": 30,
+                "left": 526,
+                "right": 1520,
+                "top": 546,
+                "width": 994
+              }
+            }
+          ],
+          "rect": {
+            "bottom": 576,
+            "height": 475,
+            "left": 526,
+            "right": 1520,
+            "top": 101,
+            "width": 994
+          }
+        }
+      ],
+      "minGap": 12,
+      "title": "新建定时任务",
+      "viewport": {
+        "height": 1314,
+        "width": 1560
+      }
+    },
+    {
+      "badGaps": [],
+      "horizontalOverflow": false,
+      "label": "Local Data",
+      "measures": [],
+      "minGap": null,
+      "title": "本地数据",
+      "viewport": {
+        "height": 1314,
+        "width": 1560
+      }
+    }
+  ],
+  "narrowResults": [
+    {
+      "badGaps": [],
+      "horizontalOverflow": false,
+      "label": "Telegram narrow",
+      "measures": [
+        {
+          "backgroundColor": "rgba(0, 0, 0, 0)",
+          "borderTopWidth": "0px",
+          "className": "settings-form",
+          "gaps": [
+            {
+              "className": "detail-actions",
+              "gap": 12,
+              "rect": {
+                "bottom": 531,
+                "height": 30,
+                "left": 463,
+                "right": 795,
+                "top": 501,
+                "width": 333
+              }
+            },
+            {
+              "className": "json-details",
+              "gap": 12,
+              "rect": {
+                "bottom": 581,
+                "height": 38,
+                "left": 463,
+                "right": 795,
+                "top": 543,
+                "width": 333
+              }
+            }
+          ],
+          "rect": {
+            "bottom": 581,
+            "height": 480,
+            "left": 463,
+            "right": 795,
+            "top": 101,
+            "width": 333
+          }
+        }
+      ],
+      "minGap": 12,
+      "title": "Telegram",
+      "viewport": {
+        "height": 920,
+        "width": 820
+      }
+    },
+    {
+      "badGaps": [],
+      "horizontalOverflow": false,
+      "label": "Worker Gateway narrow",
+      "measures": [
+        {
+          "backgroundColor": "rgba(0, 0, 0, 0)",
+          "borderTopWidth": "0px",
+          "className": "settings-form",
+          "gaps": [
+            {
+              "className": "detail-actions",
+              "gap": 12,
+              "rect": {
+                "bottom": 312,
+                "height": 30,
+                "left": 463,
+                "right": 795,
+                "top": 282,
+                "width": 333
+              }
+            }
+          ],
+          "rect": {
+            "bottom": 312,
+            "height": 211,
+            "left": 463,
+            "right": 795,
+            "top": 101,
+            "width": 333
+          }
+        }
+      ],
+      "minGap": 12,
+      "title": "Worker Gateway",
+      "viewport": {
+        "height": 920,
+        "width": 820
+      }
+    }
+  ],
+  "consoleErrors": []
+}

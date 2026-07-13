@@ -20,6 +20,7 @@ try {
     export { normalizeRunEvent, normalizeRunEvents, normalizeStatus } from '${root}/src/features/chat/runEventNormalizer.ts';
     export { getEventVisibility } from '${root}/src/features/chat/eventVisibility.ts';
     export { buildConversationRenderItems } from '${root}/src/features/chat/conversationProjector.ts';
+    export { messagesForConversationHydration, resolveConversationRoom, shouldRestoreThreadMessages } from '${root}/src/features/chat/conversationHydration.ts';
   `);
   execFileSync(esbuildBin, [
     entry,
@@ -30,7 +31,16 @@ try {
     '--outfile=' + bundle,
   ], { cwd: root, stdio: 'inherit' });
 
-  const { normalizeRunEvent, normalizeRunEvents, normalizeStatus, getEventVisibility, buildConversationRenderItems } = await import(pathToFileURL(bundle).href);
+  const {
+    normalizeRunEvent,
+    normalizeRunEvents,
+    normalizeStatus,
+    getEventVisibility,
+    buildConversationRenderItems,
+    messagesForConversationHydration,
+    resolveConversationRoom,
+    shouldRestoreThreadMessages,
+  } = await import(pathToFileURL(bundle).href);
 
   const event = (event_type, payload = {}, extra = {}) => normalizeRunEvent({
     id: `${event_type}-${payload.seq || payload.call_id || payload.item_id || payload.task_id || Math.random()}`,
@@ -47,6 +57,24 @@ try {
     content: '完成了',
     metadata: { run_id: 'run_1' },
   };
+
+  {
+    const rooms = [
+      { id: 'room_previous', conversation_id: 'conv_previous' },
+      { id: 'room_selected', conversation_id: 'conv_selected' },
+    ];
+    assert.equal(resolveConversationRoom(rooms, 'conv_selected', 'room_previous')?.id, 'room_selected');
+    assert.equal(resolveConversationRoom(rooms, '', 'room_previous')?.id, 'room_previous');
+  }
+
+  {
+    const settled = [{ id: 'persisted-final', content: 'final answer' }];
+    const restored = [{ id: 'old-thread-delta', content: 'partial answer' }];
+    assert.deepEqual(messagesForConversationHydration(settled, restored), settled);
+    assert.deepEqual(messagesForConversationHydration([], restored), restored);
+    assert.equal(shouldRestoreThreadMessages(settled.length, 3), false);
+    assert.equal(shouldRestoreThreadMessages(0, 3), true);
+  }
 
   assert.equal(normalizeStatus('succeeded'), 'completed');
   assert.equal(normalizeStatus('waiting_confirmation'), 'waiting_approval');

@@ -1,5 +1,6 @@
 import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { desktopIpcMethods, type DesktopIpcMethod, type JoiInvokeRequest } from '../../../../packages/shared-types/src/preload-api';
 import type {
@@ -41,7 +42,9 @@ import type {
   TerminalSessionKillRequest,
   TerminalSessionResizeRequest,
   TerminalSessionStartRequest,
+  UpdateMessengerProjectRequest,
   WorkspaceSettings,
+  UpdateMessengerRoomRequest,
   UpdateProjectPersonaRequest,
 } from '../../../../packages/shared-types/src/desktop-api';
 import type { JoiSQLiteStore, PersistedToolResult, StartedToolCallingChat, ToolCallingPromptAssembly, ToolCallingResumeRequest } from '../../../../packages/store/src/sqlite';
@@ -68,6 +71,7 @@ const invokeRequestSchema = z.object({
 const externalUrlSchema = z.string().url();
 
 type Handler = (payload?: unknown) => Promise<unknown> | unknown;
+type DesktopIpcHandlerMap = Record<DesktopIpcMethod, Handler>;
 
 export type AppDirs = {
   userDataDir: string;
@@ -90,6 +94,7 @@ export type RegisterIpcOptions = {
 
 let terminalSessionManager: TerminalSessionManager | null = null;
 let terminalDisposeRegistered = false;
+let browserBridgeServer: Server | null = null;
 
 function getTerminalSessionManager() {
   if (!terminalSessionManager) {
@@ -172,6 +177,12 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     },
     CreateSharedRoom(payload) {
       return store.createSharedRoom(payload as CreateSharedRoomRequest);
+    },
+    UpdateMessengerRoom(payload) {
+      return store.updateMessengerRoom(payload as UpdateMessengerRoomRequest);
+    },
+    UpdateMessengerProject(payload) {
+      return store.updateMessengerProject(payload as UpdateMessengerProjectRequest);
     },
     ConnectExternalMirrorRoom(payload) {
       return store.connectExternalMirrorRoom(payload as ConnectExternalMirrorRoomRequest);
@@ -310,6 +321,9 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     },
     GetConversation(payload) {
       return store.getConversation(String(payload ?? ''));
+    },
+    GetConversationForMessage(payload) {
+      return store.getConversationForMessage(String(payload ?? ''));
     },
     ListConversationGroups() {
       return store.listConversationGroups();
@@ -725,6 +739,8 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     },
   };
 
+  startBrowserBridgeIfEnabled(sqliteApi, store);
+
   ipcMain.removeHandler('joi:invoke');
   ipcMain.handle('joi:invoke', async (_event, input: unknown) => {
     const { method, payload } = invokeRequestSchema.parse(input);
@@ -800,6 +816,128 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
 
   ipcMain.removeHandler('joi:terminal:getStatus');
   ipcMain.handle('joi:terminal:getStatus', (_event, rawID: unknown) => terminalManager.getStatus(String(rawID ?? '')));
+}
+
+function startBrowserBridgeIfEnabled(handlers: DesktopIpcHandlerMap, store: JoiSQLiteStore): void {
+  if (browserBridgeServer) return;
+  if (!browserBridgeEnabled()) return;
+
+  const { host, port } = browserBridgeAddr();
+  browserBridgeServer = createServer(async (req, res) => {
+    const origin = String(req.headers.origin || '');
+    if (!browserBridgeOriginAllowed(origin)) {
+      writeBrowserBridgeJson(res, 403, { ok: false, data: null, error: { message: 'origin not allowed' } }, origin);
+      return;
+    }
+    if (req.method === 'OPTIONS') {
+      writeBrowserBridgeJson(res, 204, null, origin);
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/health') {
+      writeBrowserBridgeJson(res, 200, { ok: true, data: { status: 'ok' }, error: null }, origin);
+      return;
+    }
+    if (req.method !== 'POST' || req.url !== '/invoke') {
+      writeBrowserBridgeJson(res, 404, { ok: false, data: null, error: { message: 'not found' } }, origin);
+      return;
+    }
+
+    try {
+      const rawBody = await readBrowserBridgeBody(req);
+      const input = JSON.parse(rawBody) as unknown;
+      const { method, payload } = invokeRequestSchema.parse(input);
+      const handler = handlers[method as DesktopIpcMethod];
+      if (!handler) {
+        throw new Error(`Unsupported Joi bridge method: ${method}`);
+      }
+      const result = await handler(payload);
+      writeBrowserBridgeJson(res, 200, { ok: true, data: result, error: null }, origin);
+    } catch (error) {
+      safeRecordAppLog(store, {
+        level: 'error',
+        risk_level: 'read_only',
+        category: 'browser_bridge',
+        feature_key: 'browser_bridge.invoke.failed',
+        source: 'electron_browser_bridge',
+        message: 'Browser bridge invocation failed',
+        error,
+      });
+      writeBrowserBridgeJson(res, 500, {
+        ok: false,
+        data: null,
+        error: { message: error instanceof Error ? error.message : String(error) },
+      }, origin);
+    }
+  });
+
+  browserBridgeServer.on('error', (error) => {
+    browserBridgeServer = null;
+    console.warn('browser bridge skipped', error);
+  });
+  browserBridgeServer.listen(port, host, () => {
+    console.info(`Joi browser bridge listening on http://${host}:${port}`);
+  });
+  app.once('before-quit', () => {
+    void browserBridgeServer?.close();
+    browserBridgeServer = null;
+  });
+}
+
+function browserBridgeEnabled(): boolean {
+  const value = String(process.env.JOI_BROWSER_BRIDGE_ENABLED || '').trim().toLowerCase();
+  if (value === '0' || value === 'false' || value === 'off' || value === 'no') return false;
+  if (value === '1' || value === 'true' || value === 'on' || value === 'yes') return true;
+  return Boolean(process.env.ELECTRON_RENDERER_URL);
+}
+
+function browserBridgeAddr(): { host: string; port: number } {
+  const raw = String(process.env.JOI_BROWSER_BRIDGE_ADDR || '127.0.0.1:18083').trim();
+  const [host = '127.0.0.1', rawPort = '18083'] = raw.split(':');
+  const port = Number.parseInt(rawPort, 10);
+  return {
+    host: host || '127.0.0.1',
+    port: Number.isFinite(port) && port > 0 ? port : 18083,
+  };
+}
+
+function browserBridgeOriginAllowed(origin: string): boolean {
+  if (!origin) return true;
+  try {
+    const url = new URL(origin);
+    return url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost');
+  } catch {
+    return false;
+  }
+}
+
+function writeBrowserBridgeJson(res: ServerResponse, status: number, payload: unknown, origin: string): void {
+  res.statusCode = status;
+  if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (status === 204) {
+    res.end();
+    return;
+  }
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(payload));
+}
+
+function readBrowserBridgeBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 1024 * 1024 * 10) {
+        reject(new Error('browser bridge request is too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => resolve(body || '{}'));
+    req.on('error', reject);
+  });
 }
 
 function safeRecordAppLog(store: JoiSQLiteStore, input: Parameters<JoiSQLiteStore['recordAppLog']>[0]): void {

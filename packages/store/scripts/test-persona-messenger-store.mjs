@@ -17,7 +17,7 @@ try {
   });
 
   const initial = store.listPersonaMessenger();
-  assert.ok(initial.rooms.some((room) => room.type === 'private_hub'));
+  assert.deepEqual(initial.rooms.map((room) => room.id), ['room_private_hub', 'room_joi_dm']);
   assert.ok(initial.personas.some((persona) => persona.handle === '@joi-desktop'));
   assert.ok(Array.isArray(initial.persona_versions));
 
@@ -48,6 +48,17 @@ try {
   assert.equal(created.room.type, 'project_dm');
   assert.equal(created.room.conversation_id?.startsWith('conv_'), true);
 
+  const updatedProject = store.updateMessengerProject({
+    project_id: created.project.id,
+    name: 'Apollo Mobile Local',
+    local_path: '/Users/hao/project/apollo-mobile',
+  }).project;
+  assert.equal(updatedProject.name, 'Apollo Mobile Local');
+  assert.equal(updatedProject.metadata.local_path, '/Users/hao/project/apollo-mobile');
+  assert.equal(store['get'](`SELECT subtitle FROM rooms WHERE id=?`, created.room.id).subtitle, 'Apollo Mobile Local');
+  assert.equal(store['get'](`SELECT title FROM rooms WHERE id='room_private_hub'`).title, '私人总群');
+  assert.equal(store.getConversation(created.room.conversation_id).conversation?.title, 'Mira · Apollo Mobile Local');
+
   const duplicateDisplay = store.createProjectPersona({
     project_name: 'Apollo Web',
     persona_choice: { display_name: 'Mira' },
@@ -62,6 +73,23 @@ try {
   }).route_lock;
   assert.equal(locked?.persona_id, created.persona.id);
   assert.equal(store.listPersonaMessenger().route_locks.some((lock) => lock.room_id === created.room.id), true);
+
+  const threadCountBeforeCasualProjectChat = store.listPersonaMessenger().threads.length;
+  const casualProjectChat = await store.sendDeterministicChat({
+    room_id: created.room.id,
+    conversation_id: created.room.conversation_id,
+    message: '今天有点累，跟我闲聊两句吧',
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+    scope_override: 'current_project',
+  });
+  const afterCasualProjectChat = store.listPersonaMessenger();
+  assert.equal(afterCasualProjectChat.threads.length, threadCountBeforeCasualProjectChat);
+  const casualProjectChatDecision = afterCasualProjectChat.recent_routing_decisions.find((item) => item.run_id === casualProjectChat.run_id);
+  assert.ok(casualProjectChatDecision);
+  assert.equal(casualProjectChatDecision.thread_action.type, 'none');
+  assert.equal(casualProjectChatDecision.thread_action.reason, 'chat_assist_without_task');
+  assert.equal(store['all'](`SELECT id FROM messenger_thread_events WHERE run_id=?`, casualProjectChat.run_id).length, 0);
 
   const response = await store.sendDeterministicChat({
     room_id: created.room.id,
@@ -162,12 +190,16 @@ try {
     tagline: '约束先行的项目推进者',
     self_intro: '我会把目标、风险和验证路径拆清楚再推进。',
     traits: { directness: 0.91, risk_sensitivity: 0.87 },
+    permission_summary: '仅在 Apollo Mobile 私聊内写入，外部动作需确认',
+    model_strategy: 'grok-4.3',
     change_reason: 'Make ownership clearer in the room list',
   });
   assert.equal(updated.display_name, 'Mira Ops');
   assert.equal(updated.avatar, 'avatar://mira-ops');
   assert.equal(updated.self_intro, '我会把目标、风险和验证路径拆清楚再推进。');
   assert.equal(updated.traits.directness, 0.91);
+  assert.equal(updated.permission_summary, '仅在 Apollo Mobile 私聊内写入，外部动作需确认');
+  assert.equal(updated.model_strategy, 'grok-4.3');
   assert.equal(updated.version, 2);
 
   assert.throws(() => store.updateProjectPersona({
@@ -191,6 +223,8 @@ try {
     change_reason: 'Restore prior identity',
   });
   assert.equal(rolledBack.display_name, 'Mira Ops');
+  assert.equal(rolledBack.permission_summary, '仅在 Apollo Mobile 私聊内写入，外部动作需确认');
+  assert.equal(rolledBack.model_strategy, 'grok-4.3');
   assert.equal(rolledBack.version, 4);
 
   const hubMention = await store.sendDeterministicChat({
@@ -271,13 +305,20 @@ try {
   assert.notEqual(archivedProjectDecision.speaker_persona_id, duplicateDisplay.persona.id);
   assert.notEqual(archivedProjectDecision.owner_project_id, duplicateDisplay.project.id);
   assert.ok(archivedProjectDecision.reason_codes.includes('ARCHIVED_PROJECT_EXCLUDED'));
+  assert.equal(store.listPersonaMessenger().rooms.some((room) => room.id === duplicateDisplay.room.id), false);
 
   store['exec'](
     `UPDATE projects SET status='active', archived_at=NULL, updated_at=datetime('now') WHERE id=?`,
     duplicateDisplay.project.id,
   );
   const afterReactivate = store.listPersonaMessenger();
-  assert.ok(afterReactivate.rooms.some((room) => room.id === duplicateDisplay.room.id && room.project_id === duplicateDisplay.project.id));
+  const afterReactivateRoomIDs = afterReactivate.rooms.map((room) => room.id);
+  assert.equal(afterReactivateRoomIDs[0], 'room_private_hub');
+  assert.ok(afterReactivateRoomIDs.includes('room_joi_dm'));
+  assert.ok(afterReactivateRoomIDs.includes(created.room.id));
+  assert.ok(afterReactivate.projects.some((project) => project.id === duplicateDisplay.project.id));
+  assert.ok(afterReactivate.personas.some((persona) => persona.id === duplicateDisplay.persona.id));
+  assert.ok(afterReactivateRoomIDs.includes(duplicateDisplay.room.id));
   assert.ok(afterReactivate.threads.some((thread) => thread.project_id === duplicateDisplay.project.id && thread.run_ids.includes(dormantWake.run_id)));
 
   const crossProjectRun = await store.sendDeterministicChat({
@@ -333,7 +374,7 @@ try {
   const topicSwitch = await store.sendDeterministicChat({
     room_id: 'room_private_hub',
     conversation_id: 'conv_private_hub',
-    message: 'Apollo Mobile 项目需要另起一个部署检查',
+    message: 'Apollo Mobile Local 项目需要另起一个部署检查',
     input_mode: 'serious_task',
     runtime_mode: 'tool_calling',
     scope_override: 'auto_route',
@@ -492,7 +533,7 @@ try {
     persona_id: rolledBack.id,
     text: '首页 PRD 已完成。',
   });
-  assert.match(previewExternal.text, /Mira Ops · Apollo Mobile ◇/);
+  assert.match(previewExternal.text, /Mira Ops · Apollo Mobile Local ◇/);
   assert.ok(previewExternal.controls.some((item) => item.includes('锁定')));
 
   const outboundExternal = store.recordExternalConnectorOutbound({

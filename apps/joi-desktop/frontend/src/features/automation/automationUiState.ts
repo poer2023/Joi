@@ -29,12 +29,12 @@ export type AutomationDetailState = {
 
 export function getAutomationSettingsObjects(automations: AutomationDefinition[]): AutomationSettingsObject[] {
   return [
-    { id: 'new-schedule', label: '新建定时任务', description: '按 cron、interval、daily 或 weekly 触发' },
-    { id: 'new-webhook', label: '新建 Hook 任务', description: '通过本地 HMAC Webhook 触发' },
+    { id: 'new-schedule', label: '新建定时任务', description: '按间隔、每天、每周或指定时间运行' },
+    { id: 'new-webhook', label: '新建外部触发任务', description: '收到已授权的外部事件后运行' },
     ...automations.map((automation) => ({
       id: automation.id,
       label: automation.name,
-      description: `${automation.kind === 'webhook' ? 'Webhook' : '定时'} · ${automation.enabled ? '已启用' : '已停用'}`,
+      description: `${automation.kind === 'webhook' ? '外部触发' : '定时运行'} · ${automation.enabled ? '已启用' : '已停用'}`,
     })),
   ];
 }
@@ -55,7 +55,6 @@ export function getAutomationDetailState(input: {
   const latestRun = recentRuns[0];
   const latestTrigger = recentTriggers[0];
   const errorMessage = latestRun?.error_message || latestTrigger?.error_message || '';
-  const errorCode = latestRun?.error_code || latestTrigger?.error_code || 'ERROR';
   const lastRunStatus = latestRun?.status || latestTrigger?.status || 'idle';
   return {
     recentTriggers,
@@ -68,7 +67,7 @@ export function getAutomationDetailState(input: {
       ? {
           tone: 'error',
           title: '最近一次自动化失败',
-          message: `${errorCode} · ${errorMessage}`,
+          message: errorMessage,
         }
       : latestRun
         ? {

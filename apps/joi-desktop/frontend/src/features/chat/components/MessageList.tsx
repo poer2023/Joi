@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
-import { MessageBubble } from './MessageBubble';
+import { MessageBubble, MessageThreadMarker } from './MessageBubble';
 import { MarkdownContent } from './MarkdownContent';
-import type { ChatMessageRenderItem, ConversationRenderItem, TranscriptLineRenderItem } from '../types';
+import type { ChatMessageRenderItem, ConversationRenderItem, MessageThreadAnnotation, TranscriptLineRenderItem } from '../types';
 
 type MessageListItem =
   | ConversationRenderItem
@@ -27,22 +27,28 @@ export function MessageList({
   assistantAvatarSrc,
   emptyState,
   formatAssistantContent,
+  highlightedMessageId,
   items,
   onOpenArtifact,
   onOpenTask,
+  onOpenThread,
   onOpenTrace,
   onResolveApproval,
-  runSummaries,
+  selectedThreadId,
+  threadAnnotations,
 }: {
   assistantAvatarSrc?: string;
   emptyState?: ReactNode;
   formatAssistantContent?: (content: string) => string;
+  highlightedMessageId?: string;
   items: ConversationRenderItem[];
   onOpenArtifact?: (artifactId: string) => void;
   onOpenTask?: (taskId: string) => void;
+  onOpenThread?: (threadId: string) => void;
   onOpenTrace?: (runId: string) => void;
   onResolveApproval?: (approvalId: string, approve: boolean, scope?: 'one_call' | 'current_run') => void;
-  runSummaries?: Record<string, string>;
+  selectedThreadId?: string;
+  threadAnnotations?: Record<string, MessageThreadAnnotation>;
 }) {
   if (items.length === 0) {
     return <>{emptyState}</>;
@@ -57,9 +63,11 @@ export function MessageList({
               key={item.id}
               assistantAvatarSrc={assistantAvatarSrc}
               formatAssistantContent={formatAssistantContent}
+              highlighted={highlightedMessageId === item.id}
               item={item}
-              onOpenTrace={onOpenTrace}
-              traceSummary={item.runId ? runSummaries?.[item.runId] : undefined}
+              onOpenThread={onOpenThread}
+              threadAnnotation={threadAnnotations?.[item.id]}
+              threadSelected={Boolean(selectedThreadId && threadAnnotations?.[item.id]?.threadId === selectedThreadId)}
             />
           );
         }
@@ -69,10 +77,13 @@ export function MessageList({
               key={item.id}
               assistantAvatarSrc={assistantAvatarSrc}
               formatAssistantContent={formatAssistantContent}
+              highlightedMessageId={highlightedMessageId}
               item={item}
+              onOpenThread={onOpenThread}
               onOpenTrace={onOpenTrace}
               onResolveApproval={onResolveApproval}
-              runSummaries={runSummaries}
+              selectedThreadId={selectedThreadId}
+              threadAnnotations={threadAnnotations}
             />
           );
         }
@@ -174,22 +185,32 @@ function processGroupFromLines(lines: TranscriptLineRenderItem[]): ProcessGroupI
 function AssistantResponse({
   assistantAvatarSrc,
   formatAssistantContent,
+  highlightedMessageId,
   item,
+  onOpenThread,
   onOpenTrace,
   onResolveApproval,
-  runSummaries,
+  selectedThreadId,
+  threadAnnotations,
 }: {
   assistantAvatarSrc?: string;
   formatAssistantContent?: (content: string) => string;
+  highlightedMessageId?: string;
   item: AssistantResponseItem;
+  onOpenThread?: (threadId: string) => void;
   onOpenTrace?: (runId: string) => void;
   onResolveApproval?: (approvalId: string, approve: boolean, scope?: 'one_call' | 'current_run') => void;
-  runSummaries?: Record<string, string>;
+  selectedThreadId?: string;
+  threadAnnotations?: Record<string, MessageThreadAnnotation>;
 }) {
   const content = formatAssistantContent ? formatAssistantContent(item.message.content) : item.message.content;
-  const showTraceLink = item.message.runId && onOpenTrace;
+  const threadAnnotation = threadAnnotations?.[item.message.id];
   return (
-    <article className={`message-row assistant-message assistant-response-row${item.message.streaming ? ' streaming-message' : ''}`}>
+    <article
+      className={`message-row assistant-message assistant-response-row${item.message.streaming ? ' streaming-message' : ''}${highlightedMessageId === item.message.id ? ' message-source-highlight' : ''}`}
+      data-message-id={item.message.id}
+      data-run-id={item.message.runId}
+    >
       {assistantAvatarSrc ? <img className="message-avatar assistant" src={assistantAvatarSrc} alt="Joi" /> : <div className="message-avatar assistant">J</div>}
       <div className="assistant-response-stack">
         {item.leadGroups.map((group) => (
@@ -198,10 +219,12 @@ function AssistantResponse({
         <div className="message-bubble">
           {content ? <MarkdownContent content={content} /> : <p className="message-skeleton">正在组织回复...</p>}
         </div>
-        {showTraceLink ? (
-          <button className="message-run-summary" type="button" onClick={() => onOpenTrace(item.message.runId!)}>
-            {runSummaries?.[item.message.runId!] || '查看 Run'}
-          </button>
+        {threadAnnotation ? (
+          <MessageThreadMarker
+            annotation={threadAnnotation}
+            selected={Boolean(selectedThreadId && threadAnnotation.threadId === selectedThreadId)}
+            onOpenThread={onOpenThread}
+          />
         ) : null}
         {item.tailGroups.map((group) => (
           <ProcessGroupContent key={group.id} group={group} onOpenTrace={onOpenTrace} onResolveApproval={onResolveApproval} />
@@ -236,11 +259,11 @@ function ProcessGroupContent({
   onOpenTrace?: (runId: string) => void;
   onResolveApproval?: (approvalId: string, approve: boolean, scope?: 'one_call' | 'current_run') => void;
 }) {
-  const bodyLines = group.header.kind === 'thinking' ? group.lines.slice(1) : group.lines;
+  const bodyLines = group.lines;
   const summary = processGroupSummary(group);
   const stepLabel = group.lines.length === 1 ? '1 step' : `${group.lines.length} steps`;
   return (
-    <details className="process-group">
+    <details className="process-group" open>
       <summary className="process-group-summary">
         <span className={`status-dot ${statusDotClass(processGroupStatus(group.lines))}`} />
         <span className="process-group-title">{summary}</span>
@@ -288,11 +311,11 @@ function TranscriptLineContent({
       <div className="transcript-line-main">
         <span className={`status-dot ${statusDotClass(item.status)}`} />
         <span className="transcript-line-copy">
-          <span className="transcript-line-label">{item.label}</span>
-          {item.detail ? <span className="transcript-line-detail"> · {item.detail}</span> : null}
+          <span className="transcript-line-label">{transcriptLabel(item.label)}</span>
+          {item.detail ? <span className="transcript-line-detail"> · {transcriptDetail(item.detail)}</span> : null}
         </span>
         {item.traceAvailable && onOpenTrace ? (
-          <button className="transcript-line-link" type="button" onClick={() => onOpenTrace(item.runId)}>Trace</button>
+          <button className="transcript-line-link" type="button" onClick={() => onOpenTrace(item.runId)}>查看过程</button>
         ) : null}
       </div>
       {approval && onResolveApproval ? (
@@ -300,11 +323,10 @@ function TranscriptLineContent({
           <div>
             <strong>{approval.requestedAction || '受控能力请求'}</strong>
             <small>
-              能力：{approval.capability || '未知'}
+              操作：{approval.capability ? '使用受控能力' : '需要你的确认'}
               {approval.resourceLabel ? ` · 范围：${approval.resourceLabel}` : ''}
               {approval.riskLevel ? ` · 风险：${approval.riskLevel}` : ''}
             </small>
-            {approval.preview ? <pre>{approval.preview}</pre> : null}
           </div>
           <div className="inline-approval-actions">
             <button type="button" onClick={() => onResolveApproval(approval.id, true, 'one_call')}>允许一次</button>
@@ -317,10 +339,32 @@ function TranscriptLineContent({
   );
 }
 
+function transcriptLabel(value: string) {
+  const labels: Record<string, string> = {
+    Approval: '等待确认',
+    Process: '处理过程',
+    Thinking: '正在思考',
+    'Tool calls': '使用能力',
+  };
+  if (labels[value]) return labels[value];
+  if (/browser[_ ]?preview/i.test(value)) return '检查网页';
+  if (/[_]/.test(value)) return '使用受控能力';
+  return value;
+}
+
+function transcriptDetail(value: string) {
+  return value
+    .replace(/browser_preview/gi, '网页检查')
+    .replace(/ui_contract/gi, '界面方案')
+    .replace(/thread_[a-z0-9_-]+/gi, '相关线程')
+    .replace(/art_[a-z0-9_-]+/gi, '相关交付物');
+}
+
 function processGroupSummary(group: ProcessGroupItem): string {
-  if (group.header.kind === 'thinking') return group.header.label;
-  if (group.header.kind === 'tool' || group.header.kind === 'approval') return group.lines.length === 1 ? group.header.label : 'Process';
-  return 'Process';
+  if (group.header.kind === 'thinking') return '正在思考';
+  if (group.header.kind === 'approval') return '等待确认';
+  if (group.header.kind === 'tool') return '使用能力';
+  return '处理过程';
 }
 
 function processGroupStatus(lines: TranscriptLineRenderItem[]): TranscriptLineRenderItem['status'] {

@@ -60,6 +60,7 @@ export function buildConversationRenderItems(
       id: input.streamingAssistant.id,
       role: 'assistant',
       content: messageContentValue(input.streamingAssistant.content),
+      attachments: normalizeMessageAttachments(input.streamingAssistant.attachments),
       runId: input.streamingAssistant.run_id,
       streaming: !input.streamingAssistant.complete,
       createdAt: input.streamingAssistant.created_at,
@@ -279,10 +280,39 @@ function projectMessage(message: ConversationMessage, streaming: boolean): ChatM
     id: message.id,
     role: message.role,
     content: messageContentValue(message.content),
+    attachments: normalizeMessageAttachments(message.attachments),
     runId: getMessageRunId(message),
     streaming,
     createdAt: message.created_at,
   };
+}
+
+function normalizeMessageAttachments(value: unknown): ChatMessageRenderItem['attachments'] {
+  if (!Array.isArray(value)) return undefined;
+  const attachments: NonNullable<ChatMessageRenderItem['attachments']> = [];
+  value.forEach((item, index) => {
+    if (!item || typeof item !== 'object') return;
+    const raw = item as Record<string, unknown>;
+    const name = stringValue(raw.name) || stringValue(raw.filename) || `附件 ${index + 1}`;
+    const mimeType = stringValue(raw.mimeType) || stringValue(raw.mime_type) || stringValue(raw.type);
+    const rawKind = stringValue(raw.kind);
+    const kind = rawKind === 'image' || rawKind === 'video'
+      ? rawKind
+      : mimeType.startsWith('image/')
+        ? 'image'
+        : mimeType.startsWith('video/')
+          ? 'video'
+          : 'file';
+    attachments.push({
+      id: stringValue(raw.id) || `${name}-${index}`,
+      name,
+      kind,
+      mimeType,
+      size: numberValue(raw.size),
+      previewUrl: stringValue(raw.previewUrl) || stringValue(raw.preview_url) || stringValue(raw.url),
+    });
+  });
+  return attachments.length ? attachments : undefined;
 }
 
 function projectTranscriptLine(
@@ -416,6 +446,21 @@ function toolTranscriptLabel(event: NormalizedRunEvent, status: TranscriptLineRe
     const action = status === 'running' || status === 'pending' ? '读取中' : status === 'completed' ? '读取网页' : verb;
     return `${action} · ${target}`;
   }
+  if (lower.includes('memory') || lower.includes('memories')) {
+    const operation = compactText(stringFromEvent(event, ['operation', 'query', 'target', 'memory_id']) || humanizeToolName(toolName));
+    const action = lower.includes('candidate') || lower.includes('proposal') || lower.includes('write')
+      ? status === 'running' || status === 'pending'
+        ? '正在生成记忆建议'
+        : status === 'failed'
+          ? '记忆建议失败'
+          : '生成记忆建议'
+      : status === 'running' || status === 'pending'
+        ? '正在检索记忆'
+        : status === 'failed'
+          ? '记忆检索失败'
+          : '检索记忆';
+    return `${action} · ${operation}`;
+  }
   if (lower.includes('workspace') || lower.includes('search') || lower.includes('grep') || lower.includes('rg')) {
     return `搜索工作区 · ${compactText(stringFromEvent(event, ['query', 'q', 'pattern', 'search']) || humanizeToolName(toolName))}`;
   }
@@ -484,7 +529,7 @@ function isWorkSummaryEvent(event: NormalizedRunEvent): boolean {
 }
 
 function workSummaryText(event: NormalizedRunEvent): string {
-  return stringFromEvent(event, ['summary', 'text', 'message', 'plan_summary', 'rationale']);
+  return event.summary || stringFromEvent(event, ['summary', 'text', 'message', 'plan_summary', 'rationale']);
 }
 
 function modelStepValue(event: NormalizedRunEvent): string {
@@ -599,6 +644,15 @@ function stringValue(value: unknown): string {
   if (typeof value === 'string') return value.trim();
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return '';
+}
+
+function numberValue(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, value);
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return Math.max(0, parsed);
+  }
+  return 0;
 }
 
 function textChunkValue(value: unknown): string {
