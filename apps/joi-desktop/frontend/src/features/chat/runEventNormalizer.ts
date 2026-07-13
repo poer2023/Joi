@@ -71,7 +71,9 @@ export function normalizeRunEvent(raw: unknown): NormalizedRunEvent {
     'artifact_id',
     'task_id',
   )) || inferItemId(type, itemType, payload, source);
-  const status = normalizeStatus(stringValue(read('status')) || statusFromEventType(type));
+  const declaredStatus = stringValue(read('status'));
+  const inferredStatus = statusFromEventType(type);
+  const status = normalizeStatus(inferredStatus === 'running' ? (declaredStatus || inferredStatus) : inferredStatus);
   const createdAt = stringValue(read('created_at', 'createdAt', 'emitted_at')) || undefined;
   const id = stringValue(source.id) || eventIdentity({
     runId,
@@ -285,18 +287,20 @@ function inferItemId(
 }
 
 function statusFromEventType(type: string): string {
-  if (type.endsWith('.failed')) return 'failed';
-  if (type.endsWith('.denied') || type.endsWith('.rejected')) return 'rejected';
-  if (type.endsWith('.cancelled') || type.endsWith('.canceled')) return 'cancelled';
+  const semanticType = type.replace(/_/g, '.');
+  if (type === 'run.cancel_requested') return 'running';
+  if (semanticType.endsWith('.failed')) return 'failed';
+  if (semanticType.endsWith('.denied') || semanticType.endsWith('.rejected')) return 'rejected';
+  if (semanticType.endsWith('.cancelled') || semanticType.endsWith('.canceled')) return 'cancelled';
   if (type === 'run.redirected' || type.endsWith('.redirected')) return 'redirected';
   if (type === 'run.recovery_required') return 'waiting_approval';
-  if (type.endsWith('.expired') || type.endsWith('.suppressed') || type.endsWith('.dismissed')) return 'skipped';
-  if (type.endsWith('.authorized') || type.endsWith('.scheduled') || type.endsWith('.snoozed')) return 'queued';
-  if (type.endsWith('.delivered') || type.endsWith('.responded') || type.endsWith('.closed')) return 'completed';
-  if (type.endsWith('.completed') || type.endsWith('.finished') || type === 'run.completed') return 'completed';
-  if (type.endsWith('.skipped')) return 'skipped';
-  if (type.endsWith('.queued')) return 'queued';
-  if (type.endsWith('.required') || type.endsWith('.requested') || type.includes('waiting_confirmation')) return 'waiting_approval';
+  if (semanticType.endsWith('.expired') || semanticType.endsWith('.suppressed') || semanticType.endsWith('.dismissed')) return 'skipped';
+  if (semanticType.endsWith('.authorized') || semanticType.endsWith('.scheduled') || semanticType.endsWith('.snoozed')) return 'queued';
+  if (semanticType.endsWith('.delivered') || semanticType.endsWith('.responded') || semanticType.endsWith('.closed')) return 'completed';
+  if (semanticType.endsWith('.completed') || semanticType.endsWith('.finished') || type === 'run.completed') return 'completed';
+  if (semanticType.endsWith('.skipped')) return 'skipped';
+  if (semanticType.endsWith('.queued')) return 'queued';
+  if (semanticType.endsWith('.required') || semanticType.endsWith('.requested') || type.includes('waiting_confirmation')) return 'waiting_approval';
   return 'running';
 }
 

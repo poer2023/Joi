@@ -27,14 +27,26 @@ export type AutomationDetailState = {
   banner?: AutomationDetailBanner;
 };
 
+export type AutomationTelegramNotificationDraft = {
+  enabled: boolean;
+  chatID: string;
+};
+
+export type AutomationTelegramReadiness = {
+  ready: boolean;
+  defaultChatID: string;
+  allowedChatIDs: string[];
+  message: string;
+};
+
 export function getAutomationSettingsObjects(automations: AutomationDefinition[]): AutomationSettingsObject[] {
   return [
-    { id: 'new-schedule', label: '新建定时任务', description: '按 cron、interval、daily 或 weekly 触发' },
-    { id: 'new-webhook', label: '新建 Hook 任务', description: '通过本地 HMAC Webhook 触发' },
+    { id: 'new-schedule', label: '新建定时任务', description: '按间隔、每天、每周或指定时间运行' },
+    { id: 'new-webhook', label: '新建外部触发任务', description: '收到已授权的外部事件后运行' },
     ...automations.map((automation) => ({
       id: automation.id,
       label: automation.name,
-      description: `${automation.kind === 'webhook' ? 'Webhook' : '定时'} · ${automation.enabled ? '已启用' : '已停用'}`,
+      description: `${automation.kind === 'webhook' ? '外部触发' : '定时运行'} · ${automation.enabled ? '已启用' : '已停用'}`,
     })),
   ];
 }
@@ -78,4 +90,85 @@ export function getAutomationDetailState(input: {
           }
         : undefined,
   };
+}
+
+export function getAutomationTelegramNotificationDraft(
+  automation: AutomationDefinition | undefined,
+  allowedUserIDs: string,
+): AutomationTelegramNotificationDraft {
+  const policy = asRecord(automation?.notification_policy);
+  const telegram = asRecord(policy.telegram);
+  const channel = String(telegram.channel || policy.channel || policy.provider || '').trim().toLowerCase();
+  const channels = Array.isArray(policy.channels) ? policy.channels.map((item) => String(item).trim().toLowerCase()) : [];
+  const requested = policy.telegram === true || Object.keys(telegram).length > 0 || channel === 'telegram' || channels.includes('telegram');
+  const enabled = requested && policy.enabled !== false && telegram.enabled !== false && policy.on_success !== false && telegram.on_success !== false;
+  const configuredTarget = String(telegram.chat_id || policy.telegram_chat_id || policy.chat_id || '').trim();
+  return {
+    enabled,
+    chatID: configuredTarget || firstAllowedTelegramID(allowedUserIDs),
+  };
+}
+
+export function buildAutomationTelegramNotificationPolicy(input: {
+  enabled: boolean;
+  chatID?: string;
+  allowedUserIDs: string;
+}): Record<string, unknown> {
+  if (!input.enabled) return {};
+  const chatID = input.chatID?.trim() || firstAllowedTelegramID(input.allowedUserIDs);
+  return {
+    channel: 'telegram',
+    on_success: true,
+    events: ['completed'],
+    ...(chatID ? { chat_id: chatID } : {}),
+  };
+}
+
+export function getAutomationTelegramReadiness(input: {
+  telegramEnabled: boolean;
+  tokenStatusKnown: boolean;
+  tokenConfigured: boolean;
+  allowedUserIDs: string;
+}): AutomationTelegramReadiness {
+  const allowedChatIDs = allowedTelegramIDs(input.allowedUserIDs);
+  const defaultChatID = allowedChatIDs[0] || '';
+  if (!input.telegramEnabled) {
+    return { ready: false, defaultChatID, allowedChatIDs, message: '请先前往“聊天入口 → Telegram”启用入口。' };
+  }
+  if (!input.tokenStatusKnown) {
+    return { ready: false, defaultChatID, allowedChatIDs, message: '正在读取 Telegram 凭证状态。' };
+  }
+  if (!input.tokenConfigured) {
+    return { ready: false, defaultChatID, allowedChatIDs, message: '请先在“聊天入口 → Telegram”保存 Bot Token。' };
+  }
+  if (!defaultChatID) {
+    return { ready: false, defaultChatID, allowedChatIDs, message: '请先在“聊天入口 → Telegram”填写允许用户 ID。' };
+  }
+  return {
+    ready: true,
+    defaultChatID,
+    allowedChatIDs,
+    message: `只会发送给 Telegram 白名单用户；默认 ${defaultChatID}。`,
+  };
+}
+
+export function getAutomationTelegramTargetError(input: {
+  enabled: boolean;
+  chatID: string;
+  allowedChatIDs: string[];
+}): string {
+  if (!input.enabled || !input.chatID.trim()) return '';
+  return input.allowedChatIDs.includes(input.chatID.trim()) ? '' : '目标用户 / Chat ID 不在 Telegram 白名单中，无法保存或发送。';
+}
+
+function firstAllowedTelegramID(value: string): string {
+  return allowedTelegramIDs(value)[0] || '';
+}
+
+function allowedTelegramIDs(value: string): string[] {
+  return [...new Set(value.split(',').map((item) => item.trim()).filter((item) => /^[1-9]\d{3,19}$/.test(item)))];
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }

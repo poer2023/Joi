@@ -9,10 +9,13 @@
     "preview": "vite preview --host 127.0.0.1",
     "test:execution-actions": "node scripts/test-execution-actions.mjs",
     "test:chat-projection": "node scripts/test-chat-projection.mjs",
+    "test:single-agent-workspace": "node scripts/test-single-agent-workspace.mjs",
     "test:task-mini-list": "node scripts/test-task-mini-list.mjs",
-    "test:automation-ui-state": "node scripts/test-automation-ui-state.mjs"
+    "test:automation-ui-state": "node scripts/test-automation-ui-state.mjs",
+    "test:settings-completion": "node --experimental-strip-types scripts/test-settings-completion.mjs && node --experimental-strip-types scripts/test-acp-plugin-models.mjs"
   },
   "dependencies": {
+    "@shadcn/react": "0.2.1",
     "@vitejs/plugin-react": "^5.1.1",
     "@xterm/xterm": "^6.0.0",
     "react": "^19.2.0",

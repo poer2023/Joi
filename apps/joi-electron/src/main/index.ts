@@ -10,6 +10,9 @@ import schemaSql from '../../../../database/sqlite/001_init_schema.sql?raw';
 import { TelegramInboundService } from './telegram-inbound';
 import { IMessageInboundService } from './imessage-inbound';
 import { AutomationRunner, AutomationWebhookServer } from './automation';
+import { stopJoiCommandHost } from './command-host';
+import { JoiPluginManager } from './plugin-manager';
+import { TelegramOutboundService } from './telegram-outbound';
 
 const mainDir = dirname(fileURLToPath(import.meta.url));
 
@@ -25,6 +28,10 @@ function envPath(name: string): string {
 
 function isDesktopE2E(): boolean {
   return envFlag('JOI_DESKTOP_E2E');
+}
+
+function isCliHeadlessInvocation(commandLine: string[] = process.argv): boolean {
+  return envFlag('JOI_CLI_HEADLESS') || commandLine.includes('--joi-cli-headless');
 }
 
 function configureAppPaths() {
@@ -47,6 +54,7 @@ function configureAppPaths() {
 }
 
 const appDirs = configureAppPaths();
+const cliHeadless = isCliHeadlessInvocation();
 let mainWindow: BrowserWindow | null = null;
 let store: JoiSQLiteStore | null = null;
 let workerGateway: WorkerGatewayServer | null = null;
@@ -54,6 +62,8 @@ let telegramInbound: TelegramInboundService | null = null;
 let imessageInbound: IMessageInboundService | null = null;
 let automationRunner: AutomationRunner | null = null;
 let automationWebhookServer: AutomationWebhookServer | null = null;
+let pluginManager: JoiPluginManager | null = null;
+let telegramOutbound: TelegramOutboundService | null = null;
 let isQuitting = false;
 const secrets = new KeychainSecretStore();
 
@@ -70,8 +80,23 @@ function ensureStore() {
   return store;
 }
 
+function ensurePluginManager(sqliteStore: JoiSQLiteStore) {
+  if (!pluginManager) {
+    pluginManager = new JoiPluginManager(sqliteStore, appDirs.userDataDir);
+  }
+  return pluginManager;
+}
+
+function ensureTelegramOutbound(sqliteStore: JoiSQLiteStore) {
+  if (!telegramOutbound) {
+    telegramOutbound = new TelegramOutboundService({ store: sqliteStore, secrets, logger: console });
+  }
+  return telegramOutbound;
+}
+
 function showMainWindow(window: BrowserWindow | null = mainWindow) {
   if (!window || window.isDestroyed()) return;
+  void app.dock?.show();
   if (window.isMinimized()) window.restore();
   if (!window.isVisible()) window.show();
   window.focus();
@@ -88,6 +113,10 @@ function ensureMainWindow() {
 function createMainWindow() {
   const preloadPath = join(mainDir, '../preload/index.mjs');
   const sqliteStore = ensureStore();
+  const managedPlugins = ensurePluginManager(sqliteStore);
+  const outboundTelegram = !isDesktopE2E() && !envFlag('JOI_DISABLE_OUTBOUND_NOTIFICATIONS')
+    ? ensureTelegramOutbound(sqliteStore)
+    : null;
 
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -112,6 +141,7 @@ function createMainWindow() {
       telegramInbound = new TelegramInboundService({
         store: sqliteStore,
         secrets,
+        pluginManager: managedPlugins,
         getWindow: () => mainWindow,
         logger: console,
       });
@@ -128,9 +158,10 @@ function createMainWindow() {
       void imessageInbound.start();
     }
   }
-  startAutomationServices(sqliteStore);
+  startAutomationServices(sqliteStore, managedPlugins, outboundTelegram);
 
   registerIpc(mainWindow, appDirs, sqliteStore, secrets, {
+    pluginManager: managedPlugins,
     onTelegramConfigChanged: () => telegramInbound?.scheduleReconfigure(),
     onIMessageConfigChanged: () => imessageInbound?.scheduleReconfigure(),
     getTelegramStatus: () => telegramInbound?.status(),
@@ -140,6 +171,7 @@ function createMainWindow() {
     deterministicChat: isDesktopE2E() || envFlag('JOI_DETERMINISTIC_CHAT'),
     getAutomationWebhookURL: (automation) => automationWebhookServer?.endpointFor(automation) || `http://127.0.0.1:18082/automation/webhooks/${encodeURIComponent(automation.slug)}`,
     requestAutomationDrain: () => automationRunner?.requestDrain(),
+    deliverProactiveMessage: outboundTelegram ? (id) => outboundTelegram.deliverProactiveMessage(id) : undefined,
   });
   void startConfiguredWorkerGateway(sqliteStore);
 
@@ -148,6 +180,7 @@ function createMainWindow() {
   const revealWindow = () => {
     if (didShow) return;
     didShow = true;
+    if (cliHeadless) return;
     showMainWindow(window);
   };
 
@@ -181,12 +214,14 @@ function createMainWindow() {
   }
 }
 
-function startAutomationServices(sqliteStore: JoiSQLiteStore) {
+function startAutomationServices(sqliteStore: JoiSQLiteStore, managedPlugins: JoiPluginManager, outboundTelegram?: TelegramOutboundService | null) {
   if (envFlag('JOI_DISABLE_AUTOMATION_OS')) return;
   if (!automationRunner) {
     automationRunner = new AutomationRunner({
       store: sqliteStore,
       secrets,
+      pluginManager: managedPlugins,
+      telegramOutbound: outboundTelegram || undefined,
       getWindow: () => mainWindow,
       deterministicChat: isDesktopE2E() || envFlag('JOI_DETERMINISTIC_CHAT'),
       logger: console,
@@ -232,12 +267,14 @@ if (!hasSingleInstanceLock) {
   app.quit();
 } else {
   if (!singleInstanceLockDisabled) {
-    app.on('second-instance', () => {
+    app.on('second-instance', (_event, commandLine) => {
+      if (isCliHeadlessInvocation(commandLine)) return;
       ensureMainWindow();
     });
   }
 
   app.whenReady().then(async () => {
+    if (cliHeadless) app.dock?.hide();
     if (!isDesktopE2E() && !envFlag('JOI_DISABLE_SECRET_LOAD')) {
       await secrets.loadIntoEnv();
     }
@@ -268,7 +305,10 @@ if (!hasSingleInstanceLock) {
     automationWebhookServer = null;
     void workerGateway?.close();
     workerGateway = null;
+    void stopJoiCommandHost();
     store?.close();
     store = null;
+    pluginManager = null;
+    telegramOutbound = null;
   });
 }

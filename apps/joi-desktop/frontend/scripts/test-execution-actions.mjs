@@ -14,6 +14,7 @@ try {
   writeFileSync(entry, `
     export { getExecutionDisplayMode, projectRunTraceToActions, visibleExecutionActions } from '${root}/src/executionActions.ts';
     export { permissionProfileForPrompt } from '${root}/src/permissionProfile.ts';
+    export { capabilityBackend, capabilityBackendLabel, capabilityStatusLabel } from '${root}/src/features/capabilities/capabilityPresentation.ts';
   `);
   execFileSync('node_modules/.bin/esbuild', [
     entry,
@@ -24,7 +25,15 @@ try {
     '--outfile=' + bundle,
   ], { cwd: root, stdio: 'inherit' });
 
-  const { getExecutionDisplayMode, permissionProfileForPrompt, projectRunTraceToActions, visibleExecutionActions } = await import(pathToFileURL(bundle).href);
+  const {
+    capabilityBackend,
+    capabilityBackendLabel,
+    capabilityStatusLabel,
+    getExecutionDisplayMode,
+    permissionProfileForPrompt,
+    projectRunTraceToActions,
+    visibleExecutionActions,
+  } = await import(pathToFileURL(bundle).href);
 
   const baseTrace = (steps) => ({
     id: 'run_test',
@@ -35,12 +44,22 @@ try {
 
   const withoutRawSteps = (actions) => actions.map(({ raw_steps: _rawSteps, ...action }) => action);
 
-  assert.equal(permissionProfileForPrompt('chat_assist', '帮我分析 Joi 和 Hermes 的差距'), 'read_only');
-  assert.equal(permissionProfileForPrompt('serious_task', '帮我分析并形成计划'), 'workspace_write');
-  assert.equal(permissionProfileForPrompt('background_task', '后台完成剩余工作'), 'workspace_write');
-  assert.equal(permissionProfileForPrompt('auto', '将 finding 的内容全部修复'), 'workspace_write');
-  assert.equal(permissionProfileForPrompt('auto', '更新本地实现'), 'workspace_write');
-  assert.equal(permissionProfileForPrompt('auto', '总结一下当前状态'), 'read_only');
+  assert.equal(permissionProfileForPrompt('chat_assist', '帮我分析 Joi 和 Hermes 的差距'), 'danger_full_access');
+  assert.equal(permissionProfileForPrompt('serious_task', '帮我分析并形成计划'), 'danger_full_access');
+  assert.equal(permissionProfileForPrompt('background_task', '后台完成剩余工作'), 'danger_full_access');
+  assert.equal(permissionProfileForPrompt('auto', '将 finding 的内容全部修复'), 'danger_full_access');
+  assert.equal(permissionProfileForPrompt('auto', '更新本地实现'), 'danger_full_access');
+  assert.equal(permissionProfileForPrompt('auto', '总结一下当前状态'), 'danger_full_access');
+  assert.equal(capabilityBackend({ metadata: { backend: 'planned' } }), 'planned');
+  assert.equal(capabilityBackend({ metadata: { backend: 'alias' } }), 'alias');
+  assert.equal(capabilityBackend({ metadata: {} }), 'implemented');
+  assert.equal(capabilityBackendLabel('implemented'), '已实现');
+  assert.equal(capabilityBackendLabel('alias'), '别名');
+  assert.equal(capabilityBackendLabel('planned'), '计划中');
+  assert.equal(capabilityStatusLabel({ enabled: true, metadata: { backend: 'implemented' } }), '已实现');
+  assert.equal(capabilityStatusLabel({ enabled: true, metadata: { backend: 'alias' } }), '别名');
+  assert.equal(capabilityStatusLabel({ enabled: true, metadata: { backend: 'planned' } }), '未接后端');
+  assert.equal(capabilityStatusLabel({ enabled: false, metadata: { backend: 'planned' } }), '已停用');
 
   {
     const actions = projectRunTraceToActions(baseTrace([

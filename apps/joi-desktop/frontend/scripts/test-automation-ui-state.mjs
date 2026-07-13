@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -17,7 +17,14 @@ try {
   const entry = join(outDir, 'entry.ts');
   const bundle = join(outDir, 'bundle.mjs');
   writeFileSync(entry, `
-    export { getAutomationDetailState, getAutomationSettingsObjects } from '${root}/src/features/automation/automationUiState.ts';
+    export {
+      buildAutomationTelegramNotificationPolicy,
+      getAutomationDetailState,
+      getAutomationSettingsObjects,
+      getAutomationTelegramNotificationDraft,
+      getAutomationTelegramReadiness,
+      getAutomationTelegramTargetError,
+    } from '${root}/src/features/automation/automationUiState.ts';
   `);
   execFileSync(esbuildBin, [
     entry,
@@ -28,7 +35,14 @@ try {
     '--outfile=' + bundle,
   ], { cwd: root, stdio: 'inherit' });
 
-  const { getAutomationDetailState, getAutomationSettingsObjects } = await import(pathToFileURL(bundle).href);
+  const {
+    buildAutomationTelegramNotificationPolicy,
+    getAutomationDetailState,
+    getAutomationSettingsObjects,
+    getAutomationTelegramNotificationDraft,
+    getAutomationTelegramReadiness,
+    getAutomationTelegramTargetError,
+  } = await import(pathToFileURL(bundle).href);
   const schedule = {
     id: 'auto_schedule',
     kind: 'schedule',
@@ -58,8 +72,8 @@ try {
 
   const objects = getAutomationSettingsObjects([schedule, webhook]);
   assert.deepEqual(objects.slice(0, 2).map((item) => item.id), ['new-schedule', 'new-webhook']);
-  assert.equal(objects.find((item) => item.id === schedule.id).description, '定时 · 已启用');
-  assert.equal(objects.find((item) => item.id === webhook.id).description, 'Webhook · 已停用');
+  assert.equal(objects.find((item) => item.id === schedule.id).description, '定时运行 · 已启用');
+  assert.equal(objects.find((item) => item.id === webhook.id).description, '外部触发 · 已停用');
 
   const failedState = getAutomationDetailState({
     automation: webhook,
@@ -121,6 +135,62 @@ try {
   assert.equal(succeededState.lastRunStatus, 'succeeded');
   assert.equal(succeededState.banner.title, '最近一次运行');
   assert.equal(succeededState.banner.message, 'succeeded');
+
+  const allowedUserIDs = '1234567890,8123456789';
+  assert.deepEqual(getAutomationTelegramNotificationDraft(undefined, allowedUserIDs), {
+    enabled: false,
+    chatID: '1234567890',
+  });
+  const notifyingSchedule = {
+    ...schedule,
+    notification_policy: { channel: 'telegram', on_success: true, events: ['completed'], chat_id: '8123456789' },
+  };
+  assert.deepEqual(getAutomationTelegramNotificationDraft(notifyingSchedule, allowedUserIDs), {
+    enabled: true,
+    chatID: '8123456789',
+  });
+  assert.deepEqual(buildAutomationTelegramNotificationPolicy({ enabled: true, chatID: '', allowedUserIDs }), {
+    channel: 'telegram',
+    on_success: true,
+    events: ['completed'],
+    chat_id: '1234567890',
+  });
+  assert.deepEqual(buildAutomationTelegramNotificationPolicy({ enabled: false, chatID: '1234567890', allowedUserIDs }), {});
+
+  const ready = getAutomationTelegramReadiness({
+    telegramEnabled: true,
+    tokenStatusKnown: true,
+    tokenConfigured: true,
+    allowedUserIDs,
+  });
+  assert.equal(ready.ready, true);
+  assert.equal(ready.defaultChatID, '1234567890');
+  assert.match(ready.message, /白名单/);
+  assert.match(getAutomationTelegramReadiness({
+    telegramEnabled: false,
+    tokenStatusKnown: true,
+    tokenConfigured: true,
+    allowedUserIDs,
+  }).message, /聊天入口/);
+  assert.match(getAutomationTelegramReadiness({
+    telegramEnabled: true,
+    tokenStatusKnown: true,
+    tokenConfigured: false,
+    allowedUserIDs,
+  }).message, /Bot Token/);
+  assert.match(getAutomationTelegramReadiness({
+    telegramEnabled: true,
+    tokenStatusKnown: true,
+    tokenConfigured: true,
+    allowedUserIDs: '',
+  }).message, /允许用户 ID/);
+  assert.equal(getAutomationTelegramTargetError({ enabled: true, chatID: '8123456789', allowedChatIDs: ready.allowedChatIDs }), '');
+  assert.match(getAutomationTelegramTargetError({ enabled: true, chatID: '9000000000', allowedChatIDs: ready.allowedChatIDs }), /不在 Telegram 白名单/);
+
+  const appSource = readFileSync(join(root, 'src/App.tsx'), 'utf8');
+  for (const marker of ['完成后推送到 Telegram', '目标用户 / Chat ID', 'notification_policy: buildAutomationTelegramNotificationPolicy']) {
+    assert.equal(appSource.includes(marker), true, `Automation UI must contain ${marker}`);
+  }
 
   console.log('automation UI state tests passed');
 } finally {

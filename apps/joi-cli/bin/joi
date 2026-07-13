@@ -1,0 +1,14 @@
+#!/bin/sh
+# Joi managed CLI launcher. Installed by scripts/install_joi_cli.sh.
+set -eu
+
+APP_BUNDLE="${JOI_APP_BUNDLE:-/Applications/Joi.app}"
+RUNTIME="$APP_BUNDLE/Contents/MacOS/Joi"
+CLI="$APP_BUNDLE/Contents/Resources/cli/joi.mjs"
+
+if [ ! -x "$RUNTIME" ] || [ ! -f "$CLI" ]; then
+  echo "Joi CLI is not installed in $APP_BUNDLE" >&2
+  exit 127
+fi
+
+ELECTRON_RUN_AS_NODE=1 exec "$RUNTIME" "$CLI" "$@"

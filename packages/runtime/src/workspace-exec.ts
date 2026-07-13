@@ -88,11 +88,12 @@ export async function executeShellCommand(req: ShellCommandRequest, settings: Wo
   const normalized = normalizeWorkspaceSettings(settings);
   const argv = commandArgvFrom(req.cmd);
   if (argv.length === 0) throw new Error('shell_command cmd is required');
+  const profile = normalizedPermissionProfile(req.permission_profile);
   const cwd = resolveWorkspaceDirectory(req.cwd || normalized.default_root, normalized, 'shell_command cwd must be a directory');
-  validateShellCommandArgv(argv, cwd, normalized);
+  validateShellCommandArgv(argv, cwd, normalized, profile);
   const timeoutSeconds = boundedInteger(req.timeout_seconds, defaultShellCommandTimeoutSeconds, maxShellCommandTimeoutSeconds);
   const maxOutputBytes = boundedInteger(req.max_output_bytes, defaultShellCommandOutputBytes, maxShellCommandOutputBytes);
-  const result = await runCommand(argv, cwd, timeoutSeconds, maxOutputBytes, normalizedPermissionProfile(req.permission_profile), normalized.allowed_roots, 'shell_command_v1_exec_context', options.signal);
+  const result = await runCommand(argv, cwd, timeoutSeconds, maxOutputBytes, profile, normalized.allowed_roots, 'shell_command_v1_exec_context', options.signal);
   return {
     status: 'completed',
     command_status: result.status,
@@ -107,6 +108,7 @@ export async function executeShellCommand(req: ShellCommandRequest, settings: Wo
     duration_ms: result.duration_ms,
     max_output_bytes: maxOutputBytes,
     timeout_seconds: timeoutSeconds,
+    command_policy: commandPolicyForProfile(profile),
     sandbox: result.sandbox,
     error: result.error,
     summary: `shell_command ${result.status}: ${argv.join(' ')}`,
@@ -118,11 +120,12 @@ export async function executeTestCommand(req: TestCommandRequest, settings: Work
   const normalized = normalizeWorkspaceSettings(settings);
   const argv = commandArgvFrom(req.cmd);
   if (argv.length === 0) throw new Error('test_command cmd is required');
-  validateTestCommandArgv(argv);
+  const profile = normalizedPermissionProfile(req.permission_profile);
+  validateTestCommandArgv(argv, profile);
   const cwd = resolveWorkspaceDirectory(req.cwd || normalized.default_root, normalized, 'test_command cwd must be a directory');
   const timeoutSeconds = boundedInteger(req.timeout_seconds, defaultTestCommandTimeoutSeconds, maxTestCommandTimeoutSeconds);
   const maxOutputBytes = boundedInteger(req.max_output_bytes, defaultTestCommandOutputBytes, maxTestCommandOutputBytes);
-  const result = await runCommand(argv, cwd, timeoutSeconds, maxOutputBytes, normalizedPermissionProfile(req.permission_profile), normalized.allowed_roots, 'test_command_v1_allowlisted_exec', options.signal);
+  const result = await runCommand(argv, cwd, timeoutSeconds, maxOutputBytes, profile, normalized.allowed_roots, 'test_command_v1_allowlisted_exec', options.signal);
   let testStatus = result.status === 'completed' && result.exit_code === 0 ? 'succeeded' : 'failed';
   if (result.status === 'timed_out' || result.status === 'aborted') testStatus = result.status;
   return {
@@ -140,6 +143,7 @@ export async function executeTestCommand(req: TestCommandRequest, settings: Work
     max_output_bytes: maxOutputBytes,
     timeout_seconds: timeoutSeconds,
     duration_ms: result.duration_ms,
+    command_policy: commandPolicyForProfile(profile),
     sandbox: result.sandbox,
     error: result.error,
     summary: `test_command ${testStatus}: ${argv.join(' ')}`,
@@ -185,7 +189,11 @@ function resolveWorkspaceDirectory(input: string, settings: WorkspaceSettings, e
   return path;
 }
 
-function validateShellCommandArgv(argv: string[], cwd: string, settings: WorkspaceSettings): void {
+function validateShellCommandArgv(argv: string[], cwd: string, settings: WorkspaceSettings, profile: PermissionProfile): void {
+  if (profile === 'danger_full_access') {
+    validateFullAccessCommandArgv(argv, 'shell_command');
+    return;
+  }
   validateShellArgSafety(argv);
   const bin = basename(argv[0]);
   if (bin !== argv[0]) throw policyDenied('shell_command executable paths are not allowed');
@@ -217,7 +225,7 @@ function validateShellCommandArgv(argv: string[], cwd: string, settings: Workspa
     case 'npm':
     case 'pnpm':
     case 'yarn':
-      validateTestCommandArgv(argv);
+      validateTestCommandArgv(argv, profile);
       return;
     default:
       throw policyDenied(`shell_command executable ${bin} is not allowlisted`);
@@ -237,6 +245,146 @@ function validateShellArgSafety(argv: string[]): void {
 function forbiddenShellExecutable(bin: string): boolean {
   return new Set(['rm', 'mv', 'cp', 'chmod', 'chown', 'sudo', 'curl', 'wget', 'brew', 'docker', 'sh', 'bash', 'zsh', 'python', 'python3', 'node'])
     .has(bin.toLowerCase().trim());
+}
+
+const fullAccessBlockedExecutables = new Set([
+  'rm',
+  'rmdir',
+  'unlink',
+  'srm',
+  'shred',
+  'dd',
+  'gpt',
+  'fdisk',
+  'wipefs',
+  'sudo',
+  'su',
+  'doas',
+  'shutdown',
+  'reboot',
+  'halt',
+  'csrutil',
+  'nvram',
+  'bless',
+  'dscl',
+  'sysadminctl',
+]);
+
+const shellCommandExecutables = new Set(['sh', 'bash', 'zsh', 'fish', 'dash', 'ksh']);
+
+export function validateFullAccessCommandInput(value: unknown, capability = 'shell_command'): void {
+  if (Array.isArray(value)) {
+    const argv = value.map((item) => String(item).trim()).filter(Boolean);
+    if (argv.length !== value.length) throw policyDenied(`${capability} arguments must be non-empty strings`);
+    validateFullAccessCommandArgv(argv, capability);
+    return;
+  }
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${capability} cmd is required`);
+  if (value.includes('\0')) throw policyDenied(`${capability} arguments must not contain NUL bytes`);
+  validateShellCommandText(value, capability, 0);
+}
+
+function validateFullAccessCommandArgv(argv: string[], capability: string, depth = 0): void {
+  if (argv.length === 0) throw new Error(`${capability} cmd is required`);
+  for (const arg of argv) {
+    if (!arg.trim() || arg.includes('\0')) throw policyDenied(`${capability} arguments must be non-empty strings`);
+  }
+  if (depth > 4) throw policyDenied('command_blacklisted: nested command wrappers exceed policy depth');
+
+  const bin = basename(argv[0]).toLowerCase().trim();
+  if (fullAccessBlockedExecutables.has(bin) || /^(?:mkfs|newfs)(?:[._-]|$)/.test(bin)) {
+    throw policyDenied(`command_blacklisted: ${bin} is disabled by full_access_blacklist_v1`);
+  }
+
+  const args = argv.slice(1);
+  const lowerArgs = args.map((arg) => arg.toLowerCase());
+  if (bin === 'diskutil' && diskutilCommandIsDestructive(lowerArgs)) {
+    throw policyDenied('command_blacklisted: destructive diskutil operation is disabled by full_access_blacklist_v1');
+  }
+  if (bin === 'asr' && lowerArgs.includes('restore')) {
+    throw policyDenied('command_blacklisted: asr restore is disabled by full_access_blacklist_v1');
+  }
+  if (bin === 'softwareupdate' && lowerArgs.includes('--erase-install')) {
+    throw policyDenied('command_blacklisted: softwareupdate --erase-install is disabled by full_access_blacklist_v1');
+  }
+  if (bin === 'tmutil' && lowerArgs.some((arg) => ['delete', 'deletelocalsnapshots'].includes(arg))) {
+    throw policyDenied('command_blacklisted: destructive tmutil operation is disabled by full_access_blacklist_v1');
+  }
+  if (bin === 'security' && lowerArgs.some((arg) => arg.startsWith('delete-'))) {
+    throw policyDenied('command_blacklisted: keychain deletion is disabled by full_access_blacklist_v1');
+  }
+  if (bin === 'fdesetup' && lowerArgs.some((arg) => ['disable', 'remove', 'removeall'].includes(arg))) {
+    throw policyDenied('command_blacklisted: FileVault removal is disabled by full_access_blacklist_v1');
+  }
+  if (bin === 'launchctl' && lowerArgs.some((arg) => ['bootout', 'remove', 'unload', 'disable'].includes(arg))) {
+    throw policyDenied('command_blacklisted: service removal is disabled by full_access_blacklist_v1');
+  }
+  if (bin === 'find' && lowerArgs.some((arg) => ['-delete', '-exec', '-execdir', '-ok', '-okdir'].includes(arg))) {
+    throw policyDenied('command_blacklisted: destructive find action is disabled by full_access_blacklist_v1');
+  }
+  if (bin === 'git' && gitCommandDiscardsWorktree(lowerArgs)) {
+    throw policyDenied('command_blacklisted: destructive git worktree operation is disabled by full_access_blacklist_v1');
+  }
+
+  if (shellCommandExecutables.has(bin)) {
+    const commandIndex = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/i.test(arg));
+    if (commandIndex >= 0 && args[commandIndex + 1]) {
+      validateShellCommandText(args[commandIndex + 1], capability, depth + 1);
+    }
+  }
+
+  if (['env', 'command', 'nohup'].includes(bin)) {
+    const nested = unwrapCommandWrapper(bin, args);
+    if (nested.length > 0) validateFullAccessCommandArgv(nested, capability, depth + 1);
+  }
+}
+
+function diskutilCommandIsDestructive(args: string[]): boolean {
+  const text = args.join(' ');
+  return /(?:^|\s)(?:erase\w*|partition\w*|secured?erase|zerodisk|randomdisk|resetfusion)(?:\s|$)/.test(text)
+    || /(?:^|\s)apfs\s+(?:delete|erase|destroy)\w*/.test(text)
+    || /(?:^|\s)appleraid\s+delete(?:\s|$)/.test(text);
+}
+
+function gitCommandDiscardsWorktree(args: string[]): boolean {
+  if (args[0] === 'clean' || args[0] === 'restore') return true;
+  if (args[0] === 'reset' && args.includes('--hard')) return true;
+  return args[0] === 'checkout' && args.includes('--');
+}
+
+function validateShellCommandText(command: string, capability: string, depth: number): void {
+  const segments = command.split(/(?:&&|\|\||[;|\n])/u);
+  for (const segment of segments) {
+    const tokens = (segment.match(/"[^"]*"|'[^']*'|\S+/g) ?? [])
+      .map((token) => token.replace(/^(['"])(.*)\1$/, '$2'))
+      .filter(Boolean);
+    if (tokens.length > 0) validateFullAccessCommandArgv(tokens, capability, depth);
+  }
+}
+
+function unwrapCommandWrapper(bin: string, args: string[]): string[] {
+  let index = 0;
+  if (bin === 'env') {
+    while (index < args.length) {
+      const arg = args[index];
+      if (arg === '-u') {
+        index += 2;
+        continue;
+      }
+      if (arg.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) {
+        index += 1;
+        continue;
+      }
+      break;
+    }
+  } else {
+    while (index < args.length && args[index].startsWith('-')) index += 1;
+  }
+  return args.slice(index);
+}
+
+function commandPolicyForProfile(profile: PermissionProfile): string {
+  return profile === 'danger_full_access' ? 'full_access_blacklist_v1' : 'sandbox_allowlist_v1';
 }
 
 function validateShellWorkspaceArgs(
@@ -320,8 +468,12 @@ function validateWorkspacePathArgument(arg: string, cwd: string, settings: Works
   }
 }
 
-function validateTestCommandArgv(argv: string[]): void {
+function validateTestCommandArgv(argv: string[], profile: PermissionProfile = 'read_only'): void {
   if (argv.length === 0) throw new Error('cmd is required');
+  if (profile === 'danger_full_access') {
+    validateFullAccessCommandArgv(argv, 'test_command');
+    return;
+  }
   for (const arg of argv) {
     if (!arg.trim() || arg.includes('\0')) throw policyDenied('test_command arguments must be non-empty strings');
   }
@@ -450,6 +602,16 @@ function runCommand(
 }
 
 function commandSandbox(tempDir: string, cwd: string, profile: PermissionProfile, allowedRoots: string[]): CommandSandbox {
+  if (profile === 'danger_full_access') {
+    return {
+      engine: 'none',
+      enforced: false,
+      permission_profile: profile,
+      temp_dir: tempDir,
+      writable_roots: ['/'],
+      reason: 'Host execution enabled for danger_full_access; guarded by full_access_blacklist_v1',
+    };
+  }
   const writableRoots = sandboxWritableRoots(tempDir, profile, allowedRoots);
   if (platform() !== 'darwin') {
     return {

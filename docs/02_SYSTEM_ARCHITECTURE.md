@@ -55,6 +55,8 @@ TypeScript SQLite store。负责 conversation、message、run、run events、set
 
 TypeScript runtime。负责 model provider、tool-calling turn loop、capability executors、workspace/file/web/exec/browser/computer/desktop-app/diagnostics capability，以及 Worker Gateway。
 
+其中 `AgentKernel` 是模型与 Joi 控制面的唯一运行边界：它负责规范化 turn/event 生命周期、工具参数校验、模型重试、只读工具并行、工具幂等复用、上下文裁剪、steering/follow-up 和错误回灌。OpenAI-compatible Chat Completions 只是一个 transport adapter，不拥有 Agent、权限、记忆或持久化策略。
+
 ### packages/secrets
 
 本机 secret adapter。macOS 默认使用 Keychain，环境变量只作为开发 fallback。
@@ -141,4 +143,5 @@ Desktop Worker Gateway → worker register/heartbeat → claim → execute minim
 - Memory OS 不做通用聊天。
 - Worker 不保存主库，不接收完整长期记忆。
 - 模型不能绕过 runtime 直接执行 shell、文件写入或浏览器操作。
+- 模型可见工具必须同时通过 Agent capability allowlist、permission profile 和 runtime backend 状态三层过滤；planned/alias inventory 默认不进入模型工具表。
 - Desktop Mode 不要求 Docker、Postgres、NATS 或 localhost Web Console 才能启动。

@@ -1,0 +1,39 @@
+{
+  "generated_at": "2026-06-28",
+  "source_checkout": "/Users/hao/.codex/worktrees/2596/Joi",
+  "canonical_repo": "/Users/hao/project/Joi",
+  "installed_app": "/Applications/Joi.app",
+  "dev_server": {
+    "url": "http://127.0.0.1:5173/?capture=20260628",
+    "command": "npm run dev -- --port 5173 --strictPort",
+    "cwd": "/Users/hao/.codex/worktrees/2596/Joi/apps/joi-desktop/frontend"
+  },
+  "bridge": {
+    "url": "http://127.0.0.1:18083",
+    "running_during_capture": false,
+    "note": "Screenshots reflect frontend preview/mock data exposed by the Vite dev server."
+  },
+  "screenshot_count": 20,
+  "screenshots": [
+    "screenshots/01-chat-private-hub-main.png",
+    "screenshots/02-chat-private-hub-overview.png",
+    "screenshots/03-inspector-runs.png",
+    "screenshots/04-inspector-threads-list.png",
+    "screenshots/05-inspector-thread-detail.png",
+    "screenshots/06-inspector-assets.png",
+    "screenshots/07-inspector-memory.png",
+    "screenshots/08-inspector-member-detail-joi.png",
+    "screenshots/09-project-dm-joi-overview.png",
+    "screenshots/10-settings-models.png",
+    "screenshots/11-settings-chat-entrances.png",
+    "screenshots/12-settings-automations.png",
+    "screenshots/13-settings-observability.png",
+    "screenshots/14-settings-data-memory.png",
+    "screenshots/15-settings-capabilities.png",
+    "screenshots/16-settings-nodes-execution.png",
+    "screenshots/17-settings-privacy-security.png",
+    "screenshots/18-settings-advanced.png",
+    "screenshots/19-modal-new-project-persona.png",
+    "screenshots/20-responsive-narrow-chat.png"
+  ]
+}

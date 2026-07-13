@@ -23,6 +23,7 @@ type TerminalRecord = {
 };
 
 type TerminalLogSink = (event: TerminalSessionEvent) => void;
+type TerminalEventListener = (event: TerminalSessionEvent) => void;
 
 const require = createRequire(import.meta.url);
 const MAX_BUFFER_CHARS = 80_000;
@@ -34,6 +35,7 @@ export class TerminalSessionManager {
   private window: BrowserWindow | null = null;
   private nodePty: NodePtyModule | null = null;
   private logSink: TerminalLogSink | null = null;
+  private readonly listeners = new Set<TerminalEventListener>();
 
   attachWindow(window: BrowserWindow) {
     this.window = window;
@@ -47,6 +49,11 @@ export class TerminalSessionManager {
 
   setLogSink(sink: TerminalLogSink | null) {
     this.logSink = sink;
+  }
+
+  onEvent(listener: TerminalEventListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   start(payload?: TerminalSessionStartRequest): TerminalSessionInfo {
@@ -176,6 +183,7 @@ export class TerminalSessionManager {
 
   private emit(event: TerminalSessionEvent) {
     this.logSink?.(event);
+    for (const listener of this.listeners) listener(event);
     if (!this.window || this.window.isDestroyed()) return;
     this.window.webContents.send('joi:terminal:event', event);
   }

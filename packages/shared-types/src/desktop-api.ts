@@ -18,6 +18,7 @@ export type ChatRequest = {
   redirected_from_run_id?: string;
   runtime_mode?: RuntimeMode;
   permission_profile?: PermissionProfile;
+  attachments?: unknown[];
 };
 
 export type MessengerRoomType = 'private_hub' | 'project_dm' | 'shared' | 'human_dm' | 'external_mirror' | string;
@@ -57,6 +58,7 @@ export type ProjectPersona = {
   capabilities: string[];
   permission_summary?: string;
   model_strategy?: string;
+  model_reasoning_effort?: string;
   metadata?: Record<string, unknown>;
   created_at?: string;
   updated_at?: string;
@@ -91,6 +93,7 @@ export type MessengerRoom = {
   id: string;
   type: MessengerRoomType;
   title: string;
+  avatar?: string;
   subtitle?: string;
   owner_user_id: string;
   project_id?: string;
@@ -295,6 +298,9 @@ export type UpdateProjectPersonaRequest = {
   traits?: Record<string, number>;
   disagreement_style?: string;
   uncertainty_style?: string;
+  permission_summary?: string;
+  model_strategy?: string;
+  model_reasoning_effort?: string;
   change_reason: string;
 };
 
@@ -322,6 +328,20 @@ export type CreateSharedRoomRequest = {
   visible_project_ids?: string[];
   permission_summary?: string;
   tool_policy?: Record<string, unknown>;
+};
+
+export type UpdateMessengerRoomRequest = {
+  room_id: string;
+  title?: string;
+  avatar?: string;
+  actor_id?: string;
+};
+
+export type UpdateMessengerProjectRequest = {
+  project_id: string;
+  name?: string;
+  local_path?: string;
+  actor_id?: string;
 };
 
 export type ConnectExternalMirrorRoomRequest = {
@@ -957,6 +977,9 @@ export type RunTrace = {
   terminal_reason?: string;
   parent_run_id?: string;
   redirected_from_run_id?: string;
+  started_at?: string;
+  finished_at?: string;
+  duration_ms?: number;
   status: string;
   selected_agent_id: string;
   route_result?: Record<string, unknown>;
@@ -1135,6 +1158,17 @@ export type MCPServerRecord = {
   metadata?: Record<string, unknown>;
 };
 
+export type MCPServerConfigRequest = {
+  id: string;
+  name: string;
+  transport?: 'stdio' | string;
+  command?: string;
+  args?: string[];
+  enabled?: boolean;
+  trust?: string;
+  metadata?: Record<string, unknown>;
+};
+
 export type MCPWrapToolRequest = {
   capability_id?: string;
   description: string;
@@ -1161,6 +1195,58 @@ export type SkillRecord = {
   enabled: boolean;
   metadata?: Record<string, unknown>;
   recent_run?: Record<string, unknown>;
+};
+
+export type PluginRecord = {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  enabled: boolean;
+  status: string;
+  manifest_path?: string;
+  capability_ids: string[];
+  skill_ids: string[];
+  mcp_server_ids: string[];
+  provider_ids: string[];
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type PluginProviderConfig = {
+  id: string;
+  name: string;
+  protocol: 'acp' | string;
+  command: string;
+  args: string[];
+  runtime?: 'node' | 'binary' | string;
+  env?: Record<string, string>;
+  default_model?: string;
+  models?: Array<{ id: string; name?: string }>;
+  auth_method?: string;
+  description?: string;
+  plugin_id?: string;
+  plugin_root?: string;
+};
+
+export type PluginInstallFromGitHubRequest = {
+  source: string;
+  ref?: string;
+};
+
+export type PluginProviderTestResult = {
+  ok: boolean;
+  status: string;
+  provider_id: string;
+  protocol?: string;
+  command?: string;
+  agent_name?: string;
+  agent_version?: string;
+  protocol_version?: number;
+  current_model?: string;
+  models?: Array<{ id: string; name?: string }>;
+  error_summary?: string;
 };
 
 export type ToolWorkflowStep = {
@@ -1208,8 +1294,38 @@ export type WorkspaceSettings = {
   default_root: string;
   browser_allowed_hosts: string[];
   web_research_allow_private_hosts: boolean;
+  web_search_provider?: 'auto' | 'brave' | 'duckduckgo' | string;
+  brave_search_api_key?: string;
+  brave_search_api_key_configured?: boolean;
   file_analyze_max_bytes: number;
   workspace_search_max_results: number;
+  browser_enabled?: boolean;
+  github_default_repo?: string;
+  github_api_base_url?: string;
+  node_assignment_policy?: 'main_first' | 'auto' | 'manual' | string;
+  allow_remote_execution?: boolean;
+  privacy_local_only?: boolean;
+  remote_execution_requires_confirmation?: boolean;
+  diagnostic_redaction_enabled?: boolean;
+  destructive_operations_disabled?: boolean;
+  desktop_notifications_enabled?: boolean;
+  desktop_notification_sound?: boolean;
+  cli_enabled?: boolean;
+  cli_socket_path?: string;
+  webhook_chat_enabled?: boolean;
+  webhook_chat_path?: string;
+  wechat_claw_enabled?: boolean;
+  wechat_claw_endpoint?: string;
+  wechat_claw_allowed_senders?: string[];
+};
+
+export type GitHubConnectionResult = {
+  status: 'ok' | 'missing_secret' | 'invalid_config' | 'error' | string;
+  api_base_url: string;
+  login?: string;
+  repository?: string;
+  rate_limit_remaining?: number;
+  error_summary?: string;
 };
 
 export type SystemHealth = {
@@ -1268,6 +1384,26 @@ export type MemorySearchResult = {
   memory: MemoryRecord;
   score: number;
   reason: string;
+  retrieval_source?: 'fts' | 'governance' | string;
+  matched_terms?: string[];
+  scope_match?: 'global' | 'user' | 'room' | 'project' | string;
+};
+
+export type MemoryQualityMetrics = {
+  confirmed_count: number;
+  candidate_count: number;
+  old_candidate_count: number;
+  stale_confirmed_count: number;
+  duplicate_candidate_count: number;
+  recalled_count: number;
+  injected_count: number;
+  used_in_answer_count: number;
+  unused_injection_count: number;
+  positive_feedback_count: number;
+  negative_feedback_count: number;
+  injection_use_rate: number;
+  scope_counts: Record<string, number>;
+  oldest_candidate_at?: string;
 };
 
 export type MemoryCandidateFilter = {
@@ -1518,7 +1654,10 @@ export type SettingsRecord = {
   model_provider: string;
   model_name: string;
   model_reasoning_name?: string;
+  model_reasoning_effort?: string;
   model_base_url: string;
+  model_timeout_seconds?: number;
+  model_max_retries?: number;
   telegram_enabled: boolean;
   telegram_allowed_user_ids?: string;
   imessage_enabled: boolean;
@@ -1603,6 +1742,7 @@ export type ModelConfigRequest = {
   base_url: string;
   name: string;
   reasoning_name?: string;
+  reasoning_effort?: string;
   timeout_seconds?: number;
   max_retries?: number;
 };
@@ -1613,7 +1753,7 @@ export type ModelConnectionTestRequest = ModelConfigRequest & {
 
 export type XAIOAuthLoginResult = {
   status: 'succeeded';
-  provider: 'xai_oauth';
+  provider: 'xai_oauth' | 'grok_build';
   base_url: string;
   model_name: string;
   last_refresh: string;
@@ -1731,6 +1871,8 @@ export type DesktopBindings = {
   UpdateProjectPersona(req: UpdateProjectPersonaRequest): Promise<ProjectPersona>;
   RollbackProjectPersona(req: RollbackProjectPersonaRequest): Promise<ProjectPersona>;
   CreateSharedRoom(req: CreateSharedRoomRequest): Promise<{ room: MessengerRoom }>;
+  UpdateMessengerRoom(req: UpdateMessengerRoomRequest): Promise<{ room: MessengerRoom }>;
+  UpdateMessengerProject(req: UpdateMessengerProjectRequest): Promise<{ project: MessengerProject }>;
   ConnectExternalMirrorRoom(req: ConnectExternalMirrorRoomRequest): Promise<{ connector: RoomConnector; room: MessengerRoom }>;
   RecordExternalConnectorInbound(req: RecordExternalConnectorInboundRequest): Promise<{ event: ExternalConnectorEvent; room: MessengerRoom; message_id?: string; duplicate: boolean }>;
   RecordExternalConnectorOutbound(req: RecordExternalConnectorOutboundRequest): Promise<{ event: ExternalConnectorEvent; room: MessengerRoom; message_id: string; duplicate: boolean }>;
@@ -1757,6 +1899,7 @@ export type DesktopBindings = {
   ListRunTraceSpans(filter?: RunTraceSpanFilter): Promise<{ spans: RunTraceSpan[]; summary: RunTraceSpanSummary }>;
   ListConversations(filter: ConversationFilter): Promise<{ conversations: ConversationSummary[] }>;
   GetConversation(conversationID: string): Promise<ConversationDetail>;
+  GetConversationForMessage(messageID: string): Promise<ConversationDetail>;
   ListConversationGroups(): Promise<{ groups: ConversationGroup[] }>;
   SaveConversationGroup(req: ConversationGroupRequest): Promise<ConversationGroup>;
   DeleteConversationGroup(id: string): Promise<void>;
@@ -1766,15 +1909,27 @@ export type DesktopBindings = {
   RestoreConversation(req: ConversationActionRequest): Promise<ConversationActionResponse>;
   PurgeConversation(req: ConversationActionRequest): Promise<ConversationActionResponse>;
   ListCapabilities(): Promise<{ capabilities: CapabilityRecord[] }>;
+  SetCapabilityEnabled(req: { id: string; enabled: boolean }): Promise<void>;
   ListMCPServers(): Promise<{ servers: MCPServerRecord[] }>;
+  SaveMCPServer(req: MCPServerConfigRequest): Promise<{ server: MCPServerRecord }>;
+  DeleteMCPServer(id: string): Promise<void>;
+  SetMCPServerEnabled(req: { id: string; enabled: boolean }): Promise<{ server: MCPServerRecord }>;
   SyncMCPServer(id: string): Promise<{ server: MCPServerRecord }>;
   WrapMCPTool(serverID: string, toolName: string, req: MCPWrapToolRequest): Promise<{ capability: CapabilityRecord }>;
   ListSkills(): Promise<{ skills: SkillRecord[] }>;
+  SetSkillEnabled(req: { id: string; enabled: boolean }): Promise<void>;
+  TestGitHubConnection(): Promise<GitHubConnectionResult>;
+  ListPlugins(): Promise<{ plugins: PluginRecord[] }>;
+  InstallPluginFromManifest(path: string): Promise<{ plugin: PluginRecord }>;
+  InstallPluginFromGitHub(req: PluginInstallFromGitHubRequest): Promise<{ plugin: PluginRecord }>;
+  TestPluginProvider(req: { plugin_id: string; provider_id?: string }): Promise<PluginProviderTestResult>;
+  SetPluginEnabled(req: { id: string; enabled: boolean }): Promise<{ plugin: PluginRecord }>;
+  RemovePlugin(id: string): Promise<void>;
   ListToolWorkflows(): Promise<{ workflows: ToolWorkflowRecord[] }>;
   ListToolRuns(): Promise<{ tool_runs: ToolRunRecord[] }>;
   SetToolWorkflowEnabled(req: { name: string; enabled: boolean }): Promise<void>;
   GetSystemHealth(): Promise<SystemHealth>;
-  ListMemories(filter: { query?: string; limit?: number }): Promise<{ memories: MemoryRecord[] }>;
+  ListMemories(filter: { query?: string; limit?: number }): Promise<{ memories: MemoryRecord[]; metrics: MemoryQualityMetrics }>;
   UpdateMemory(req: { id: string; action: string; feedback?: string; comment?: string; target_id?: string; reason?: string; content?: string; summary?: string; scope_type?: string; run_id?: string }): Promise<void>;
   ListMemoriesUsedForRun(runID: string): Promise<{ memories: MemorySearchResult[] }>;
   ListMemoryCandidates(filter: MemoryCandidateFilter): Promise<{ memories: MemoryRecord[] }>;
@@ -1840,6 +1995,7 @@ export type DesktopBindings = {
   GetSecretStatus(): Promise<SecretStatus>;
   SaveSecret(req: { name: string; value: string }): Promise<void>;
   LoginXAIOAuth(): Promise<XAIOAuthLoginResult>;
+  TestWebSearch(req?: { query?: string; max_results?: number }): Promise<Record<string, unknown>>;
   TestModelConnection(req?: ModelConnectionTestRequest): Promise<ConnectionTest>;
   TestTelegramConnection(): Promise<ConnectionTest>;
   GenerateWorkerToken(): Promise<{ token: string }>;
@@ -1894,6 +2050,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'GetAutomation',
   'GetAutomationWebhookEndpoint',
   'GetConversation',
+  'GetConversationForMessage',
   'GetExternalHandoffAudit',
   'GetLogEntry',
   'GetModelUsage',
@@ -1916,12 +2073,16 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'ListAutomations',
   'ListBackups',
   'ListCapabilities',
+  'SetCapabilityEnabled',
   'ListConfirmations',
   'ListConversationGroups',
   'ListConversations',
   'ListLogs',
   'LoginXAIOAuth',
   'ListMCPServers',
+  'SaveMCPServer',
+  'DeleteMCPServer',
+  'SetMCPServerEnabled',
   'ListMemories',
   'ListMemoriesUsedForRun',
   'ListMemoryCandidates',
@@ -1935,6 +2096,14 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'ListRelationshipStates',
   'ListSavedModels',
   'ListSkills',
+  'SetSkillEnabled',
+  'TestGitHubConnection',
+  'ListPlugins',
+  'InstallPluginFromManifest',
+  'InstallPluginFromGitHub',
+  'TestPluginProvider',
+  'SetPluginEnabled',
+  'RemovePlugin',
   'ListToolRuns',
   'ListToolWorkflows',
   'ListWorkerGatewayAuditLogs',
@@ -1976,10 +2145,13 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'TestAutomationWebhook',
   'TestIMessageConnection',
   'TestModelConnection',
+  'TestWebSearch',
   'TestTelegramConnection',
   'TrashConversation',
   'TriggerAutomationNow',
   'UpdateMemory',
+  'UpdateMessengerProject',
   'UpdateProjectPersona',
+  'UpdateMessengerRoom',
   'WrapMCPTool',
 ];

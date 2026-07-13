@@ -145,6 +145,22 @@ CREATE TABLE skill_runs (
   finished_at TIMESTAMPTZ
 );
 
+CREATE TABLE plugin_definitions (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT 'v1',
+  description TEXT NOT NULL DEFAULT '',
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  status TEXT NOT NULL DEFAULT 'installed',
+  manifest_path TEXT NOT NULL DEFAULT '',
+  capability_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+  skill_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+  mcp_server_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE conversations (
   id TEXT PRIMARY KEY,
   channel TEXT NOT NULL,

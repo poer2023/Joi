@@ -4,6 +4,7 @@ import type {
   AutomationTriggerRecord,
   ChatRequest,
   ChatResponse,
+  RunEvent,
   SettingsRecord,
 } from '../../../../packages/shared-types/src/desktop-api';
 import type { JoiSQLiteStore } from '../../../../packages/store/src/sqlite';
@@ -14,12 +15,17 @@ import {
   scheduleDedupKey,
   shouldCoalesceMissedFire,
 } from '../../../../packages/runtime/src/automation';
+import { LOCAL_MODEL_PROXY_API_KEY } from '../../../../packages/runtime/src/model';
 import {
   canRunRealToolCalling,
+  emitRunEvent,
   emitRunEvents,
   resolveAPIKeyForModelEndpoint,
   runLiveElectronToolCallingChat,
 } from './ipc';
+import type { JoiPluginManager } from './plugin-manager';
+import type { TelegramOutboundService } from './telegram-outbound';
+import { resolveAutomationModelRuntimeRoute } from './automation-runtime-route';
 export { AutomationWebhookServer, automationWebhookSecretRef, newAutomationWebhookSecret } from './automation-webhook';
 
 type AutomationAppLogInput = Parameters<JoiSQLiteStore['recordAppLog']>[0];
@@ -27,6 +33,8 @@ type AutomationAppLogInput = Parameters<JoiSQLiteStore['recordAppLog']>[0];
 export type AutomationRunnerOptions = {
   store: JoiSQLiteStore;
   secrets: KeychainSecretStore;
+  pluginManager?: JoiPluginManager;
+  telegramOutbound?: TelegramOutboundService;
   getWindow: () => BrowserWindow | null;
   deterministicChat?: boolean;
   logger?: Pick<Console, 'info' | 'warn' | 'error'>;
@@ -36,6 +44,8 @@ export type AutomationRunnerOptions = {
 export class AutomationRunner {
   private store: JoiSQLiteStore;
   private secrets: KeychainSecretStore;
+  private pluginManager?: JoiPluginManager;
+  private telegramOutbound?: TelegramOutboundService;
   private getWindow: () => BrowserWindow | null;
   private deterministicChat: boolean;
   private logger: Pick<Console, 'info' | 'warn' | 'error'>;
@@ -48,6 +58,8 @@ export class AutomationRunner {
   constructor(options: AutomationRunnerOptions) {
     this.store = options.store;
     this.secrets = options.secrets;
+    this.pluginManager = options.pluginManager;
+    this.telegramOutbound = options.telegramOutbound;
     this.getWindow = options.getWindow;
     this.deterministicChat = Boolean(options.deterministicChat);
     this.logger = options.logger || console;
@@ -98,6 +110,8 @@ export class AutomationRunner {
     try {
       this.reconcileSchedules();
       this.drainQueue();
+      await this.telegramOutbound?.drainFailedDeliveries();
+      await this.telegramOutbound?.drainAuthorizedProactiveMessages();
     } catch (error) {
       this.logger.warn('automation runner tick failed', error);
       recordAutomationAppLog(this.store, this.logger, {
@@ -248,12 +262,22 @@ export class AutomationRunner {
         emitRunEventsIfPossible(this.getWindow(), this.store, response.run_id);
         return;
       }
-      this.store.recordAutomationRunCompleted({
-        automation_run_id: automationRun.id,
-        run_id: response.run_id,
-        product_task_id: productTaskID,
-        output_summary: response.response.slice(0, 500),
-      });
+      if (this.telegramOutbound) {
+        await this.telegramOutbound.deliverAutomationCompletion({
+          automation,
+          trigger,
+          response,
+          automation_run_id: automationRun.id,
+          product_task_id: productTaskID,
+        });
+      } else {
+        this.store.recordAutomationRunCompleted({
+          automation_run_id: automationRun.id,
+          run_id: response.run_id,
+          product_task_id: productTaskID,
+          output_summary: response.response.slice(0, 500),
+        });
+      }
       recordAutomationAppLog(this.store, this.logger, {
         level: 'info',
         risk_level: 'state_change',
@@ -300,17 +324,26 @@ export class AutomationRunner {
       return response;
     }
     const settings = this.store.getSettings();
-    const apiKey = await resolveAPIKeyForModelEndpoint(settings, this.secrets);
-    if (!canRunRealToolCalling(settings, apiKey, req)) {
+    const route = await resolveAutomationModelRuntimeRoute({
+      settings,
+      request: req,
+      localProxyAPIKey: LOCAL_MODEL_PROXY_API_KEY,
+      resolveACPProvider: (providerID, permissionProfile) => this.pluginManager?.resolveProvider(providerID, permissionProfile),
+      resolveAPIKey: () => resolveAPIKeyForModelEndpoint(settings, this.secrets),
+      canRun: canRunRealToolCalling,
+    });
+    if (!route.ready) {
       throw codedAutomationError('MODEL_NOT_CONFIGURED', modelConfigError(settings));
     }
     const response = await runLiveElectronToolCallingChat(
       req,
       settings,
-      apiKey,
+      this.secrets,
       this.store,
       this.activeRuns,
-      (runID) => emitRunEventsIfPossible(this.getWindow(), this.store, runID),
+      (runID, event?: RunEvent) => emitRunEventsIfPossible(this.getWindow(), this.store, runID, event),
+      this.pluginManager,
+      { model_selection_policy: route.model_selection_policy },
     );
     emitRunEventsIfPossible(this.getWindow(), this.store, response.run_id);
     return response;
@@ -388,12 +421,16 @@ function codedAutomationError(code: string, message: string): Error & { code?: s
 }
 
 function modelConfigError(settings: SettingsRecord): string {
+  if ((settings.model_provider || '').startsWith('acp_')) {
+    return `ACP provider is not installed or enabled for automation: provider=${settings.model_provider || 'empty'} model=${settings.model_name || 'empty'}`;
+  }
   return `Real model runtime is not configured for automation: provider=${settings.model_provider || 'empty'} model=${settings.model_name || 'empty'}`;
 }
 
-function emitRunEventsIfPossible(window: BrowserWindow | null, store: JoiSQLiteStore, runID: string): void {
+function emitRunEventsIfPossible(window: BrowserWindow | null, store: JoiSQLiteStore, runID: string, event?: RunEvent): void {
   if (!window || window.isDestroyed()) return;
-  emitRunEvents(window, store.getRunTrace(runID));
+  if (event) emitRunEvent(window, event);
+  else emitRunEvents(window, store.getRunTrace(runID));
 }
 
 function recordAutomationAppLog(store: JoiSQLiteStore, logger: Pick<Console, 'warn'>, input: AutomationAppLogInput): void {

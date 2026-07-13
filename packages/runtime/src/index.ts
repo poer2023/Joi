@@ -1,5 +1,6 @@
 export * from './model';
 export * from './telegram';
+export * from './telegram-message';
 export * from './worker-gateway';
 export * from './capabilities';
 export * from './workspace-exec';
@@ -7,7 +8,10 @@ export * from './browser-computer';
 export * from './desktop-apps';
 export * from './diagnostics';
 export * from './tool-calling';
+export * from './agent-kernel';
 export * from './capability-compiler';
 export * from './xai-oauth';
 export * from './imessage';
 export * from './automation';
+export * from './grok-build-image';
+export * from './acp';

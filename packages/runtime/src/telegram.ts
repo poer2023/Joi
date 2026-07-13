@@ -1,4 +1,5 @@
 import type { ConnectionTest } from '../../shared-types/src/desktop-api';
+import { postTelegramFormattedText } from './telegram-message.ts';
 
 export type TelegramConnectionOptions = {
   token?: string;
@@ -44,22 +45,26 @@ export async function sendTestTelegramMessage(options: TelegramTestMessageOption
   if (!chatID) {
     return { ok: false, status: 'missing_chat_id', error_summary: 'No Telegram chat ID or allowed user ID configured' };
   }
-  const form = new URLSearchParams();
-  form.set('chat_id', chatID);
-  form.set('text', options.message || defaultTelegramTestMessage);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), (options.timeoutSeconds ?? defaultTimeoutSeconds) * 1000);
   try {
-    const response = await fetchWithTimeout(telegramBotURL(token, 'sendMessage', options.apiBaseURL), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form.toString(),
-    }, options.timeoutSeconds ?? defaultTimeoutSeconds);
-    await response.arrayBuffer();
-    if (!response.ok) {
-      return { ok: false, status: responseStatus(response), error_summary: 'telegram sendMessage returned non-2xx' };
+    const result = await postTelegramFormattedText({
+      apiBaseURL: options.apiBaseURL || process.env.TELEGRAM_API_BASE_URL || defaultTelegramAPIBaseURL,
+      token,
+      chatID,
+      text: options.message || defaultTelegramTestMessage,
+      fetchImpl: fetch,
+      signal: controller.signal,
+    });
+    if (!result.ok) {
+      const status = result.statusText ? `${result.status} ${result.statusText}` : String(result.status);
+      return { ok: false, status, error_summary: `telegram ${result.method} returned non-2xx` };
     }
     return { ok: true, status: 'succeeded' };
   } catch (error) {
     return { ok: false, status: 'failed', error_summary: sanitizeTelegramError(error, token) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

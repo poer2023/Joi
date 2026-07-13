@@ -1,0 +1,154 @@
+{
+  "schema_version": 3,
+  "captured_at": "2026-07-10T19:48:39.301Z",
+  "source": {
+    "kind": "folo_wa_sqlite_aggregate_snapshot",
+    "access": "read_only",
+    "local_path_retained": false
+  },
+  "privacy": {
+    "output_mode": "shareable_redacted",
+    "aggregate_only": true,
+    "private_titles_included": false,
+    "private_urls_included": false,
+    "public_titles_included": false,
+    "public_urls_included": false,
+    "source_names_included": false,
+    "custom_category_labels_included": false,
+    "private_category_labels_included": false,
+    "cookies_or_tokens_included": false,
+    "representative_sources_included": false
+  },
+  "counts": {
+    "total_subscriptions": 88,
+    "public_subscriptions": 50,
+    "private_subscriptions": 38,
+    "hidden_from_timeline": 1,
+    "by_view": [
+      {
+        "view": 0,
+        "key": "articles",
+        "label": "文章",
+        "total": 18,
+        "public": 15,
+        "private": 3,
+        "hidden_from_timeline": 0
+      },
+      {
+        "view": 1,
+        "key": "social_media",
+        "label": "社交媒体",
+        "total": 18,
+        "public": 16,
+        "private": 2,
+        "hidden_from_timeline": 0
+      },
+      {
+        "view": 2,
+        "key": "pictures",
+        "label": "图片",
+        "total": 6,
+        "public": 4,
+        "private": 2,
+        "hidden_from_timeline": 0
+      },
+      {
+        "view": 3,
+        "key": "videos",
+        "label": "视频",
+        "total": 19,
+        "public": 11,
+        "private": 8,
+        "hidden_from_timeline": 0
+      },
+      {
+        "view": 5,
+        "key": "notifications",
+        "label": "通知",
+        "total": 27,
+        "public": 4,
+        "private": 23,
+        "hidden_from_timeline": 1
+      }
+    ]
+  },
+  "categories": [
+    {
+      "key": "articles",
+      "label": "文章",
+      "total": 18,
+      "public": 15,
+      "private": 3
+    },
+    {
+      "key": "social_media",
+      "label": "社交媒体",
+      "total": 18,
+      "public": 16,
+      "private": 2
+    },
+    {
+      "key": "pictures",
+      "label": "图片",
+      "total": 6,
+      "public": 4,
+      "private": 2
+    },
+    {
+      "key": "videos",
+      "label": "视频",
+      "total": 19,
+      "public": 11,
+      "private": 8
+    },
+    {
+      "key": "notifications",
+      "label": "通知",
+      "total": 27,
+      "public": 4,
+      "private": 23
+    }
+  ],
+  "topics": [
+    {
+      "key": "x_and_social",
+      "label": "X / Twitter 与社交动态",
+      "matched_public_subscriptions": 21
+    },
+    {
+      "key": "news_and_reading",
+      "label": "资讯、博客与阅读",
+      "matched_public_subscriptions": 17
+    },
+    {
+      "key": "video_and_hardware",
+      "label": "视频、数码与硬件",
+      "matched_public_subscriptions": 11
+    },
+    {
+      "key": "ai_and_agents",
+      "label": "AI、模型与智能体",
+      "matched_public_subscriptions": 6
+    },
+    {
+      "key": "images_and_photography",
+      "label": "图片、摄影与视觉内容",
+      "matched_public_subscriptions": 6
+    },
+    {
+      "key": "developer_tools",
+      "label": "开发工具与软件",
+      "matched_public_subscriptions": 5
+    },
+    {
+      "key": "notification_watch",
+      "label": "更新、发布与提醒",
+      "matched_public_subscriptions": 4
+    },
+    {
+      "key": "games",
+      "label": "游戏与游戏资讯",
+      "matched_public_subscriptions": 3
+    }
+  ]
+}

@@ -1,5 +1,9 @@
 import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { testGitHubConnection } from './github';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { join } from 'node:path';
 import { z } from 'zod';
 import { desktopIpcMethods, type DesktopIpcMethod, type JoiInvokeRequest } from '../../../../packages/shared-types/src/preload-api';
 import type {
@@ -9,6 +13,7 @@ import type {
   AutomationDefinitionRequest,
   AutomationTriggerNowRequest,
   AutomationWebhookTestRequest,
+  CapabilityRecord,
   ChatRequest,
   ConnectExternalMirrorRoomRequest,
   CreateProjectPersonaRequest,
@@ -24,6 +29,8 @@ import type {
   ModelConnectionTestRequest,
   ModelConfigRequest,
   ModelSettingsRequest,
+  PluginInstallFromGitHubRequest,
+  MCPServerRecord,
   PhotonIMessageStatus,
   PreviewExternalPersonaMessageRequest,
   RecordExternalConnectorFailureRequest,
@@ -33,6 +40,7 @@ import type {
   RetryExternalConnectorEventRequest,
   RollbackProjectPersonaRequest,
   RoutingFeedbackRequest,
+  RunEvent,
   RunTraceSpanFilter,
   SetRouteLockRequest,
   SettingsRecord,
@@ -41,24 +49,38 @@ import type {
   TerminalSessionKillRequest,
   TerminalSessionResizeRequest,
   TerminalSessionStartRequest,
+  UpdateMessengerProjectRequest,
   WorkspaceSettings,
+  UpdateMessengerRoomRequest,
   UpdateProjectPersonaRequest,
 } from '../../../../packages/shared-types/src/desktop-api';
 import type { JoiSQLiteStore, PersistedToolResult, StartedToolCallingChat, ToolCallingPromptAssembly, ToolCallingResumeRequest } from '../../../../packages/store/src/sqlite';
 import type { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
 import { fetchAvailableModels, isLoopbackModelEndpoint, LOCAL_MODEL_PROXY_API_KEY, testModelConnection } from '../../../../packages/runtime/src/model';
-import { DEFAULT_XAI_OAUTH_BASE_URL, isXAIOAuthProvider, loginWithXAIOAuthLoopback, resolveXAIOAuthCredentials, validateXAIInferenceBaseURL } from '../../../../packages/runtime/src/xai-oauth';
+import { DEFAULT_XAI_OAUTH_BASE_URL, isGrokBuildProvider, isXAIOAuthBackedProvider, loginWithXAIOAuthLoopback, resolveXAIOAuthCredentials, validateXAIInferenceBaseURL } from '../../../../packages/runtime/src/xai-oauth';
 import { sendTestTelegramMessage, testTelegramConnection } from '../../../../packages/runtime/src/telegram';
 import { PHOTON_DASHBOARD_TOKEN_SECRET, PHOTON_PROJECT_SECRET_SECRET, setupPhotonIMessage, testPhotonIMessageConnection } from '../../../../packages/runtime/src/imessage';
-import { executeFileAnalyze, executeFileRead, executeWebResearch, executeWorkspaceSearch } from '../../../../packages/runtime/src/capabilities';
+import { executeFileAnalyze, executeFileRead, executePublicWebExtract, executeUnsupportedCapability, executeWebResearch, executeWorkspaceSearch } from '../../../../packages/runtime/src/capabilities';
 import { executeApplyPatch, executeShellCommand, executeTestCommand } from '../../../../packages/runtime/src/workspace-exec';
 import { executeBrowserClick, executeBrowserNavigate, executeBrowserObserve, executeBrowserType, executeComputerObserve } from '../../../../packages/runtime/src/browser-computer';
 import { executeDesktopAppInspect, executeDesktopAppList } from '../../../../packages/runtime/src/desktop-apps';
 import { executeServerDiagnose, executeSystemHealthCheck } from '../../../../packages/runtime/src/diagnostics';
 import { runChatCompletionsToolTurn } from '../../../../packages/runtime/src/tool-calling';
-import { compileElectronCapabilityTools } from '../../../../packages/runtime/src/capability-compiler';
+import { runACPChatTurn, type ACPProviderRuntimeConfig } from '../../../../packages/runtime/src/acp';
+import { inferFinalResponseContract } from '../../../../packages/runtime/src/agent-kernel';
+import { canonicalElectronCapabilityName, compileElectronCapabilityTools, listElectronCapabilityToolDefinitions } from '../../../../packages/runtime/src/capability-compiler';
+import { executeGrokBuildImageGeneration } from '../../../../packages/runtime/src/grok-build-image';
 import { TerminalSessionManager } from './terminal';
 import { automationWebhookSecretRef, newAutomationWebhookSecret } from './automation';
+import { JoiPluginManager } from './plugin-manager';
+import { isProactiveTelegramDeliveryRequested, type TelegramOutboundDeliveryResult } from './telegram-outbound';
+import {
+  defaultJoiCommandSocketPath,
+  publishJoiRunEvent,
+  publishJoiTerminalEvent,
+  startJoiCommandHost,
+} from './command-host';
+import { acpWebBridgeToken } from './acp-web-bridge';
 
 const invokeRequestSchema = z.object({
   method: z.enum(desktopIpcMethods),
@@ -68,6 +90,7 @@ const invokeRequestSchema = z.object({
 const externalUrlSchema = z.string().url();
 
 type Handler = (payload?: unknown) => Promise<unknown> | unknown;
+type DesktopIpcHandlerMap = Record<DesktopIpcMethod, Handler>;
 
 export type AppDirs = {
   userDataDir: string;
@@ -77,6 +100,8 @@ export type AppDirs = {
 };
 
 export type RegisterIpcOptions = {
+  pluginManager?: JoiPluginManager;
+  deliverProactiveMessage?: (id: string) => Promise<TelegramOutboundDeliveryResult>;
   onTelegramConfigChanged?: () => void;
   onIMessageConfigChanged?: () => void;
   getTelegramStatus?: () => TelegramInboundStatus | undefined;
@@ -90,6 +115,8 @@ export type RegisterIpcOptions = {
 
 let terminalSessionManager: TerminalSessionManager | null = null;
 let terminalDisposeRegistered = false;
+let terminalCliEventUnsubscribe: (() => void) | null = null;
+let browserBridgeServer: Server | null = null;
 
 function getTerminalSessionManager() {
   if (!terminalSessionManager) {
@@ -106,10 +133,14 @@ function getTerminalSessionManager() {
   return terminalSessionManager;
 }
 
-export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: JoiSQLiteStore, secrets: KeychainSecretStore, options: RegisterIpcOptions = {}) {
+export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiSQLiteStore, secrets: KeychainSecretStore, options: RegisterIpcOptions = {}) {
   const activeToolCallingRuns = new Map<string, AbortController>();
   const emittedRunSeqByRunID = new Map<string, number>();
   const terminalManager = getTerminalSessionManager();
+  if (!terminalCliEventUnsubscribe) {
+    terminalCliEventUnsubscribe = terminalManager.onEvent(publishJoiTerminalEvent);
+  }
+  const pluginManager = options.pluginManager || new JoiPluginManager(store, appDirs.userDataDir);
   terminalManager.attachWindow(window);
   terminalManager.setLogSink?.((event) => {
     safeRecordAppLog(store, {
@@ -132,7 +163,13 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     terminalManager.detachWindow(window);
     terminalManager.dispose();
   });
-  const emitNewRunEvents = (runID: string) => {
+  const emitNewRunEvents = (runID: string, event?: RunEvent) => {
+    if (event) {
+      emitRunEvent(window, event);
+      const lastSeq = emittedRunSeqByRunID.get(runID) || 0;
+      if (event.seq > lastSeq) emittedRunSeqByRunID.set(runID, event.seq);
+      return;
+    }
     emitRunEventsSince(window, store.getRunTrace(runID), emittedRunSeqByRunID);
   };
   const sqliteApi: Record<DesktopIpcMethod, Handler> = {
@@ -147,11 +184,12 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
         return result;
       }
       const settings = store.getSettings();
-      const apiKey = await resolveAPIKeyForModelEndpoint(settings, secrets);
-      if (!canRunRealToolCalling(settings, apiKey, chatRequest)) {
-        throw new Error(unconfiguredModelMessage(settings, apiKey, chatRequest));
+      const acpProvider = pluginManager.resolveProvider(settings.model_provider, chatRequest.permission_profile || 'read_only');
+      const apiKey = acpProvider ? LOCAL_MODEL_PROXY_API_KEY : await resolveAPIKeyForModelEndpoint(settings, secrets);
+      if (!canRunRealToolCalling(settings, apiKey, chatRequest, Boolean(acpProvider))) {
+        throw new Error(unconfiguredModelMessage(settings, apiKey, chatRequest, Boolean(acpProvider)));
       }
-      const result = await runLiveElectronToolCallingChat(chatRequest, settings, apiKey, store, activeToolCallingRuns, emitNewRunEvents);
+      const result = await runLiveElectronToolCallingChat(chatRequest, settings, secrets, store, activeToolCallingRuns, emitNewRunEvents, pluginManager);
       emitNewRunEvents(result.run_id);
       return result;
     },
@@ -172,6 +210,12 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     },
     CreateSharedRoom(payload) {
       return store.createSharedRoom(payload as CreateSharedRoomRequest);
+    },
+    UpdateMessengerRoom(payload) {
+      return store.updateMessengerRoom(payload as UpdateMessengerRoomRequest);
+    },
+    UpdateMessengerProject(payload) {
+      return store.updateMessengerProject(payload as UpdateMessengerProjectRequest);
     },
     ConnectExternalMirrorRoom(payload) {
       return store.connectExternalMirrorRoom(payload as ConnectExternalMirrorRoomRequest);
@@ -311,6 +355,9 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     GetConversation(payload) {
       return store.getConversation(String(payload ?? ''));
     },
+    GetConversationForMessage(payload) {
+      return store.getConversationForMessage(String(payload ?? ''));
+    },
     ListConversationGroups() {
       return store.listConversationGroups();
     },
@@ -360,19 +407,65 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
       return testTelegramConnection({ token: await secrets.resolve('TELEGRAM_BOT_TOKEN') });
     },
     ListCapabilities() {
-      return store.listCapabilities();
+      return mergeRuntimeCapabilityRecords(store.listCapabilities().capabilities);
+    },
+    SetCapabilityEnabled(payload) {
+      store.setCapabilityEnabled(payload as { id?: string; enabled?: boolean });
     },
     ListMCPServers() {
       return store.listMCPServers();
     },
-    SyncMCPServer(payload) {
-      return store.syncMCPServer(String(payload ?? ''));
+    SaveMCPServer(payload) {
+      return store.saveMCPServer(payload as Parameters<typeof store.saveMCPServer>[0]);
+    },
+    DeleteMCPServer(payload) {
+      store.deleteMCPServer(String(payload ?? ''));
+    },
+    SetMCPServerEnabled(payload) {
+      return store.setMCPServerEnabled(payload as { id?: string; enabled?: boolean });
+    },
+    async SyncMCPServer(payload) {
+      const serverID = String(payload ?? '').trim();
+      const server = store.listMCPServers().servers.find((item) => item.id === serverID);
+      if (!server) return store.syncMCPServer(serverID);
+      try {
+        const inventory = await inspectStdioMCPServer(server);
+        return store.replaceMCPInventory(serverID, inventory);
+      } catch (error) {
+        store.recordMCPSyncFailure(serverID, error instanceof Error ? error.message : String(error));
+        throw error;
+      }
     },
     WrapMCPTool(payload) {
       return store.wrapMCPTool(payload as Parameters<typeof store.wrapMCPTool>[0]);
     },
     ListSkills() {
       return store.listSkills();
+    },
+    SetSkillEnabled(payload) {
+      store.setSkillEnabled(payload as { id?: string; enabled?: boolean });
+    },
+    TestGitHubConnection() {
+      return testGitHubConnection(store.getWorkspaceSettings(), (name) => secrets.resolve(name));
+    },
+    ListPlugins() {
+      return store.listPlugins();
+    },
+    InstallPluginFromManifest(payload) {
+      return store.installPluginFromManifest(String(payload ?? ''));
+    },
+    async InstallPluginFromGitHub(payload) {
+      return pluginManager.installFromGitHub(payload as PluginInstallFromGitHubRequest);
+    },
+    async TestPluginProvider(payload) {
+      const req = payload as { plugin_id?: string; provider_id?: string };
+      return pluginManager.testProvider(String(req.plugin_id || ''), req.provider_id);
+    },
+    SetPluginEnabled(payload) {
+      return store.setPluginEnabled(payload as { id?: string; enabled?: boolean });
+    },
+    async RemovePlugin(payload) {
+      await pluginManager.remove(String(payload ?? ''));
     },
     ListToolWorkflows() {
       return store.listToolWorkflows();
@@ -468,7 +561,6 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
         return { redirected_run: redirected };
       }
       const settings = store.getSettings();
-      const apiKey = await resolveAPIKeyForModelEndpoint(settings, secrets);
       const result = await runLiveElectronToolCallingChat({
         conversation_id: redirected.conversation_id,
         channel: redirected.entry_channel || 'desktop',
@@ -478,7 +570,7 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
         parent_run_id: runID,
         redirected_from_run_id: runID,
         runtime_mode: 'tool_calling',
-      }, settings, apiKey, store, activeToolCallingRuns, emitNewRunEvents);
+      }, settings, secrets, store, activeToolCallingRuns, emitNewRunEvents);
       emitNewRunEvents(result.run_id);
       return { redirected_run: redirected, new_run: result };
     },
@@ -520,6 +612,13 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     },
     SaveWorkspaceSettings(payload) {
       store.saveWorkspaceSettings(payload as WorkspaceSettings);
+    },
+    async TestWebSearch(payload) {
+      const req = payload as { query?: string; max_results?: number } | undefined;
+      return executeWebResearch(
+        { query: req?.query?.trim() || 'Brave Search API', max_results: req?.max_results || 3 },
+        await workspaceSettingsWithSecrets(store, secrets),
+      );
     },
     SaveModelConfig(payload) {
       store.saveModelConfig(payload as ModelConfigRequest);
@@ -684,8 +783,26 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
     ListProactiveMessages(payload) {
       return store.listProactiveMessages(payload as { status?: string; limit?: number });
     },
-    DecideProactiveMessage(payload) {
-      store.decideProactiveMessage(payload as { id?: string; action?: string; feedback?: string });
+    async DecideProactiveMessage(payload) {
+      const req = payload as { id?: string; action?: string; feedback?: string };
+      const id = req.id?.trim() || '';
+      const action = req.action?.trim() || '';
+      if (!id || !action) throw new Error('id and action are required');
+      const context = store.getProactiveOutboundContext(id);
+      const shouldDeliverTelegram = Boolean(options.deliverProactiveMessage)
+        && ['send', 'approve', 'sent'].includes(action)
+        && isProactiveTelegramDeliveryRequested(context);
+      if (!shouldDeliverTelegram) {
+        store.decideProactiveMessage(req);
+        return;
+      }
+      if (context.status !== 'delivered') {
+        store.decideProactiveMessage({ ...req, action: action === 'sent' ? 'send' : action });
+      }
+      const delivery = await options.deliverProactiveMessage!(id);
+      if (delivery.status === 'failed') {
+        throw new Error(`Telegram 主动推送失败：${delivery.error_summary || '请查看 Run Trace 和日志。'}`);
+      }
     },
     RecordNotificationOpened(payload) {
       store.recordNotificationOpened(payload as { id?: string; actor?: string; external_delivery_id?: string });
@@ -704,17 +821,19 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
         readClipboard: () => clipboard.readText(),
         timeoutSeconds: 240,
       });
-      const modelName = 'grok-4.3';
+      const modelName = 'grok-4.5';
       store.saveModelConfig({
-        provider: 'xai_oauth',
+        provider: 'grok_build',
         base_url: DEFAULT_XAI_OAUTH_BASE_URL,
         name: modelName,
         reasoning_name: modelName,
+        reasoning_effort: 'low',
         timeout_seconds: 60,
         max_retries: 1,
       });
       return {
         ...result,
+        provider: 'grok_build',
         model_name: modelName,
       };
     },
@@ -724,6 +843,129 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
       return { token };
     },
   };
+
+  if (!envFlagValue(process.env.JOI_DISABLE_CLI_HOST)) {
+    void startJoiCommandHost({
+      socketPath: defaultJoiCommandSocketPath(appDirs.userDataDir),
+      handlers: sqliteApi,
+      riskForMethod: ipcRiskLevel,
+      hostInfo: {
+        app: 'Joi',
+        version: app.getVersion(),
+        runtime: 'electron_sqlite',
+      },
+      terminal: {
+        start: (req) => terminalManager.start(req),
+        input: (req) => terminalManager.input(req),
+        resize: (req) => terminalManager.resize(req),
+        kill: (req) => terminalManager.kill(req),
+        getStatus: (id) => terminalManager.getStatus(id),
+      },
+      replayRunEvents: (runID, afterSeq) => (store.getRunTrace(runID).events || []).filter((event) => Number(event.seq || 0) > afterSeq),
+      acpWeb: {
+        token: acpWebBridgeToken(),
+        execute: async ({ capability, payload, request_id }) => {
+          const startedAt = Date.now();
+          const capabilityRecords = mergeRuntimeCapabilityRecords(store.listCapabilities().capabilities).capabilities;
+          const disabled = [capability, 'web_research']
+            .map((id) => capabilityRecords.find((record) => record.id === id))
+            .some((record) => record?.enabled === false);
+          if (disabled) {
+            const output = {
+              status: 'policy_blocked',
+              capability,
+              code: 'CAPABILITY_DISABLED',
+              summary: `${capability} is disabled in Joi Settings.`,
+              permission_profile: 'read_only',
+              bridge_trace_id: request_id,
+            };
+            safeRecordAppLog(store, {
+              level: 'warn',
+              risk_level: 'read_only',
+              category: 'tool',
+              feature_key: `acp_web.${capability}.blocked`,
+              source: 'acp_mcp_bridge',
+              message: `ACP web capability ${capability} was blocked`,
+              duration_ms: Date.now() - startedAt,
+              payload: { capability, request_id, reason: 'capability_disabled' },
+            });
+            return output;
+          }
+          try {
+            const executed = await executeElectronCapability(
+              capability,
+              payload,
+              {
+                message: `ACP requested Joi capability ${capability}`,
+                runtime_mode: 'tool_calling',
+                permission_profile: 'read_only',
+              },
+              store,
+              secrets,
+            );
+            if (!executed) throw new Error(`${capability} did not produce a Joi capability result`);
+            const output: Record<string, unknown> = {
+              ...executed.output,
+              capability,
+              permission_profile: 'read_only',
+              bridge_trace_id: request_id,
+            };
+            const outputStatus = String(output.status || 'completed');
+            safeRecordAppLog(store, {
+              level: outputStatus === 'failed' ? 'error' : outputStatus === 'policy_blocked' ? 'warn' : 'info',
+              risk_level: 'read_only',
+              category: 'tool',
+              feature_key: `acp_web.${capability}.${outputStatus}`,
+              source: 'acp_mcp_bridge',
+              message: `ACP web capability ${capability} ${outputStatus}`,
+              duration_ms: Date.now() - startedAt,
+              payload: { capability, request_id, status: outputStatus },
+            });
+            return output;
+          } catch (error) {
+            safeRecordAppLog(store, {
+              level: 'error',
+              risk_level: 'read_only',
+              category: 'tool',
+              feature_key: `acp_web.${capability}.failed`,
+              source: 'acp_mcp_bridge',
+              message: `ACP web capability ${capability} failed`,
+              duration_ms: Date.now() - startedAt,
+              payload: { capability, request_id },
+              error,
+            });
+            throw error;
+          }
+        },
+      },
+      logger: console,
+      onInvocation: ({ method, risk, duration_ms, ok, error }) => {
+        safeRecordAppLog(store, {
+          level: ok ? 'debug' : 'error',
+          risk_level: risk,
+          category: 'cli',
+          feature_key: `cli.${method}.${ok ? 'succeeded' : 'failed'}`,
+          source: 'unix_command_host',
+          message: `CLI ${method} ${ok ? 'succeeded' : 'failed'}`,
+          duration_ms,
+          payload: { method },
+          error,
+        });
+      },
+    }).catch((error) => {
+      safeRecordAppLog(store, {
+        level: 'error',
+        risk_level: 'read_only',
+        category: 'cli',
+        feature_key: 'cli.command_host.failed',
+        source: 'unix_command_host',
+        message: 'CLI command host failed to start',
+        error,
+      });
+    });
+  }
+
+  startBrowserBridgeIfEnabled(sqliteApi, store);
 
   ipcMain.removeHandler('joi:invoke');
   ipcMain.handle('joi:invoke', async (_event, input: unknown) => {
@@ -800,6 +1042,250 @@ export function registerIpc(window: BrowserWindow, _appDirs: AppDirs, store: Joi
 
   ipcMain.removeHandler('joi:terminal:getStatus');
   ipcMain.handle('joi:terminal:getStatus', (_event, rawID: unknown) => terminalManager.getStatus(String(rawID ?? '')));
+}
+
+async function inspectStdioMCPServer(server: MCPServerRecord): Promise<{
+  tools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>;
+  resources: Array<{ uri: string; name?: string; description?: string; mimeType?: string }>;
+  prompts: Array<{ name: string; description?: string; arguments?: Array<{ name?: string }> }>;
+}> {
+  if (server.transport !== 'stdio') throw new Error(`Unsupported MCP transport: ${server.transport}`);
+  const command = server.command?.trim();
+  if (!command) throw new Error('MCP stdio command is required');
+  const child = spawn(command, server.args || [], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, JOI_MCP_INVENTORY_ONLY: '1' },
+  });
+  let stderr = '';
+  let stdoutBuffer = '';
+  let nextID = 1;
+  const pending = new Map<number, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
+  const rejectAll = (error: Error) => {
+    for (const request of pending.values()) request.reject(error);
+    pending.clear();
+  };
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => {
+    stderr = `${stderr}${String(chunk)}`.slice(-4000);
+  });
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    stdoutBuffer += String(chunk);
+    for (;;) {
+      const newline = stdoutBuffer.indexOf('\n');
+      if (newline < 0) break;
+      const line = stdoutBuffer.slice(0, newline).trim();
+      stdoutBuffer = stdoutBuffer.slice(newline + 1);
+      if (!line) continue;
+      try {
+        const message = JSON.parse(line) as { id?: number; result?: Record<string, unknown>; error?: { message?: string } };
+        if (typeof message.id !== 'number') continue;
+        const request = pending.get(message.id);
+        if (!request) continue;
+        pending.delete(message.id);
+        if (message.error) request.reject(new Error(message.error.message || 'MCP request failed'));
+        else request.resolve(message.result || {});
+      } catch {
+        // Some servers write human-readable startup messages to stdout. Inventory
+        // parsing ignores those lines but keeps valid JSON-RPC messages bounded.
+      }
+    }
+  });
+  child.once('error', (error) => rejectAll(error));
+  child.once('exit', (code) => {
+    if (pending.size > 0) rejectAll(new Error(`MCP server exited (${code ?? 'unknown'}): ${stderr.trim() || 'no stderr'}`));
+  });
+  const send = (message: Record<string, unknown>) => {
+    if (!child.stdin.writable) throw new Error('MCP server stdin is not writable');
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+  };
+  const call = (method: string, params: Record<string, unknown> = {}) => new Promise<Record<string, unknown>>((resolveCall, rejectCall) => {
+    const id = nextID++;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      rejectCall(new Error(`MCP ${method} timed out${stderr.trim() ? `: ${stderr.trim()}` : ''}`));
+    }, 8000);
+    pending.set(id, {
+      resolve: (value) => {
+        clearTimeout(timer);
+        resolveCall(value);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        rejectCall(error);
+      },
+    });
+    send({ jsonrpc: '2.0', id, method, params });
+  });
+  const optionalList = async (method: string, key: string) => {
+    try {
+      const result = await call(method);
+      return Array.isArray(result[key]) ? result[key] as Record<string, unknown>[] : [];
+    } catch (error) {
+      if (/method not found|not supported/i.test(error instanceof Error ? error.message : String(error))) return [];
+      throw error;
+    }
+  };
+  try {
+    await call('initialize', {
+      protocolVersion: '2025-03-26',
+      capabilities: {},
+      clientInfo: { name: 'Joi Desktop', version: app.getVersion() },
+    });
+    send({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
+    const [tools, resources, prompts] = await Promise.all([
+      optionalList('tools/list', 'tools'),
+      optionalList('resources/list', 'resources'),
+      optionalList('prompts/list', 'prompts'),
+    ]);
+    return {
+      tools: tools.map((item) => ({
+        name: String(item.name || ''),
+        description: String(item.description || ''),
+        inputSchema: item.inputSchema && typeof item.inputSchema === 'object' ? item.inputSchema as Record<string, unknown> : {},
+      })).filter((item) => item.name),
+      resources: resources.map((item) => ({
+        uri: String(item.uri || ''),
+        name: String(item.name || item.uri || ''),
+        description: String(item.description || ''),
+        mimeType: String(item.mimeType || ''),
+      })).filter((item) => item.uri),
+      prompts: prompts.map((item) => ({
+        name: String(item.name || ''),
+        description: String(item.description || ''),
+        arguments: Array.isArray(item.arguments) ? item.arguments as Array<{ name?: string }> : [],
+      })).filter((item) => item.name),
+    };
+  } finally {
+    rejectAll(new Error('MCP inventory session closed'));
+    child.kill();
+  }
+}
+
+function startBrowserBridgeIfEnabled(handlers: DesktopIpcHandlerMap, store: JoiSQLiteStore): void {
+  if (browserBridgeServer) return;
+  if (!browserBridgeEnabled()) return;
+
+  const { host, port } = browserBridgeAddr();
+  browserBridgeServer = createServer(async (req, res) => {
+    const origin = String(req.headers.origin || '');
+    if (!browserBridgeOriginAllowed(origin)) {
+      writeBrowserBridgeJson(res, 403, { ok: false, data: null, error: { message: 'origin not allowed' } }, origin);
+      return;
+    }
+    if (req.method === 'OPTIONS') {
+      writeBrowserBridgeJson(res, 204, null, origin);
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/health') {
+      writeBrowserBridgeJson(res, 200, { ok: true, data: { status: 'ok' }, error: null }, origin);
+      return;
+    }
+    if (req.method !== 'POST' || req.url !== '/invoke') {
+      writeBrowserBridgeJson(res, 404, { ok: false, data: null, error: { message: 'not found' } }, origin);
+      return;
+    }
+
+    try {
+      const rawBody = await readBrowserBridgeBody(req);
+      const input = JSON.parse(rawBody) as unknown;
+      const { method, payload } = invokeRequestSchema.parse(input);
+      const handler = handlers[method as DesktopIpcMethod];
+      if (!handler) {
+        throw new Error(`Unsupported Joi bridge method: ${method}`);
+      }
+      const result = await handler(payload);
+      writeBrowserBridgeJson(res, 200, { ok: true, data: result, error: null }, origin);
+    } catch (error) {
+      safeRecordAppLog(store, {
+        level: 'error',
+        risk_level: 'read_only',
+        category: 'browser_bridge',
+        feature_key: 'browser_bridge.invoke.failed',
+        source: 'electron_browser_bridge',
+        message: 'Browser bridge invocation failed',
+        error,
+      });
+      writeBrowserBridgeJson(res, 500, {
+        ok: false,
+        data: null,
+        error: { message: error instanceof Error ? error.message : String(error) },
+      }, origin);
+    }
+  });
+
+  browserBridgeServer.on('error', (error) => {
+    browserBridgeServer = null;
+    console.warn('browser bridge skipped', error);
+  });
+  browserBridgeServer.listen(port, host, () => {
+    console.info(`Joi browser bridge listening on http://${host}:${port}`);
+  });
+  app.once('before-quit', () => {
+    void browserBridgeServer?.close();
+    browserBridgeServer = null;
+  });
+}
+
+function browserBridgeEnabled(): boolean {
+  const value = String(process.env.JOI_BROWSER_BRIDGE_ENABLED || '').trim().toLowerCase();
+  if (value === '0' || value === 'false' || value === 'off' || value === 'no') return false;
+  if (value === '1' || value === 'true' || value === 'on' || value === 'yes') return true;
+  return Boolean(process.env.ELECTRON_RENDERER_URL);
+}
+
+function envFlagValue(value: unknown): boolean {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function browserBridgeAddr(): { host: string; port: number } {
+  const raw = String(process.env.JOI_BROWSER_BRIDGE_ADDR || '127.0.0.1:18083').trim();
+  const [host = '127.0.0.1', rawPort = '18083'] = raw.split(':');
+  const port = Number.parseInt(rawPort, 10);
+  return {
+    host: host || '127.0.0.1',
+    port: Number.isFinite(port) && port > 0 ? port : 18083,
+  };
+}
+
+function browserBridgeOriginAllowed(origin: string): boolean {
+  if (!origin) return true;
+  try {
+    const url = new URL(origin);
+    return url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost');
+  } catch {
+    return false;
+  }
+}
+
+function writeBrowserBridgeJson(res: ServerResponse, status: number, payload: unknown, origin: string): void {
+  res.statusCode = status;
+  if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (status === 204) {
+    res.end();
+    return;
+  }
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(payload));
+}
+
+function readBrowserBridgeBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 1024 * 1024 * 10) {
+        reject(new Error('browser bridge request is too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => resolve(body || '{}'));
+    req.on('error', reject);
+  });
 }
 
 function safeRecordAppLog(store: JoiSQLiteStore, input: Parameters<JoiSQLiteStore['recordAppLog']>[0]): void {
@@ -1010,29 +1496,39 @@ function nextActionForExternalHandoffStatus(status: ExternalHandoffAudit['status
 export async function runLiveElectronToolCallingChat(
   req: ChatRequest,
   settings: SettingsRecord,
-  apiKey: string,
+  secrets: KeychainSecretStore,
   store: JoiSQLiteStore,
   activeRuns: Map<string, AbortController>,
-  emitInitialEvents: (runID: string) => void,
+  emitInitialEvents: (runID: string, event?: RunEvent) => void,
+  pluginManager?: JoiPluginManager,
+  routeOptions: {
+    model_selection_policy?: 'agent_preferred' | 'settings_preferred';
+  } = {},
 ) {
   const modelName = (req.model_name || settings.model_name || '').trim();
-  const agentID = 'general_agent';
-  const promptAssembly = store.assembleToolCallingPrompt(req, agentID, modelName);
   const started = store.beginToolCallingChat(req, {
     provider: settings.model_provider || 'openai_compatible',
     model_name: modelName,
-    selected_agent_id: agentID,
-    prompt_assembly: promptAssembly,
+    model_base_url: settings.model_base_url || '',
+    model_reasoning_effort: settings.model_reasoning_effort,
+    model_selection_policy: routeOptions.model_selection_policy,
   });
   emitInitialEvents(started.run_id);
   const controller = new AbortController();
   activeRuns.set(started.run_id, controller);
   try {
-    const turn = await runElectronToolCallingTurn(req, settings, apiKey, store, {
+    const effectiveSettings = settingsForStartedModel(settings, started);
+    const acpProvider = pluginManager?.resolveProvider(effectiveSettings.model_provider, req.permission_profile || 'read_only');
+    const apiKey = acpProvider ? LOCAL_MODEL_PROXY_API_KEY : await resolveAPIKeyForModelEndpoint(effectiveSettings, secrets);
+    if (!canRunRealToolCalling(effectiveSettings, apiKey, { ...req, model_name: started.model_name }, Boolean(acpProvider))) {
+      throw new Error(unconfiguredModelMessage(effectiveSettings, apiKey, { ...req, model_name: started.model_name }, Boolean(acpProvider)));
+    }
+    const turn = await runElectronToolCallingTurn(req, effectiveSettings, apiKey, store, secrets, {
       started,
-      promptAssembly,
+      promptAssembly: started.prompt_assembly,
       signal: controller.signal,
-      onRunEvent: () => emitInitialEvents(started.run_id),
+      onRunEvent: (event) => emitInitialEvents(started.run_id, event),
+      acpProvider,
     });
     return store.finishToolCallingChat(started, turn);
   } catch (error) {
@@ -1044,11 +1540,30 @@ export async function runLiveElectronToolCallingChat(
   }
 }
 
+function settingsForStartedModel(settings: SettingsRecord, started: StartedToolCallingChat): SettingsRecord {
+  return {
+    ...settings,
+    model_provider: started.provider || settings.model_provider,
+    model_name: started.model_name || settings.model_name,
+    model_base_url: started.model_base_url || settings.model_base_url,
+    model_reasoning_effort: started.model_reasoning_effort || settings.model_reasoning_effort,
+  };
+}
+
 export function emitRunEvents(window: BrowserWindow, trace: ReturnType<JoiSQLiteStore['getRunTrace']>): void {
   for (const event of trace.events ?? []) {
-    if (!window.isDestroyed()) {
-      window.webContents.send('joi:run:event', event);
-    }
+    emitRunEvent(window, event);
+  }
+}
+
+export function shouldForwardRunEventToRenderer(event: RunEvent): boolean {
+  return event.visibility !== 'trace_only' && event.event_type !== 'model.delta';
+}
+
+export function emitRunEvent(window: BrowserWindow, event: RunEvent): void {
+  publishJoiRunEvent(event);
+  if (!window.isDestroyed() && shouldForwardRunEventToRenderer(event)) {
+    window.webContents.send('joi:run:event', event);
   }
 }
 
@@ -1063,9 +1578,7 @@ function emitRunEventsSince(
   for (const event of trace.events ?? []) {
     const seq = typeof event.seq === 'number' ? event.seq : Number((event as Record<string, unknown>).seq || 0);
     if (seq <= lastSeq) continue;
-    if (!window.isDestroyed()) {
-      window.webContents.send('joi:run:event', event);
-    }
+    emitRunEvent(window, event);
     if (seq > nextSeq) nextSeq = seq;
   }
   if (runID && nextSeq > lastSeq) {
@@ -1073,8 +1586,9 @@ function emitRunEventsSince(
   }
 }
 
-export function canRunRealToolCalling(settings: SettingsRecord, apiKey: string, req: ChatRequest): boolean {
+export function canRunRealToolCalling(settings: SettingsRecord, apiKey: string, req: ChatRequest, acpProviderConfigured = false): boolean {
   if (req.runtime_mode && req.runtime_mode !== 'tool_calling') return false;
+  if (acpProviderConfigured) return Boolean((req.model_name || settings.model_name || 'default').trim());
   const effectiveAPIKey = apiKeyForModelEndpoint(settings, apiKey);
   return realModelProviderConfigured(settings)
     && Boolean(modelBaseURLForSettings(settings).trim())
@@ -1082,10 +1596,11 @@ export function canRunRealToolCalling(settings: SettingsRecord, apiKey: string, 
     && Boolean(effectiveAPIKey.trim());
 }
 
-function unconfiguredModelMessage(settings: SettingsRecord, apiKey: string, req: ChatRequest): string {
+function unconfiguredModelMessage(settings: SettingsRecord, apiKey: string, req: ChatRequest, acpProviderConfigured = false): string {
   if (req.runtime_mode && req.runtime_mode !== 'tool_calling') {
     return 'Joi Electron no longer supports the legacy desktop chat runtime. Use runtime_mode=tool_calling.';
   }
+  if (acpProviderConfigured && !(req.model_name || settings.model_name || 'default').trim()) return 'ACP model name is not configured.';
   if (!realModelProviderConfigured(settings)) {
     return `Real model provider is not configured: ${settings.model_provider || 'empty'}. Configure an OpenAI-compatible or xAI OAuth provider.`;
   }
@@ -1108,7 +1623,7 @@ export function apiKeyForModelEndpoint(settings: SettingsRecord, apiKey: string)
 
 export async function resolveAPIKeyForModelEndpoint(settings: SettingsRecord, secrets: KeychainSecretStore): Promise<string> {
   if (isLoopbackModelEndpoint(settings.model_base_url || '')) return LOCAL_MODEL_PROXY_API_KEY;
-  if (isXAIOAuthProvider(settings.model_provider)) {
+  if (isXAIOAuthBackedProvider(settings.model_provider)) {
     const credentials = await resolveXAIOAuthCredentials((name) => secrets.resolve(name), (name, value) => secrets.save(name, value));
     return credentials.apiKey;
   }
@@ -1116,14 +1631,22 @@ export async function resolveAPIKeyForModelEndpoint(settings: SettingsRecord, se
 }
 
 function realModelProviderConfigured(settings: SettingsRecord): boolean {
-  return settings.model_provider === 'openai_compatible' || isXAIOAuthProvider(settings.model_provider);
+  return settings.model_provider === 'openai_compatible' || isXAIOAuthBackedProvider(settings.model_provider);
 }
 
 function modelBaseURLForSettings(settings: SettingsRecord): string {
-  if (isXAIOAuthProvider(settings.model_provider)) {
+  if (isXAIOAuthBackedProvider(settings.model_provider)) {
     return validateXAIInferenceBaseURL(settings.model_base_url || DEFAULT_XAI_OAUTH_BASE_URL);
   }
   return settings.model_base_url || '';
+}
+
+function reasoningEffortForSettings(settings: SettingsRecord, modelName: string): string | undefined {
+  const effort = (settings.model_reasoning_effort || '').trim().toLowerCase();
+  if (!['none', 'low', 'medium', 'high'].includes(effort)) return undefined;
+  const normalizedModel = modelName.trim().toLowerCase();
+  if (isXAIOAuthBackedProvider(settings.model_provider) && normalizedModel.startsWith('grok-')) return effort;
+  return undefined;
 }
 
 async function runElectronToolCallingTurn(
@@ -1131,30 +1654,59 @@ async function runElectronToolCallingTurn(
   settings: SettingsRecord,
   apiKey: string,
   store: JoiSQLiteStore,
+  secrets: KeychainSecretStore,
   options: {
     started?: StartedToolCallingChat;
     promptAssembly?: ToolCallingPromptAssembly;
     signal?: AbortSignal;
-    onRunEvent?: () => void;
+    onRunEvent?: (event: RunEvent) => void;
+    acpProvider?: ACPProviderRuntimeConfig;
   } = {},
 ) {
   const modelName = options.started?.model_name || (req.model_name || settings.model_name || '').trim();
   const agentID = options.started?.selected_agent_id || 'general_agent';
   const promptAssembly = options.promptAssembly || store.assembleToolCallingPrompt(req, agentID, modelName);
-  const result = await runChatCompletionsToolTurn({
+  const agentCapabilities = promptAssembly.agent_capabilities || store.getAgentCapabilities(agentID);
+  const compiledTools = compileElectronCapabilityTools(req.permission_profile, {
+    allowed_capabilities: agentCapabilities,
+  });
+  const compiledToolNames = new Set(compiledTools.map((tool) => tool.name));
+  const conversationMessages = [
+    ...promptAssembly.conversation_messages.map((message) => ({ role: message.role, content: message.content })),
+    { role: 'user', content: req.message },
+  ];
+  const callbacks = options.started ? store.createToolCallingEventCallbacks(options.started, options.onRunEvent) : undefined;
+  const result = options.acpProvider ? await runACPChatTurn({
+    ...options.acpProvider,
+    model: modelName,
+    system_message: promptAssembly.system_message,
+    messages: conversationMessages,
+    signal: options.signal,
+    callbacks,
+  }) : await runChatCompletionsToolTurn({
     base_url: modelBaseURLForSettings(settings),
     api_key: apiKey,
     model: modelName,
     messages: [
       { role: 'system', content: promptAssembly.system_message },
-      { role: 'user', content: req.message },
+      ...conversationMessages,
     ],
-    tools: compileElectronCapabilityTools(req.permission_profile),
+    tools: compiledTools,
     stream: true,
+    reasoning_effort: reasoningEffortForSettings(settings, modelName),
+    max_retries: settings.model_max_retries ?? 1,
+    retry_backoff_ms: 300,
+    tool_execution: 'parallel',
+    max_context_messages: 80,
+    max_tool_result_bytes: 64 * 1024,
+    final_response_contract: inferFinalResponseContract(conversationMessages),
     max_steps: 6,
-    timeout_seconds: 60,
+    timeout_seconds: settings.model_timeout_seconds ?? 60,
     signal: options.signal,
-    callbacks: options.started ? store.createToolCallingEventCallbacks(options.started, options.onRunEvent) : undefined,
+    callbacks,
+    beforeToolCall: ({ call }) => compiledToolNames.has(call.name)
+      ? undefined
+      : { block: true, reason: `Capability ${call.name} is not allowed for agent ${agentID}.` },
     executeTool: async (call, toolOptions) => {
       try {
         if (shouldPauseElectronToolForConfirmation(call.name)) {
@@ -1174,7 +1726,11 @@ async function runElectronToolCallingTurn(
             },
           };
         }
-        const executed = await executeElectronCapability(call.name, call.arguments, req, store, { signal: toolOptions?.signal });
+        const executed = await executeElectronCapability(call.name, call.arguments, req, store, secrets, {
+          signal: toolOptions?.signal,
+          modelProvider: settings.model_provider,
+          modelName,
+        });
         return {
           call_id: call.id,
           name: call.name,
@@ -1243,7 +1799,7 @@ async function resumeApprovalRunFromPayload(
     throw new Error('approval run_id does not match confirmation request');
   }
   const settings = store.getSettings();
-  await resumeElectronToolCallingRun(resume, settings, await resolveAPIKeyForModelEndpoint(settings, secrets), store);
+  await resumeElectronToolCallingRun(resume, settings, await resolveAPIKeyForModelEndpoint(settings, secrets), store, secrets);
   const trace = store.getRunTrace(resume.run_id);
   emitRunEvents(window, trace);
   return { resumed: true, trace };
@@ -1254,6 +1810,7 @@ async function resumeElectronToolCallingRun(
   settings: SettingsRecord,
   apiKey: string,
   store: JoiSQLiteStore,
+  secrets: KeychainSecretStore,
 ) {
   const modelName = (resume.model_name || settings.model_name || '').trim();
   const resumeReq: ChatRequest = {
@@ -1262,9 +1819,17 @@ async function resumeElectronToolCallingRun(
     runtime_mode: 'tool_calling',
     permission_profile: resume.risk_level === 'browser_interaction' ? 'danger_full_access' : resume.risk_level === 'workspace_write' ? 'workspace_write' : 'read_only',
   };
+  const resumeAgentCapabilities = store.getAgentCapabilities(resume.agent_id);
+  const resumeCapability = canonicalElectronCapabilityName(resume.capability_id);
+  const approvedCapabilities = new Set(compileElectronCapabilityTools(resumeReq.permission_profile, {
+    allowed_capabilities: resumeAgentCapabilities,
+  }).map((tool) => canonicalElectronCapabilityName(tool.name)));
+  if (!approvedCapabilities.has(resumeCapability)) {
+    throw new Error(`Capability ${resume.capability_id} is no longer allowed for agent ${resume.agent_id}.`);
+  }
   let toolResult: PersistedToolResult;
   try {
-    const executed = await executeElectronCapability(resume.capability_id, resume.input, resumeReq, store);
+    const executed = await executeElectronCapability(resume.capability_id, resume.input, resumeReq, store, secrets);
     toolResult = {
       call_id: resume.call_id,
       name: resume.capability_id,
@@ -1319,12 +1884,18 @@ async function resumeElectronToolCallingRun(
             content: JSON.stringify(toolResult.output),
           },
         ],
-        tools: compileElectronCapabilityTools('read_only'),
+        tools: compileElectronCapabilityTools('read_only', { allowed_capabilities: resumeAgentCapabilities }),
         stream: true,
+        reasoning_effort: reasoningEffortForSettings(settings, modelName),
+        max_retries: settings.model_max_retries ?? 1,
+        retry_backoff_ms: 300,
+        tool_execution: 'parallel',
+        max_context_messages: 80,
+        max_tool_result_bytes: 64 * 1024,
         max_steps: 4,
-        timeout_seconds: 60,
+        timeout_seconds: settings.model_timeout_seconds ?? 60,
         executeTool: async (call) => {
-          const executed = await executeElectronCapability(call.name, call.arguments, { ...resumeReq, permission_profile: 'read_only' }, store);
+          const executed = await executeElectronCapability(call.name, call.arguments, { ...resumeReq, permission_profile: 'read_only' }, store, secrets);
           return {
             call_id: call.id,
             name: call.name,
@@ -1358,13 +1929,66 @@ async function resumeElectronToolCallingRun(
   });
 }
 
+const electronWorkspaceWriteCapabilities = new Set([
+  'apply_patch',
+  'patch',
+  'edit_file',
+  'edit',
+  'write_file',
+  'write',
+  'execute_code',
+  'code_execution',
+  'sandbox_run',
+  'delegate_task',
+  'subagent_delegate',
+  'mcp_tool_call',
+  'extension_register_tool',
+  'lsp_rename',
+  'lsp_format',
+  'memory_write_candidate',
+  'memory',
+  'session_branch',
+  'queue_followup',
+  'cronjob',
+  'project_create',
+  'project_switch',
+  'skill_manage',
+]);
+
+const electronBrowserInteractionCapabilities = new Set([
+  'browser_click',
+  'browser_type',
+  'browser_back',
+  'browser_scroll',
+  'browser_press',
+  'browser_dialog',
+  'browser_cdp',
+  'computer_use',
+  'debugger_attach',
+  'debugger_breakpoint',
+  'debugger_step',
+  'debugger_evaluate',
+  'ha_call_service',
+]);
+
+const electronConfirmationRequiredCapabilities = new Set([
+  'apply_patch',
+  'patch',
+  'edit_file',
+  'edit',
+  'write_file',
+  'write',
+  'browser_click',
+  'browser_type',
+]);
+
 function shouldPauseElectronToolForConfirmation(capability: string): boolean {
-  return capability === 'apply_patch' || capability === 'browser_click' || capability === 'browser_type';
+  return electronConfirmationRequiredCapabilities.has(capability);
 }
 
 function electronRiskForCapability(capability: string): string {
-  if (capability === 'browser_click' || capability === 'browser_type') return 'browser_interaction';
-  if (capability === 'apply_patch') return 'workspace_write';
+  if (electronBrowserInteractionCapabilities.has(capability)) return 'browser_interaction';
+  if (electronWorkspaceWriteCapabilities.has(capability)) return 'workspace_write';
   return 'read_only';
 }
 
@@ -1375,8 +1999,182 @@ function electronSystemMessage(): Record<string, unknown> {
       'You are Joi Desktop running inside an Electron-native local app.',
       'Use only the provided capability tools. Do not claim that a tool ran unless a tool result is present.',
       'Prefer concise final answers grounded in tool outputs. Never request Docker/Postgres/NATS as a default prerequisite for this local desktop app.',
+      'Do not proactively add emoji, decorative symbols, or celebratory icons to assistant replies. Only include emoji when the user explicitly asks to discuss, quote, transform, or generate emoji content.',
+      runtimeDateContextText(),
     ].join('\n'),
   };
+}
+
+function runtimeDateContextText(): string {
+  const now = new Date();
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+  return [
+    `Current date: ${formatRuntimeDate(now)}`,
+    `Current time: ${formatRuntimeTime(now)}`,
+    `Timezone: ${timezone}`,
+    `Current ISO timestamp: ${now.toISOString()}`,
+    'Treat the current date above as authoritative for all relative-date, release-date, schedule, and news comparisons.',
+    'Search result snippets are unverified summaries. For releases or official announcements, prefer official pages and state when a result is only an unverified snippet.',
+  ].join('\n');
+}
+
+function formatRuntimeDate(date: Date): string {
+  return [
+    date.getFullYear(),
+    padRuntimeDatePart(date.getMonth() + 1),
+    padRuntimeDatePart(date.getDate()),
+  ].join('-');
+}
+
+function formatRuntimeTime(date: Date): string {
+  return [
+    padRuntimeDatePart(date.getHours()),
+    padRuntimeDatePart(date.getMinutes()),
+    padRuntimeDatePart(date.getSeconds()),
+  ].join(':');
+}
+
+function padRuntimeDatePart(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+function mergeRuntimeCapabilityRecords(existing: CapabilityRecord[]): { capabilities: CapabilityRecord[] } {
+  const byID = new Map(existing.map((capability) => [capability.id, {
+    ...capability,
+    metadata: { ...(capability.metadata || {}) },
+  }]));
+  for (const definition of listElectronCapabilityToolDefinitions()) {
+    const current = byID.get(definition.name);
+    const metadata = {
+      ...(current?.metadata || {}),
+      electron_native: true,
+      model_visible: definition.backend !== 'planned' && definition.backend !== 'alias',
+      backend: definition.backend || 'implemented',
+      fields: definition.fields,
+    };
+    byID.set(definition.name, {
+      id: definition.name,
+      name: current?.name || capabilityDisplayName(definition.name),
+      description: current?.description || definition.description,
+      risk_level: current?.risk_level || definition.risk,
+      enabled: definition.backend === 'planned' ? false : current?.enabled ?? true,
+      metadata,
+    });
+  }
+  return {
+    capabilities: [...byID.values()].sort((left, right) => left.id.localeCompare(right.id)),
+  };
+}
+
+function capabilityDisplayName(value: string): string {
+  const explicit: Record<string, string> = {
+    web_research: 'Web Research',
+    web_search: 'Web Search',
+    web_extract: 'Web Extract',
+    x_search: 'X Search',
+    workspace_search: 'Workspace Search',
+    search_files: 'Search Files',
+    file_read: 'File Read',
+    read_file: 'Read File',
+    file_analyze: 'File Analyze',
+    apply_patch: 'Apply Patch',
+    execute_code: 'Execute Code',
+    code_execution: 'Code Execution',
+    mcp_tool_call: 'MCP Tool Call',
+    text_to_speech: 'Text To Speech',
+    ha_call_service: 'Home Assistant Call Service',
+  };
+  if (explicit[value]) return explicit[value];
+  return value
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+async function workspaceSettingsWithSecrets(store: JoiSQLiteStore, secrets: KeychainSecretStore): Promise<WorkspaceSettings> {
+  const settings = store.getWorkspaceSettings();
+  const braveSearchAPIKey = (await secrets.resolve('BRAVE_SEARCH_API_KEY')).trim();
+  return {
+    ...settings,
+    brave_search_api_key: braveSearchAPIKey,
+    brave_search_api_key_configured: Boolean(braveSearchAPIKey),
+  };
+}
+
+
+function firstStringInput(inputs: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = inputs[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function workspaceSearchAliasInputs(inputs: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...inputs,
+    query: firstStringInput(inputs, ['query', 'pattern', 'name', 'goal', 'text']),
+  };
+}
+
+function fileReadAliasInputs(inputs: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...inputs,
+    path: firstStringInput(inputs, ['path', 'file_path', 'target_path']),
+  };
+}
+
+function webSearchAliasInputs(inputs: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...inputs,
+    query: firstStringInput(inputs, ['query', 'q', 'goal', 'text']),
+  };
+}
+
+function webExtractAliasInputs(inputs: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...inputs,
+    url: firstStringInput(inputs, ['url', 'source_url', 'href']),
+  };
+}
+
+function commandAliasInputs(inputs: Record<string, unknown> & { permission_profile: string }): Record<string, unknown> & { permission_profile: string } {
+  return {
+    ...inputs,
+    cmd: commandArgvFromAlias(inputs.cmd),
+  };
+}
+
+function listAliasInputs(inputs: Record<string, unknown> & { permission_profile: string }): Record<string, unknown> & { permission_profile: string } {
+  const path = firstStringInput(inputs, ['path', 'root']);
+  return {
+    ...inputs,
+    cmd: path ? ['ls', path] : ['ls'],
+  };
+}
+
+function patchAliasInputs(
+  capability: string,
+  inputs: Record<string, unknown> & { permission_profile: string },
+): Record<string, unknown> | undefined {
+  const patch = firstStringInput(inputs, ['patch']);
+  if (!patch) return undefined;
+  return {
+    ...inputs,
+    patch,
+    source_capability: capability,
+  };
+}
+
+function commandArgvFromAlias(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+  if (typeof value !== 'string') return [];
+  const text = value.trim();
+  if (!text || /[;&|`$<>]/.test(text)) return [];
+  return (text.match(/"[^"]*"|'[^']*'|\S+/g) ?? [])
+    .map((item) => item.replace(/^(['"])(.*)\1$/, '$2').trim())
+    .filter(Boolean);
 }
 
 async function executeElectronCapability(
@@ -1384,40 +2182,97 @@ async function executeElectronCapability(
   inputs: Record<string, unknown>,
   req: ChatRequest,
   store: JoiSQLiteStore,
-  options: { signal?: AbortSignal } = {},
+  secrets: KeychainSecretStore,
+  options: { signal?: AbortSignal; modelProvider?: string; modelName?: string } = {},
 ): Promise<{ output: Record<string, unknown> } | undefined> {
   const permissionProfile = String(req.permission_profile || inputs.permission_profile || 'read_only');
   const inputsWithPermission: Record<string, unknown> & { permission_profile: string } = {
     ...inputs,
     permission_profile: permissionProfile,
   };
+  const workspaceSettings = store.getWorkspaceSettings();
+  const browserDisabled = () => ({
+    output: {
+      status: 'blocked',
+      code: 'CAPABILITY_DISABLED',
+      capability,
+      summary: 'Browser capabilities are disabled in Settings.',
+    },
+  });
   switch (capability) {
     case 'workspace_search':
       return { output: executeWorkspaceSearch(inputs, store.getWorkspaceSettings()) };
+    case 'search_files':
+    case 'grep':
+    case 'find':
+      return { output: executeWorkspaceSearch(workspaceSearchAliasInputs(inputs), store.getWorkspaceSettings()) };
     case 'file_analyze':
       return { output: executeFileAnalyze(inputs, store.getWorkspaceSettings()) };
     case 'file_read':
       return { output: executeFileRead(inputs, store.getWorkspaceSettings()) };
+    case 'read_file':
+    case 'read':
+      return { output: executeFileRead(fileReadAliasInputs(inputs), store.getWorkspaceSettings()) };
     case 'web_research':
-      if (typeof inputs.url !== 'string' || !inputs.url.trim()) return undefined;
-      return { output: await executeWebResearch(inputs, store.getWorkspaceSettings()) };
+      if (
+        (typeof inputs.url !== 'string' || !inputs.url.trim())
+        && (typeof inputs.query !== 'string' || !inputs.query.trim())
+      ) return undefined;
+      return { output: await executeWebResearch(inputs, await workspaceSettingsWithSecrets(store, secrets)) };
+    case 'web_search':
+      return { output: await executeWebResearch(webSearchAliasInputs(inputs), await workspaceSettingsWithSecrets(store, secrets)) };
+    case 'web_extract':
+      return { output: await executePublicWebExtract(webExtractAliasInputs(inputs), await workspaceSettingsWithSecrets(store, secrets)) };
     case 'shell_command':
       return { output: await executeShellCommand(inputsWithPermission, store.getWorkspaceSettings(), { signal: options.signal }) };
+    case 'bash':
+      return { output: await executeShellCommand(commandAliasInputs(inputsWithPermission), store.getWorkspaceSettings(), { signal: options.signal }) };
+    case 'ls':
+      return { output: await executeShellCommand(listAliasInputs(inputsWithPermission), store.getWorkspaceSettings(), { signal: options.signal }) };
     case 'test_command':
       return { output: await executeTestCommand(inputsWithPermission, store.getWorkspaceSettings(), { signal: options.signal }) };
+    case 'image_generate':
+      if (!isGrokBuildProvider(options.modelProvider)) {
+        return { output: executeUnsupportedCapability(capability, inputsWithPermission, 'grok_build_required') };
+      }
+      return {
+        output: await executeGrokBuildImageGeneration(inputs, {
+          session_cwd: join(app.getPath('userData'), 'grok-build-image-runtime'),
+          output_dir: join(app.getPath('userData'), 'generated-images'),
+          timeout_seconds: 180,
+          signal: options.signal,
+        }),
+      };
     case 'apply_patch':
       if (!['workspace_write', 'danger_full_access'].includes(String(req.permission_profile || ''))) return undefined;
       return { output: executeApplyPatch(inputsWithPermission, store.getWorkspaceSettings()) };
+    case 'patch':
+    case 'edit_file':
+    case 'edit':
+    case 'write_file':
+    case 'write': {
+      if (!['workspace_write', 'danger_full_access'].includes(String(req.permission_profile || ''))) return undefined;
+      const patchInputs = patchAliasInputs(capability, inputsWithPermission);
+      if (!patchInputs) return { output: executeUnsupportedCapability(capability, inputsWithPermission, 'patch_required') };
+      return { output: executeApplyPatch(patchInputs, store.getWorkspaceSettings()) };
+    }
     case 'computer_observe':
       return { output: await executeComputerObserve(inputs) };
     case 'browser_observe':
+      if (workspaceSettings.browser_enabled === false) return browserDisabled();
+      return { output: await executeBrowserObserve(inputs) };
+    case 'browser_snapshot':
+      if (workspaceSettings.browser_enabled === false) return browserDisabled();
       return { output: await executeBrowserObserve(inputs) };
     case 'browser_navigate':
+      if (workspaceSettings.browser_enabled === false) return browserDisabled();
       return { output: await executeBrowserNavigate(inputs, store.getWorkspaceSettings()) };
     case 'browser_click':
+      if (workspaceSettings.browser_enabled === false) return browserDisabled();
       if (String(req.permission_profile || '') !== 'danger_full_access') return undefined;
       return { output: await executeBrowserClick(inputs) };
     case 'browser_type':
+      if (workspaceSettings.browser_enabled === false) return browserDisabled();
       if (String(req.permission_profile || '') !== 'danger_full_access') return undefined;
       return { output: await executeBrowserType(inputs) };
     case 'desktop_app_list':
@@ -1429,6 +2284,6 @@ async function executeElectronCapability(
     case 'server_diagnose':
       return { output: await executeServerDiagnose(inputs) };
     default:
-      return undefined;
+      return { output: executeUnsupportedCapability(capability, inputsWithPermission) };
   }
 }

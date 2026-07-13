@@ -4,6 +4,7 @@ import { parseChatCompletionsSSE, runChatCompletionsToolTurn } from '../src/tool
 
 const requests = [];
 const streamRequests = [];
+const contractStreamRequests = [];
 const waitingRequests = [];
 const abortRequests = [];
 const server = createServer((req, res) => {
@@ -16,11 +17,28 @@ const server = createServer((req, res) => {
   req.on('data', (chunk) => { body += chunk; });
   req.on('end', () => {
     const payload = JSON.parse(body);
+    if (payload.model === 'contract-stream-model') {
+      contractStreamRequests.push(payload);
+      const text = contractStreamRequests.length === 1
+        ? 'RESULT: this invalid draft is intentionally much longer than the accepted answer'
+        : 'RESULT=accepted';
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end([
+        sse({ choices: [{ delta: { content: text } }] }),
+        sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+        sse({ usage: { prompt_tokens: 5, completion_tokens: 2 } }),
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n'));
+      return;
+    }
     if (payload.stream) {
       streamRequests.push(payload);
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       if (streamRequests.length === 1) {
         res.end([
+          sse({ choices: [{ delta: { content: 'I will inspect the workspace before answering. ' } }] }),
           sse({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_stream_workspace', type: 'function', function: { name: 'workspace_search', arguments: '{"query"' } }] } }] }),
           sse({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: ':"Run Trace","root":"."}' } }] } }] }),
           sse({ usage: { prompt_tokens: 8, completion_tokens: 4 } }),
@@ -133,6 +151,7 @@ try {
     api_key: 'sk-test',
     model: 'tool-model',
     messages: [{ role: 'user', content: 'Find Run Trace docs.' }],
+    reasoning_effort: 'high',
     tools: [{
       name: 'workspace_search',
       description: 'Search workspace',
@@ -159,6 +178,8 @@ try {
   assert.equal(result.usage.reasoning_tokens, 2);
   assert.equal(result.usage.total_tokens, 34);
   assert.equal(requests.length, 2);
+  assert.equal(requests[0].reasoning_effort, 'high');
+  assert.equal(requests[1].reasoning_effort, 'high');
 
   const streamCallbackEvents = [];
   const streamed = await runChatCompletionsToolTurn({
@@ -195,6 +216,9 @@ try {
       onToolCallRequested(event) {
         streamCallbackEvents.push(['tool.call_requested', event.call.name]);
       },
+      onToolStarted(event) {
+        streamCallbackEvents.push(['tool.started', event.call.name]);
+      },
       onToolCompleted(event) {
         streamCallbackEvents.push(['tool.completed', event.result.output.status]);
       },
@@ -217,10 +241,55 @@ try {
   assert.equal(streamed.usage.reasoning_tokens, 0);
   assert.equal(streamed.usage.total_tokens, 30);
   assert.equal(streamRequests.length, 2);
+  assert.deepEqual(streamRequests[0].stream_options, { include_usage: true });
+  assert.deepEqual(streamRequests[1].stream_options, { include_usage: true });
   assert.ok(streamCallbackEvents.some((event) => event[0] === 'tool.call_requested' && event[1] === 'workspace_search'));
-  assert.ok(streamCallbackEvents.some((event) => event[0] === 'assistant.delta' && event[1] === 'Streamed '));
+  assert.ok(streamCallbackEvents.some((event) => event[0] === 'tool.started' && event[1] === 'workspace_search'));
+  assert.ok(streamCallbackEvents.findIndex((event) => event[0] === 'tool.started') > streamCallbackEvents.findIndex((event) => event[0] === 'tool.call_requested'));
+  assert.ok(streamCallbackEvents.findIndex((event) => event[0] === 'tool.completed') > streamCallbackEvents.findIndex((event) => event[0] === 'tool.started'));
+  assert.deepEqual(
+    streamCallbackEvents.filter((event) => event[0] === 'assistant.delta' || event[0] === 'assistant.completed'),
+    [
+      ['assistant.delta', 'Streamed answer.'],
+      ['assistant.completed', 'Streamed answer.'],
+    ],
+  );
+  assert.equal(streamCallbackEvents.some((event) => String(event[1]).includes('inspect the workspace')), false);
+  assert.ok(streamCallbackEvents.findIndex((event) => event[0] === 'assistant.delta') > streamCallbackEvents.findIndex((event) => event[0] === 'tool.completed'));
   assert.ok(streamCallbackEvents.some((event) => event[0] === 'assistant.completed' && event[1] === 'Streamed answer.'));
   assert.ok(streamCallbackEvents.some((event) => event[0] === 'usage.recorded' && event[1] === 'recorded'));
+
+  const contractVisibleEvents = [];
+  const contracted = await runChatCompletionsToolTurn({
+    base_url: `http://127.0.0.1:${port}/v1`,
+    api_key: 'sk-test',
+    model: 'contract-stream-model',
+    messages: [{ role: 'user', content: 'Return one RESULT=value line.' }],
+    stream: true,
+    tools: [],
+    executeTool() { throw new Error('unused'); },
+    final_response_contract: {
+      fields: [{ key: 'RESULT', description: 'accepted result' }],
+      delimiter: '=',
+      exact_non_empty_lines: 1,
+      max_repairs: 1,
+    },
+    callbacks: {
+      onAssistantDelta(event) {
+        contractVisibleEvents.push(['delta', event.text]);
+      },
+      onAssistantCompleted(event) {
+        contractVisibleEvents.push(['completed', event.text]);
+      },
+    },
+  });
+  assert.equal(contracted.final_message, 'RESULT=accepted');
+  assert.equal(contractStreamRequests.length, 2);
+  assert.deepEqual(contractVisibleEvents, [
+    ['delta', 'RESULT=accepted'],
+    ['completed', 'RESULT=accepted'],
+  ]);
+  assert.equal(contractVisibleEvents.some((event) => String(event[1]).includes('invalid draft')), false);
 
   const waiting = await runChatCompletionsToolTurn({
     base_url: `http://127.0.0.1:${port}/v1`,

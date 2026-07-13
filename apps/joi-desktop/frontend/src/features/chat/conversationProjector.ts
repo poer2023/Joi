@@ -40,6 +40,7 @@ export function buildConversationRenderItems(
       events: input.runEventsByRunId[runId] || [],
       mode: input.mode,
       debug: input.debug,
+      showThinkingStatus: false,
     });
     items.push(...projected.itemsBeforeAssistant);
     items.push(projectedMessage);
@@ -50,7 +51,7 @@ export function buildConversationRenderItems(
   }
 
   if (input.pendingUserMessage && !messages.some((message) => message.id === input.pendingUserMessage?.id)) {
-    const projected = projectMessage(input.pendingUserMessage, true);
+    const projected = projectMessage(input.pendingUserMessage, false);
     if (projected) items.push(projected);
   }
 
@@ -60,6 +61,7 @@ export function buildConversationRenderItems(
       id: input.streamingAssistant.id,
       role: 'assistant',
       content: messageContentValue(input.streamingAssistant.content),
+      attachments: normalizeMessageAttachments(input.streamingAssistant.attachments),
       runId: input.streamingAssistant.run_id,
       streaming: !input.streamingAssistant.complete,
       createdAt: input.streamingAssistant.created_at,
@@ -73,6 +75,7 @@ export function buildConversationRenderItems(
         events: input.runEventsByRunId[runId] || [],
         mode: input.mode,
         debug: input.debug,
+        showThinkingStatus: true,
       });
       items.push(...projected.itemsBeforeAssistant);
       items.push(streamingMessage);
@@ -98,6 +101,7 @@ export function buildConversationRenderItems(
       events: runEvents,
       mode: input.mode,
       debug: input.debug,
+      showThinkingStatus: input.activeRunId === runId,
     });
     if (!assistantMessage && projected.items.length === 0) {
       traceOnlyEventsByRunId[runId] = projected.traceOnlyEvents;
@@ -133,6 +137,7 @@ export function projectRunEventsForAssistantMessage(input: {
   events: NormalizedRunEvent[];
   mode: BuildConversationRenderItemsInput['mode'];
   debug?: boolean;
+  showThinkingStatus?: boolean;
 }): {
   items: ConversationRenderItem[];
   itemsBeforeAssistant: ConversationRenderItem[];
@@ -160,6 +165,7 @@ export function projectRunEventsForAssistantMessage(input: {
       assistantMessageId: input.assistantMessageId,
       events: visibleEvents,
       mode: input.mode,
+      showThinkingStatus: Boolean(input.showThinkingStatus),
     });
   const leadingItems = groupedItems
     .filter((item) => isLeadingAssistantProcessItem(item.item))
@@ -218,7 +224,7 @@ function aggregateVisibleEvents(input: {
   events: NormalizedRunEvent[];
   mode: BuildConversationRenderItemsInput['mode'];
 }): ConversationRenderItem[] {
-  return aggregateVisibleEventGroups(input).map((item) => item.item);
+  return aggregateVisibleEventGroups({ ...input, showThinkingStatus: false }).map((item) => item.item);
 }
 
 function aggregateVisibleEventGroups(input: {
@@ -226,6 +232,7 @@ function aggregateVisibleEventGroups(input: {
   assistantMessageId: string;
   events: NormalizedRunEvent[];
   mode: BuildConversationRenderItemsInput['mode'];
+  showThinkingStatus: boolean;
 }): Array<{ item: ConversationRenderItem; seq: number }> {
   const groups = [...groupEventsByItem(input.events).entries()]
     .map(([id, events]) => {
@@ -238,7 +245,7 @@ function aggregateVisibleEventGroups(input: {
   for (const group of groups) {
     const visibility = getEventVisibility(group.latest, input.mode);
     if (visibility === 'trace_only' || visibility === 'hidden' || visibility === 'chat') continue;
-    if (!shouldShowTranscriptGroup(group.latest, group.events)) continue;
+    if (!shouldShowTranscriptGroup(group.latest, group.events, input.showThinkingStatus)) continue;
     items.push({
       item: projectTranscriptLine(input.runId, group.latest, group.events),
       seq: group.events[0]?.seq ?? group.latest.seq,
@@ -249,7 +256,12 @@ function aggregateVisibleEventGroups(input: {
 }
 
 function isLeadingAssistantProcessItem(item: ConversationRenderItem): boolean {
-  return item.type === 'transcript_line' && (item.kind === 'thinking' || item.kind === 'tool' || item.kind === 'approval');
+  return item.type === 'transcript_line' && (
+    item.kind === 'thinking'
+    || item.kind === 'tool'
+    || item.kind === 'approval'
+    || (item.kind === 'run' && item.status === 'failed')
+  );
 }
 
 function groupEventsByItem(events: NormalizedRunEvent[]): Map<string, NormalizedRunEvent[]> {
@@ -262,6 +274,9 @@ function groupEventsByItem(events: NormalizedRunEvent[]): Map<string, Normalized
 }
 
 function groupKeyForEvent(event: NormalizedRunEvent): string {
+  if (isModelProgressEvent(event)) {
+    return `${event.itemType || 'model'}:${event.itemId || event.runId || 'model'}:step:${modelStepValue(event) || '0'}`;
+  }
   if (isWorkSummaryEvent(event)) {
     return `${event.itemType || 'model'}:${event.itemId || event.runId || 'model'}:step:${modelStepValue(event) || '0'}`;
   }
@@ -279,10 +294,39 @@ function projectMessage(message: ConversationMessage, streaming: boolean): ChatM
     id: message.id,
     role: message.role,
     content: messageContentValue(message.content),
+    attachments: normalizeMessageAttachments(message.attachments),
     runId: getMessageRunId(message),
     streaming,
     createdAt: message.created_at,
   };
+}
+
+function normalizeMessageAttachments(value: unknown): ChatMessageRenderItem['attachments'] {
+  if (!Array.isArray(value)) return undefined;
+  const attachments: NonNullable<ChatMessageRenderItem['attachments']> = [];
+  value.forEach((item, index) => {
+    if (!item || typeof item !== 'object') return;
+    const raw = item as Record<string, unknown>;
+    const name = stringValue(raw.name) || stringValue(raw.filename) || `附件 ${index + 1}`;
+    const mimeType = stringValue(raw.mimeType) || stringValue(raw.mime_type) || stringValue(raw.type);
+    const rawKind = stringValue(raw.kind);
+    const kind = rawKind === 'image' || rawKind === 'video'
+      ? rawKind
+      : mimeType.startsWith('image/')
+        ? 'image'
+        : mimeType.startsWith('video/')
+          ? 'video'
+          : 'file';
+    attachments.push({
+      id: stringValue(raw.id) || `${name}-${index}`,
+      name,
+      kind,
+      mimeType,
+      size: numberValue(raw.size),
+      previewUrl: stringValue(raw.previewUrl) || stringValue(raw.preview_url) || stringValue(raw.url),
+    });
+  });
+  return attachments.length ? attachments : undefined;
 }
 
 function projectTranscriptLine(
@@ -302,14 +346,19 @@ function projectTranscriptLine(
     kind,
     label: transcriptLabel(event, kind, status),
     detail: transcriptDetail(event, kind),
+    detailRows: kind === 'tool' ? toolDetailRows(event, events) : undefined,
     approval: kind === 'approval' || status === 'waiting_approval' ? approvalForEvent(event) : undefined,
     traceAvailable: status === 'failed' || status === 'waiting_approval',
     startedAt: started?.createdAt,
     completedAt: completed?.createdAt,
+    runStartedAt: event.runStartedAt,
+    runCompletedAt: event.runCompletedAt,
+    runDurationMs: event.runDurationMs,
   };
 }
 
 function transcriptKind(event: NormalizedRunEvent): TranscriptLineKind {
+  if (isModelProgressEvent(event)) return 'thinking';
   if (isWorkSummaryEvent(event)) return 'thinking';
   if (event.type.startsWith('tool.') || event.itemType === 'tool' || event.itemType === 'capability' || event.itemType === 'node') return 'tool';
   if (event.type.startsWith('approval.') || event.itemType === 'approval') return 'approval';
@@ -320,7 +369,17 @@ function transcriptKind(event: NormalizedRunEvent): TranscriptLineKind {
   return 'system';
 }
 
-function shouldShowTranscriptGroup(event: NormalizedRunEvent, events: NormalizedRunEvent[]): boolean {
+function shouldShowTranscriptGroup(event: NormalizedRunEvent, events: NormalizedRunEvent[], showThinkingStatus: boolean): boolean {
+  if (isWorkSummaryEvent(event)) {
+    if (event.status === 'failed' || event.status === 'blocked') return true;
+    if (event.status === 'running' || event.status === 'queued' || event.status === 'pending') return showThinkingStatus;
+    return false;
+  }
+  if (isModelProgressEvent(event) && event.status !== 'running' && event.status !== 'queued' && event.status !== 'pending') {
+    if (event.status === 'failed' || event.status === 'blocked') return true;
+    return false;
+  }
+  if (isModelProgressEvent(event)) return showThinkingStatus;
   return true;
 }
 
@@ -369,11 +428,14 @@ function transcriptLabel(
 }
 
 function transcriptDetail(event: NormalizedRunEvent, kind: TranscriptLineKind): string | undefined {
-  if (kind === 'thinking') return workSummaryText(event) || undefined;
+  if (kind === 'thinking') {
+    if (isModelProgressEvent(event)) return undefined;
+    return workSummaryText(event) || undefined;
+  }
+  if (kind === 'tool') return undefined;
   if (kind === 'approval') return approvalDetail(event);
-  const detail = event.summary || detailForExecutionEvent(event);
+  const detail = usefulSummary(event) || detailForExecutionEvent(event);
   if (!detail) return undefined;
-  if (kind === 'tool' && transcriptLabel(event, kind, transcriptStatus(event.status)).includes(detail)) return undefined;
   return compactText(detail, 180);
 }
 
@@ -393,36 +455,101 @@ function transcriptStatus(status: NormalizedStatus): TranscriptLineRenderItem['s
 }
 
 function toolTranscriptLabel(event: NormalizedRunEvent, status: TranscriptLineRenderItem['status']): string {
+  return displayToolName(event, status);
+}
+
+function displayToolName(event: NormalizedRunEvent, status: TranscriptLineRenderItem['status']): string {
   const toolName = toolNameFromEvent(event);
   const lower = toolName.toLowerCase();
-  const verb = status === 'running' || status === 'pending'
-    ? '正在执行'
-    : status === 'failed'
-      ? '执行失败'
-      : status === 'waiting_approval'
-        ? '等待确认'
-        : '已执行';
+  void status;
   if (event.terminal || lower.includes('terminal') || lower.includes('shell') || lower.includes('command') || lower.includes('exec') || lower.includes('bash')) {
-    const command = compactText(stringFromEvent(event, ['command', 'cmd', 'shell_command', 'script']) || 'command');
-    return `${status === 'completed' ? '运行命令' : verb} · ${command}`;
+    return '运行命令';
   }
   if (lower.includes('apply_patch') || lower.includes('patch') || lower.includes('workspace_write')) {
-    const target = compactText(resourceLabelFromEvent(event) || stringFromEvent(event, ['path', 'target_path', 'file_path']) || 'workspace');
-    return `${status === 'failed' ? '写入失败' : '写入文件'} · ${target}`;
+    return '写入文件';
   }
-  if (lower.includes('web') || lower.includes('browser') || lower.includes('url')) {
-    const url = stringFromEvent(event, ['final_url', 'url', 'source_url', 'href']) || detailForExecutionEvent(event) || '';
-    const target = compactText(hostLabel(url) || url || humanizeToolName(toolName));
-    const action = status === 'running' || status === 'pending' ? '读取中' : status === 'completed' ? '读取网页' : verb;
-    return `${action} · ${target}`;
+  if (
+    lower.includes('web_extract')
+    || lower.includes('web.extract')
+    || lower.includes('browser_read')
+    || lower.includes('browser.read')
+    || lower.includes('read_url')
+    || lower.includes('fetch')
+    || lower.includes('http_get')
+  ) {
+    return '读取网页';
+  }
+  if (lower.includes('web') || lower.includes('browser') || lower.includes('url') || lower.includes('http')) {
+    return '网页搜索';
+  }
+  if (lower.includes('memory') || lower.includes('memories')) {
+    return lower.includes('candidate') || lower.includes('proposal') || lower.includes('write')
+      ? '记忆建议'
+      : '记忆检索';
   }
   if (lower.includes('workspace') || lower.includes('search') || lower.includes('grep') || lower.includes('rg')) {
-    return `搜索工作区 · ${compactText(stringFromEvent(event, ['query', 'q', 'pattern', 'search']) || humanizeToolName(toolName))}`;
+    return '工作区搜索';
   }
   if (lower.includes('file') || lower.includes('read') || lower.includes('path')) {
-    return `读取文件 · ${compactText(stringFromEvent(event, ['path', 'file', 'filename', 'target_path']) || humanizeToolName(toolName))}`;
+    return '读取文件';
   }
-  return `${verb} · ${compactText(humanizeToolName(toolName))}`;
+  return humanizeToolName(toolName);
+}
+
+function toolDetailRows(event: NormalizedRunEvent, events: NormalizedRunEvent[]): TranscriptLineRenderItem['detailRows'] {
+  const payload = eventPayload(event);
+  const rows: NonNullable<TranscriptLineRenderItem['detailRows']> = [];
+  const input = inputValueForToolEvents(event, events);
+  if (input !== undefined) rows.push({ label: 'Input', value: formatDetailValue(input) });
+  const output = outputValueForToolEvent(event, payload);
+  const outputDetail = output !== undefined ? formatDetailValue(output) : '';
+  if (outputDetail) rows.push({ label: outputLabelForToolEvent(event), value: outputDetail });
+  const error = event.error || stringFromEvent(event, ['error']);
+  if (error) {
+    const errorDetail = formatDetailValue(error);
+    if (errorDetail && comparableDetailValue(error) !== comparableDetailValue(output)) rows.push({ label: 'Error', value: errorDetail });
+  }
+  return rows.length > 0 ? rows : undefined;
+}
+
+function inputValueForToolEvents(event: NormalizedRunEvent, events: NormalizedRunEvent[]): unknown {
+  const sorted = sortBySeq(events);
+  for (const item of sorted) {
+    const payload = eventPayload(item);
+    const input = firstPresentValue(
+      payload.input,
+      objectValue(payload.arguments),
+      item.snapshot.input,
+      item.delta.input,
+      objectValue(item.snapshot.arguments),
+      objectValue(item.delta.arguments),
+    );
+    if (input !== undefined) return input;
+  }
+  const payload = eventPayload(event);
+  return firstPresentValue(
+    payload.input,
+    objectValue(payload.arguments),
+    event.snapshot.input,
+    event.delta.input,
+    objectValue(event.snapshot.arguments),
+    objectValue(event.delta.arguments),
+  );
+}
+
+function outputValueForToolEvent(event: NormalizedRunEvent, payload: Record<string, unknown>): unknown {
+  if (event.type === 'tool.output_delta') {
+    return firstPresentValue(payload.delta, event.delta);
+  }
+  if (event.type === 'tool.completed' || event.type === 'tool.finished' || event.type === 'tool.failed' || event.type === 'tool.policy_blocked') {
+    return firstPresentValue(payload.snapshot, payload.delta, event.snapshot, event.delta);
+  }
+  return undefined;
+}
+
+function outputLabelForToolEvent(event: NormalizedRunEvent): string {
+  if (event.type === 'tool.output_delta') return 'Output Delta';
+  return 'Output';
 }
 
 function toolNameFromEvent(event: NormalizedRunEvent): string {
@@ -484,7 +611,19 @@ function isWorkSummaryEvent(event: NormalizedRunEvent): boolean {
 }
 
 function workSummaryText(event: NormalizedRunEvent): string {
-  return stringFromEvent(event, ['summary', 'text', 'message', 'plan_summary', 'rationale']);
+  if (isModelProgressEvent(event)) {
+    if (event.status === 'running' || event.status === 'queued' || event.status === 'pending') return '模型正在组织下一步';
+    if (event.status === 'completed') return '模型完成本轮思考';
+  }
+  return event.summary || stringFromEvent(event, ['summary', 'text', 'message', 'plan_summary', 'rationale']);
+}
+
+function usefulSummary(event: NormalizedRunEvent): string {
+  const summary = (event.summary || '').trim();
+  if (!summary) return '';
+  const generic = `${event.type} ${event.status}`.trim().toLowerCase();
+  if (summary.toLowerCase() === generic) return '';
+  return summary;
 }
 
 function modelStepValue(event: NormalizedRunEvent): string {
@@ -516,13 +655,54 @@ function firstObject(...values: Array<Record<string, unknown>>): Record<string, 
   return values.find((value) => Object.keys(value).length > 0) || {};
 }
 
-function hostLabel(value: string): string {
-  if (!value) return '';
-  try {
-    return new URL(value).hostname.replace(/^www\./, '');
-  } catch {
-    return '';
+function firstPresentValue(...values: unknown[]): unknown {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === 'string' && value.trim() === '') continue;
+    if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value as Record<string, unknown>).length === 0) continue;
+    return value;
   }
+  return undefined;
+}
+
+function formatDetailValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return JSON.stringify(redactSensitiveValue(value), null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function comparableDetailValue(value: unknown): string {
+  let normalized = value;
+  if (typeof value === 'string' && value.trim().startsWith('{')) {
+    try {
+      normalized = JSON.parse(value) as unknown;
+    } catch {
+      normalized = value.trim();
+    }
+  }
+  try {
+    return JSON.stringify(redactSensitiveValue(normalized));
+  } catch {
+    return String(normalized);
+  }
+}
+
+function redactSensitiveValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => redactSensitiveValue(item));
+  if (!value || typeof value !== 'object') return value;
+  const redacted: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (/token|secret|password|api[_-]?key|authorization|cookie/i.test(key)) {
+      redacted[key] = '[redacted]';
+      continue;
+    }
+    redacted[key] = redactSensitiveValue(item);
+  }
+  return redacted;
 }
 
 function compactText(value: string, max = 120): string {
@@ -599,6 +779,15 @@ function stringValue(value: unknown): string {
   if (typeof value === 'string') return value.trim();
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return '';
+}
+
+function numberValue(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, value);
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return Math.max(0, parsed);
+  }
+  return 0;
 }
 
 function textChunkValue(value: unknown): string {

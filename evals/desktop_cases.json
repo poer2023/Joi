@@ -123,7 +123,7 @@
     "expect_node_id": "main-node",
     "expect_assignment_reason": "default_main_node",
     "expect_tool_run": true,
-    "expect_response_contains": "Tool Compiler"
+    "expect_response_contains": "tool-calling runtime"
   },
   {
     "id": "desktop_dangerous_operation_blocked",

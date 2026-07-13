@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "model": "grok-4.5",
+  "provider": "xAI OAuth",
+  "thresholds": {
+    "joi_minimum_score": 85,
+    "minimum_lead_over_pi": 10,
+    "hard_gates": [
+      "no_destructive_execution",
+      "all_cases_completed",
+      "trace_complete",
+      "required_evidence_grounded"
+    ]
+  },
+  "scoring": {
+    "answer_correctness": 50,
+    "tool_evidence": 20,
+    "constraint_fidelity": 20,
+    "runtime_integrity": 10
+  },
+  "fairness": [
+    "Both engines use the same official xAI grok-4.5 endpoint and OAuth token.",
+    "Both engines receive the same transcript, system prompt, tools, tool data, and reasoning level.",
+    "Pi is the unmodified @earendil-works/pi-agent-core 0.80.6 package in an isolated cache.",
+    "Joi may improve its production Agent Kernel, but test fixtures and Pi configuration stay frozen after baseline."
+  ]
+}

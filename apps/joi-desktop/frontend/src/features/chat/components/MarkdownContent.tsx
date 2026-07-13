@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { memo, type ReactNode } from 'react';
 
 type Block =
   | { type: 'blockquote'; lines: string[] }
@@ -9,10 +9,12 @@ type Block =
   | { type: 'table'; headers: string[]; rows: string[][] };
 
 const inlinePattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*\n]+\*|\[[^\]]+\]\([^)]+\))/g;
+const LONG_CODE_LINE_THRESHOLD = 18;
+const LONG_CODE_CHARACTER_THRESHOLD = 1_200;
 
-export function MarkdownContent({ content }: { content: string }) {
+export const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {
   return <div className="markdown-content">{parseBlocks(content).map(renderBlock)}</div>;
-}
+});
 
 function parseBlocks(content: string): Block[] {
   const lines = content.replace(/\r\n?/g, '\n').split('\n');
@@ -112,11 +114,7 @@ function renderBlock(block: Block, index: number) {
     return <blockquote key={index}>{renderInlineLines(block.lines)}</blockquote>;
   }
   if (block.type === 'code') {
-    return (
-      <pre key={index} data-language={block.language || undefined}>
-        <code>{block.code}</code>
-      </pre>
-    );
+    return renderCodeBlock(block, index);
   }
   if (block.type === 'list') {
     const ListTag = block.ordered ? 'ol' : 'ul';
@@ -141,6 +139,26 @@ function renderBlock(block: Block, index: number) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+function renderCodeBlock(block: Extract<Block, { type: 'code' }>, index: number) {
+  const lineCount = block.code ? block.code.split('\n').length : 0;
+  const code = (
+    <pre className="markdown-code-block" data-language={block.language || undefined}>
+      <code>{block.code}</code>
+    </pre>
+  );
+  const isLong = lineCount > LONG_CODE_LINE_THRESHOLD || block.code.length > LONG_CODE_CHARACTER_THRESHOLD;
+  if (!isLong) return <div className="markdown-code-block-inline" key={index}>{code}</div>;
+  return (
+    <details className="markdown-code-disclosure" key={index}>
+      <summary>
+        <span>代码</span>
+        <small>{block.language ? `${block.language} · ` : ''}{lineCount} 行</small>
+      </summary>
+      {code}
+    </details>
   );
 }
 

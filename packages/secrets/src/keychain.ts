@@ -8,6 +8,8 @@ export const joiKeychainService = process.env.JOI_KEYCHAIN_SERVICE || 'Joi Deskt
 export const desktopSecretNames = [
   'MODEL_API_KEY',
   'XAI_OAUTH_STATE',
+  'BRAVE_SEARCH_API_KEY',
+  'GITHUB_TOKEN',
   'TELEGRAM_BOT_TOKEN',
   'PHOTON_DASHBOARD_TOKEN',
   'PHOTON_PROJECT_SECRET',

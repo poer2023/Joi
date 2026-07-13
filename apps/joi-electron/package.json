@@ -2,13 +2,16 @@
   "name": "@joi/electron",
   "private": true,
   "version": "0.1.1",
+  "description": "Local-first personal agent OS desktop client",
+  "author": "Hao",
   "type": "module",
   "main": "dist/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
     "build": "tsc --noEmit && electron-vite build",
     "package:mac": "pnpm build && electron-builder --mac dir --arm64 --config.mac.identity=null",
-    "test:contract": "node scripts/test-preload-contract.mjs && node scripts/test-automation-webhook-server.mjs"
+    "test:contract": "node --experimental-strip-types scripts/test-github-connection.mjs && node --experimental-strip-types scripts/test-plugin-manager.mjs && node scripts/test-acp-ephemeral-launcher.mjs && node --experimental-strip-types scripts/test-acp-web-mcp.mjs && node --experimental-strip-types scripts/test-imessage-outbound.mjs && node --experimental-strip-types scripts/test-telegram-acp-routing.mjs && node --experimental-strip-types scripts/test-telegram-outbound.mjs && node scripts/test-preload-contract.mjs && node scripts/test-automation-webhook-server.mjs",
+    "test:plugin-github-live": "node --experimental-strip-types scripts/test-plugin-manager-github-live.mjs"
   },
   "dependencies": {
     "@joi/shared-types": "workspace:*",
@@ -34,6 +37,18 @@
       "package.json"
     ],
     "extraResources": [
+      {
+        "from": "../joi-cli/src/joi.mjs",
+        "to": "cli/joi.mjs"
+      },
+      {
+        "from": "resources/acp-web-mcp",
+        "to": "acp-web-mcp"
+      },
+      {
+        "from": "resources/acp-ephemeral-launcher",
+        "to": "acp-ephemeral-launcher"
+      },
       {
         "from": "resources/photon-sidecar",
         "to": "photon-sidecar"

@@ -6,7 +6,7 @@ import type {
 } from '../../shared-types/src/desktop-api';
 import {
   DEFAULT_XAI_OAUTH_BASE_URL,
-  isXAIOAuthProvider,
+  isXAIOAuthBackedProvider,
   resolveXAIOAuthCredentials,
   type XAIOAuthSecretSaver,
   validateXAIInferenceBaseURL,
@@ -221,7 +221,7 @@ function resolveModelConfig(req: ModelConnectionTestRequest | undefined, setting
   const baseURL = req?.base_url?.trim() || settings.model_base_url || '';
   return {
     provider,
-    baseURL: isXAIOAuthProvider(provider) ? validateXAIInferenceBaseURL(baseURL || DEFAULT_XAI_OAUTH_BASE_URL) : baseURL,
+    baseURL: isXAIOAuthBackedProvider(provider) ? validateXAIInferenceBaseURL(baseURL || DEFAULT_XAI_OAUTH_BASE_URL) : baseURL,
     modelName: req?.name?.trim() || settings.model_name || '',
     timeoutSeconds: req?.timeout_seconds && req.timeout_seconds > 0 ? req.timeout_seconds : 30,
   };
@@ -235,7 +235,7 @@ async function resolveAPIKey(
 ): Promise<string> {
   if (req?.api_key?.trim()) return req.api_key.trim();
   if (isLoopbackModelEndpoint(config.baseURL)) return LOCAL_MODEL_PROXY_API_KEY;
-  if (isXAIOAuthProvider(config.provider)) {
+  if (isXAIOAuthBackedProvider(config.provider)) {
     const creds = await resolveXAIOAuthCredentials(resolveSecret, saveSecret);
     return creds.apiKey;
   }

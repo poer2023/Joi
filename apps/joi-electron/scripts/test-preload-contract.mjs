@@ -22,7 +22,7 @@ function extractDesktopMethods(source) {
 
 function extractSqliteHandlers(source) {
   const start = source.indexOf('const sqliteApi: Record<DesktopIpcMethod, Handler> = {');
-  const endRelative = start >= 0 ? source.slice(start).search(/\n  };\n\n  ipcMain\.(?:removeHandler|handle)/) : -1;
+  const endRelative = start >= 0 ? source.slice(start).search(/\n  };\n\n  (?:if \(!envFlagValue\(process\.env\.JOI_DISABLE_CLI_HOST\)\)|startBrowserBridgeIfEnabled|ipcMain\.(?:removeHandler|handle))/) : -1;
   const end = endRelative >= 0 ? start + endRelative : -1;
   if (start < 0 || end < 0) {
     throw new Error('Could not find SQLite DesktopApi handlers');
@@ -38,6 +38,8 @@ const imessageInbound = read('apps/joi-electron/src/main/imessage-inbound.ts');
 const desktopFrontend = read('apps/joi-desktop/frontend/src/App.tsx');
 const desktopBridge = read('apps/joi-desktop/frontend/src/api/desktop.ts');
 const rendererRuntime = read('apps/joi-desktop/frontend/src/api/runtime.ts');
+const commandHost = read('apps/joi-electron/src/main/command-host.ts');
+const cli = read('apps/joi-cli/src/joi.mjs');
 
 const contractMethods = extractDesktopMethods(desktopApiContract);
 const sqliteHandlers = extractSqliteHandlers(ipc);
@@ -64,6 +66,24 @@ for (const required of ['z.enum(desktopIpcMethods)', 'TerminalSessionManager', "
   }
 }
 
+for (const required of ['startJoiCommandHost(', 'defaultJoiCommandSocketPath(', 'handlers: sqliteApi', 'riskForMethod: ipcRiskLevel']) {
+  if (!ipc.includes(required)) {
+    fail(`main IPC router is missing CLI command-host integration: ${required}`);
+  }
+}
+
+for (const required of ['desktopBindingMethods', "| 'subscribe'", "| 'terminal_start'", "| 'terminal_input'", "| 'terminal_resize'", "| 'terminal_kill'", "| 'terminal_status'", 'cliAuxiliaryOperations', 'methodRequiresCliConfirmation', 'chmodSync(options.socketPath, 0o600)', 'dispatchJoiCommand(', 'publishJoiRunEvent(', 'publishJoiTerminalEvent(', 'format: \'jsonl\'']) {
+  if (!commandHost.includes(required)) {
+    fail(`CLI command host is missing required contract: ${required}`);
+  }
+}
+
+for (const required of ["command === 'commands'", "command === 'chat'", "command === 'invoke'", "command === 'call'", "command === 'watch'", "action === 'attach'", "action: 'terminal_start'", "action: 'terminal_input'", "action: 'terminal_resize'", "action: 'terminal_kill'", "action: 'terminal_status'", 'subscription.started', 'JOI_CLI_HEADLESS', 'ELECTRON_RUN_AS_NODE', '--no-start', '--yes', '--follow', '--after-seq']) {
+  if (!cli.includes(required)) {
+    fail(`CLI client is missing required surface: ${required}`);
+  }
+}
+
 for (const required of ['fetchAvailableModels(', 'testModelConnection(', 'testTelegramConnection(', 'sendTestTelegramMessage(', 'secrets.status()', 'secrets.save(', 'store.replaceFetchedModels(']) {
   if (!ipc.includes(required)) {
     fail(`main IPC router is missing real secret/model integration: ${required}`);
@@ -79,6 +99,12 @@ for (const forbidden of ['createMockDesktopApi', 'sendMockChat(', 'mockDesktopAp
 for (const required of ['runLiveElectronToolCallingChat(', 'AbortController', 'activeToolCallingRuns', 'runChatCompletionsToolTurn(', 'compileElectronCapabilityTools(', 'store.beginToolCallingChat(', 'store.finishToolCallingChat(', 'store.failToolCallingChat(', 'store.assembleToolCallingPrompt(', 'store.loadApprovedToolCallingResume(', 'store.completeApprovedToolCallingResume(', 'canRunRealToolCalling(']) {
   if (!ipc.includes(required)) {
     fail(`main IPC router is missing real TS tool-calling chat integration: ${required}`);
+  }
+}
+
+for (const required of ['allowed_capabilities: agentCapabilities', "tool_execution: 'parallel'", 'beforeToolCall:', 'max_tool_result_bytes:', 'model_max_retries']) {
+  if (!ipc.includes(required)) {
+    fail(`main IPC router is missing production Agent Kernel policy: ${required}`);
   }
 }
 
@@ -130,4 +156,4 @@ if (process.exitCode) {
   process.exit(process.exitCode);
 }
 
-console.log(`preload contract ok: ${contractMethods.length} DesktopApi methods covered`);
+console.log(`preload contract ok: ${contractMethods.length + 9} interface operations covered (${contractMethods.length} DesktopApi + 9 auxiliary)`);

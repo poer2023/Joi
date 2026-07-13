@@ -1,13 +1,21 @@
 import type { BrowserWindow } from 'electron';
-import { createHash } from 'node:crypto';
-import type { ChatRequest, ChatResponse, SettingsRecord, TelegramInboundStatus } from '../../../../packages/shared-types/src/desktop-api';
+import type { ChatRequest, ChatResponse, RunEvent, SettingsRecord, TelegramInboundStatus } from '../../../../packages/shared-types/src/desktop-api';
 import type { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
-import type { AppLogInput, JoiSQLiteStore } from '../../../../packages/store/src/sqlite';
-import { canRunRealToolCalling, emitRunEvents, resolveAPIKeyForModelEndpoint, runLiveElectronToolCallingChat } from './ipc';
+import type { AppLogInput, JoiSQLiteStore, TelegramInboundUpdateRecord } from '../../../../packages/store/src/sqlite';
+import { LOCAL_MODEL_PROXY_API_KEY } from '../../../../packages/runtime/src/model';
+import {
+  planTelegramMessage,
+  postTelegramMessage,
+} from '../../../../packages/runtime/src/telegram-message.ts';
+import { canRunRealToolCalling, emitRunEvent, emitRunEvents, resolveAPIKeyForModelEndpoint, runLiveElectronToolCallingChat } from './ipc';
+import type { JoiPluginManager } from './plugin-manager';
+import { resolveTelegramModelRuntimeRoute, telegramOwnerPermissionProfile } from './telegram-runtime-route';
+import { telegramConversationID } from './telegram-thread';
 
 type TelegramInboundOptions = {
   store: JoiSQLiteStore;
   secrets: KeychainSecretStore;
+  pluginManager: JoiPluginManager;
   getWindow: () => BrowserWindow | null;
   logger?: Pick<Console, 'info' | 'warn' | 'error'>;
 };
@@ -25,6 +33,7 @@ type TelegramUpdate = {
 
 type TelegramMessage = {
   message_id: number;
+  message_thread_id?: number;
   text?: string;
   chat: { id: number; type: string };
   from?: { id: number };
@@ -40,11 +49,13 @@ const telegramAPIBaseURL = 'https://api.telegram.org';
 const pollTimeoutSeconds = 45;
 const retryDelayMs = 3000;
 const typingPulseIntervalMs = 4000;
+const replyTimeoutMs = 10_000;
 const localOwnerPrincipalID = 'principal_local_owner';
 
 export class TelegramInboundService {
   private readonly store: JoiSQLiteStore;
   private readonly secrets: KeychainSecretStore;
+  private readonly pluginManager: JoiPluginManager;
   private readonly getWindow: () => BrowserWindow | null;
   private readonly logger: Pick<Console, 'info' | 'warn' | 'error'>;
   private controller: AbortController | null = null;
@@ -59,6 +70,7 @@ export class TelegramInboundService {
   constructor(options: TelegramInboundOptions) {
     this.store = options.store;
     this.secrets = options.secrets;
+    this.pluginManager = options.pluginManager;
     this.getWindow = options.getWindow;
     this.logger = options.logger || console;
   }
@@ -120,7 +132,8 @@ export class TelegramInboundService {
   }
 
   private async pollLoop(token: string, signal: AbortSignal): Promise<void> {
-    let offset = 0;
+    let offset = this.store.getTelegramInboundOffset();
+    this.lastUpdateID = offset > 0 ? offset - 1 : null;
     this.polling = true;
     this.lastError = '';
     this.logger.info('telegram inbound started');
@@ -133,17 +146,32 @@ export class TelegramInboundService {
       message: 'Telegram inbound poll started',
     });
     try {
+      await this.drainDurableInbox(token, signal);
       while (!signal.aborted) {
         try {
           const updates = await this.getUpdates(token, offset, signal);
           this.lastPollAt = new Date().toISOString();
           this.lastError = '';
-          for (const update of updates) {
-            if (signal.aborted) break;
-            await this.handleUpdate(token, update);
-            offset = Math.max(offset, update.update_id + 1);
-            this.lastUpdateID = update.update_id;
+          if (updates.length > 0) {
+            const persisted = this.store.persistTelegramInboundUpdates(updates.map((update) => ({
+              update_id: update.update_id,
+              message_id: update.message?.message_id,
+              chat_id: update.message?.chat.id,
+              from_id: update.message?.from?.id,
+              chat_type: update.message?.chat.type,
+              text: update.message?.text || '',
+              metadata: {
+                source: 'telegram_get_updates',
+                external_thread_id: update.message?.message_thread_id ? String(update.message.message_thread_id) : '',
+              },
+            })));
+            // Requesting the next persisted offset acknowledges the batch to
+            // Telegram. The durable inbox, not process memory, is now the
+            // source of truth for processing and deduplication.
+            offset = persisted.offset;
+            this.lastUpdateID = offset > 0 ? offset - 1 : this.lastUpdateID;
           }
+          await this.drainDurableInbox(token, signal);
         } catch (error) {
           if (!signal.aborted) {
             this.lastError = sanitizeTelegramError(error, token);
@@ -188,10 +216,82 @@ export class TelegramInboundService {
     return payload.result || [];
   }
 
-  private async handleUpdate(token: string, update: TelegramUpdate): Promise<void> {
+  private async drainDurableInbox(token: string, signal: AbortSignal): Promise<void> {
+    await this.drainPendingReplies(token, signal);
+    while (!signal.aborted) {
+      const update = this.store.claimTelegramInboundUpdate();
+      if (!update) break;
+      await this.handleUpdate(token, update);
+      await this.drainPendingReplies(token, signal);
+    }
+  }
+
+  private async drainPendingReplies(token: string, signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      const update = this.store.claimTelegramInboundReply();
+      if (!update) break;
+      try {
+        const messageID = await sendTelegramMessage(token, Number(update.chat_id), update.response_text);
+        this.store.completeTelegramInboundUpdate({
+          update_id: update.update_id,
+          external_delivery_id: `telegram:${update.chat_id}:${messageID}`,
+        });
+        this.log({
+          level: 'info',
+          risk_level: 'state_change',
+          category: 'external',
+          feature_key: 'telegram.reply.sent',
+          source: 'telegram_inbound',
+          message: 'Telegram reply sent',
+          run_id: update.run_id,
+          conversation_id: telegramConversationID(update.chat_id, telegramExternalThreadID(update)),
+          item_type: 'telegram_chat',
+          item_id: update.chat_id,
+          payload: { update_id: update.update_id, response_length: update.response_text.length, external_message_id: messageID },
+        });
+      } catch (error) {
+        const code = telegramRequestErrorCode(error);
+        const acceptanceUnknown = isTelegramAcceptanceUnknown(code);
+        this.store.failTelegramInboundUpdate({
+          update_id: update.update_id,
+          error_code: code,
+          error_message: sanitizeTelegramError(error, token),
+          acceptance_unknown: acceptanceUnknown,
+        });
+        this.log({
+          level: 'error',
+          risk_level: 'state_change',
+          category: 'external',
+          feature_key: acceptanceUnknown ? 'telegram.reply.acceptance_unknown' : 'telegram.reply.failed',
+          source: 'telegram_inbound',
+          message: acceptanceUnknown ? 'Telegram reply acceptance is unknown; automatic resend suppressed' : 'Telegram reply failed',
+          run_id: update.run_id,
+          item_type: 'telegram_message',
+          item_id: update.message_id,
+          payload: { update_id: update.update_id, retryable: false, acceptance_unknown: acceptanceUnknown },
+          error: { code, message: sanitizeTelegramError(error, token) },
+        });
+      }
+    }
+  }
+
+  private async handleUpdate(token: string, persisted: TelegramInboundUpdateRecord): Promise<void> {
+    const update: TelegramUpdate = {
+      update_id: persisted.update_id,
+      message: persisted.message_id || persisted.chat_id ? {
+        message_id: Number(persisted.message_id || 0),
+        message_thread_id: telegramExternalThreadID(persisted) || undefined,
+        text: persisted.text,
+        chat: { id: Number(persisted.chat_id || 0), type: persisted.chat_type },
+        from: persisted.from_id ? { id: Number(persisted.from_id) } : undefined,
+      } : undefined,
+    };
     const message = update.message;
     const text = message?.text?.trim() || '';
-    if (!message || !text) return;
+    if (!message || !text) {
+      this.store.completeTelegramInboundUpdate({ update_id: persisted.update_id });
+      return;
+    }
     if (message.chat.type !== 'private') {
       this.log({
         level: 'info',
@@ -204,13 +304,13 @@ export class TelegramInboundService {
         item_id: String(message.message_id),
         payload: { chat_id: message.chat.id, chat_type: message.chat.type, update_id: update.update_id, reason: 'non_private_chat' },
       });
-      await sendTelegramMessage(token, message.chat.id, '当前 Joi Telegram 入口只支持私聊文本消息。');
+      this.store.completeTelegramInboundUpdate({ update_id: update.update_id });
       return;
     }
     const fromID = message.from?.id;
     const settings = this.store.getSettings();
     const allowed = allowedUserIDs(settings.telegram_allowed_user_ids);
-    if (allowed.size > 0 && (!fromID || !allowed.has(fromID))) {
+    if (!fromID || !allowed.has(fromID)) {
       this.log({
         level: 'warn',
         risk_level: 'read_only',
@@ -222,10 +322,12 @@ export class TelegramInboundService {
         item_id: String(message.message_id),
         payload: { chat_id: message.chat.id, from_id: fromID, update_id: update.update_id, reason: 'unauthorized_user' },
       });
-      await sendTelegramMessage(token, message.chat.id, '未授权：当前 Joi Telegram 入口只允许白名单用户使用。');
+      // Strict allow-list: reject and audit without sending any data back to
+      // an untrusted chat/user.
+      this.store.completeTelegramInboundUpdate({ update_id: update.update_id });
       return;
     }
-    const principalID = allowed.size > 0 ? localOwnerPrincipalID : undefined;
+    const principalID = localOwnerPrincipalID;
     if (isStatusCommand(text)) {
       this.log({
         level: 'info',
@@ -238,7 +340,10 @@ export class TelegramInboundService {
         item_id: String(message.message_id),
         payload: { chat_id: message.chat.id, from_id: fromID, update_id: update.update_id },
       });
-      await sendTelegramMessage(token, message.chat.id, await this.telegramStatusReply(settings));
+      this.store.markTelegramInboundReplyPending({
+        update_id: update.update_id,
+        response_text: await this.telegramStatusReply(settings),
+      });
       return;
     }
     this.log({
@@ -252,13 +357,42 @@ export class TelegramInboundService {
       item_id: String(message.message_id),
       payload: { chat_id: message.chat.id, from_id: fromID, update_id: update.update_id, text_length: text.length },
     });
-    await this.runJoiAndReply(token, message, settings, principalID);
+    this.store.markTelegramInboundModelStarted(update.update_id);
+    try {
+      const result = await this.runJoiForReply(token, update.update_id, message, settings, principalID);
+      this.store.markTelegramInboundReplyPending({
+        update_id: update.update_id,
+        response_text: result.reply,
+        run_id: result.runID,
+      });
+    } catch (error) {
+      this.logger.error('telegram inbound run failed', sanitizeTelegramError(error, token));
+      this.log({
+        level: 'error',
+        risk_level: 'read_only',
+        category: 'external',
+        feature_key: 'telegram.run.failed',
+        source: 'telegram_inbound',
+        message: 'Telegram run failed',
+        conversation_id: telegramConversationID(message.chat.id, message.message_thread_id),
+        error: { message: sanitizeTelegramError(error, token) },
+      });
+      // The durable model_started boundary prevents a retry of this model
+      // task. A failure response may still be delivered once.
+      this.store.markTelegramInboundReplyPending({
+        update_id: update.update_id,
+        response_text: `处理失败：${compactText(safeErrorMessage(error), 260)}`,
+      });
+    }
   }
 
   private async telegramStatusReply(settings: SettingsRecord): Promise<string> {
     let modelCredential = 'missing';
     try {
-      const apiKey = await resolveAPIKeyForModelEndpoint(settings, this.secrets);
+      const acpProvider = this.pluginManager.resolveProvider(settings.model_provider || '', telegramOwnerPermissionProfile);
+      const apiKey = acpProvider
+        ? LOCAL_MODEL_PROXY_API_KEY
+        : await resolveAPIKeyForModelEndpoint(settings, this.secrets);
       modelCredential = apiKey.trim() ? 'available' : 'missing';
     } catch (error) {
       modelCredential = `failed: ${compactText(safeErrorMessage(error), 180)}`;
@@ -270,13 +404,19 @@ export class TelegramInboundService {
       `Model: ${settings.model_provider || 'unset'} / ${settings.model_name || 'unset'}`,
       `Model credential: ${modelCredential}`,
       `SQLite: ${health.service_status.sqlite ? 'ok' : 'failed'}`,
-      'Remote mode: read_only',
+      'Remote mode: danger_full_access + full_access_blacklist_v1',
     ].join('\n');
   }
 
-  private async runJoiAndReply(token: string, message: TelegramMessage, initialSettings: SettingsRecord, principalID?: string): Promise<void> {
+  private async runJoiForReply(
+    token: string,
+    updateID: number,
+    message: TelegramMessage,
+    _initialSettings: SettingsRecord,
+    principalID?: string,
+  ): Promise<{ reply: string; runID?: string }> {
     const req: ChatRequest = {
-      conversation_id: stableInboundConversationID('telegram', `chat:${message.chat.id}`),
+      conversation_id: telegramConversationID(message.chat.id, message.message_thread_id),
       channel: 'telegram',
       user_id: message.from?.id ? `telegram:${message.from.id}` : `telegram:${message.chat.id}`,
       principal_id: principalID,
@@ -284,7 +424,7 @@ export class TelegramInboundService {
       preferred_node: 'main-node',
       allow_worker: false,
       runtime_mode: 'tool_calling',
-      permission_profile: 'read_only',
+      permission_profile: telegramOwnerPermissionProfile,
     };
     const stopTyping = startTelegramTypingLoop(token, message.chat.id, this.logger);
     try {
@@ -299,8 +439,15 @@ export class TelegramInboundService {
         payload: { chat_id: message.chat.id, from_id: message.from?.id, text_length: req.message.length },
       });
       const settings = this.store.getSettings();
-      const apiKey = await resolveAPIKeyForModelEndpoint(settings, this.secrets);
-      if (!canRunRealToolCalling(settings, apiKey, req)) {
+      const runtimeRoute = await resolveTelegramModelRuntimeRoute({
+        settings,
+        request: req,
+        localProxyAPIKey: LOCAL_MODEL_PROXY_API_KEY,
+        resolveACPProvider: (providerID, permissionProfile) => this.pluginManager.resolveProvider(providerID, permissionProfile),
+        resolveAPIKey: () => resolveAPIKeyForModelEndpoint(settings, this.secrets),
+        canRun: canRunRealToolCalling,
+      });
+      if (!runtimeRoute.ready) {
         this.log({
           level: 'warn',
           risk_level: 'read_only',
@@ -311,42 +458,28 @@ export class TelegramInboundService {
           conversation_id: req.conversation_id,
           payload: { reason: 'model_not_configured' },
         });
-        await sendTelegramMessage(token, message.chat.id, 'Joi Telegram 入口已收到消息，但模型未配置完整，无法生成回复。请先在 Joi Desktop 里完成模型设置。');
-        return;
+        return { reply: 'Joi Telegram 入口已收到消息，但模型未配置完整，无法生成回复。请先在 Joi Desktop 里完成模型设置。' };
       }
-      const result = await runLiveElectronToolCallingChat(req, settings || initialSettings, apiKey, this.store, this.activeRuns, (runID) => {
-        const window = this.getWindow();
-        if (window && !window.isDestroyed()) emitRunEvents(window, this.store.getRunTrace(runID));
-      });
+      const result = await runLiveElectronToolCallingChat(
+        req,
+        settings || _initialSettings,
+        this.secrets,
+        this.store,
+        this.activeRuns,
+        (runID, event?: RunEvent) => {
+          this.store.attachTelegramInboundRun(updateID, runID);
+          const window = this.getWindow();
+          if (window && !window.isDestroyed()) {
+            if (event) emitRunEvent(window, event);
+            else emitRunEvents(window, this.store.getRunTrace(runID));
+          }
+        },
+        this.pluginManager,
+        { model_selection_policy: runtimeRoute.model_selection_policy },
+      );
       const window = this.getWindow();
       if (window && !window.isDestroyed()) emitRunEvents(window, this.store.getRunTrace(result.run_id));
-      await sendTelegramMessage(token, message.chat.id, telegramReply(result));
-      this.log({
-        level: 'info',
-        risk_level: 'state_change',
-        category: 'external',
-        feature_key: 'telegram.reply.sent',
-        source: 'telegram_inbound',
-        message: 'Telegram reply sent',
-        run_id: result.run_id,
-        conversation_id: result.conversation_id,
-        item_type: 'telegram_chat',
-        item_id: String(message.chat.id),
-        payload: { response_length: result.response.length },
-      });
-    } catch (error) {
-      this.logger.error('telegram inbound run failed', sanitizeTelegramError(error, token));
-      this.log({
-        level: 'error',
-        risk_level: 'read_only',
-        category: 'external',
-        feature_key: 'telegram.run.failed',
-        source: 'telegram_inbound',
-        message: 'Telegram run failed',
-        conversation_id: req.conversation_id,
-        error: { message: sanitizeTelegramError(error, token) },
-      });
-      await sendTelegramMessage(token, message.chat.id, `处理失败：${compactText(safeErrorMessage(error), 260)}`);
+      return { reply: telegramReply(result), runID: result.run_id };
     } finally {
       stopTyping();
     }
@@ -361,11 +494,11 @@ export class TelegramInboundService {
   }
 }
 
-function stableInboundConversationID(channel: 'telegram', externalKey: string): string {
-  const normalized = externalKey.trim() || 'unknown';
-  const slug = normalized.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'unknown';
-  const digest = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
-  return `conv_${channel}_${slug}_${digest}`;
+function telegramExternalThreadID(update: Pick<TelegramInboundUpdateRecord, 'metadata'>): number | undefined {
+  const value = String(update.metadata?.external_thread_id ?? '').trim();
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
 function allowedUserIDs(value = ''): Set<number> {
@@ -382,21 +515,61 @@ function isStatusCommand(text: string): boolean {
 }
 
 function telegramReply(result: ChatResponse): string {
-  const response = compactText(result.response || '', 3400);
-  if (response) return response;
-  return compactText(`Joi 已完成处理，但没有生成可见文本。Run Trace: ${result.run_id}`, 3400);
+  const response = result.response || '';
+  if (response.trim()) return response;
+  return `Joi 已完成处理，但没有生成可见文本。Run Trace: ${result.run_id}`;
 }
 
-async function sendTelegramMessage(token: string, chatID: number, text: string): Promise<void> {
-  await telegramRequest(token, 'sendMessage', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatID,
-      text: compactText(text, 3500),
-      disable_web_page_preview: true,
-    }),
-  });
+async function sendTelegramMessage(token: string, chatID: number, text: string): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), telegramReplyTimeoutMs(text));
+  timer.unref?.();
+  try {
+    const result = await postTelegramMessage({
+      apiBaseURL: telegramAPIBaseURL,
+      token,
+      chatID,
+      text,
+      disableLinkPreview: true,
+      fetchImpl: fetch,
+      signal: controller.signal,
+    });
+    if (!result.ok) {
+      throw codedTelegramRequestError(
+        result.messageIDs.length > 0 ? 'TELEGRAM_ACCEPTANCE_UNKNOWN_PARTIAL' : 'TELEGRAM_API_REJECTED',
+        result.payload.description || `Telegram rejected ${result.method} with HTTP ${result.status}.`,
+      );
+    }
+    const messageID = result.messageIDs[0] || '';
+    if (!messageID) {
+      throw codedTelegramRequestError(
+        'TELEGRAM_ACCEPTANCE_UNKNOWN_RESPONSE',
+        `Telegram ${result.method} returned no message ID; automatic resend is suppressed.`,
+      );
+    }
+    return messageID;
+  } catch (error) {
+    const code = telegramRequestErrorCode(error);
+    if (controller.signal.aborted) {
+      throw codedTelegramRequestError(
+        'TELEGRAM_ACCEPTANCE_UNKNOWN_TIMEOUT',
+        'Telegram sendMessage timed out; automatic resend is suppressed.',
+      );
+    }
+    if (code === 'TELEGRAM_REQUEST_FAILED') {
+      throw codedTelegramRequestError(
+        'TELEGRAM_ACCEPTANCE_UNKNOWN_CONNECTION',
+        `Telegram connection ended before acceptance was confirmed: ${compactText(safeErrorMessage(error), 220)}`,
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function telegramReplyTimeoutMs(text: string): number {
+  return planTelegramMessage(text).images.length > 0 ? Math.max(replyTimeoutMs, 90_000) : replyTimeoutMs;
 }
 
 function startTelegramTypingLoop(token: string, chatID: number, logger: Pick<Console, 'warn'>): () => void {
@@ -431,9 +604,23 @@ async function telegramRequest<T = TelegramAPIResponse>(token: string, method: s
   const response = await fetch(`${telegramAPIBaseURL}/bot${token}/${method}`, init);
   const payload = await response.json().catch(() => ({ ok: false, description: 'telegram returned non-json' })) as T & { ok?: boolean; description?: string };
   if (!response.ok) {
-    throw new Error(payload.description || `telegram request failed: ${response.status}`);
+    throw codedTelegramRequestError('TELEGRAM_API_REJECTED', payload.description || `telegram request failed: ${response.status}`);
   }
   return payload;
+}
+
+function codedTelegramRequestError(code: string, message: string): Error & { code?: string } {
+  const error = new Error(message) as Error & { code?: string };
+  error.code = code;
+  return error;
+}
+
+function telegramRequestErrorCode(error: unknown): string {
+  return String((error as { code?: unknown })?.code || 'TELEGRAM_REQUEST_FAILED').trim() || 'TELEGRAM_REQUEST_FAILED';
+}
+
+function isTelegramAcceptanceUnknown(code: string): boolean {
+  return code.startsWith('TELEGRAM_ACCEPTANCE_UNKNOWN');
 }
 
 function compactText(value: string, maxLength: number): string {

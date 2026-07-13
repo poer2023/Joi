@@ -15,6 +15,7 @@ import {
 } from '../src/telegram.ts';
 
 const requests = [];
+let fallbackSendCount = 0;
 const server = http.createServer((req, res) => {
   const request = {
     method: req.method,
@@ -62,6 +63,22 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, result: { message_id: 7 } }));
+    });
+    return;
+  }
+  if (req.url === '/bottelegram-fallback/sendMessage' && req.method === 'POST') {
+    fallbackSendCount += 1;
+    req.on('data', (chunk) => {
+      request.body += chunk;
+    });
+    req.on('end', () => {
+      if (fallbackSendCount === 1) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, description: 'Bad Request: formatted message rejected' }));
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, result: { message_id: 8 } }));
+      }
     });
     return;
   }
@@ -155,15 +172,35 @@ try {
     token: 'telegram-test',
     apiBaseURL: baseURL,
     allowedUserIDs: ' 12345,67890 ',
-    message: 'hello from Joi',
+    message: '# Joi\n\n1. **保留格式**\n2. `保留代码`',
     timeoutSeconds: 1,
   });
   assert.deepEqual(telegramSent, { ok: true, status: 'succeeded' });
   const sendRequest = requests.find((request) => request.url === '/bottelegram-test/sendMessage');
-  assert.equal(sendRequest.contentType, 'application/x-www-form-urlencoded');
-  const sentForm = new URLSearchParams(sendRequest.body);
-  assert.equal(sentForm.get('chat_id'), '12345');
-  assert.equal(sentForm.get('text'), 'hello from Joi');
+  assert.equal(sendRequest.contentType, 'application/json');
+  const sentBody = JSON.parse(sendRequest.body);
+  assert.equal(sentBody.chat_id, '12345');
+  assert.equal(sentBody.parse_mode, 'HTML');
+  assert.equal(sentBody.text, '<b>Joi</b>\n\n1. <b>保留格式</b>\n2. <code>保留代码</code>');
+  assert.equal(sentBody.text.includes('\n\n'), true, 'formatted send must preserve paragraph breaks');
+
+  requests.length = 0;
+  const telegramFallback = await sendTestTelegramMessage({
+    token: 'telegram-fallback',
+    apiBaseURL: baseURL,
+    allowedUserIDs: '12345',
+    message: '第一行\n\n第二行',
+    timeoutSeconds: 1,
+  });
+  assert.deepEqual(telegramFallback, { ok: true, status: 'succeeded' });
+  assert.deepEqual(
+    requests.map((request) => request.url),
+    ['/bottelegram-fallback/sendMessage', '/bottelegram-fallback/sendMessage'],
+    'only an explicit formatted-message rejection may fall back to plain sendMessage',
+  );
+  const fallbackBody = JSON.parse(requests.at(-1).body);
+  assert.equal(fallbackBody.text, '第一行\n\n第二行', 'plain fallback must preserve line breaks');
+  assert.equal('parse_mode' in fallbackBody, false, 'plain fallback must not pretend raw CommonMark is Telegram MarkdownV2');
 
   console.log('model runtime tests passed');
 } finally {

@@ -47,6 +47,38 @@ try {
   await assert.rejects(() => executeShellCommand({ cmd: ['rm', 'docs/info.txt'], cwd: root }, settings), /policy_denied/);
   await assert.rejects(() => executeShellCommand({ cmd: ['cat', join(outside, 'secret.txt')], cwd: root }, settings), /policy_denied/);
 
+  const fullAccessOutput = join(outside, 'full-access.txt');
+  const fullAccess = await executeShellCommand({
+    cmd: ['/usr/bin/touch', fullAccessOutput],
+    cwd: root,
+    permission_profile: 'danger_full_access',
+  }, settings);
+  assert.equal(fullAccess.command_status, 'completed');
+  assert.equal(fullAccess.command_policy, 'full_access_blacklist_v1');
+  assert.equal(fullAccess.sandbox.enforced, false);
+  assert.equal(existsSync(fullAccessOutput), true);
+
+  const fullAccessDNS = await executeShellCommand({
+    cmd: [process.execPath, '-e', "require('node:dns').lookup('localhost', (error) => { if (error) throw error; console.log('dns ok'); })"],
+    cwd: root,
+    permission_profile: 'danger_full_access',
+  }, settings);
+  assert.equal(fullAccessDNS.command_status, 'completed');
+  assert.ok(String(fullAccessDNS.output).includes('dns ok'));
+
+  await assert.rejects(() => executeShellCommand({ cmd: ['/bin/rm', '-rf', outside], cwd: root, permission_profile: 'danger_full_access' }, settings), /command_blacklisted/);
+  await assert.rejects(() => executeShellCommand({ cmd: ['diskutil', 'eraseDisk', 'APFS', 'Unsafe', '/dev/disk0'], cwd: root, permission_profile: 'danger_full_access' }, settings), /command_blacklisted/);
+  await assert.rejects(() => executeShellCommand({ cmd: ['git', 'reset', '--hard'], cwd: root, permission_profile: 'danger_full_access' }, settings), /command_blacklisted/);
+  await assert.rejects(() => executeShellCommand({ cmd: ['bash', '-lc', 'rm -rf /tmp/unsafe'], cwd: root, permission_profile: 'danger_full_access' }, settings), /command_blacklisted/);
+
+  const fullAccessShell = await executeShellCommand({
+    cmd: ['bash', '-lc', 'printf safe-shell'],
+    cwd: root,
+    permission_profile: 'danger_full_access',
+  }, settings);
+  assert.equal(fullAccessShell.command_status, 'completed');
+  assert.ok(String(fullAccessShell.output).includes('safe-shell'));
+
   const test = await executeTestCommand({ cmd: ['npm', 'run', 'test:fixture'], cwd: root, timeout_seconds: 30, max_output_bytes: 10000 }, settings);
   assert.equal(test.mode, 'test_command_v1_allowlisted_exec');
   assert.equal(test.test_status, 'succeeded');
@@ -74,6 +106,14 @@ try {
   }
 
   await assert.rejects(() => executeTestCommand({ cmd: ['node', '-e', 'console.log(1)'], cwd: root }, settings), /policy_denied/);
+
+  const fullAccessTest = await executeTestCommand({
+    cmd: [process.execPath, '-e', "console.log('full access test ok')"],
+    cwd: root,
+    permission_profile: 'danger_full_access',
+  }, settings);
+  assert.equal(fullAccessTest.test_status, 'succeeded');
+  assert.equal(fullAccessTest.command_policy, 'full_access_blacklist_v1');
 
   assert.throws(() => executeApplyPatch({
     permission_profile: 'read_only',

@@ -157,6 +157,22 @@ CREATE TABLE IF NOT EXISTS skill_runs (
   finished_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS plugin_definitions (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT 'v1',
+  description TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'installed',
+  manifest_path TEXT NOT NULL DEFAULT '',
+  capability_ids TEXT NOT NULL DEFAULT '[]',
+  skill_ids TEXT NOT NULL DEFAULT '[]',
+  mcp_server_ids TEXT NOT NULL DEFAULT '[]',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   principal_id TEXT,
@@ -959,6 +975,32 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Telegram updates are acknowledged to Telegram only after they have landed in
+-- this durable inbox.  Processing and reply state live here so an app restart
+-- cannot invoke the model a second time for the same update.
+CREATE TABLE IF NOT EXISTS telegram_inbound_updates (
+  update_id INTEGER PRIMARY KEY,
+  message_id TEXT NOT NULL DEFAULT '',
+  chat_id TEXT NOT NULL DEFAULT '',
+  from_id TEXT NOT NULL DEFAULT '',
+  chat_type TEXT NOT NULL DEFAULT '',
+  text TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  claim_token TEXT,
+  claimed_at TEXT,
+  model_started_at TEXT,
+  run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  response_text TEXT NOT NULL DEFAULT '',
+  response_started_at TEXT,
+  response_sent_at TEXT,
+  external_delivery_id TEXT NOT NULL DEFAULT '',
+  error_code TEXT,
+  error_message TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  received_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS automation_definitions (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL CHECK(kind IN ('schedule', 'webhook')),
@@ -1222,6 +1264,7 @@ CREATE INDEX IF NOT EXISTS idx_channel_identities_principal ON channel_identitie
 CREATE INDEX IF NOT EXISTS idx_conversation_entry_links_conversation ON conversation_entry_links(conversation_id, channel);
 CREATE INDEX IF NOT EXISTS idx_task_entry_links_task ON task_entry_links(product_task_id, principal_id);
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_target ON notification_deliveries(conversation_id, product_task_id, status);
+CREATE INDEX IF NOT EXISTS idx_telegram_inbound_updates_status ON telegram_inbound_updates(status, update_id);
 CREATE INDEX IF NOT EXISTS idx_automation_definitions_kind ON automation_definitions(kind, enabled, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_automation_definitions_enabled ON automation_definitions(enabled, deleted_at, next_fire_at);
 CREATE INDEX IF NOT EXISTS idx_automation_definitions_slug ON automation_definitions(slug);

@@ -1,0 +1,12 @@
+{
+  "name": "@joi/cli",
+  "private": true,
+  "version": "0.1.1",
+  "type": "module",
+  "bin": {
+    "joi": "bin/joi"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types scripts/test-cli.mjs"
+  }
+}

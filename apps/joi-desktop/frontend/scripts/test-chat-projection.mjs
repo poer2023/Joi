@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -14,23 +14,44 @@ const esbuildBin = [
 ].find((candidate) => existsSync(candidate)) || 'node_modules/.bin/esbuild';
 
 try {
-  const entry = join(outDir, 'entry.ts');
-  const bundle = join(outDir, 'bundle.mjs');
+  const entry = join(outDir, 'entry.tsx');
+  const bundle = join(outDir, 'bundle.cjs');
   writeFileSync(entry, `
     export { normalizeRunEvent, normalizeRunEvents, normalizeStatus } from '${root}/src/features/chat/runEventNormalizer.ts';
     export { getEventVisibility } from '${root}/src/features/chat/eventVisibility.ts';
     export { buildConversationRenderItems } from '${root}/src/features/chat/conversationProjector.ts';
+    export { messagesForConversationHydration, shouldRestoreThreadMessages } from '${root}/src/features/chat/conversationHydration.ts';
+    import React from '${root}/node_modules/react/index.js';
+    import { renderToStaticMarkup } from '${root}/node_modules/react-dom/server.node.js';
+    import { MarkdownContent } from '${root}/src/features/chat/components/MarkdownContent.tsx';
+    import { MessageList } from '${root}/src/features/chat/components/MessageList.tsx';
+    export function renderMessageList(items) {
+      return renderToStaticMarkup(React.createElement(MessageList, { items, onResolveApproval: () => {} }));
+    }
+    export function renderMarkdownContent(content) {
+      return renderToStaticMarkup(React.createElement(MarkdownContent, { content }));
+    }
   `);
   execFileSync(esbuildBin, [
     entry,
     '--bundle',
-    '--format=esm',
+    '--format=cjs',
     '--platform=node',
     '--target=es2020',
     '--outfile=' + bundle,
   ], { cwd: root, stdio: 'inherit' });
 
-  const { normalizeRunEvent, normalizeRunEvents, normalizeStatus, getEventVisibility, buildConversationRenderItems } = await import(pathToFileURL(bundle).href);
+  const {
+    normalizeRunEvent,
+    normalizeRunEvents,
+    normalizeStatus,
+    getEventVisibility,
+    buildConversationRenderItems,
+    messagesForConversationHydration,
+    shouldRestoreThreadMessages,
+    renderMarkdownContent,
+    renderMessageList,
+  } = await import(pathToFileURL(bundle).href);
 
   const event = (event_type, payload = {}, extra = {}) => normalizeRunEvent({
     id: `${event_type}-${payload.seq || payload.call_id || payload.item_id || payload.task_id || Math.random()}`,
@@ -48,11 +69,37 @@ try {
     metadata: { run_id: 'run_1' },
   };
 
+  {
+    const settled = [{ id: 'persisted-final', content: 'final answer' }];
+    const restored = [{ id: 'old-thread-delta', content: 'partial answer' }];
+    assert.deepEqual(messagesForConversationHydration(settled, restored), settled);
+    assert.deepEqual(messagesForConversationHydration([], restored), restored);
+    assert.equal(shouldRestoreThreadMessages(settled.length, 3), false);
+    assert.equal(shouldRestoreThreadMessages(0, 3), true);
+  }
+
   assert.equal(normalizeStatus('succeeded'), 'completed');
   assert.equal(normalizeStatus('waiting_confirmation'), 'waiting_approval');
   assert.equal(normalizeStatus('delivered'), 'completed');
   assert.equal(normalizeStatus('suppressed'), 'skipped');
   assert.equal(normalizeStatus('rejected'), 'failed');
+
+  {
+    const shortMarkup = renderMarkdownContent('```ts\nconst ok = true;\n```');
+    assert.match(shortMarkup, /markdown-code-block-inline/);
+    assert.doesNotMatch(shortMarkup, /markdown-code-disclosure/);
+
+    const longCode = Array.from({ length: 20 }, (_, index) => `  const line${index + 1} = ${index + 1};`).join('\n');
+    const longMarkup = renderMarkdownContent(`\`\`\`ts\n${longCode}\n\`\`\``);
+    assert.match(longMarkup, /<details class="markdown-code-disclosure">/);
+    assert.match(longMarkup, /ts · 20 行/);
+    assert.match(longMarkup, /const line20 = 20;/);
+    assert.doesNotMatch(longMarkup, /markdown-code-disclosure" open/);
+
+    const styles = readFileSync(join(root, 'src', 'styles.css'), 'utf8');
+    assert.match(styles, /\.markdown-content pre[\s\S]*?max-height: none;[\s\S]*?overflow: visible;/);
+    assert.match(styles, /\.markdown-table-wrap[\s\S]*?overflow: visible;/);
+  }
 
   {
     const normalized = normalizeRunEvent({
@@ -73,9 +120,83 @@ try {
   assert.equal(getEventVisibility(event('tool.call.started', { tool_name: 'workspace_search_v1', status: 'running' }), 'auto'), 'transcript');
   assert.equal(getEventVisibility(event('tool.call.started', { tool_name: 'workspace_search_v1', status: 'running' }), 'chat_assist'), 'transcript');
   assert.equal(getEventVisibility(event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'trace_only', status: 'running', step: 0 }), 'auto'), 'trace_only');
+  assert.equal(getEventVisibility(event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'transcript', status: 'running', step: 0 }), 'auto'), 'transcript');
   assert.equal(getEventVisibility(event('worker.started', { task_id: 'task_1', status: 'running' }), 'background_task'), 'trace_only');
   assert.equal(getEventVisibility(event('run.completed', { status: 'succeeded' }), 'auto'), 'hidden');
-  assert.equal(getEventVisibility(event('automation.run_started', { status: 'running', summary: '自动化开始执行' }, { item_type: 'automation', visibility: 'inline_status' }), 'background_task'), 'transcript');
+  assert.equal(getEventVisibility(event('automation.run_started', { status: 'running', summary: '自动化开始执行' }, { item_type: 'automation', visibility: 'inline_status' }), 'background_task'), 'trace_only');
+
+  {
+    const legacyAutomationCompletion = event('automation.run_completed', {
+      status: 'running',
+      summary: 'Legacy completion with contradictory status',
+    }, {
+      item_type: 'automation',
+      visibility: 'inline_status',
+    });
+    assert.equal(legacyAutomationCompletion.status, 'completed');
+    assert.equal(getEventVisibility(legacyAutomationCompletion, 'background_task'), 'trace_only');
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [{
+        id: 'msg_generated_image',
+        conversation_id: 'conv_1',
+        role: 'assistant',
+        content: '图片已生成。',
+        attachments: [{
+          id: 'attachment_generated_image',
+          name: 'joi-grok-image.jpg',
+          kind: 'image',
+          mime_type: 'image/jpeg',
+          size: 2048,
+          preview_url: 'file:///tmp/joi-grok-image.jpg',
+        }],
+        metadata: { run_id: 'run_generated_image' },
+      }],
+      runEventsByRunId: {},
+      mode: 'auto',
+    });
+    const generated = result.items.find((item) => item.type === 'message');
+    assert.equal(generated.attachments[0].kind, 'image');
+    assert.equal(generated.attachments[0].previewUrl, 'file:///tmp/joi-grok-image.jpg');
+    assert.equal(generated.attachments[0].mimeType, 'image/jpeg');
+
+    const withProcess = buildConversationRenderItems({
+      messages: result.items.filter((item) => item.type === 'message').map((item) => ({
+        id: item.id,
+        conversation_id: item.conversationId,
+        role: item.role,
+        content: item.content,
+        attachments: [{
+          id: 'attachment_generated_image',
+          name: 'joi-grok-image.jpg',
+          kind: 'image',
+          mime_type: 'image/jpeg',
+          size: 2048,
+          preview_url: 'file:///tmp/joi-grok-image.jpg',
+        }],
+        metadata: { run_id: 'run_generated_image' },
+      })),
+      runEventsByRunId: {
+        run_generated_image: [event('tool.completed', {
+          call_id: 'call_image_generate',
+          tool_name: 'image_generate',
+          status: 'completed',
+          seq: 1,
+        }, {
+          run_id: 'run_generated_image',
+          item_type: 'tool_run',
+          item_id: 'call_image_generate',
+          visibility: 'tool',
+        })],
+      },
+      mode: 'auto',
+    });
+    const markup = renderMessageList(withProcess.items);
+    assert.match(markup, /message-attachment-expanded-image/);
+    assert.match(markup, /src="file:\/\/\/tmp\/joi-grok-image\.jpg"/);
+  }
 
   {
     const expanded = normalizeRunEvents([
@@ -122,6 +243,45 @@ try {
     assert.equal(projectedAssistant.content, 'hello world');
     assert.equal(projectedAssistant.streaming, false);
     assert.equal(result.activeRunStatusByRunId.run_stream, 'completed');
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [{
+        id: 'msg_failed_assistant',
+        conversation_id: 'conv_1',
+        role: 'assistant',
+        content: '运行失败：FOREIGN KEY constraint failed',
+        metadata: { run_id: 'run_failed' },
+      }],
+      runEventsByRunId: {
+        run_failed: [
+          event('tool.completed', { call_id: 'call_failed_search', tool_name: 'web_search', status: 'completed', seq: 1 }, {
+            run_id: 'run_failed',
+            item_type: 'tool_run',
+            item_id: 'call_failed_search',
+            visibility: 'tool',
+          }),
+          event('assistant.completed', { text: 'A provider answer that did not persist.', status: 'completed', seq: 2 }, {
+            run_id: 'run_failed',
+            item_type: 'assistant_message',
+            item_id: 'msg_failed_assistant',
+            visibility: 'chat',
+          }),
+          event('run.failed', { status: 'failed', error: 'FOREIGN KEY constraint failed', seq: 3 }, {
+            run_id: 'run_failed',
+            item_type: 'run',
+            item_id: 'run_failed',
+            visibility: 'trace_only',
+          }),
+        ],
+      },
+      mode: 'auto',
+    });
+    assert.deepEqual(result.items.map((item) => item.type), ['transcript_line', 'transcript_line', 'message']);
+    assert.equal(result.items[1].kind, 'run');
+    assert.equal(result.items[1].status, 'failed');
+    assert.equal(result.activeRunStatusByRunId.run_failed, 'failed');
   }
 
   {
@@ -197,6 +357,19 @@ try {
   {
     const result = buildConversationRenderItems({
       messages: [],
+      pendingUserMessage: { id: 'msg_pending_user', conversation_id: 'conv_1', role: 'user', content: '刚发出的消息' },
+      runEventsByRunId: {},
+      mode: 'auto',
+    });
+    assert.equal(result.items.length, 1);
+    assert.equal(result.items[0].type, 'message');
+    assert.equal(result.items[0].role, 'user');
+    assert.equal(result.items[0].streaming, false);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [],
       activeRunId: 'run_auto',
       runEventsByRunId: {
         run_auto: [
@@ -206,11 +379,26 @@ try {
       },
       mode: 'background_task',
     });
+    assert.equal(result.items.length, 0);
+    assert.equal(result.activeRunStatusByRunId.run_auto, 'completed');
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [],
+      activeRunId: 'run_auto_failed',
+      runEventsByRunId: {
+        run_auto_failed: [
+          event('automation.run_started', { status: 'running', summary: 'Daily report', seq: 1 }, { run_id: 'run_auto_failed', item_type: 'automation', item_id: 'automation_1', visibility: 'inline_status' }),
+          event('automation.run_failed', { status: 'failed', summary: 'Delivery failed', seq: 2 }, { run_id: 'run_auto_failed', item_type: 'automation', item_id: 'automation_1', visibility: 'inline_status' }),
+        ],
+      },
+      mode: 'background_task',
+    });
     assert.equal(result.items.length, 1);
     assert.equal(result.items[0].type, 'transcript_line');
-    assert.equal(result.items[0].label, '自动化更新 · Daily report done');
-    assert.equal(result.items[0].detail, 'Daily report done');
-    assert.equal(result.activeRunStatusByRunId.run_auto, 'completed');
+    assert.equal(result.items[0].status, 'failed');
+    assert.equal(result.items[0].label, '自动化失败 · Delivery failed');
   }
 
   {
@@ -240,7 +428,7 @@ try {
       mode: 'auto',
     });
     assert.equal(result.items.some((item) => item.type === 'message' && item.content === 'leaked answer'), false);
-    assert.equal(result.items.some((item) => item.type === 'transcript_line' && item.label === '读取网页 · current.example'), true);
+    assert.equal(result.items.some((item) => item.type === 'transcript_line' && item.label === '网页搜索'), true);
     assert.deepEqual(result.items.map((item) => item.type), ['transcript_line', 'message']);
   }
 
@@ -356,7 +544,7 @@ try {
       mode: 'auto',
     });
     assert.equal(result.items[0].type, 'transcript_line');
-    assert.equal(result.items[0].label, '读取网页 · example.com');
+    assert.equal(result.items[0].label, '网页搜索');
     assert.equal(result.items[0].detail, undefined);
     assert.equal(result.items[1].type, 'message');
     assert.equal(result.activeRunStatusByRunId.run_1, 'completed');
@@ -391,7 +579,7 @@ try {
     });
     const transcriptLines = result.items.filter((item) => item.type === 'transcript_line');
     assert.deepEqual(transcriptLines.map((item) => item.kind), ['tool']);
-    assert.deepEqual(transcriptLines.map((item) => item.label), ['读取网页 · example.com']);
+    assert.deepEqual(transcriptLines.map((item) => item.label), ['网页搜索']);
     assert.equal(JSON.stringify(result.items).includes('hidden reasoning must not render'), false);
     assert.deepEqual(result.items.map((item) => item.type), ['transcript_line', 'message']);
   }
@@ -399,6 +587,181 @@ try {
   {
     const result = buildConversationRenderItems({
       messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'transcript', status: 'running', model: 'grok-4.3', step: 0, seq: 1 }),
+          event('model.delta', {
+            item_type: 'model_call',
+            item_id: 'model_1',
+            visibility: 'trace_only',
+            status: 'running',
+            step: 0,
+            delta: { choices: [{ delta: { reasoning_content: 'hidden reasoning must not render', content: 'partial answer' } }] },
+            seq: 2,
+          }),
+          event('model.completed', { item_type: 'model_call', item_id: 'model_1', visibility: 'transcript', status: 'completed', step: 0, seq: 3 }),
+          event('assistant.completed', { status: 'completed', seq: 4 }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const transcriptLines = result.items.filter((item) => item.type === 'transcript_line');
+    assert.deepEqual(transcriptLines.map((item) => item.kind), []);
+    assert.equal(JSON.stringify(result.items).includes('hidden reasoning must not render'), false);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'transcript', status: 'running', model: 'grok-4.3', step: 0, seq: 1 }),
+          event('model.completed', { item_type: 'model_call', item_id: 'model_1', visibility: 'transcript', status: 'completed', step: 0, finish_reason: 'tool_calls', seq: 2 }),
+          event('tool.call_requested', { item_type: 'tool_run', item_id: 'call_1', call_id: 'call_1', tool_name: 'web_research_v2', visibility: 'tool', status: 'requested', seq: 3 }),
+          event('tool.completed', { item_type: 'tool_run', item_id: 'call_1', call_id: 'call_1', tool_name: 'web_research_v2', visibility: 'tool', status: 'completed', seq: 4 }),
+          event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'transcript', status: 'running', model: 'grok-4.3', step: 1, seq: 5 }),
+          event('model.completed', { item_type: 'model_call', item_id: 'model_1', visibility: 'transcript', status: 'completed', step: 1, finish_reason: 'stop', seq: 6 }),
+          event('assistant.completed', { status: 'completed', seq: 7 }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const transcriptLines = result.items.filter((item) => item.type === 'transcript_line');
+    assert.deepEqual(transcriptLines.map((item) => item.kind), ['tool']);
+    assert.deepEqual(transcriptLines.map((item) => item.label), ['网页搜索']);
+    assert.deepEqual(result.items.map((item) => item.type), ['transcript_line', 'message']);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'transcript', status: 'running', model: 'grok-4.3', step: 0, seq: 1 }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const transcriptLines = result.items.filter((item) => item.type === 'transcript_line');
+    assert.deepEqual(transcriptLines.map((item) => item.kind), []);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [],
+      streamingAssistant: { ...message, complete: false },
+      activeRunId: 'run_1',
+      runEventsByRunId: {
+        run_1: [
+          event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'transcript', status: 'running', model: 'grok-4.3', step: 0, seq: 1 }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const transcriptLines = result.items.filter((item) => item.type === 'transcript_line');
+    assert.deepEqual(transcriptLines.map((item) => item.kind), ['thinking']);
+    assert.deepEqual(transcriptLines.map((item) => item.label), ['Thinking']);
+    assert.deepEqual(transcriptLines.map((item) => item.detail), [undefined]);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('tool.call_requested', {
+            item_type: 'tool_run',
+            item_id: 'call_weather',
+            call_id: 'call_weather',
+            tool_name: 'web_research',
+            input: { url: 'https://wttr.in/Shanghai?format=3', api_key: 'secret-value' },
+            visibility: 'tool',
+            status: 'requested',
+            seq: 1,
+          }),
+          event('tool.completed', {
+            item_type: 'tool_run',
+            item_id: 'call_weather',
+            call_id: 'call_weather',
+            tool_name: 'web_research',
+            snapshot: { status: 'completed', url: 'https://wttr.in/Shanghai?format=3', summary: 'Shanghai: rain' },
+            visibility: 'tool',
+            status: 'completed',
+            seq: 2,
+          }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const transcriptLines = result.items.filter((item) => item.type === 'transcript_line');
+    assert.equal(transcriptLines.length, 1);
+    assert.equal(transcriptLines[0].kind, 'tool');
+    assert.equal(transcriptLines[0].label, '网页搜索');
+    assert.equal(transcriptLines[0].detail, undefined);
+    assert.deepEqual(transcriptLines[0].detailRows.map((row) => row.label), ['Input', 'Output']);
+    assert.ok(transcriptLines[0].detailRows.some((row) => row.label === 'Input' && row.value.includes('https://wttr.in/Shanghai?format=3')));
+    assert.ok(transcriptLines[0].detailRows.some((row) => row.label === 'Output' && row.value.includes('Shanghai: rain')));
+    assert.equal(JSON.stringify(transcriptLines[0].detailRows).includes('secret-value'), false);
+    assert.equal(JSON.stringify(transcriptLines[0].detailRows).includes('call_weather'), false);
+    const completedMarkup = renderMessageList(result.items);
+    assert.match(completedMarkup, /<details class="process-stack process-stack-completed">/);
+    assert.doesNotMatch(completedMarkup, /process-stack process-stack-completed" open/);
+    assert.match(completedMarkup, /<div class="message-bubble-frame">[\s\S]*?完成了/);
+  }
+
+  {
+    const toolEvents = [];
+    for (let index = 0; index < 6; index += 1) {
+      toolEvents.push(event('tool.completed', {
+        item_type: 'tool_run',
+        item_id: `search_${index}`,
+        call_id: `search_${index}`,
+        tool_name: 'mcp.joi_web.web_search',
+        input: { server: 'joi_web', tool: 'web_search', arguments: { query: `pi query ${index + 1}` } },
+        snapshot: { status: 'completed' },
+        visibility: 'tool',
+        status: 'completed',
+        seq: index + 1,
+      }));
+    }
+    for (let index = 0; index < 8; index += 1) {
+      toolEvents.push(event(index === 7 ? 'tool.failed' : 'tool.completed', {
+        item_type: 'tool_run',
+        item_id: `extract_${index}`,
+        call_id: `extract_${index}`,
+        tool_name: 'mcp.joi_web.web_extract',
+        input: { server: 'joi_web', tool: 'web_extract', arguments: { url: `https://example.com/${index + 1}` } },
+        snapshot: { status: index === 7 ? 'failed' : 'completed' },
+        visibility: 'tool',
+        status: index === 7 ? 'failed' : 'completed',
+        seq: index + 7,
+      }));
+    }
+    const result = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: { run_1: toolEvents },
+      mode: 'auto',
+    });
+    const transcriptLines = result.items.filter((item) => item.type === 'transcript_line');
+    assert.equal(transcriptLines.length, 14);
+    assert.deepEqual(transcriptLines.slice(0, 6).map((item) => item.label), Array(6).fill('网页搜索'));
+    assert.deepEqual(transcriptLines.slice(6).map((item) => item.label), Array(8).fill('读取网页'));
+
+    const markup = renderMessageList(result.items);
+    assert.match(markup, /process-tool-cluster-title">网页搜索<\/span><span class="process-tool-cluster-count">× 6/);
+    assert.match(markup, /process-tool-cluster-title">读取网页<\/span><span class="process-tool-cluster-count">× 8/);
+    assert.match(markup, /1 · pi query 1/);
+    assert.match(markup, /1 · https:\/\/example\.com\/1/);
+    assert.match(markup, /<details class="process-stack process-stack-failed">/);
+    assert.doesNotMatch(markup, /process-stack process-stack-failed" open/);
+    assert.doesNotMatch(markup, /process-tool-cluster process-tool-cluster-[^"]+" open/);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [],
+      streamingAssistant: { ...message, complete: false },
+      activeRunId: 'run_1',
       runEventsByRunId: {
         run_1: [
           event('work_summary.updated', { item_type: 'work_summary', item_id: 'summary_1', summary: '先检查现有实现', status: 'running', step: 0, seq: 1 }),
@@ -429,6 +792,10 @@ try {
     assert.equal(transcriptLines.length, 2);
     assert.deepEqual(transcriptLines.map((item) => item.kind), ['tool', 'tool']);
     assert.equal(result.items.some((item) => item.type === 'compact_run_card'), false);
+    const runningMarkup = renderMessageList(result.items);
+    assert.match(runningMarkup, /<details class="process-stack process-stack-running">/);
+    assert.doesNotMatch(runningMarkup, /process-stack process-stack-running" open/);
+    assert.match(runningMarkup, /<div class="message-bubble-frame">[\s\S]*?完成了/);
   }
 
   {
@@ -589,6 +956,11 @@ try {
     assert.equal(approvalLine.approval.id, 'confirm_1');
     assert.equal(approvalLine.approval.requestedAction, '写入文件');
     assert.equal(result.activeRunStatusByRunId.run_confirm, 'waiting_approval');
+    const waitingMarkup = renderMessageList(result.items);
+    assert.match(waitingMarkup, /<details class="process-stack process-stack-waiting_approval">/);
+    assert.doesNotMatch(waitingMarkup, /process-stack process-stack-waiting_approval" open/);
+    assert.match(waitingMarkup, />等待确认</);
+    assert.match(waitingMarkup, />允许一次</);
   }
 } finally {
   rmSync(outDir, { recursive: true, force: true });

@@ -85,6 +85,14 @@ export function isXAIOAuthProvider(provider: string | undefined): boolean {
   return ['xai_oauth', 'xai-oauth', 'xai'].includes((provider || '').trim().toLowerCase());
 }
 
+export function isGrokBuildProvider(provider: string | undefined): boolean {
+  return ['grok_build', 'grok-build'].includes((provider || '').trim().toLowerCase());
+}
+
+export function isXAIOAuthBackedProvider(provider: string | undefined): boolean {
+  return isXAIOAuthProvider(provider) || isGrokBuildProvider(provider);
+}
+
 export async function resolveXAIOAuthCredentials(
   resolveSecret: XAIOAuthSecretResolver,
   saveSecret?: XAIOAuthSecretSaver,

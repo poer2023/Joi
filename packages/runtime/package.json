@@ -4,12 +4,13 @@
   "version": "0.1.1",
   "type": "module",
   "scripts": {
-    "test": "node --experimental-strip-types scripts/test-model-runtime.mjs && node --experimental-strip-types scripts/test-xai-oauth-runtime.mjs && node --experimental-strip-types scripts/test-imessage-runtime.mjs && node --experimental-strip-types scripts/test-worker-gateway-runtime.mjs && node --experimental-strip-types scripts/test-capabilities-runtime.mjs && node --experimental-strip-types scripts/test-workspace-exec-runtime.mjs && node --experimental-strip-types scripts/test-browser-computer-runtime.mjs && node --experimental-strip-types scripts/test-desktop-apps-runtime.mjs && node --experimental-strip-types scripts/test-diagnostics-runtime.mjs && node --experimental-strip-types scripts/test-tool-calling-runtime.mjs && node --experimental-strip-types scripts/test-capability-compiler-runtime.mjs && node --experimental-strip-types scripts/test-automation-runner.mjs"
+    "test": "node --experimental-strip-types scripts/test-model-runtime.mjs && node --experimental-strip-types scripts/test-telegram-message-runtime.mjs && node --experimental-strip-types scripts/test-xai-oauth-runtime.mjs && node --experimental-strip-types scripts/test-grok-build-image-runtime.mjs && node --experimental-strip-types scripts/test-imessage-runtime.mjs && node --experimental-strip-types scripts/test-worker-gateway-runtime.mjs && node --experimental-strip-types scripts/test-capabilities-runtime.mjs && node --experimental-strip-types scripts/test-workspace-exec-runtime.mjs && node --experimental-strip-types scripts/test-browser-computer-runtime.mjs && node --experimental-strip-types scripts/test-desktop-apps-runtime.mjs && node --experimental-strip-types scripts/test-diagnostics-runtime.mjs && node --experimental-strip-types scripts/test-agent-kernel-runtime.mjs && node --experimental-strip-types scripts/test-tool-calling-runtime.mjs && node --experimental-strip-types scripts/test-acp-runtime.mjs && node --experimental-strip-types scripts/test-capability-compiler-runtime.mjs && node --experimental-strip-types scripts/test-automation-runner.mjs"
   },
   "exports": {
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "1.2.1",
     "cron-parser": "^5.6.0"
   }
 }

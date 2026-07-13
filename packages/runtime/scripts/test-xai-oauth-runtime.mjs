@@ -8,6 +8,8 @@ import {
   createXAIOAuthAuthorizationRequest,
   exchangeXAIOAuthCode,
   isXAIOAuthProvider,
+  isGrokBuildProvider,
+  isXAIOAuthBackedProvider,
   loginWithXAIOAuthLoopback,
   normalizeXAIOAuthManualCode,
   normalizeXAIOAuthState,
@@ -76,6 +78,9 @@ assert.equal(savedState.discovery.token_endpoint, 'https://auth.x.ai/oauth/token
 
 assert.equal(isXAIOAuthProvider('xai-oauth'), true);
 assert.equal(isXAIOAuthProvider('xai_oauth'), true);
+assert.equal(isGrokBuildProvider('grok_build'), true);
+assert.equal(isGrokBuildProvider('grok-build'), true);
+assert.equal(isXAIOAuthBackedProvider('grok_build'), true);
 assert.equal(isXAIOAuthProvider('openai_compatible'), false);
 assert.equal(xaiAccessTokenIsExpiring(expiredToken, 0), true);
 assert.equal(xaiAccessTokenIsExpiring(futureToken, 60), false);

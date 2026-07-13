@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Joi 当前产品理念与页面截图包</title>
+  <style>
+    :root {
+      color: #1d1d1f;
+      background: #f5f4f1;
+      font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+    }
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 32px 24px 56px;
+    }
+    h1, h2 {
+      line-height: 1.2;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 30px;
+    }
+    h2 {
+      margin: 32px 0 12px;
+      font-size: 20px;
+    }
+    p {
+      margin: 8px 0;
+    }
+    .meta,
+    .note {
+      color: #5f6368;
+    }
+    .note {
+      border-left: 3px solid #d8d2c6;
+      padding-left: 12px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 18px;
+      margin-top: 18px;
+    }
+    figure {
+      margin: 0;
+      background: #fff;
+      border: 1px solid #dfddd8;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    figure img {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #fff;
+    }
+    figcaption {
+      padding: 10px 12px;
+      font-size: 13px;
+      color: #4b4f56;
+      border-top: 1px solid #ebe9e4;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.92em;
+    }
+    ul {
+      padding-left: 20px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Joi 当前产品理念与页面截图包</h1>
+    <p class="meta">生成时间：2026-06-28 · 来源：<code>http://127.0.0.1:5173/?capture=20260628</code></p>
+    <p class="note">采集时 <code>127.0.0.1:18083</code> Electron/SQLite 桥未运行，所以截图展示的是当前前端 dev server 可见的预览数据与样式状态，不代表已连接真实 SQLite 数据或已安装 app 状态。</p>
+
+    <h2>核心理念</h2>
+    <p>Joi 是 local-first Personal Agent OS：自然聊天在前台，受控执行在后台，模型、工具、节点、记忆和交付物都要可追溯。</p>
+    <p>当前前台体验采用“伪装群聊”：用户看到私人总群，里面有真人用户和多个项目人格。群聊只是降低认知成本的 UI 隐喻，底层仍由 Orchestrator Core、tool-calling runtime、Capability policy、Memory OS 和 Run Trace 控制。</p>
+    <p>“项目作为 agent 人格”是核心表达：每个项目可拥有名称、头像、项目路径、自述、权限规则和模型策略。Agent 是岗位和职责边界，模型只是可替换的执行引擎。</p>
+    <p>主聊天保持自然消息瀑布流；右侧 inspector 承接运行、线程、资产、记忆和成员/项目详情；设置中心作为高级管理入口。</p>
+
+    <h2>截图</h2>
+    <div class="grid">
+      <figure><img src="screenshots/01-chat-private-hub-main.png" alt=""><figcaption>01 私人总群主聊天，右侧 inspector 折叠</figcaption></figure>
+      <figure><img src="screenshots/02-chat-private-hub-overview.png" alt=""><figcaption>02 私人总群 + 右侧概览</figcaption></figure>
+      <figure><img src="screenshots/03-inspector-runs.png" alt=""><figcaption>03 运行 tab</figcaption></figure>
+      <figure><img src="screenshots/04-inspector-threads-list.png" alt=""><figcaption>04 线程列表</figcaption></figure>
+      <figure><img src="screenshots/05-inspector-thread-detail.png" alt=""><figcaption>05 线程详情</figcaption></figure>
+      <figure><img src="screenshots/06-inspector-assets.png" alt=""><figcaption>06 当前对话资产</figcaption></figure>
+      <figure><img src="screenshots/07-inspector-memory.png" alt=""><figcaption>07 记忆 tab</figcaption></figure>
+      <figure><img src="screenshots/08-inspector-member-detail-joi.png" alt=""><figcaption>08 成员详情：Joi 项目人格</figcaption></figure>
+      <figure><img src="screenshots/09-project-dm-joi-overview.png" alt=""><figcaption>09 项目私聊概览</figcaption></figure>
+      <figure><img src="screenshots/10-settings-models.png" alt=""><figcaption>10 设置：模型</figcaption></figure>
+      <figure><img src="screenshots/11-settings-chat-entrances.png" alt=""><figcaption>11 设置：聊天入口</figcaption></figure>
+      <figure><img src="screenshots/12-settings-automations.png" alt=""><figcaption>12 设置：自动化</figcaption></figure>
+      <figure><img src="screenshots/13-settings-observability.png" alt=""><figcaption>13 设置：日志与用量</figcaption></figure>
+      <figure><img src="screenshots/14-settings-data-memory.png" alt=""><figcaption>14 设置：数据与记忆</figcaption></figure>
+      <figure><img src="screenshots/15-settings-capabilities.png" alt=""><figcaption>15 设置：能力与工具</figcaption></figure>
+      <figure><img src="screenshots/16-settings-nodes-execution.png" alt=""><figcaption>16 设置：节点与执行</figcaption></figure>
+      <figure><img src="screenshots/17-settings-privacy-security.png" alt=""><figcaption>17 设置：隐私与安全</figcaption></figure>
+      <figure><img src="screenshots/18-settings-advanced.png" alt=""><figcaption>18 设置：高级</figcaption></figure>
+      <figure><img src="screenshots/19-modal-new-project-persona.png" alt=""><figcaption>19 新建项目人格弹窗</figcaption></figure>
+      <figure><img src="screenshots/20-responsive-narrow-chat.png" alt=""><figcaption>20 窄屏聊天状态</figcaption></figure>
+    </div>
+
+    <h2>未覆盖</h2>
+    <ul>
+      <li>未截图已安装 <code>/Applications/Joi.app</code>。</li>
+      <li>未连接 <code>127.0.0.1:18083</code>，没有验证真实 SQLite 数据。</li>
+      <li>未点击会产生写入、副作用或外部发送的操作。</li>
+    </ul>
+  </main>
+</body>
+</html>

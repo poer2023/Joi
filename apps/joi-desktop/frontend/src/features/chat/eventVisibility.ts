@@ -23,6 +23,14 @@ export function getEventVisibility(event: NormalizedRunEvent, mode: ChatInputMod
     return 'hidden';
   }
 
+  if (type === 'run.failed' || type === 'run.cancelled' || type === 'run.interrupted' || type === 'turn.aborted') {
+    return 'transcript';
+  }
+
+  if (itemType === 'automation' || type.startsWith('automation.')) {
+    return event.status === 'failed' || event.status === 'cancelled' ? 'transcript' : 'trace_only';
+  }
+
   if (declared === 'trace_only' || declared === 'chat') {
     return declared;
   }

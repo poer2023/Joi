@@ -29,6 +29,8 @@
 }
 ```
 
+`allowed_capabilities` 是 runtime 的硬约束，不是 Prompt 提示。模型只会收到 allowlist 与当前 permission profile 的交集；未接入的 planned capability 和兼容 alias 只保留在能力清单中，默认不暴露给模型。
+
 ## 2. Router 输入
 
 ```json
@@ -60,11 +62,11 @@
 
 ## 4. 路由层级
 
-1. 显式路由：`@devops`、`@research`。
-2. 规则路由：关键词。
-3. 会话粘性：连续追问沿用 active_agent。
-4. 小模型分类：只输出 JSON。
-5. 低置信度澄清。
+1. 房间路由：项目人格房间绑定的 executor 优先。
+2. 显式路由：`@devops_agent`、`@research_agent` 或 Agent 名称。
+3. 规则路由：读取 Agent Card 的 `route_hints.keywords`。
+4. 会话粘性：无显式或规则命中时沿用 active_agent。
+5. 低置信度回退到 `general_agent`；后续可接结构化分类器，但分类器不得生成最终回复。
 
 ## 5. 规则示例
 

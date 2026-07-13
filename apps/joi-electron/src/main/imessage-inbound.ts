@@ -5,11 +5,12 @@ import { createHash, randomBytes } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
-import type { ChatRequest, ChatResponse, ConnectionTest, PhotonIMessageStatus, SettingsRecord } from '../../../../packages/shared-types/src/desktop-api';
+import type { ChatRequest, ChatResponse, ConnectionTest, PhotonIMessageStatus, RunEvent, SettingsRecord } from '../../../../packages/shared-types/src/desktop-api';
 import type { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
 import type { AppLogInput, JoiSQLiteStore } from '../../../../packages/store/src/sqlite';
 import { PHOTON_PROJECT_SECRET_SECRET, testPhotonIMessageConnection } from '../../../../packages/runtime/src/imessage';
-import { canRunRealToolCalling, emitRunEvents, resolveAPIKeyForModelEndpoint, runLiveElectronToolCallingChat } from './ipc';
+import { canRunRealToolCalling, emitRunEvent, emitRunEvents, resolveAPIKeyForModelEndpoint, runLiveElectronToolCallingChat } from './ipc';
+import { resolveIMessageOutboundAttachments, type IMessageOutboundAttachment } from './imessage-outbound';
 
 type IMessageInboundOptions = {
   store: JoiSQLiteStore;
@@ -638,13 +639,60 @@ export class IMessageInboundService {
         await this.sidecarSend(spaceID, 'Joi iMessage received the message, but the model is not configured. Configure the model in Joi Desktop first.');
         return;
       }
-      const result = await runLiveElectronToolCallingChat(req, settings, apiKey, this.store, this.activeRuns, (runID) => {
+      const result = await runLiveElectronToolCallingChat(req, settings, this.secrets, this.store, this.activeRuns, (runID, event?: RunEvent) => {
         const window = this.getWindow();
-        if (window && !window.isDestroyed()) emitRunEvents(window, this.store.getRunTrace(runID));
+        if (window && !window.isDestroyed()) {
+          if (event) emitRunEvent(window, event);
+          else emitRunEvents(window, this.store.getRunTrace(runID));
+        }
       });
       const window = this.getWindow();
       if (window && !window.isDestroyed()) emitRunEvents(window, this.store.getRunTrace(result.run_id));
       await this.sidecarSend(spaceID, imessageReply(result));
+      const outboundAttachments = resolveIMessageOutboundAttachments(
+        result,
+        join(this.appDirs.userDataDir, 'generated-images'),
+      );
+      let attachmentsSent = 0;
+      let attachmentsFailed = 0;
+      for (const attachment of outboundAttachments) {
+        try {
+          await this.sidecarSendAttachment(spaceID, attachment);
+          attachmentsSent += 1;
+          this.log({
+            level: 'info',
+            risk_level: 'state_change',
+            category: 'external',
+            feature_key: 'imessage.attachment.sent',
+            source: 'imessage_inbound',
+            message: 'iMessage attachment sent',
+            run_id: result.run_id,
+            conversation_id: result.conversation_id,
+            item_type: 'artifact',
+            item_id: attachment.artifact_id,
+            payload: { name: attachment.name, mime_type: attachment.mime_type, size: attachment.size },
+          });
+        } catch (error) {
+          attachmentsFailed += 1;
+          this.log({
+            level: 'error',
+            risk_level: 'state_change',
+            category: 'external',
+            feature_key: 'imessage.attachment.failed',
+            source: 'imessage_inbound',
+            message: 'iMessage attachment failed',
+            run_id: result.run_id,
+            conversation_id: result.conversation_id,
+            item_type: 'artifact',
+            item_id: attachment.artifact_id,
+            payload: { name: attachment.name, mime_type: attachment.mime_type, size: attachment.size },
+            error,
+          });
+        }
+      }
+      if (attachmentsFailed > 0) {
+        await this.sidecarSend(spaceID, `图片已生成，但有 ${attachmentsFailed} 个附件回传失败。请在 Joi Desktop 查看产物。`).catch(() => undefined);
+      }
       this.log({
         level: 'info',
         risk_level: 'state_change',
@@ -656,7 +704,12 @@ export class IMessageInboundService {
         conversation_id: result.conversation_id,
         item_type: 'imessage_space',
         item_id: spaceID,
-        payload: { response_length: result.response.length },
+        payload: {
+          response_length: result.response.length,
+          attachment_count: outboundAttachments.length,
+          attachments_sent: attachmentsSent,
+          attachments_failed: attachmentsFailed,
+        },
       });
     } catch (error) {
       this.logger.error('imessage inbound run failed', error);
@@ -708,6 +761,16 @@ export class IMessageInboundService {
       text: compactText(text, 7600),
       format: process.env.PHOTON_MARKDOWN === 'false' ? 'text' : 'markdown',
     });
+  }
+
+  private async sidecarSendAttachment(spaceID: string, attachment: IMessageOutboundAttachment): Promise<void> {
+    await this.sidecarCall('/send-attachment', {
+      spaceId: spaceID,
+      path: attachment.path,
+      name: attachment.name,
+      mimeType: attachment.mime_type,
+      kind: 'attachment',
+    }, { timeoutMs: 60000 });
   }
 
   private async sidecarCall(path: string, body: Record<string, unknown>, options: { timeoutMs?: number } = {}): Promise<SidecarResponse> {

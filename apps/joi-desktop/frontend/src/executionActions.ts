@@ -111,6 +111,14 @@ const toolStepTypes = new Set([
   'node_selected',
   'approval_requested',
   'tool_started',
+  'tool_call_started',
+  'tool_call_delta',
+  'tool_call_completed',
+  'tool_call_failed',
+  'tool_execution_start',
+  'tool_execution_update',
+  'tool_execution_end',
+  'tool_execution_error',
   'tool_step_started',
   'tool_step_completed',
   'mcp_tool_call_started',
@@ -418,8 +426,8 @@ function projectToolSteps(runID: string, steps: RunStep[]): ExecutionAction {
   const title = titleForCapability(capability, toolName);
   const kind = kindForCapability(capability, toolName, title);
   const status = statusForSteps(steps);
-  const statusDetail = descriptionForToolAction(title, status);
   const resultOutput = sanitizeForDisplay(finished?.output ?? lastOutput(steps));
+  const statusDetail = descriptionForToolAction(title, status, resultOutput);
   const source = extractSource(steps);
   const sourceLabel = extractSourceLabel(source);
   const command = extractCommand(steps);
@@ -470,16 +478,29 @@ function projectEvidenceSteps(runID: string, steps: RunStep[]): ExecutionAction 
   });
 }
 
-function descriptionForToolAction(title: string, status: ExecutionActionStatus) {
+function descriptionForToolAction(title: string, status: ExecutionActionStatus, output?: unknown) {
   if (status === 'waiting_approval') {
     if (title === '写入文件') return '等待你的确认，批准前不会写入';
     if (title === '点击浏览器' || title === '输入浏览器') return '等待你的确认，批准前不会操作页面';
     return '等待你的确认，批准前不会执行';
   }
   if (status === 'running' || status === 'queued') {
+    if (title === '网页搜索') return '正在搜索网页...';
     if (title === '读取网页') return '正在读取网页...';
+    if (title === '搜索 X') return '正在搜索 X...';
     if (title === '搜索工作区') return '正在搜索工作区...';
     if (title === '读取文件') return '正在读取文件...';
+    if (title === '查询代码索引') return '正在查询代码索引...';
+    if (title === '调试程序') return '正在调试程序...';
+    if (title === '执行代码') return '正在执行代码...';
+    if (title === '执行沙箱') return '正在执行沙箱...';
+    if (title === '派发子任务') return '正在派发子任务...';
+    if (title === '调用 MCP 工具') return '正在调用 MCP 工具...';
+    if (title === '分析图片') return '正在分析图片...';
+    if (title === '生成图片') return '正在生成图片...';
+    if (title === '生成视频') return '正在生成视频...';
+    if (title === '分析视频') return '正在分析视频...';
+    if (title === '生成语音') return '正在生成语音...';
     if (title === '列出本机 App') return '正在列出本机 App...';
     if (title === '检查本机 App') return '正在检查本机 App...';
     if (title === '导航浏览器') return '正在导航浏览器...';
@@ -491,10 +512,26 @@ function descriptionForToolAction(title: string, status: ExecutionActionStatus) 
     return '正在执行...';
   }
   if (status === 'failed') return '执行失败，展开可查看原因';
-  if (status === 'blocked' || status === 'limited') return '需要确认或权限不足';
+  if (status === 'blocked' || status === 'limited') {
+    if (isNotConfiguredToolOutput(output)) return '工具后端未配置，未执行';
+    return '需要确认或权限不足';
+  }
+  if (title === '网页搜索') return '本轮执行了工具：已搜索网页';
   if (title === '读取网页') return '本轮执行了工具：已读取网页并提取正文';
+  if (title === '搜索 X') return '本轮执行了工具：已搜索 X';
   if (title === '搜索工作区') return '本轮执行了工具：已搜索工作区';
   if (title === '读取文件') return '本轮执行了工具：已读取文件';
+  if (title === '查询代码索引') return '本轮执行了工具：已查询代码索引';
+  if (title === '调试程序') return '本轮执行了工具：已执行调试动作';
+  if (title === '执行代码') return '本轮执行了工具：已执行代码';
+  if (title === '执行沙箱') return '本轮执行了工具：已执行沙箱';
+  if (title === '派发子任务') return '本轮执行了工具：已派发子任务';
+  if (title === '调用 MCP 工具') return '本轮执行了工具：已调用 MCP 工具';
+  if (title === '分析图片') return '本轮执行了工具：已分析图片';
+  if (title === '生成图片') return '本轮执行了工具：已生成图片';
+  if (title === '生成视频') return '本轮执行了工具：已生成视频';
+  if (title === '分析视频') return '本轮执行了工具：已分析视频';
+  if (title === '生成语音') return '本轮执行了工具：已生成语音';
   if (title === '列出本机 App') return '本轮执行了工具：已列出本机 App';
   if (title === '检查本机 App') return '本轮执行了工具：已检查本机 App';
   if (title === '导航浏览器') return '本轮执行了工具：已导航浏览器';
@@ -564,12 +601,24 @@ function makeAction(input: {
 
 function statusForSteps(steps: RunStep[]): ExecutionActionStatus {
   if (steps.some((step) => step.status === 'waiting_approval' || step.status === 'waiting_confirmation' || step.step_type === 'approval_requested')) return 'waiting_approval';
+  if (steps.some((step) => outputStatusForStep(step) === 'policy_blocked')) return 'blocked';
+  if (steps.some((step) => outputStatusForStep(step) === 'failed')) return 'failed';
   if (steps.some((step) => step.step_type.includes('blocked') || step.status === 'blocked')) return 'blocked';
   if (steps.some((step) => step.step_type.includes('failed') || step.status === 'failed' || step.error)) return 'failed';
   if (steps.some((step) => step.status === 'running')) return 'running';
   if (steps.some((step) => step.step_type === 'task_dispatched')) return 'queued';
   if (steps.every((step) => step.status === 'succeeded' || step.status === 'success' || step.status === 'completed')) return 'completed';
   return normalizeActionStatus(steps[steps.length - 1]?.status);
+}
+
+function outputStatusForStep(step: RunStep): string {
+  const output = objectFromUnknown(step.output);
+  return String(output.status || output.fetch_status || '').trim();
+}
+
+function isNotConfiguredToolOutput(value: unknown): boolean {
+  const output = objectFromUnknown(value);
+  return output.mode === 'capability_registry_v1_not_configured' || output.reason === 'not_configured';
 }
 
 function totalDuration(steps: RunStep[]) {
@@ -601,19 +650,54 @@ function capabilityFromStep(step?: RunStep) {
 
 function titleForCapability(capability: string, workflow: string) {
   const key = `${capability} ${workflow}`.toLowerCase();
+  if (key.includes('x_search')) return '搜索 X';
+  if (key.includes('web_extract') || key.includes('web_research_v2') || key.includes('fetch') || key.includes('crawl')) return '读取网页';
+  if (key.includes('web_search') || key.includes('web_search_v1')) return '网页搜索';
+  if (key.includes('web_research')) return '网页搜索';
+  if (key.includes('vision_analyze')) return '分析图片';
+  if (key.includes('image_generate')) return '生成图片';
+  if (key.includes('video_generate')) return '生成视频';
+  if (key.includes('video_analyze')) return '分析视频';
+  if (key.includes('text_to_speech') || key.includes('tts')) return '生成语音';
+  if (key.includes('execute_code') || key.includes('code_execution')) return '执行代码';
+  if (key.includes('sandbox_run')) return '执行沙箱';
+  if (key.includes('delegate_task') || key.includes('subagent_delegate')) return '派发子任务';
+  if (key.includes('mcp_tool_call')) return '调用 MCP 工具';
+  if (key.includes('extension_register_tool')) return '注册扩展工具';
+  if (key.includes('lsp_')) return '查询代码索引';
+  if (key.includes('debugger_')) return '调试程序';
+  if (key.includes('session_search')) return '搜索会话';
+  if (key.includes('session_summary')) return '总结会话';
+  if (key.includes('session_branch')) return '创建会话分支';
+  if (key.includes('compaction')) return '压缩上下文';
+  if (key.includes('queue_followup')) return '加入队列';
+  if (key.includes('clarify')) return '请求澄清';
+  if (key.includes('todo')) return '更新待办';
+  if (key.includes('cronjob')) return '设置定时任务';
+  if (key.includes('project_')) return '管理项目';
+  if (key.includes('skill_') || key.includes('skills_')) return '管理技能';
+  if (key.includes('ha_')) return '调用 Home Assistant';
   if (key.includes('apply_patch') || key.includes('patch') || key.includes('workspace_write') || key.includes('write_file')) return '写入文件';
-  if (key.includes('web') || key.includes('research') || key.includes('fetch') || key.includes('crawl')) return '读取网页';
   if (key.includes('desktop_app_list') || key.includes('desktop_list_app')) return '列出本机 App';
   if (key.includes('desktop_app_inspect') || key.includes('desktop_inspect_app')) return '检查本机 App';
   if (key.includes('browser_navigate') || key.includes('browser_navigate_url')) return '导航浏览器';
+  if (key.includes('browser_back')) return '浏览器后退';
+  if (key.includes('browser_scroll')) return '滚动浏览器';
+  if (key.includes('browser_press')) return '按键浏览器';
+  if (key.includes('browser_console')) return '读取浏览器控制台';
+  if (key.includes('browser_dialog')) return '处理浏览器弹窗';
+  if (key.includes('browser_get_images')) return '提取页面图片';
+  if (key.includes('browser_vision')) return '分析页面画面';
+  if (key.includes('browser_cdp')) return '调用浏览器 CDP';
   if (key.includes('browser_click') || key.includes('browser_click_element')) return '点击浏览器';
   if (key.includes('browser_type') || key.includes('browser_type_text')) return '输入浏览器';
   if (key.includes('browser_observe') || key.includes('browser_snapshot')) return '观察浏览器';
+  if (key.includes('computer_use')) return '操作屏幕';
   if (key.includes('computer_observe') || key.includes('computer_snapshot')) return '观察屏幕';
-  if (key.includes('workspace_search') || key.includes('search')) return '搜索工作区';
+  if (key.includes('workspace_search') || key.includes('search_files') || key.includes('grep') || key.includes('find')) return '搜索工作区';
   if (key.includes('file') || key.includes('read')) return '读取文件';
   if (key.includes('test_command') || key.includes('test')) return '运行测试';
-  if (key.includes('shell') || key.includes('bash') || key.includes('command')) return '运行命令';
+  if (key.includes('shell') || key.includes('bash') || key.includes('command') || key.includes('ls')) return '运行命令';
   if (key.includes('memory')) return '处理记忆';
   if (capability && capability !== 'unknown') return formatCapabilityTitle(capability);
   return '执行工具';
@@ -621,6 +705,16 @@ function titleForCapability(capability: string, workflow: string) {
 
 function kindForCapability(capability: string, workflow: string, title: string): ExecutionActionKind {
   const key = `${capability} ${workflow} ${title}`.toLowerCase();
+  if (key.includes('x_search') || title === '搜索 X') return 'web';
+  if (key.includes('web_search') || key.includes('web_research') || key.includes('web_extract') || title === '网页搜索') return 'web';
+  if (key.includes('image_generate') || key.includes('video_generate') || title === '生成图片' || title === '生成视频') return 'artifact';
+  if (key.includes('vision_analyze') || key.includes('video_analyze') || title === '分析图片' || title === '分析视频') return 'observe';
+  if (key.includes('text_to_speech') || title === '生成语音') return 'artifact';
+  if (key.includes('lsp_')) return key.includes('rename') || key.includes('format') ? 'file' : 'workspace';
+  if (key.includes('debugger_') || key.includes('execute_code') || key.includes('code_execution') || key.includes('sandbox_run')) return 'command';
+  if (key.includes('delegate_task') || key.includes('subagent_delegate') || key.includes('mcp_tool_call') || key.includes('extension_register_tool')) return 'command';
+  if (key.includes('session_') || key.includes('compaction') || key.includes('queue_followup') || key.includes('todo') || key.includes('cronjob')) return 'proactive';
+  if (key.includes('project_') || key.includes('skill_') || key.includes('skills_') || key.includes('ha_')) return 'command';
   if (key.includes('apply_patch') || title === '写入文件') return 'file';
   if (key.includes('web') || key.includes('research') || key.includes('fetch') || key.includes('crawl')) return 'web';
   if (key.includes('browser_click') || key.includes('browser_type') || title === '点击浏览器' || title === '输入浏览器') return 'command';
@@ -635,6 +729,8 @@ function kindForCapability(capability: string, workflow: string, title: string):
 
 function completedLabelForAction(kind: ExecutionActionKind, sourceLabel: string | undefined, title: string) {
   if (title === '写入文件') return `已写入文件${sourceLabel ? ` · ${sourceLabel}` : ''}`;
+  if (title === '网页搜索') return `已搜索网页${sourceLabel ? ` · ${sourceLabel}` : ''}`;
+  if (title === '搜索 X') return `已搜索 X${sourceLabel ? ` · ${sourceLabel}` : ''}`;
   if (kind === 'web') return `已读取网页${sourceLabel ? ` · ${sourceLabel}` : ''}`;
   if (kind === 'file') return `已读取文件${sourceLabel ? ` · ${sourceLabel}` : ''}`;
   if (kind === 'workspace') return `已搜索工作区${sourceLabel ? ` · ${sourceLabel}` : ''}`;

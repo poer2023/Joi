@@ -1,15 +1,25 @@
 import { openAICompatibleChatCompletionsEndpoint } from './model.ts';
+import {
+  AgentModelTransportError,
+  runAgentKernel,
+  type AgentKernelEvent,
+  type AgentKernelRequest,
+} from './agent-kernel.ts';
 
 export type ToolSpec = {
   name: string;
   description?: string;
   parameters?: Record<string, unknown>;
+  execution_mode?: 'sequential' | 'parallel';
+  timeout_seconds?: number;
 };
 
 export type ToolCall = {
   id: string;
   name: string;
   arguments: Record<string, unknown>;
+  raw_arguments?: unknown;
+  argument_error?: string;
 };
 
 export type ToolResult = {
@@ -35,6 +45,8 @@ export type ToolCallingCallbacks = {
   onApprovalRequired?: (event: { step: number; call: ToolCall; result: ToolResult }) => void;
   onUsage?: (event: { step: number; usage: ToolCallingTurnResult['usage']; usage_status: UsageStatus }) => void;
   onError?: (event: { step: number; error: Error }) => void;
+  onRetry?: (event: { step: number; attempt: number; delay_ms: number; error: Error }) => void | Promise<void>;
+  onEvent?: (event: AgentKernelEvent) => void | Promise<void>;
 };
 
 export type UsageStatus = 'recorded' | 'provider_missing' | 'estimated' | 'failed';
@@ -48,9 +60,22 @@ export type ToolCallingTurnRequest = {
   executeTool: ToolExecutor;
   timeout_seconds?: number;
   max_steps?: number;
+  max_retries?: number;
+  retry_backoff_ms?: number;
   stream?: boolean;
+  reasoning_effort?: string;
+  tool_execution?: 'sequential' | 'parallel';
+  max_context_messages?: number;
+  max_tool_result_bytes?: number;
+  final_response_contract?: AgentKernelRequest['final_response_contract'];
   signal?: AbortSignal;
   callbacks?: ToolCallingCallbacks;
+  transformMessages?: AgentKernelRequest['transformMessages'];
+  beforeToolCall?: AgentKernelRequest['beforeToolCall'];
+  afterToolCall?: AgentKernelRequest['afterToolCall'];
+  shouldStopAfterTurn?: AgentKernelRequest['shouldStopAfterTurn'];
+  getSteeringMessages?: AgentKernelRequest['getSteeringMessages'];
+  getFollowUpMessages?: AgentKernelRequest['getFollowUpMessages'];
 };
 
 export type ToolCallingTurnResult = {
@@ -71,136 +96,98 @@ export type ToolCallingTurnResult = {
 };
 
 export async function runChatCompletionsToolTurn(req: ToolCallingTurnRequest): Promise<ToolCallingTurnResult> {
-  const maxSteps = positiveInteger(req.max_steps, 6);
-  const messages = req.messages.map((message) => ({ ...message }));
-  const tools = req.tools.map((tool) => ({
-    type: 'function',
-    function: {
-      name: tool.name,
-      description: tool.description || '',
-      parameters: tool.parameters || { type: 'object', properties: {}, additionalProperties: true },
-    },
-  }));
-  const toolResults: ToolResult[] = [];
-  const modelResponses: Array<Record<string, unknown>> = [];
-  const usage = {
-    input_tokens: 0,
-    output_tokens: 0,
-    cached_input_tokens: 0,
-    cache_write_input_tokens: 0,
-    reasoning_tokens: 0,
-    total_tokens: 0,
-  };
-  let usageStatus: UsageStatus = 'provider_missing';
-  let finishReason = '';
-  for (let step = 0; step < maxSteps; step++) {
-    throwIfAborted(req.signal);
-    req.callbacks?.onModelStarted?.({ step, model: req.model, streaming: Boolean(req.stream) });
-    const payload = {
-      model: req.model,
-      messages,
-      tools,
-      tool_choice: tools.length > 0 ? 'auto' : undefined,
-      stream: Boolean(req.stream),
-    };
-    const response = await fetchWithTimeout(openAICompatibleChatCompletionsEndpoint(req.base_url), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${req.api_key}`,
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    }, positiveInteger(req.timeout_seconds, 30), req.signal);
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`chat completion returned ${response.status} ${response.statusText}: ${body.slice(0, 2000)}`);
-    }
-    const parsed = req.stream
-      ? await parseChatCompletionsSSEResponse(response, req.callbacks, step, req.signal)
-      : JSON.parse(await response.text()) as Record<string, unknown>;
-    modelResponses.push(parsed);
-    const stepUsageStatus = addUsage(usage, parsed.usage);
-    usageStatus = mergeUsageStatus(usageStatus, stepUsageStatus);
-    finishReason = finishReasonFromPayload(parsed) || finishReason;
-    req.callbacks?.onUsage?.({ step, usage: { ...usage }, usage_status: stepUsageStatus });
-    req.callbacks?.onModelCompleted?.({ step, finish_reason: finishReason || undefined, usage_status: stepUsageStatus });
-    const message = firstChoiceMessage(parsed);
-    const toolCalls = parseToolCalls(message.tool_calls);
-    if (toolCalls.length === 0) {
-      req.callbacks?.onAssistantCompleted?.({
-        step,
-        text: stringValue(message.content),
-        finish_reason: finishReason || undefined,
-        usage_status: stepUsageStatus,
-      });
-      return {
-        status: 'completed',
-        final_message: stringValue(message.content),
-        tool_results: toolResults,
-        usage,
-        usage_status: usageStatus,
-        finish_reason: finishReason || undefined,
-        model_responses: modelResponses,
-      };
-    }
-    messages.push({
-      role: 'assistant',
-      content: message.content || '',
-      tool_calls: toolCalls.map((call) => ({
-        id: call.id,
+  const callbacks = committedAnswerCallbacks(req.callbacks);
+  return runAgentKernel({
+    model: req.model,
+    streaming: Boolean(req.stream),
+    messages: req.messages,
+    tools: req.tools,
+    executeTool: req.executeTool,
+    max_steps: req.max_steps,
+    max_retries: req.max_retries,
+    retry_backoff_ms: req.retry_backoff_ms,
+    tool_execution: req.tool_execution,
+    max_context_messages: req.max_context_messages,
+    max_tool_result_bytes: req.max_tool_result_bytes,
+    final_response_contract: req.final_response_contract,
+    signal: req.signal,
+    callbacks,
+    transformMessages: req.transformMessages,
+    beforeToolCall: req.beforeToolCall,
+    afterToolCall: req.afterToolCall,
+    shouldStopAfterTurn: req.shouldStopAfterTurn,
+    getSteeringMessages: req.getSteeringMessages,
+    getFollowUpMessages: req.getFollowUpMessages,
+    callModel: async ({ messages, tools, step, signal }) => {
+      const providerTools = tools.map((tool) => ({
         type: 'function',
-        function: { name: call.name, arguments: JSON.stringify(call.arguments) },
-      })),
-    });
-    for (const call of toolCalls) {
-      throwIfAborted(req.signal);
-      req.callbacks?.onToolCallRequested?.({ step, call });
-      let result: ToolResult;
-      try {
-        result = await req.executeTool(call, { signal: req.signal });
-      } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        req.callbacks?.onToolFailed?.({ step, call, error: err });
-        throw err;
+        function: {
+          name: tool.name,
+          description: tool.description || '',
+          parameters: tool.parameters || { type: 'object', properties: {}, additionalProperties: true },
+        },
+      }));
+      const payload = {
+        model: req.model,
+        messages,
+        tools: providerTools,
+        tool_choice: providerTools.length > 0 ? 'auto' : undefined,
+        stream: Boolean(req.stream),
+        stream_options: req.stream ? { include_usage: true } : undefined,
+        reasoning_effort: normalizeReasoningEffort(req.reasoning_effort),
+      };
+      const response = await fetchWithTimeout(openAICompatibleChatCompletionsEndpoint(req.base_url), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${req.api_key}`,
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      }, positiveInteger(req.timeout_seconds, 30), signal);
+      if (!response.ok) {
+        const body = await response.text();
+        throw new AgentModelTransportError(
+          `chat completion returned ${response.status} ${response.statusText}: ${body.slice(0, 2000)}`,
+          { status: response.status, retryable: retryableHTTPStatus(response.status) },
+        );
       }
-      toolResults.push(result);
-      req.callbacks?.onToolOutputDelta?.({ step, call, output: result.output });
-      messages.push({
-        role: 'tool',
-        tool_call_id: call.id,
-        name: call.name,
-        content: JSON.stringify(result.output),
-      });
-      if (result.output?.status === 'waiting_confirmation') {
-        req.callbacks?.onApprovalRequired?.({ step, call, result });
-        return {
-          status: 'waiting_confirmation',
-          final_message: stringValue(result.output.message) || '这个受控能力需要你确认后才会执行。',
-          tool_results: toolResults,
-          usage,
-          usage_status: usageStatus,
-          finish_reason: finishReason || undefined,
-          model_responses: modelResponses,
-        };
-      }
-      req.callbacks?.onToolStarted?.({ step, call });
-      if (toolResultFailed(result)) {
-        req.callbacks?.onToolFailed?.({ step, call, result });
-      } else {
-        req.callbacks?.onToolCompleted?.({ step, call, result });
-      }
-    }
-  }
+      const parsed = req.stream
+        ? await parseChatCompletionsSSEResponse(response, callbacks, step, signal)
+        : JSON.parse(await response.text()) as Record<string, unknown>;
+      return {
+        message: firstChoiceMessage(parsed),
+        usage: normalizedUsage(parsed.usage),
+        usage_status: usageStatusFromPayload(parsed.usage),
+        finish_reason: finishReasonFromPayload(parsed) || undefined,
+        raw: parsed,
+      };
+    },
+  });
+}
+
+export function committedAnswerCallbacks(
+  callbacks: ToolCallingCallbacks | undefined,
+): ToolCallingCallbacks | undefined {
+  if (!callbacks) return callbacks;
   return {
-    status: 'max_steps_exceeded',
-    final_message: '',
-    tool_results: toolResults,
-    usage,
-    usage_status: usageStatus,
-    finish_reason: finishReason || undefined,
-    model_responses: modelResponses,
+    ...callbacks,
+    // Provider deltas can belong to a tool-call preamble, a rejected response-
+    // contract attempt, or text that the runtime later normalizes. Keep those
+    // deltas in model Trace and publish only the answer committed by the kernel.
+    onAssistantDelta() {},
+    onAssistantCompleted(event) {
+      if (event.text) callbacks.onAssistantDelta?.({ step: event.step, text: event.text, index: 0 });
+      callbacks.onAssistantCompleted?.(event);
+    },
   };
+}
+
+export function responseContractSafeCallbacks(
+  callbacks: ToolCallingCallbacks | undefined,
+  enabled: boolean,
+): ToolCallingCallbacks | undefined {
+  return enabled ? committedAnswerCallbacks(callbacks) : callbacks;
 }
 
 export function parseChatCompletionsSSE(raw: string, callbacks?: ToolCallingCallbacks, step = 0): Record<string, unknown> {
@@ -280,6 +267,7 @@ async function parseChatCompletionsSSEResponse(
   const decoder = new TextDecoder();
   let raw = '';
   let buffer = '';
+  let deltaIndex = 0;
   try {
     while (true) {
       throwIfAborted(signal);
@@ -293,7 +281,7 @@ async function parseChatCompletionsSSEResponse(
         if (!line.startsWith('data:')) continue;
         const item = line.slice('data:'.length).trim();
         if (!item || item === '[DONE]') continue;
-        callbacks && emitSSECallbacks(item, callbacks, step);
+        if (callbacks) deltaIndex = emitSSECallbacks(item, callbacks, step, deltaIndex);
       }
     }
     if (buffer) {
@@ -302,7 +290,7 @@ async function parseChatCompletionsSSEResponse(
         if (!line.startsWith('data:')) continue;
         const item = line.slice('data:'.length).trim();
         if (!item || item === '[DONE]') continue;
-        callbacks && emitSSECallbacks(item, callbacks, step);
+        if (callbacks) deltaIndex = emitSSECallbacks(item, callbacks, step, deltaIndex);
       }
     }
   } finally {
@@ -311,7 +299,7 @@ async function parseChatCompletionsSSEResponse(
   return parseChatCompletionsSSE(raw);
 }
 
-function emitSSECallbacks(item: string, callbacks: ToolCallingCallbacks, step: number): void {
+function emitSSECallbacks(item: string, callbacks: ToolCallingCallbacks, step: number, deltaIndex: number): number {
   const payload = JSON.parse(item) as Record<string, unknown>;
   callbacks.onModelDelta?.({ step, payload });
   const choices = Array.isArray(payload.choices) ? payload.choices : [];
@@ -320,8 +308,9 @@ function emitSSECallbacks(item: string, callbacks: ToolCallingCallbacks, step: n
     const delta = (choice as Record<string, unknown>).delta;
     if (!delta || typeof delta !== 'object') continue;
     const text = stringValue((delta as Record<string, unknown>).content);
-    if (text) callbacks.onAssistantDelta?.({ step, text, index: 0 });
+    if (text) callbacks.onAssistantDelta?.({ step, text, index: deltaIndex++ });
   }
+  return deltaIndex;
 }
 
 function sseDataItems(raw: string): string[] {
@@ -342,35 +331,16 @@ function firstChoiceMessage(payload: Record<string, unknown>): Record<string, un
   return message && typeof message === 'object' ? message as Record<string, unknown> : {};
 }
 
-function parseToolCalls(value: unknown): ToolCall[] {
-  if (!Array.isArray(value)) return [];
-  const calls: ToolCall[] = [];
-  for (const item of value) {
-    if (!item || typeof item !== 'object') continue;
-    const object = item as Record<string, unknown>;
-    const fn = object.function && typeof object.function === 'object' ? object.function as Record<string, unknown> : {};
-    const id = stringValue(object.id) || `call_${calls.length + 1}`;
-    const name = stringValue(fn.name);
-    if (!name) continue;
-    calls.push({
-      id,
-      name,
-      arguments: parseArguments(fn.arguments),
-    });
-  }
-  return calls;
-}
-
-function parseArguments(value: unknown): Record<string, unknown> {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
-  if (typeof value !== 'string' || !value.trim()) return {};
-  const parsed = JSON.parse(value);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-  return parsed as Record<string, unknown>;
-}
-
-function addUsage(total: ToolCallingTurnResult['usage'], value: unknown): UsageStatus {
-  if (!value || typeof value !== 'object') return 'provider_missing';
+function normalizedUsage(value: unknown): ToolCallingTurnResult['usage'] {
+  const total: ToolCallingTurnResult['usage'] = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_input_tokens: 0,
+    cache_write_input_tokens: 0,
+    reasoning_tokens: 0,
+    total_tokens: 0,
+  };
+  if (!value || typeof value !== 'object') return total;
   const usage = value as Record<string, unknown>;
   const promptDetails = objectValue(usage.prompt_tokens_details) || objectValue(usage.input_tokens_details);
   const completionDetails = objectValue(usage.completion_tokens_details) || objectValue(usage.output_tokens_details);
@@ -397,21 +367,12 @@ function addUsage(total: ToolCallingTurnResult['usage'], value: unknown): UsageS
   total.cache_write_input_tokens += cacheWriteInputTokens;
   total.reasoning_tokens += reasoningTokens;
   total.total_tokens += totalTokens;
-  return inputTokens > 0
-    || outputTokens > 0
-    || cachedInputTokens > 0
-    || cacheWriteInputTokens > 0
-    || reasoningTokens > 0
-    || totalTokens > 0
-    ? 'recorded'
-    : 'provider_missing';
+  return total;
 }
 
-function mergeUsageStatus(current: UsageStatus, next: UsageStatus): UsageStatus {
-  if (current === 'recorded' || next === 'recorded') return 'recorded';
-  if (current === 'estimated' || next === 'estimated') return 'estimated';
-  if (current === 'failed' || next === 'failed') return 'failed';
-  return 'provider_missing';
+function usageStatusFromPayload(value: unknown): UsageStatus {
+  const usage = normalizedUsage(value);
+  return Object.values(usage).some((item) => item > 0) ? 'recorded' : 'provider_missing';
 }
 
 function finishReasonFromPayload(payload: Record<string, unknown>): string {
@@ -424,9 +385,8 @@ function finishReasonFromPayload(payload: Record<string, unknown>): string {
   return '';
 }
 
-function toolResultFailed(result: ToolResult): boolean {
-  const status = stringValue(result.output?.status).toLowerCase();
-  return ['failed', 'error', 'policy_blocked', 'blocked', 'cancelled', 'canceled'].includes(status);
+function retryableHTTPStatus(status: number): boolean {
+  return [408, 409, 425, 429, 500, 502, 503, 504].includes(status);
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutSeconds: number, signal?: AbortSignal): Promise<Response> {
@@ -452,6 +412,11 @@ function throwIfAborted(signal?: AbortSignal): void {
 function positiveInteger(value: unknown, fallback: number): number {
   const number = Number(value);
   return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function normalizeReasoningEffort(value: unknown): string | undefined {
+  const normalized = String(value || '').trim().toLowerCase();
+  return ['none', 'low', 'medium', 'high'].includes(normalized) ? normalized : undefined;
 }
 
 function stringValue(value: unknown): string {

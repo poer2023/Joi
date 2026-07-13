@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { JoiSQLiteStore } from '../src/sqlite.ts';
+import { compileElectronCapabilityTools } from '../../runtime/src/capability-compiler.ts';
 
 const root = resolve(import.meta.dirname, '../../..');
 const tempDir = mkdtempSync(join(tmpdir(), 'joi-store-'));
@@ -15,6 +17,57 @@ try {
     backupDir: join(tempDir, 'backups'),
     version: 'test',
   });
+
+  const initialWorkspaceSettings = store.getWorkspaceSettings();
+  store.saveWorkspaceSettings({ ...initialWorkspaceSettings, allowed_roots: [...initialWorkspaceSettings.allowed_roots, tempDir] });
+  const enhancedDiagnosticsPath = store.exportDiagnostics().path;
+  const enhancedDiagnosticsManifest = JSON.parse(execFileSync('unzip', ['-p', enhancedDiagnosticsPath, 'manifest.json'], { encoding: 'utf8' }));
+  assert.equal(enhancedDiagnosticsManifest.redaction_profile, 'enhanced');
+  const enhancedDiagnosticsSettings = execFileSync('unzip', ['-p', enhancedDiagnosticsPath, 'settings.json'], { encoding: 'utf8' });
+  assert.equal(enhancedDiagnosticsSettings.includes(process.env.HOME || '/Users/hao'), false);
+  store.saveWorkspaceSettings({ ...store.getWorkspaceSettings(), diagnostic_redaction_enabled: false });
+  const baselineDiagnosticsManifest = JSON.parse(execFileSync('unzip', ['-p', store.exportDiagnostics().path, 'manifest.json'], { encoding: 'utf8' }));
+  assert.equal(baselineDiagnosticsManifest.redaction_profile, 'secrets_only');
+  store.saveWorkspaceSettings({ ...store.getWorkspaceSettings(), diagnostic_redaction_enabled: true });
+  const firstCapability = store.listCapabilities().capabilities[0];
+  assert.ok(firstCapability);
+  store.setCapabilityEnabled({ id: firstCapability.id, enabled: false });
+  assert.equal(store.listCapabilities().capabilities.find((item) => item.id === firstCapability.id)?.enabled, false);
+  store.setCapabilityEnabled({ id: firstCapability.id, enabled: true });
+  const firstSkill = store.listSkills().skills[0];
+  assert.ok(firstSkill);
+  store.setSkillEnabled({ id: firstSkill.id, enabled: false });
+  assert.equal(store.listSkills().skills.find((item) => item.id === firstSkill.id)?.enabled, false);
+  store.setSkillEnabled({ id: firstSkill.id, enabled: true });
+  const mcpServer = store.saveMCPServer({ id: 'test_mcp', name: 'Test MCP', command: 'node', args: ['server.mjs'], enabled: true }).server;
+  assert.equal(mcpServer.status, 'configured');
+  assert.equal(store.setMCPServerEnabled({ id: mcpServer.id, enabled: false }).server.enabled, false);
+  store.deleteMCPServer(mcpServer.id);
+  assert.equal(store.listMCPServers().servers.some((item) => item.id === mcpServer.id), false);
+  assert.throws(() => store.syncMCPServer('missing_mcp'), /MCP server not found/);
+  assert.equal(store.listMCPServers().servers.some((item) => item.id === 'local_mcp_registry'), false);
+  const pluginManifestPath = join(tempDir, 'plugin.json');
+  writeFileSync(pluginManifestPath, JSON.stringify({
+    id: 'test.settings.plugin',
+    name: 'Settings Plugin Test',
+    version: 'v1',
+    capabilities: [{ id: 'test_plugin_capability', name: 'Test Plugin Capability', risk_level: 'read_only' }],
+    workflows: [{ id: 'workflow_test_plugin', capability_id: 'test_plugin_capability', name: 'test_plugin_v1', steps: [{ tool: 'test_tool', risk_level: 'read_only' }] }],
+    skills: [{ id: 'test_plugin_skill', name: 'Test Plugin Skill', required_capabilities: ['test_plugin_capability'] }],
+    mcp_servers: [{ id: 'test_plugin_mcp', name: 'Test Plugin MCP', command: 'node', args: ['server.mjs'] }],
+    providers: [{ id: 'test_plugin_acp', name: 'Test Plugin ACP', protocol: 'acp', runtime: 'node', command: 'agent.mjs', args: [], default_model: 'test-model', models: [{ id: 'test-model', name: 'Test Model' }] }],
+  }));
+  const installedPlugin = store.installPluginFromManifest(pluginManifestPath).plugin;
+  assert.equal(installedPlugin.id, 'test.settings.plugin');
+  assert.deepEqual(installedPlugin.provider_ids, ['test_plugin_acp']);
+  assert.equal(store.getEnabledPluginProvider('test_plugin_acp')?.command, join(tempDir, 'agent.mjs'));
+  assert.equal(store.listCapabilities().capabilities.some((item) => item.id === 'test_plugin_capability'), true);
+  assert.equal(store.listToolWorkflows().workflows.some((item) => item.id === 'workflow_test_plugin'), true);
+  assert.equal(store.setPluginEnabled({ id: installedPlugin.id, enabled: false }).plugin.enabled, false);
+  assert.equal(store.getEnabledPluginProvider('test_plugin_acp'), undefined);
+  assert.equal(store.listSkills().skills.find((item) => item.id === 'test_plugin_skill')?.enabled, false);
+  store.removePlugin(installedPlugin.id);
+  assert.equal(store.listPlugins().plugins.some((item) => item.id === installedPlugin.id), false);
 
   const response = await store.sendDeterministicChat({
     message: 'store test ping',
@@ -88,6 +141,127 @@ try {
   assert.equal(usageSummaryItem?.total_tokens, 1500);
   assert.ok(Number(usageSummaryItem?.estimated_cost ?? 0) > 0);
 
+  const legacyACPUsageResponse = store.recordToolCallingChat({
+    message: 'legacy ACP usage summary',
+    input_mode: 'chat_assist',
+    runtime_mode: 'tool_calling',
+    model_name: 'gpt-5.6-terra[medium]',
+  }, {
+    provider: 'acp_codex_cli',
+    model_name: 'gpt-5.6-terra[medium]',
+    selected_agent_id: 'general_agent',
+    final_message: 'legacy ACP usage recorded',
+    tool_results: [],
+    usage: {
+      input_tokens: 56_624,
+      output_tokens: 1_000,
+      cached_input_tokens: 71_168,
+      total_tokens: 128_792,
+    },
+    usage_status: 'recorded',
+    finish_reason: 'end_turn',
+    model_responses: [{ protocol: 'acp' }],
+  });
+  store['exec'](
+    `UPDATE model_calls SET metadata=json_remove(metadata, '$.input_tokens_include_cached') WHERE run_id=?`,
+    legacyACPUsageResponse.run_id,
+  );
+  store['exec'](`UPDATE runs SET duration_ms=25000 WHERE id=?`, legacyACPUsageResponse.run_id);
+  const legacyACPSummary = store.getModelUsage().items.find((item) => item.provider === 'acp_codex_cli');
+  assert.equal(legacyACPSummary?.input_tokens, 56_624 + 71_168);
+  assert.ok(Number(legacyACPSummary?.cache_hit_ratio) <= 1);
+  assert.ok(Math.abs(Number(legacyACPSummary?.cache_hit_ratio) - (71_168 / (56_624 + 71_168))) < 1e-12);
+  assert.equal(legacyACPSummary?.avg_latency_ms, 25_000);
+
+  const acpLatencyStarted = store.beginToolCallingChat({
+    message: 'measure ACP model latency',
+    input_mode: 'chat_assist',
+    runtime_mode: 'tool_calling',
+    model_name: 'gpt-5.6-terra[medium]',
+  }, {
+    provider: 'acp_codex_cli',
+    model_name: 'gpt-5.6-terra[medium]',
+    selected_agent_id: 'general_agent',
+  });
+  store['exec'](`UPDATE model_calls SET created_at=datetime('now', '-25 seconds') WHERE id=?`, acpLatencyStarted.model_call_id);
+  store.finishToolCallingChat(acpLatencyStarted, {
+    status: 'completed',
+    provider: 'acp_codex_cli',
+    model_name: 'gpt-5.6-terra[medium]',
+    selected_agent_id: 'general_agent',
+    final_message: 'ACP latency measured',
+    tool_results: [],
+    usage: { input_tokens: 100, output_tokens: 10, cached_input_tokens: 40, total_tokens: 110 },
+    usage_status: 'recorded',
+    finish_reason: 'end_turn',
+    model_responses: [{ protocol: 'acp' }],
+  });
+  const acpLatencyCall = store.getRunTrace(acpLatencyStarted.run_id).model_calls[0];
+  assert.ok(acpLatencyCall.latency_ms >= 24_000 && acpLatencyCall.latency_ms <= 27_000, `unexpected ACP latency: ${acpLatencyCall.latency_ms}`);
+
+  const imageStarted = store.beginToolCallingChat({
+    message: '生成一张蓝色圆形图片',
+    input_mode: 'chat_assist',
+    runtime_mode: 'tool_calling',
+    model_name: 'grok-4.5',
+  }, {
+    provider: 'grok_build',
+    model_name: 'grok-4.5',
+    selected_agent_id: 'general_agent',
+  });
+  const imageResponse = store.finishToolCallingChat(imageStarted, {
+    status: 'completed',
+    provider: 'grok_build',
+    model_name: 'grok-4.5',
+    selected_agent_id: 'general_agent',
+    final_message: '图片已生成。',
+    tool_results: [{
+      call_id: 'call_image_generate_1',
+      name: 'image_generate',
+      arguments: { prompt: '蓝色圆形', aspect_ratio: '1:1' },
+      output: {
+        status: 'completed',
+        capability: 'image_generate',
+        mode: 'grok_build_native_image_gen',
+        provider: 'grok_build',
+        model: 'grok-4.5',
+        native_tool: 'image_gen',
+        source_session_id: 'grok-session-image-1',
+        source_tool_call_id: 'native-image-call-1',
+        prompt_sha256: 'prompt-hash',
+        aspect_ratio: '1:1',
+        file_path: '/tmp/joi-generated-image.jpg',
+        summary: 'Grok Build 已生成图片。',
+        attachment: {
+          id: 'attachment_image_1',
+          name: 'joi-generated-image.jpg',
+          kind: 'image',
+          mime_type: 'image/jpeg',
+          size: 2048,
+          preview_url: 'file:///tmp/joi-generated-image.jpg',
+        },
+      },
+    }],
+    usage: { input_tokens: 50, output_tokens: 20 },
+    usage_status: 'recorded',
+    finish_reason: 'stop',
+    model_responses: [{ id: 'chatcmpl_image_generation' }],
+  });
+  const imageConversation = store.getConversation(imageResponse.conversation_id);
+  assert.deepEqual(imageConversation.messages.at(-1)?.attachments, [{
+    id: 'attachment_image_1',
+    name: 'joi-generated-image.jpg',
+    kind: 'image',
+    mime_type: 'image/jpeg',
+    size: 2048,
+    preview_url: 'file:///tmp/joi-generated-image.jpg',
+  }]);
+  const imageArtifact = store.listArtifacts({ type: 'image', limit: 10 }).artifacts.find((item) => item.source_run_id === imageResponse.run_id);
+  assert.equal(imageArtifact?.metadata?.native_tool, 'image_gen');
+  assert.equal(imageArtifact?.metadata?.preview_url, 'file:///tmp/joi-generated-image.jpg');
+  const imageTrace = store.getRunTrace(imageResponse.run_id);
+  assert.ok(imageTrace.events.some((event) => event.event_type === 'artifact.created' && event.payload?.native_tool === 'image_gen'));
+
   const chatOnlyResponse = await store.sendDeterministicChat({
     message: '今天只做一个纯聊天检查：用一句话回复我，不要创建任务。',
     input_mode: 'auto',
@@ -114,7 +288,7 @@ try {
 
   const telegramBuildTask = await store.sendDeterministicChat({
     channel: 'telegram',
-    user_id: 'telegram:7991996397',
+    user_id: 'telegram:1234567890',
     message: '为 joi 构建一个简单的 loading page',
     input_mode: 'auto',
     runtime_mode: 'tool_calling',
@@ -140,6 +314,8 @@ try {
 
   const health = store.systemHealth();
   assert.deepEqual(health.service_status, { sqlite: true, electron: 'running', runtime: 'electron_ts_sqlite' });
+  assert.ok(Number(health.token_cost_today.cache_hit_ratio) <= 1);
+  assert.ok(Number(health.model_latency.avg_latency_ms) > 0);
 
   const capabilities = store.listCapabilities().capabilities.map((capability) => capability.id);
   assert.ok(capabilities.includes('memory_search'));
@@ -198,7 +374,10 @@ try {
   });
   assert.equal(store.listAutomationRuns({ automation_id: automation.id }).runs[0].status, 'succeeded');
   assert.equal(store.listAutomationTriggers({ automation_id: automation.id }).triggers[0].status, 'succeeded');
-  assert.ok(store.getRunTrace(automationResponse.run_id).events.some((event) => event.event_type === 'automation.run_completed'));
+  const automationCompletedEvent = store.getRunTrace(automationResponse.run_id).events.find((event) => event.event_type === 'automation.run_completed');
+  assert.equal(automationCompletedEvent?.status, 'completed');
+  assert.equal(automationCompletedEvent?.terminal, true);
+  assert.equal(automationCompletedEvent?.visibility, 'trace_only');
 
   const retryAutomation = store.saveAutomation({
     kind: 'webhook',
@@ -392,6 +571,209 @@ try {
   assert.ok(!ttlMemoryIDs.includes('mem_current_state_expired'));
   assert.match(ttlPrompt.dynamic_tail, /Active TTL project focus/);
   assert.equal(ttlPrompt.dynamic_tail.includes('Expired TTL project focus'), false);
+
+  store['exec'](`INSERT INTO projects (id, name, status) VALUES ('prj_memory_scope_a', 'Memory Scope A', 'active')`);
+  store['exec'](`INSERT INTO projects (id, name, status) VALUES ('prj_memory_scope_b', 'Memory Scope B', 'active')`);
+  store['exec'](
+    `INSERT INTO conversations (id, channel, user_id, principal_id, active_project_id, title, metadata)
+     VALUES ('conv_memory_scope', 'desktop', 'desktop_user', 'desktop_user', 'prj_memory_scope_a', 'Memory scope test', '{}')`,
+  );
+  store['exec'](
+    `INSERT INTO rooms (id, type, title, owner_user_id, project_id, conversation_id, metadata)
+     VALUES ('room_memory_scope', 'shared', 'Memory scope test', 'desktop_user', 'prj_memory_scope_a', 'conv_memory_scope', ?)`,
+    JSON.stringify({ visible_project_ids: ['prj_memory_scope_a', 'prj_memory_scope_b'] }),
+  );
+  for (const [id, scopeType, scopeID, content] of [
+    ['mem_scope_project_a', 'project', 'prj_memory_scope_a', 'Scope cipher belongs to project alpha.'],
+    ['mem_scope_project_b', 'project', 'prj_memory_scope_b', 'Scope cipher belongs to project beta.'],
+    ['mem_scope_room', 'room', 'room_memory_scope', 'Scope priority room exact.'],
+    ['mem_scope_user', 'user', 'desktop_user', 'Scope priority user exact.'],
+    ['mem_scope_global', 'global', '', 'Scope priority global exact.'],
+  ]) {
+    store['exec'](
+      `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence, status, source_event_ids, entities, metadata)
+       VALUES (?, 'preference', ?, ?, ?, NULLIF(?, ''), 'internal', 0.8, 'confirmed', '[]', '[]', '{}')`,
+      id,
+      content,
+      content,
+      scopeType,
+      scopeID,
+    );
+  }
+  const projectScopedPrompt = store.assembleToolCallingPrompt({
+    conversation_id: 'conv_memory_scope',
+    room_id: 'room_memory_scope',
+    user_id: 'desktop_user',
+    message: 'Scope cipher',
+    runtime_mode: 'tool_calling',
+  }, 'general_agent', 'real-tool-model');
+  assert.ok(projectScopedPrompt.memory_results.some((result) => result.memory.id === 'mem_scope_project_a'));
+  assert.ok(!projectScopedPrompt.memory_results.some((result) => result.memory.id === 'mem_scope_project_b'));
+  assert.deepEqual(projectScopedPrompt.memory_scope.project_ids, ['prj_memory_scope_a']);
+  const crossProjectPrompt = store.assembleToolCallingPrompt({
+    conversation_id: 'conv_memory_scope',
+    room_id: 'room_memory_scope',
+    user_id: 'desktop_user',
+    scope_override: 'cross_project',
+    message: 'Scope cipher',
+    runtime_mode: 'tool_calling',
+  }, 'general_agent', 'real-tool-model');
+  assert.ok(crossProjectPrompt.memory_results.some((result) => result.memory.id === 'mem_scope_project_a'));
+  assert.ok(crossProjectPrompt.memory_results.some((result) => result.memory.id === 'mem_scope_project_b'));
+  assert.equal(crossProjectPrompt.memory_scope.cross_project, true);
+  const priorityPrompt = store.assembleToolCallingPrompt({
+    conversation_id: 'conv_memory_scope',
+    room_id: 'room_memory_scope',
+    user_id: 'desktop_user',
+    message: 'Scope priority exact',
+    runtime_mode: 'tool_calling',
+  }, 'general_agent', 'real-tool-model');
+  const priorityIDs = priorityPrompt.memory_results.map((result) => result.memory.id);
+  assert.ok(priorityIDs.indexOf('mem_scope_room') < priorityIDs.indexOf('mem_scope_user'));
+  assert.ok(priorityIDs.indexOf('mem_scope_user') < priorityIDs.indexOf('mem_scope_global'));
+
+  for (let index = 0; index < 70; index += 1) {
+    store['exec'](
+      `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence, status, source_event_ids, entities, metadata, updated_at)
+       VALUES (?, 'note', ?, ?, 'project', 'prj_memory_scope_a', 'internal', 0.99, 'confirmed', '[]', '[]', '{}', datetime('now', ?))`,
+      `mem_recent_noise_${index}`,
+      `Recent unrelated governance memory ${index}`,
+      `Recent unrelated ${index}`,
+      `-${index} seconds`,
+    );
+  }
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence, status, source_event_ids, entities, metadata, updated_at)
+     VALUES ('mem_old_exact_fts', 'note', 'Rarearchivekey remains retrievable after governance truncation.', 'Old exact FTS memory', 'project', 'prj_memory_scope_a', 'internal', 0.2, 'confirmed', '[]', '[]', '{}', datetime('now', '-500 days'))`,
+  );
+  const oldExactPrompt = store.assembleToolCallingPrompt({
+    conversation_id: 'conv_memory_scope',
+    room_id: 'room_memory_scope',
+    user_id: 'desktop_user',
+    message: 'Rarearchivekey',
+    runtime_mode: 'tool_calling',
+  }, 'general_agent', 'real-tool-model');
+  const oldExact = oldExactPrompt.memory_results.find((result) => result.memory.id === 'mem_old_exact_fts');
+  assert.ok(oldExact);
+  assert.equal(oldExact.retrieval_source, 'fts');
+
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence, status, source_event_ids, entities, disabled_at, metadata)
+     VALUES ('mem_hard_negative_disabled', 'note', 'Hardnegativekey disabled.', 'Disabled hard negative', 'project', 'prj_memory_scope_a', 'internal', 1, 'confirmed', '[]', '[]', datetime('now'), '{}')`,
+  );
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence, status, source_event_ids, entities, metadata)
+     VALUES ('mem_hard_negative_deleted', 'note', 'Hardnegativekey deleted.', 'Deleted hard negative', 'project', 'prj_memory_scope_a', 'internal', 1, 'deleted', '[]', '[]', '{}')`,
+  );
+  const hardNegativePrompt = store.assembleToolCallingPrompt({
+    conversation_id: 'conv_memory_scope', room_id: 'room_memory_scope', message: 'Hardnegativekey', runtime_mode: 'tool_calling',
+  }, 'general_agent', 'real-tool-model');
+  assert.ok(!hardNegativePrompt.memory_results.some((result) => result.memory.id.startsWith('mem_hard_negative_')));
+
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence, status, source_event_ids, entities, metadata)
+     VALUES ('mem_disable_immediate', 'note', 'Immediategovernancekey disable target.', 'Disable target', 'project', 'prj_memory_scope_a', 'internal', 1, 'confirmed', '[]', '[]', '{}')`,
+  );
+  store.updateMemory({ id: 'mem_disable_immediate', action: 'disable' });
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence, status, source_event_ids, entities, metadata)
+     VALUES ('mem_delete_immediate', 'note', 'Immediategovernancekey delete target.', 'Delete target', 'project', 'prj_memory_scope_a', 'internal', 1, 'confirmed', '[]', '[]', '{}')`,
+  );
+  store.deleteMemory({ id: 'mem_delete_immediate' });
+  const governedPrompt = store.assembleToolCallingPrompt({
+    conversation_id: 'conv_memory_scope', room_id: 'room_memory_scope', message: 'Immediategovernancekey', runtime_mode: 'tool_calling',
+  }, 'general_agent', 'real-tool-model');
+  assert.ok(!governedPrompt.memory_results.some((result) => ['mem_disable_immediate', 'mem_delete_immediate'].includes(result.memory.id)));
+
+  for (const [id, positive, negative] of [
+    ['mem_feedback_preferred', 4, 0],
+    ['mem_feedback_penalized', 0, 4],
+  ]) {
+    store['exec'](
+      `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence, status, source_event_ids, entities, positive_feedback, negative_feedback, metadata)
+       VALUES (?, 'note', 'Feedbackrankkey comparable memory.', ?, 'project', 'prj_memory_scope_a', 'internal', 0.7, 'confirmed', '[]', '[]', ?, ?, '{}')`,
+      id,
+      id,
+      positive,
+      negative,
+    );
+  }
+  const feedbackPrompt = store.assembleToolCallingPrompt({
+    conversation_id: 'conv_memory_scope', room_id: 'room_memory_scope', message: 'Feedbackrankkey', runtime_mode: 'tool_calling',
+  }, 'general_agent', 'real-tool-model');
+  assert.ok(feedbackPrompt.memory_results.findIndex((result) => result.memory.id === 'mem_feedback_preferred')
+    < feedbackPrompt.memory_results.findIndex((result) => result.memory.id === 'mem_feedback_penalized'));
+
+  const scopedRetrievalChat = store.recordToolCallingChat({
+    conversation_id: 'conv_memory_scope',
+    room_id: 'room_memory_scope',
+    user_id: 'desktop_user',
+    message: 'Scope cipher project alpha',
+    input_mode: 'chat_assist',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'Scoped retrieval completed.',
+    tool_results: [],
+    usage: { input_tokens: 4, output_tokens: 3 },
+    model_responses: [{ id: 'chatcmpl_scoped_memory' }],
+  });
+  const scopedTrace = store.getRunTrace(scopedRetrievalChat.run_id);
+  assert.ok(scopedTrace.events.some((event) => event.event_type === 'memory.scope_resolved'
+    && event.payload.project_ids.includes('prj_memory_scope_a')
+    && !event.payload.project_ids.includes('prj_memory_scope_b')));
+  assert.ok(scopedTrace.events.some((event) => event.event_type === 'memory.recalled'
+    && event.payload.scope_match === 'project'
+    && ['fts', 'governance'].includes(event.payload.retrieval_source)));
+  const scopedPack = store['get'](`SELECT metadata FROM memory_context_packs WHERE run_id=?`, scopedRetrievalChat.run_id);
+  assert.deepEqual(JSON.parse(scopedPack.metadata).memory_scope.project_ids, ['prj_memory_scope_a']);
+  assert.ok(Number(store['get'](`SELECT COUNT(*) AS count FROM memory_usage_logs WHERE run_id=? AND injected=1`, scopedRetrievalChat.run_id).count) > 0);
+
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata, created_at)
+     VALUES ('mem_old_candidate_a', 'preference', 'Duplicate lifecycle candidate.', 'Old candidate A', 'global', 'internal', 0.6, 'proposed', '[]', '[]', '{}', datetime('now', '-10 days'))`,
+  );
+  store['exec'](
+    `INSERT INTO memories (id, type, content, summary, scope_type, privacy_level, confidence, status, source_event_ids, entities, metadata, created_at)
+     VALUES ('mem_old_candidate_b', 'preference', 'Duplicate lifecycle candidate.', 'Old candidate B', 'global', 'internal', 0.6, 'pending', '[]', '[]', '{}', datetime('now', '-9 days'))`,
+  );
+  const memoryMetrics = store.listMemories({ limit: 10 }).metrics;
+  assert.ok(memoryMetrics.candidate_count >= 2);
+  assert.ok(memoryMetrics.old_candidate_count >= 2);
+  assert.ok(memoryMetrics.duplicate_candidate_count >= 1);
+  assert.ok(memoryMetrics.injected_count >= 1);
+  assert.ok(memoryMetrics.scope_counts.project >= 1);
+
+  assert.ok(ttlPrompt.agent_capabilities.includes('workspace_search'));
+  assert.ok(ttlPrompt.agent_capabilities.includes('apply_patch'));
+  const researchPrompt = store.assembleToolCallingPrompt({
+    message: 'Research current release notes',
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, 'research_agent', 'real-tool-model');
+  assert.deepEqual(researchPrompt.agent_capabilities, ['web_research']);
+  assert.deepEqual(
+    compileElectronCapabilityTools('danger_full_access', { allowed_capabilities: researchPrompt.agent_capabilities }).map((tool) => tool.name),
+    ['web_research'],
+  );
+  assert.deepEqual(store.getAgentCapabilities('memory_agent'), ['memory_search']);
+  const explicitAgentRoute = store['resolveAgentRoute']('conv_route_explicit', '@devops_agent 检查服务状态');
+  assert.equal(explicitAgentRoute.agent_id, 'devops_agent');
+  assert.equal(explicitAgentRoute.source, 'explicit');
+  const researchAgentRoute = store['resolveAgentRoute']('conv_route_research', '帮我搜一下最新消息');
+  assert.equal(researchAgentRoute.agent_id, 'research_agent');
+  assert.equal(researchAgentRoute.source, 'rule');
+  store['exec'](
+    `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, metadata)
+     VALUES ('conv_agent_sticky', 'desktop', 'desktop_user', 'Sticky agent', 'memory_agent', '{}')`,
+  );
+  const stickyAgentRoute = store['resolveAgentRoute']('conv_agent_sticky', '继续刚才的话题');
+  assert.equal(stickyAgentRoute.agent_id, 'memory_agent');
+  assert.equal(stickyAgentRoute.source, 'sticky');
   assert.equal(store.listRelationshipStates({ limit: 10 }).memories[0].id, 'mem_relationship_api');
 
   store['exec'](
@@ -511,16 +893,91 @@ try {
   assert.equal(persistedToolRun.capability_id, 'workspace_search');
   assert.equal(JSON.parse(persistedToolRun.input).query, 'Run Trace');
   assert.equal(JSON.parse(persistedToolRun.output).mode, 'workspace_search_v1_model_tool_test');
+
+  const webSearchAliasChat = store.recordToolCallingChat({
+    message: 'Search for the GPT-6 release date',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'No official GPT-6 release date is available.',
+    tool_results: [{
+      call_id: 'call_web_search_alias',
+      name: 'web_search',
+      arguments: { query: 'GPT-6 release date OpenAI' },
+      output: { status: 'completed', summary: 'Search completed.' },
+    }],
+    usage: { input_tokens: 3, output_tokens: 2 },
+    model_responses: [{ id: 'chatcmpl_web_search_alias' }],
+  });
+  const webSearchAliasToolRun = store['get'](
+    `SELECT capability_id, workflow_name, tool_name FROM tool_runs WHERE run_id=?`,
+    webSearchAliasChat.run_id,
+  );
+  assert.equal(webSearchAliasToolRun.capability_id, 'web_research');
+  assert.equal(webSearchAliasToolRun.workflow_name, 'web_research_v1');
+  assert.equal(webSearchAliasToolRun.tool_name, 'web_search');
+  assert.equal(store.getRunTrace(webSearchAliasChat.run_id).status, 'completed');
+
+  const unsupportedAliasChat = store.recordToolCallingChat({
+    message: 'Record an unsupported model tool safely',
+    input_mode: 'chat_assist',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'The requested tool is unsupported.',
+    tool_results: [{
+      call_id: 'call_unknown_alias',
+      name: 'unknown_model_tool',
+      arguments: {},
+      output: { status: 'failed', error: 'Unsupported capability.' },
+    }],
+    usage: { input_tokens: 2, output_tokens: 2 },
+    model_responses: [{ id: 'chatcmpl_unknown_alias' }],
+  });
+  const unsupportedAliasToolRun = store['get'](
+    `SELECT capability_id, tool_name, status FROM tool_runs WHERE run_id=?`,
+    unsupportedAliasChat.run_id,
+  );
+  assert.equal(unsupportedAliasToolRun.capability_id, null);
+  assert.equal(unsupportedAliasToolRun.tool_name, 'unknown_model_tool');
+  assert.equal(unsupportedAliasToolRun.status, 'failed');
   const promptRow = store['get'](`SELECT cacheable_prefix, dynamic_tail FROM prompt_assemblies WHERE run_id=?`, toolCallingChat.run_id);
   assert.ok(promptRow.cacheable_prefix.includes('Joi Electron Tool Calling Runtime'));
   assert.ok(promptRow.cacheable_prefix.includes('Your product identity is Joi'));
   assert.ok(promptRow.cacheable_prefix.includes('The selected model id for this run is real-tool-model'));
   assert.ok(promptRow.cacheable_prefix.includes('Do not claim to be Claude'));
+  assert.ok(promptRow.cacheable_prefix.includes('Keep ordinary chat replies concise by default'));
+  assert.ok(promptRow.cacheable_prefix.includes('Earlier turn-specific wording, exact-output formats'));
+  assert.ok(promptRow.cacheable_prefix.includes('Never continue a previous fixed answer such as RESULT=4'));
+  assert.ok(promptRow.cacheable_prefix.includes('Do not proactively add emoji'));
   assert.ok(promptRow.dynamic_tail.includes('Prefer direct status updates.'));
   const memoryPackRow = store['get'](`SELECT dynamic_retrieval FROM memory_context_packs WHERE run_id=?`, toolCallingChat.run_id);
   const dynamicMemoryIDs = JSON.parse(memoryPackRow.dynamic_retrieval).map((result) => result.memory.id);
   assert.ok(dynamicMemoryIDs.includes(correctedMemory.id));
   assert.ok(!dynamicMemoryIDs.includes('mem_test'));
+
+  const emojiSanitizedChat = store.recordToolCallingChat({
+    message: '给我一个状态更新',
+    input_mode: 'chat_assist',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: '✅ 完成。请看。',
+    tool_results: [],
+    usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 },
+    model_responses: [{ id: 'chatcmpl_emoji_sanitized', choices: [{ message: { content: '✅ 完成。请看。' } }] }],
+  });
+  assert.equal(emojiSanitizedChat.response, '完成。请看。');
 
   const seriousTaskChat = store.recordToolCallingChat({
     message: '帮我分析 Joi Task OS 并给出报告',
@@ -1020,6 +1477,158 @@ try {
   assert.equal(liveFinishedTrace.model_calls[0].input_tokens, 5);
   assert.equal(store.getConversation(liveStarted.conversation_id).messages.at(-1).content, 'Live run finished.');
 
+  store.replaceFetchedModels('openai_compatible', 'https://api.persona.test/v1', [{
+    id: 'persona-special-model',
+    display_name: 'Persona Special Model',
+    provider: 'openai_compatible',
+    base_url: 'https://api.persona.test/v1',
+    supports_json_mode: true,
+    supports_tool_calling: true,
+  }]);
+
+  const routedPersona = store.createProjectPersona({
+    project_name: 'Persona Model Route',
+    project_goal: 'Verify persona-scoped model routing',
+    persona_choice: {
+      display_name: 'Model Pilot',
+      handle: 'model-pilot',
+      tagline: 'Routes runs through the persona model.',
+      self_intro: 'I verify persona-scoped model routing.',
+      model_strategy: 'persona-special-model',
+    },
+  });
+  const personaModelStarted = store.beginToolCallingChat({
+    conversation_id: 'conv_private_hub',
+    room_id: 'room_private_hub',
+    message: '@model-pilot verify routed model',
+    mentions: [routedPersona.persona.id],
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+    model_name: 'global-fallback-model',
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'global-fallback-model',
+  });
+  const personaModelTrace = store.getRunTrace(personaModelStarted.run_id);
+  assert.equal(personaModelStarted.selected_agent_id, routedPersona.persona.id);
+  assert.equal(personaModelStarted.model_name, 'persona-special-model');
+  assert.equal(personaModelTrace.selected_agent_id, routedPersona.persona.id);
+  assert.equal(personaModelTrace.model_calls[0].model_name, 'persona-special-model');
+  assert.equal(store['get'](`SELECT executor_persona_id FROM routing_decisions WHERE run_id=?`, personaModelStarted.run_id).executor_persona_id, routedPersona.persona.id);
+  store.finishToolCallingChat(personaModelStarted, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: personaModelStarted.model_name,
+    selected_agent_id: personaModelStarted.selected_agent_id,
+    final_message: 'Persona model route finished.',
+    tool_results: [],
+    usage: { input_tokens: 2, output_tokens: 2, cached_input_tokens: 0 },
+    model_responses: [{ id: 'chatcmpl_persona_model_route' }],
+  });
+
+  const telegramCurrentModelStarted = store.beginToolCallingChat({
+    conversation_id: routedPersona.room.conversation_id,
+    room_id: routedPersona.room.id,
+    channel: 'telegram',
+    user_id: 'telegram:1234567890',
+    message: 'Use the current Telegram model despite this old conversation model.',
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+    model_name: 'gpt-5.6-terra[medium]',
+  }, {
+    provider: 'acp_codex_cli',
+    model_name: 'gpt-5.6-terra[medium]',
+    model_reasoning_effort: 'medium',
+    model_selection_policy: 'settings_preferred',
+  });
+  const telegramCurrentModelTrace = store.getRunTrace(telegramCurrentModelStarted.run_id);
+  assert.equal(telegramCurrentModelStarted.selected_agent_id, routedPersona.persona.id, 'Telegram may retain the conversation persona');
+  assert.equal(telegramCurrentModelStarted.provider, 'acp_codex_cli', 'Telegram must prefer the current settings provider');
+  assert.equal(telegramCurrentModelStarted.model_name, 'gpt-5.6-terra[medium]', 'an old persona model must not replace the current Telegram model');
+  assert.equal(telegramCurrentModelStarted.model_reasoning_effort, 'medium', 'an old persona reasoning effort must not replace the current Telegram effort');
+  assert.equal(telegramCurrentModelTrace.route_result.provider, 'acp_codex_cli');
+  assert.equal(telegramCurrentModelTrace.route_result.model, 'gpt-5.6-terra[medium]');
+  store.finishToolCallingChat(telegramCurrentModelStarted, {
+    status: 'completed',
+    provider: telegramCurrentModelStarted.provider,
+    model_name: telegramCurrentModelStarted.model_name,
+    selected_agent_id: telegramCurrentModelStarted.selected_agent_id,
+    final_message: 'Telegram current model route finished.',
+    tool_results: [],
+    usage: { input_tokens: 2, output_tokens: 2, cached_input_tokens: 0 },
+    model_responses: [{ id: 'chatcmpl_telegram_current_model_route' }],
+  });
+
+  const automationCurrentModelStarted = store.beginToolCallingChat({
+    conversation_id: routedPersona.room.conversation_id,
+    room_id: routedPersona.room.id,
+    channel: 'automation',
+    user_id: 'automation:daily-digest',
+    message: 'Use the current automation model despite this old conversation model.',
+    input_mode: 'background_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'gpt-5.6-terra[medium]',
+  }, {
+    provider: 'acp_codex_cli',
+    model_name: 'gpt-5.6-terra[medium]',
+    model_reasoning_effort: 'medium',
+    model_selection_policy: 'settings_preferred',
+  });
+  const automationCurrentModelTrace = store.getRunTrace(automationCurrentModelStarted.run_id);
+  assert.equal(automationCurrentModelStarted.selected_agent_id, routedPersona.persona.id, 'Automation may retain the conversation persona');
+  assert.equal(automationCurrentModelStarted.provider, 'acp_codex_cli', 'Automation must prefer the current settings provider');
+  assert.equal(automationCurrentModelStarted.model_name, 'gpt-5.6-terra[medium]', 'an old persona model must not replace the current automation model');
+  assert.equal(automationCurrentModelStarted.model_reasoning_effort, 'medium', 'an old persona reasoning effort must not replace the current automation effort');
+  assert.equal(automationCurrentModelTrace.route_result.provider, 'acp_codex_cli');
+  assert.equal(automationCurrentModelTrace.route_result.model, 'gpt-5.6-terra[medium]');
+  store.finishToolCallingChat(automationCurrentModelStarted, {
+    status: 'completed',
+    provider: automationCurrentModelStarted.provider,
+    model_name: automationCurrentModelStarted.model_name,
+    selected_agent_id: automationCurrentModelStarted.selected_agent_id,
+    final_message: 'Automation current model route finished.',
+    tool_results: [],
+    usage: { input_tokens: 2, output_tokens: 2, cached_input_tokens: 0 },
+    model_responses: [{ id: 'chatcmpl_automation_current_model_route' }],
+  });
+
+  const staleModelPersona = store.createProjectPersona({
+    project_name: 'Stale Persona Model Route',
+    project_goal: 'Verify missing persona model falls back to request model',
+    persona_choice: {
+      display_name: 'Stale Model Pilot',
+      handle: 'stale-model-pilot',
+      tagline: 'Falls back when its model is not configured.',
+      self_intro: 'I verify stale persona-scoped model routing.',
+      model_strategy: 'missing-persona-model',
+    },
+  });
+  const staleModelStarted = store.beginToolCallingChat({
+    conversation_id: 'conv_private_hub',
+    room_id: 'room_private_hub',
+    message: '@stale-model-pilot verify fallback model',
+    mentions: [staleModelPersona.persona.id],
+    input_mode: 'auto',
+    runtime_mode: 'tool_calling',
+    model_name: 'global-fallback-model',
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'global-fallback-model',
+  });
+  assert.equal(staleModelStarted.selected_agent_id, staleModelPersona.persona.id);
+  assert.equal(staleModelStarted.model_name, 'global-fallback-model');
+  assert.equal(store.getRunTrace(staleModelStarted.run_id).model_calls[0].model_name, 'global-fallback-model');
+  store.finishToolCallingChat(staleModelStarted, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: staleModelStarted.model_name,
+    selected_agent_id: staleModelStarted.selected_agent_id,
+    final_message: 'Stale persona model route finished.',
+    tool_results: [],
+    usage: { input_tokens: 1, output_tokens: 1 },
+    model_responses: [{ id: 'chatcmpl_stale_persona_model_route' }],
+  });
+
   const streamStarted = store.beginToolCallingChat({
     message: 'Begin a streaming provider run with tool events',
     input_mode: 'auto',
@@ -1031,8 +1640,10 @@ try {
     selected_agent_id: 'general_agent',
   });
   const emittedEventTypes = [];
-  const streamCallbacks = store.createToolCallingEventCallbacks(streamStarted, () => {
-    emittedEventTypes.push(store.getRunTrace(streamStarted.run_id).events.at(-1).event_type);
+  const emittedEvents = [];
+  const streamCallbacks = store.createToolCallingEventCallbacks(streamStarted, (event) => {
+    emittedEvents.push(event);
+    emittedEventTypes.push(event.event_type);
   });
   const streamToolCall = {
     id: 'call_stream_workspace_search',
@@ -1049,9 +1660,9 @@ try {
       summary: 'streaming persistence evidence',
     },
   };
+  const committedStreamAnswer = 'Streamed answer.\n\n```ts\n  const value = 1;\n```';
   streamCallbacks.onModelStarted({ step: 0, model: 'live-tool-model', streaming: true });
   streamCallbacks.onModelDelta({ step: 0, payload: { choices: [{ delta: { content: 'Streamed ' } }] } });
-  streamCallbacks.onAssistantDelta({ step: 0, text: 'Streamed ', index: 0 });
   streamCallbacks.onToolCallRequested({ step: 0, call: streamToolCall });
   streamCallbacks.onToolStarted({ step: 0, call: streamToolCall });
   streamCallbacks.onToolOutputDelta({ step: 0, call: streamToolCall, output: { summary: 'partial stream evidence' } });
@@ -1061,35 +1672,38 @@ try {
     usage: { input_tokens: 9, output_tokens: 4, cached_input_tokens: 2 },
     usage_status: 'recorded',
   });
-  streamCallbacks.onAssistantDelta({ step: 1, text: 'answer.', index: 1 });
-  streamCallbacks.onAssistantCompleted({ step: 1, text: 'Streamed answer.', finish_reason: 'stop', usage_status: 'recorded' });
+  streamCallbacks.onAssistantDelta({ step: 1, text: `${committedStreamAnswer}\n\n`, index: 0 });
+  streamCallbacks.onAssistantCompleted({ step: 1, text: `${committedStreamAnswer}\n\n`, finish_reason: 'stop', usage_status: 'recorded' });
   streamCallbacks.onModelCompleted({ step: 1, finish_reason: 'stop', usage_status: 'recorded' });
   const streamFinished = store.finishToolCallingChat(streamStarted, {
     status: 'completed',
     provider: 'openai_compatible',
     model_name: 'live-tool-model',
     selected_agent_id: 'general_agent',
-    final_message: 'Streamed answer.',
+    final_message: `${committedStreamAnswer}\n\n`,
     tool_results: [streamToolResult],
     usage: { input_tokens: 9, output_tokens: 4, cached_input_tokens: 2 },
     usage_status: 'recorded',
     finish_reason: 'stop',
     model_responses: [{ id: 'chatcmpl_stream_finished' }],
   });
-  assert.equal(streamFinished.response, 'Streamed answer.');
+  assert.equal(streamFinished.response, committedStreamAnswer);
   assert.ok(emittedEventTypes.includes('assistant.delta'));
   assert.ok(emittedEventTypes.includes('tool.completed'));
+  assert.ok(emittedEvents.every((event) => event.run_id === streamStarted.run_id && event.seq > 0));
   const streamTrace = store.getRunTrace(streamStarted.run_id);
   const streamEventTypes = streamTrace.events.map((event) => event.event_type);
   assert.deepEqual(streamEventTypes.slice(0, 3), ['run.started', 'run.mode_resolved', 'turn.started']);
-  assert.ok(streamEventTypes.indexOf('assistant.delta') < streamEventTypes.indexOf('tool.call_requested'));
   assert.ok(streamEventTypes.indexOf('tool.call_requested') < streamEventTypes.indexOf('tool.completed'));
+  assert.ok(streamEventTypes.indexOf('tool.completed') < streamEventTypes.indexOf('assistant.delta'));
   assert.ok(streamEventTypes.indexOf('tool.completed') < streamEventTypes.indexOf('assistant.completed'));
   assert.ok(streamEventTypes.indexOf('assistant.completed') < streamEventTypes.indexOf('turn.completed'));
   assert.ok(streamEventTypes.indexOf('turn.completed') < streamEventTypes.indexOf('run.completed'));
   const providerDeltas = streamTrace.events.filter((event) => event.event_type === 'assistant.delta' && event.delta?.stream_source === 'provider_stream');
-  assert.equal(providerDeltas.length, 2);
-  assert.equal(providerDeltas.map((event) => event.delta.text).join(''), 'Streamed answer.');
+  assert.equal(providerDeltas.length, 1);
+  assert.equal(providerDeltas[0].delta.text, committedStreamAnswer);
+  assert.equal(providerDeltas[0].delta.text, streamTrace.events.find((event) => event.event_type === 'assistant.completed')?.delta.text);
+  assert.match(providerDeltas[0].delta.text, /\n  const value = 1;/, 'committed chat text must preserve code indentation');
   assert.equal(streamTrace.events.some((event) => event.event_type === 'assistant.delta' && event.delta?.stream_source === 'fallback_final_chunk'), false);
   assert.equal(streamTrace.events.filter((event) => event.event_type === 'assistant.completed').length, 1);
   assert.equal(streamTrace.events.filter((event) => event.event_type === 'tool.call_requested' && event.item_id === streamToolCall.id).length, 1);
@@ -1177,6 +1791,9 @@ try {
   assert.match(promptWithHistory.dynamic_tail, /Question 6 follow-up/);
   assert.match(promptWithHistory.dynamic_tail, /api_key=\[REDACTED\]/);
   assert.equal(promptWithHistory.dynamic_tail.includes('sk-test-secret-123456'), false);
+  assert.ok(promptWithHistory.conversation_messages.some((item) => item.role === 'user' && item.content.includes('Question 6 follow-up')));
+  assert.ok(promptWithHistory.conversation_messages.some((item) => item.role === 'assistant' && item.content.includes('Answer 6')));
+  assert.equal(JSON.stringify(promptWithHistory.conversation_messages).includes('sk-test-secret-123456'), false);
 
   const liveCancelled = store.beginToolCallingChat({
     message: 'Begin a live run that will be cancelled',
@@ -1470,6 +2087,13 @@ try {
   assert.equal(appLog.payload.nested.password, '[REDACTED]');
   assert.equal(String(appLog.payload.note).includes('log-token-value'), false);
   assert.equal(String(appLog.payload.long_note).includes(longLogBody), true);
+  assert.match(appLog.created_at, /^\d{4}-\d{2}-\d{2}/);
+  const defaultTimestampEvent = store.appendRunEventV2({
+    run_id: response.run_id,
+    event_type: 'store.test.default_timestamp',
+    created_at: '   ',
+  });
+  assert.match(defaultTimestampEvent.created_at, /^\d{4}-\d{2}-\d{2}/);
   const secretShapeLog = store.recordAppLog({
     level: 'info',
     risk_level: 'state_change',

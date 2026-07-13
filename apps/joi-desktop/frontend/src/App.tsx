@@ -1,6 +1,7 @@
 import { Terminal } from '@xterm/xterm';
 import { Component, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  ChangeEvent,
   CSSProperties,
   ErrorInfo,
   KeyboardEvent as ReactKeyboardEvent,
@@ -20,6 +21,7 @@ import {
   type BackupRecord,
   type ChatResponse,
   type CapabilityRecord,
+  type ConversationDetail,
   type ConversationMessage,
   type ConversationSummary,
   type ConfirmationRecord,
@@ -29,6 +31,7 @@ import {
   type LogCleanupRequest,
   type LogEntry,
   type MemoryRecord,
+  type MemoryQualityMetrics,
   type MemorySearchResult,
   type MessengerRoom,
   type MCPServerRecord,
@@ -37,6 +40,8 @@ import {
   type OnboardingStatus,
   type OpenLoop,
   type PhotonIMessageStatus,
+  type PluginRecord,
+  type PluginProviderConfig,
   type PersonaCandidate,
   type PersonaMessengerSnapshot,
   type ProactiveMessage,
@@ -55,6 +60,9 @@ import {
   type TerminalSessionInfo,
   type ToolRunRecord,
   type ToolWorkflowRecord,
+  type UpdateMessengerProjectRequest,
+  type UpdateMessengerRoomRequest,
+  type UpdateProjectPersonaRequest,
   type WorkerGatewayAuditRecord,
   type WorkspaceSettings,
 } from './api/desktop';
@@ -63,13 +71,40 @@ import { permissionProfileForPrompt } from './permissionProfile';
 import joiAvatar from './assets/joi-avatar-circle.png';
 import { ScrollArea } from './components/ScrollArea';
 import { buildConversationRenderItems, getMessageRunId, sortBySeq } from './features/chat/conversationProjector';
-import { getAutomationDetailState, getAutomationSettingsObjects } from './features/automation/automationUiState';
+import {
+  buildAutomationTelegramNotificationPolicy,
+  getAutomationDetailState,
+  getAutomationSettingsObjects,
+  getAutomationTelegramNotificationDraft,
+  getAutomationTelegramReadiness,
+  getAutomationTelegramTargetError,
+} from './features/automation/automationUiState';
 import { MessageList } from './features/chat/components/MessageList';
+import { ChatMessageScroller } from './features/chat/components/ChatMessageScroller';
 import { TraceDrawer } from './features/chat/components/TraceDrawer';
 import { normalizeRunEvent, normalizeRunEvents } from './features/chat/runEventNormalizer';
 import { mergeAssistantTextChunk } from './features/chat/streamingText';
-import type { NormalizedRunEvent } from './features/chat/types';
+import { messagesForConversationHydration, shouldRestoreThreadMessages } from './features/chat/conversationHydration';
+import type { MessageThreadAnnotation, NormalizedRunEvent } from './features/chat/types';
+import {
+  conversationChannelLabel,
+  filterSingleAgentConversations,
+  selectPrimaryJoiRoom,
+  visibleSingleAgentConversations,
+} from './features/workspace/singleAgentWorkspace';
+import { executionRoutingForSettings } from './features/settings/settingsRuntime';
+import {
+  acpPluginModelConfig,
+  mergeACPPluginModels,
+  selectACPPluginModel,
+  type ACPPluginModelOption,
+} from './features/settings/acpPluginModels';
 import { visibleRecentTasksForHandoff } from './productTasks';
+import {
+  capabilityBackend,
+  capabilityBackendLabel,
+  capabilityStatusLabel,
+} from './features/capabilities/capabilityPresentation';
 import {
   createOptimisticExecutionActions,
   getExecutionDisplayMode,
@@ -87,8 +122,18 @@ import '@xterm/xterm/css/xterm.css';
 type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
 type SettingsTab = Exclude<Tab, 'chat'>;
 type SettingsCategory = 'models' | 'chatEntrances' | 'automations' | 'observability' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
-type ExecutionTarget = 'main-node' | 'auto' | 'local-worker-1' | 'vps-la-1';
-type RightInspectorTab = 'overview' | 'runs' | 'threads' | 'assets' | 'memory' | 'identity';
+type RightInspectorTab = 'overview' | 'runs' | 'threads' | 'assets' | 'memory' | 'member';
+type MessengerRoomMember = NonNullable<MessengerRoom['members']>[number];
+type MessengerThread = PersonaMessengerSnapshot['threads'][number];
+type ComposerAttachment = {
+  id: string;
+  name: string;
+  size: number;
+  mime_type: string;
+  kind: 'image' | 'video' | 'file';
+  preview_url?: string;
+  last_modified?: number;
+};
 type StreamingAssistantMessage = ConversationMessage & {
   role: 'assistant';
   complete?: boolean;
@@ -155,12 +200,12 @@ const settingsCategories: Array<{ id: SettingsCategory; label: string; descripti
   { id: 'models', label: '模型', description: '模型与服务配置' },
   { id: 'chatEntrances', label: '聊天入口', description: '聊天平台与入口管理' },
   { id: 'automations', label: '自动化', description: '定时任务与 Webhook Hook' },
-  { id: 'observability', label: '日志与用量', description: '日志、Token 与成本统计' },
+  { id: 'observability', label: '运行与用量', description: '运行记录、用量与本地清理' },
   { id: 'dataMemory', label: '数据与记忆', description: '数据存储与记忆管理' },
   { id: 'capabilities', label: '能力与工具', description: '插件、工具与能力配置' },
   { id: 'nodesExecution', label: '节点与执行', description: '工作节点与执行资源' },
   { id: 'privacySecurity', label: '隐私与安全', description: '隐私设置与安全控制' },
-  { id: 'advanced', label: '高级', description: '实验性与开发者选项' },
+  { id: 'advanced', label: '支持', description: '诊断、导出与问题修复' },
 ];
 const defaultSettingsObjectByCategory: Record<SettingsCategory, string> = {
   models: 'deepseek',
@@ -190,18 +235,18 @@ const logLevelOptions = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'];
 const logRiskOptions = ['read_only', 'write_candidate', 'browser_interaction', 'workspace_write', 'state_change', 'destructive', 'unsafe'];
 const logCategoryOptions = ['ipc', 'runtime', 'terminal', 'external', 'worker_gateway', 'settings', 'system', 'run', 'tool', 'model'];
 const defaultLogCleanupScopes: LogCleanupRequest['scopes'] = ['app_logs', 'run_events', 'run_steps', 'tool_runs', 'model_calls', 'worker_gateway_audit_logs', 'log_files'];
-const executionTargetOptions: Array<{ value: ExecutionTarget; label: string; preferredNode: string; allowWorker: boolean }> = [
-  { value: 'main-node', label: '本机', preferredNode: 'main-node', allowWorker: false },
-  { value: 'auto', label: '自动', preferredNode: 'auto', allowWorker: true },
-  { value: 'local-worker-1', label: '本机 Worker', preferredNode: 'local-worker-1', allowWorker: true },
-  { value: 'vps-la-1', label: '远端 Worker', preferredNode: 'vps-la-1', allowWorker: true },
+const reasoningEffortOptions = [
+  { value: 'none', label: '关闭' },
+  { value: 'low', label: '低' },
+  { value: 'medium', label: '中' },
+  { value: 'high', label: '高' },
 ];
-const inputModeOptions: Array<{ value: InputMode; label: string; title: string }> = [
-  { value: 'auto', label: 'Auto', title: '自动判断聊天、工具、任务或后台执行' },
-  { value: 'chat_assist', label: 'Chat', title: '普通问答，默认隐藏工具过程' },
-  { value: 'serious_task', label: 'Task', title: '认真执行，多步骤过程可见' },
-  { value: 'background_task', label: 'Bg', title: '后台执行，主聊天只保留任务入口' },
+const webSearchProviderOptions = [
+  { value: 'auto', label: '自动' },
+  { value: 'brave', label: 'Brave Search API' },
+  { value: 'duckduckgo', label: 'DuckDuckGo HTML' },
 ];
+const MAX_PRELOADED_CONVERSATION_RUN_TRACES = 32;
 
 function mergeRunEvents(
   current: Record<string, NormalizedRunEvent[]>,
@@ -267,7 +312,60 @@ function latestActiveRunId(eventsByRunId: Record<string, NormalizedRunEvent[]>):
 
 function normalizeTraceEvents(trace: RunTrace | null): NormalizedRunEvent[] {
   return normalizeRunEvents(trace?.events ?? [])
-    .filter((event) => Boolean(event.runId));
+    .filter((event) => Boolean(event.runId))
+    .map((event) => ({
+      ...event,
+      runStartedAt: trace?.started_at,
+      runCompletedAt: trace?.finished_at,
+      runDurationMs: trace?.duration_ms,
+    }));
+}
+
+function runIdsForConversationRunTraces(messages: ConversationMessage[], latestRunID?: string): string[] {
+  const seen = new Set<string>();
+  const runIds: string[] = [];
+  for (const message of messages) {
+    const runID = getMessageRunId(message);
+    if (!runID || seen.has(runID)) continue;
+    seen.add(runID);
+    runIds.push(runID);
+  }
+  if (latestRunID && !seen.has(latestRunID)) {
+    seen.add(latestRunID);
+    runIds.push(latestRunID);
+  }
+  if (runIds.length <= MAX_PRELOADED_CONVERSATION_RUN_TRACES) return runIds;
+  const recentRunIds = runIds.slice(-MAX_PRELOADED_CONVERSATION_RUN_TRACES);
+  if (!latestRunID || recentRunIds.includes(latestRunID)) return recentRunIds;
+  return [...recentRunIds.slice(1), latestRunID];
+}
+
+async function loadConversationRunTraces(messages: ConversationMessage[], latestRunID?: string): Promise<RunTrace[]> {
+  const runIds = runIdsForConversationRunTraces(messages, latestRunID);
+  const traces = await Promise.all(runIds.map(async (runID) => {
+    try {
+      return await desktopApi.getRunTrace(runID);
+    } catch {
+      return null;
+    }
+  }));
+  return traces.filter((trace): trace is RunTrace => Boolean(trace?.id));
+}
+
+function shouldRevealLiveProcessEvent(event: NormalizedRunEvent): boolean {
+  const type = event.type.toLowerCase();
+  if (type === 'model.started' || type === 'model.completed') return true;
+  if (type === 'work_summary.updated' || type === 'plan.created' || type === 'plan.updated') return true;
+  if (type.startsWith('tool.')) return true;
+  return false;
+}
+
+function liveProcessEventDelay(event: NormalizedRunEvent): number {
+  const type = event.type.toLowerCase();
+  if (type === 'tool.output_delta' || type === 'tool.completed' || type === 'tool.failed') return 120;
+  if (type.startsWith('tool.')) return 90;
+  if (type === 'model.completed') return 160;
+  return 110;
 }
 
 type RenderCrashBoundaryProps = {
@@ -318,12 +416,12 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('chat');
   const [message, setMessage] = useState('');
   const [lastPrompt, setLastPrompt] = useState('');
+  const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [pendingUserMessage, setPendingUserMessage] = useState<ConversationMessage | null>(null);
   const [streamingAssistantMessage, setStreamingAssistantMessage] = useState<StreamingAssistantMessage | null>(null);
   const [activeExecutionActions, setActiveExecutionActions] = useState<ExecutionAction[]>([]);
   const [activeExecutionStatus, setActiveExecutionStatus] = useState<ExecutionRunStatus>('pending');
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const executionTarget: ExecutionTarget = 'main-node';
   const [inputMode, setInputMode] = useState<InputMode>('auto');
   const [selectedModelName, setSelectedModelName] = useState('');
   const [chat, setChat] = useState<ChatResponse | null>(null);
@@ -360,12 +458,14 @@ export default function App() {
   const [workflows, setWorkflows] = useState<ToolWorkflowRecord[]>([]);
   const [mcpServers, setMCPServers] = useState<MCPServerRecord[]>([]);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
+  const [plugins, setPlugins] = useState<PluginRecord[]>([]);
   const [toolRuns, setToolRuns] = useState<ToolRunRecord[]>([]);
   const [workspaceSettings, setWorkspaceSettings] = useState<WorkspaceSettings | null>(null);
   const [health, setHealth] = useState<SystemHealth | null>(null);
   const [closureReport, setClosureReport] = useState<RunClosureReport | null>(null);
   const [externalHandoffAudit, setExternalHandoffAudit] = useState<ExternalHandoffAudit | null>(null);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
+  const [memoryMetrics, setMemoryMetrics] = useState<MemoryQualityMetrics | null>(null);
   const [productTasks, setProductTasks] = useState<ProductTask[]>([]);
   const [activeProductTaskID, setActiveProductTaskID] = useState('');
   const [activeProductTaskDetail, setActiveProductTaskDetail] = useState<ProductTaskDetail | null>(null);
@@ -388,7 +488,9 @@ export default function App() {
   const [onboarding, setOnboarding] = useState<OnboardingStatus | null>(null);
   const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>('models');
   const [settingsObjectByCategory, setSettingsObjectByCategory] = useState<Record<SettingsCategory, string>>(defaultSettingsObjectByCategory);
-  const [manualSidebarCollapsed, setManualSidebarCollapsed] = useState(false);
+  const [sidebarPreference, setSidebarPreference] = useState<'auto' | 'collapsed' | 'expanded'>('auto');
+  const [threadSearchOpen, setThreadSearchOpen] = useState(false);
+  const [threadQuery, setThreadQuery] = useState('');
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [rightPanelWidth, setRightPanelWidth] = useState(DEFAULT_RIGHT_PANEL_WIDTH);
   const [windowWidth, setWindowWidth] = useState(() => (typeof window === 'undefined' ? 1280 : window.innerWidth));
@@ -403,25 +505,42 @@ export default function App() {
   const receivedAssistantDeltaRunIDRef = useRef('');
   const assistantCompletedRunIDsRef = useRef<Set<string>>(new Set());
   const runCompletedFallbackTimersRef = useRef<Record<string, number>>({});
+  const streamingAssistantBaseRef = useRef<StreamingAssistantMessage | null>(null);
+  const streamingAssistantQueueRef = useRef<string[]>([]);
+  const streamingAssistantTimerRef = useRef<number | null>(null);
+  const streamingAssistantDisplayedRef = useRef('');
+  const streamingAssistantPlannedRef = useRef('');
+  const streamingAssistantCompletionRef = useRef<{ runId?: string; content?: string } | null>(null);
+  const liveProcessEventQueueRef = useRef<NormalizedRunEvent[]>([]);
+  const liveProcessEventTimerRef = useRef<number | null>(null);
   const loadConversationRequestRef = useRef(0);
+  const initialConversationSelectionRef = useRef(false);
+  const newThreadRequestedRef = useRef(false);
 
   const stepCount = useMemo(() => trace?.steps?.length ?? 0, [trace]);
   const firstModelCall = trace?.model_calls?.[0] ?? chat?.model_calls?.[0];
   const inSettingsArea = activeTab !== 'chat' && activeTab !== 'trace';
-  const autoSidebarCollapsed = !manualSidebarCollapsed && windowWidth < sidebarWidth + CHAT_MAIN_MIN_WIDTH;
-  const sidebarCollapsed = manualSidebarCollapsed || autoSidebarCollapsed;
+  const autoSidebarCollapsed = sidebarPreference === 'auto' && windowWidth < sidebarWidth + CHAT_MAIN_MIN_WIDTH;
+  const sidebarCollapsed = sidebarPreference === 'collapsed' || autoSidebarCollapsed;
   const activeSidebarWidth = sidebarCollapsed ? 0 : sidebarWidth;
   const maxRightPanelWidth = Math.max(
     RIGHT_PANEL_MIN_WIDTH,
     Math.min(RIGHT_PANEL_MAX_WIDTH, windowWidth - activeSidebarWidth - COMPANION_MAIN_MIN_WIDTH),
   );
   const activeRightPanelWidth = Math.min(rightPanelWidth, maxRightPanelWidth);
-  const activeRoom = useMemo(() => {
-    if (!messenger?.rooms.length) return null;
-    return messenger.rooms.find((room) => room.id === currentRoomID)
-      ?? messenger.rooms.find((room) => room.conversation_id === currentConversationID)
-      ?? messenger.rooms[0];
-  }, [currentConversationID, currentRoomID, messenger]);
+  const activeRoom = useMemo(() => selectPrimaryJoiRoom(messenger), [messenger]);
+  const visibleConversations = useMemo(
+    () => visibleSingleAgentConversations(conversations, messenger),
+    [conversations, messenger],
+  );
+  const filteredConversations = useMemo(
+    () => filterSingleAgentConversations(visibleConversations, threadQuery),
+    [threadQuery, visibleConversations],
+  );
+  const currentConversation = useMemo(
+    () => visibleConversations.find((conversation) => conversation.id === currentConversationID) ?? null,
+    [currentConversationID, visibleConversations],
+  );
   const activePersona = useMemo(() => {
     if (!messenger || !activeRoom?.persona_id) return null;
     return messenger.personas.find((persona) => persona.id === activeRoom.persona_id) ?? null;
@@ -461,6 +580,8 @@ export default function App() {
   useEffect(() => () => {
     Object.values(runCompletedFallbackTimersRef.current).forEach((timer) => window.clearTimeout(timer));
     runCompletedFallbackTimersRef.current = {};
+    resetStreamingAssistantQueue();
+    resetLiveProcessEventQueue();
   }, []);
 
   useEffect(() => {
@@ -633,6 +754,34 @@ export default function App() {
     }
   }
 
+  async function updateMessengerRoom(req: UpdateMessengerRoomRequest) {
+    try {
+      const result = await desktopApi.updateMessengerRoom(req);
+      setMessenger((current) => current ? {
+        ...current,
+        rooms: current.rooms.map((room) => room.id === result.room.id ? result.room : room),
+      } : current);
+      setConversations((current) => current.map((conversation) => (
+        conversation.id === result.room.conversation_id
+          ? { ...conversation, title: result.room.title }
+          : conversation
+      )));
+      showNotice('群资料已更新');
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function updateMessengerProject(req: UpdateMessengerProjectRequest) {
+    try {
+      await desktopApi.updateMessengerProject(req);
+      showNotice('项目关联已更新');
+      await refreshAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function retryExternalConnectorEvent(eventID: string) {
     try {
       await desktopApi.retryExternalConnectorEvent({
@@ -646,19 +795,233 @@ export default function App() {
     }
   }
 
+  async function updateProjectPersona(req: UpdateProjectPersonaRequest) {
+    try {
+      await desktopApi.updateProjectPersona(req);
+      showNotice('个体资料已更新');
+      await refreshAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function addComposerAttachments(files: FileList | File[]) {
+    const nextFiles = Array.from(files);
+    if (nextFiles.length === 0) return;
+    setComposerAttachments((current) => [
+      ...current,
+      ...nextFiles.map((file) => ({
+        id: `att_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        name: file.name,
+        size: file.size,
+        mime_type: file.type || 'application/octet-stream',
+        kind: attachmentKind(file),
+        preview_url: file.type.startsWith('image/') || file.type.startsWith('video/') ? URL.createObjectURL(file) : undefined,
+        last_modified: file.lastModified,
+      })),
+    ]);
+  }
+
+  function removeComposerAttachment(id: string) {
+    setComposerAttachments((current) => {
+      const target = current.find((item) => item.id === id);
+      if (target?.preview_url) URL.revokeObjectURL(target.preview_url);
+      return current.filter((item) => item.id !== id);
+    });
+  }
+
+  function clearComposerAttachments() {
+    setComposerAttachments([]);
+  }
+
+  function resetStreamingAssistantQueue() {
+    if (streamingAssistantTimerRef.current !== null) {
+      window.clearTimeout(streamingAssistantTimerRef.current);
+      streamingAssistantTimerRef.current = null;
+    }
+    streamingAssistantBaseRef.current = null;
+    streamingAssistantQueueRef.current = [];
+    streamingAssistantDisplayedRef.current = '';
+    streamingAssistantPlannedRef.current = '';
+    streamingAssistantCompletionRef.current = null;
+  }
+
+  function primeStreamingAssistant(base: StreamingAssistantMessage) {
+    const currentBase = streamingAssistantBaseRef.current;
+    const incomingRunID = base.run_id || '';
+    const currentRunID = currentBase?.run_id || '';
+    if (!currentBase || (incomingRunID && currentRunID && incomingRunID !== currentRunID)) {
+      resetStreamingAssistantQueue();
+      streamingAssistantBaseRef.current = { ...base, content: '', complete: false };
+      setStreamingAssistantMessage({ ...base, content: '', complete: false });
+      return;
+    }
+    streamingAssistantBaseRef.current = {
+      ...currentBase,
+      ...base,
+      content: currentBase.content || base.content || '',
+      complete: false,
+    };
+  }
+
+  function enqueueAssistantText(base: StreamingAssistantMessage, text: string, splitLargeChunk = false) {
+    const visibleText = userFacingAssistantText(text);
+    if (!visibleText) return;
+    primeStreamingAssistant(base);
+    const plannedBefore = streamingAssistantPlannedRef.current;
+    const plannedAfter = mergeAssistantTextChunk(plannedBefore, visibleText);
+    const pendingText = plannedAfter.startsWith(plannedBefore)
+      ? plannedAfter.slice(plannedBefore.length)
+      : visibleText;
+    streamingAssistantPlannedRef.current = plannedAfter;
+    const chunks = splitLargeChunk ? splitStreamingChunks(pendingText) : [pendingText];
+    streamingAssistantQueueRef.current.push(...chunks.filter(Boolean));
+    pumpStreamingAssistantQueue();
+  }
+
+  function completeStreamingAssistant(runId?: string, finalText?: string) {
+    const visibleFinalText = finalText ? userFacingAssistantText(finalText) : '';
+    if (visibleFinalText) {
+      const base = streamingAssistantBaseRef.current || {
+        id: pendingAssistantIDRef.current || `streaming-${runId || Date.now()}`,
+        conversation_id: pendingConversationIDRef.current || currentConversationID || 'pending-conversation',
+        role: 'assistant' as const,
+        content: '',
+        run_id: runId,
+      };
+      const plannedBefore = streamingAssistantPlannedRef.current;
+      const plannedAfter = visibleFinalText.startsWith(plannedBefore)
+        ? visibleFinalText
+        : mergeAssistantTextChunk(plannedBefore, visibleFinalText);
+      const missingText = plannedAfter.startsWith(plannedBefore)
+        ? plannedAfter.slice(plannedBefore.length)
+        : '';
+      if (missingText) {
+        enqueueAssistantText(base, missingText, true);
+      }
+      streamingAssistantPlannedRef.current = plannedAfter;
+    }
+    streamingAssistantCompletionRef.current = {
+      runId,
+      content: visibleFinalText || undefined,
+    };
+    if (streamingAssistantQueueRef.current.length === 0 && streamingAssistantTimerRef.current === null) {
+      markQueuedStreamingAssistantComplete();
+    }
+  }
+
+  function pumpStreamingAssistantQueue() {
+    if (streamingAssistantTimerRef.current !== null) return;
+    const nextChunk = streamingAssistantQueueRef.current[0];
+    if (!nextChunk) {
+      markQueuedStreamingAssistantComplete();
+      return;
+    }
+    streamingAssistantTimerRef.current = window.setTimeout(() => {
+      streamingAssistantTimerRef.current = null;
+      const chunk = streamingAssistantQueueRef.current.shift();
+      if (chunk) {
+        setStreamingAssistantMessage((current) => {
+          const base = current || streamingAssistantBaseRef.current;
+          if (!base) return current;
+          const nextContent = mergeAssistantTextChunk(String(base.content || ''), chunk);
+          streamingAssistantDisplayedRef.current = nextContent;
+          const nextMessage = { ...base, content: nextContent, complete: false };
+          streamingAssistantBaseRef.current = nextMessage;
+          return nextMessage;
+        });
+      }
+      if (streamingAssistantQueueRef.current.length > 0) {
+        pumpStreamingAssistantQueue();
+        return;
+      }
+      markQueuedStreamingAssistantComplete();
+    }, streamingChunkDelay(nextChunk));
+  }
+
+  function markQueuedStreamingAssistantComplete() {
+    const completion = streamingAssistantCompletionRef.current;
+    if (!completion) return;
+    setStreamingAssistantMessage((current) => {
+      if (!current) return current;
+      if (completion.runId && current.run_id && current.run_id !== completion.runId) return current;
+      const content = completion.content || String(current.content || '');
+      streamingAssistantDisplayedRef.current = content;
+      const nextMessage = { ...current, content, complete: true };
+      streamingAssistantBaseRef.current = nextMessage;
+      return nextMessage;
+    });
+    streamingAssistantCompletionRef.current = null;
+  }
+
+  async function waitForStreamingAssistantIdle(timeoutMs = 30000) {
+    const startedAt = Date.now();
+    while (
+      streamingAssistantTimerRef.current !== null
+      || streamingAssistantQueueRef.current.length > 0
+      || streamingAssistantCompletionRef.current !== null
+    ) {
+      if (Date.now() - startedAt > timeoutMs) break;
+      await sleep(50);
+    }
+  }
+
+  function resetLiveProcessEventQueue() {
+    if (liveProcessEventTimerRef.current !== null) {
+      window.clearTimeout(liveProcessEventTimerRef.current);
+      liveProcessEventTimerRef.current = null;
+    }
+    liveProcessEventQueueRef.current = [];
+  }
+
+  function mergeRunEventForProjection(event: NormalizedRunEvent) {
+    if (!event.runId) return;
+    setRunEventsByRunId((current) => mergeRunEvents(current, event.runId, [event]));
+  }
+
+  function enqueueLiveProcessEvent(event: NormalizedRunEvent) {
+    liveProcessEventQueueRef.current.push(event);
+    pumpLiveProcessEventQueue();
+  }
+
+  function pumpLiveProcessEventQueue() {
+    if (liveProcessEventTimerRef.current !== null) return;
+    const nextEvent = liveProcessEventQueueRef.current.shift();
+    if (!nextEvent) return;
+    liveProcessEventTimerRef.current = window.setTimeout(() => {
+      liveProcessEventTimerRef.current = null;
+      mergeRunEventForProjection(nextEvent);
+      pumpLiveProcessEventQueue();
+    }, liveProcessEventDelay(nextEvent));
+  }
+
+  async function waitForLiveProcessEventQueueIdle(timeoutMs = 15000) {
+    const startedAt = Date.now();
+    while (liveProcessEventTimerRef.current !== null || liveProcessEventQueueRef.current.length > 0) {
+      if (Date.now() - startedAt > timeoutMs) break;
+      await sleep(50);
+    }
+  }
+
   function dispatchExecutionEvent(event: ExecutionEvent) {
     const normalized = normalizeRunEvent(event);
-    if (normalized.runId) {
-      setRunEventsByRunId((current) => mergeRunEvents(current, normalized.runId, [normalized]));
+    const eventType = normalized.type || event.type || event.event || '';
+    if (normalized.runId && eventType !== 'assistant.delta' && eventType !== 'model.delta') {
+      if (shouldRevealLiveProcessEvent(normalized)) {
+        enqueueLiveProcessEvent(normalized);
+      } else {
+        mergeRunEventForProjection(normalized);
+      }
     }
 
-    const eventType = normalized.type || event.type || event.event || '';
     if (!eventType) return;
 
     if (eventType === 'run.started') {
       setActiveExecutionStatus('running');
       receivedAssistantDeltaRef.current = false;
       receivedAssistantDeltaRunIDRef.current = '';
+      resetStreamingAssistantQueue();
+      resetLiveProcessEventQueue();
       if (normalized.runId) {
         assistantCompletedRunIDsRef.current.delete(normalized.runId);
         clearRunCompletedFallback(normalized.runId);
@@ -743,24 +1106,29 @@ export default function App() {
       const conversationID = pendingConversationIDRef.current || currentConversationID || 'pending-conversation';
       receivedAssistantDeltaRef.current = true;
       receivedAssistantDeltaRunIDRef.current = runID;
-      setStreamingAssistantMessage((current) => ({
-        id: current?.id || messageID,
-        conversation_id: current?.conversation_id || conversationID,
+      const streamSource = String(normalized.delta.stream_source || '');
+      enqueueAssistantText({
+        id: messageID,
+        conversation_id: conversationID,
         role: 'assistant',
-        content: mergeAssistantTextChunk(String(current?.content || ''), text),
-        run_id: runID || current?.run_id,
-        complete: false,
-      }));
+        content: '',
+        run_id: runID,
+      }, text, streamSource === 'fallback_final_chunk' || text.length > 80);
       return;
     }
 
     if (eventType === 'assistant.completed') {
       if (normalized.status === 'waiting_approval') return;
+      const text = String(normalized.delta.text ?? event.text ?? event.delta ?? '');
       if (normalized.runId) {
         assistantCompletedRunIDsRef.current.add(normalized.runId);
         clearRunCompletedFallback(normalized.runId);
       }
-      markStreamingAssistantComplete(normalized.runId);
+      if (text && !receivedAssistantDeltaRef.current) {
+        receivedAssistantDeltaRef.current = true;
+        receivedAssistantDeltaRunIDRef.current = normalized.runId;
+      }
+      completeStreamingAssistant(normalized.runId, text);
       return;
     }
 
@@ -812,10 +1180,47 @@ export default function App() {
         conversationList,
         archivedConversationList,
         trashedConversationList,
+        savedModelList,
+        desktopSettings,
+        secrets,
+        onboardingStatus,
+      ] = await Promise.all([
+        desktopApi.listPersonaMessenger(),
+        desktopApi.listConversations({ view: 'active', limit: 100 }),
+        desktopApi.listConversations({ view: 'archived', limit: 100 }),
+        desktopApi.listConversations({ view: 'trash', limit: 100 }),
+        desktopApi.listSavedModels({}),
+        desktopApi.getSettings(),
+        desktopApi.getSecretStatus(),
+        desktopApi.getOnboardingStatus(),
+      ]);
+      setMessenger(messengerSnapshot);
+      const primaryRoom = selectPrimaryJoiRoom(messengerSnapshot);
+      setCurrentRoomID(primaryRoom?.id ?? '');
+      const nextConversations = conversationList.conversations ?? [];
+      const nextVisibleConversations = visibleSingleAgentConversations(nextConversations, messengerSnapshot);
+      setConversations(nextConversations);
+      if (!initialConversationSelectionRef.current) {
+        initialConversationSelectionRef.current = true;
+        const initialConversation = nextVisibleConversations.find((item) => item.id === primaryRoom?.conversation_id)
+          ?? nextVisibleConversations[0];
+        if (initialConversation && !newThreadRequestedRef.current) {
+          void loadConversation(initialConversation.id);
+        }
+      }
+      setArchivedConversations(archivedConversationList.conversations ?? []);
+      setTrashedConversations(trashedConversationList.conversations ?? []);
+      setSavedModels(savedModelList.models ?? []);
+      setSettings(desktopSettings);
+      setSecretStatus(secrets);
+      setOnboarding(onboardingStatus);
+
+      const [
         capabilityList,
         workflowList,
         mcpServerList,
         skillList,
+        pluginList,
         toolRunList,
         workspaceConfig,
         systemHealth,
@@ -833,21 +1238,14 @@ export default function App() {
         nodeList,
         gatewayAuditList,
         modelUsage,
-        savedModelList,
         confirmationList,
         backupList,
-        desktopSettings,
-        secrets,
-        onboardingStatus,
       ] = await Promise.all([
-        desktopApi.listPersonaMessenger(),
-        desktopApi.listConversations({ view: 'active', limit: 100 }),
-        desktopApi.listConversations({ view: 'archived', limit: 100 }),
-        desktopApi.listConversations({ view: 'trash', limit: 100 }),
         desktopApi.listCapabilities(),
         desktopApi.listToolWorkflows(),
         desktopApi.listMCPServers(),
         desktopApi.listSkills(),
+        desktopApi.listPlugins(),
         desktopApi.listToolRuns(),
         desktopApi.getWorkspaceSettings(),
         desktopApi.getSystemHealth(),
@@ -865,30 +1263,21 @@ export default function App() {
         desktopApi.listNodes(),
         desktopApi.listWorkerGatewayAuditLogs(),
         desktopApi.getModelUsage(),
-        desktopApi.listSavedModels({}),
         desktopApi.listConfirmations(),
         desktopApi.listBackups(),
-        desktopApi.getSettings(),
-        desktopApi.getSecretStatus(),
-        desktopApi.getOnboardingStatus(),
       ]);
-      setMessenger(messengerSnapshot);
-      if (messengerSnapshot.rooms.length > 0 && !messengerSnapshot.rooms.some((room) => room.id === currentRoomID)) {
-        setCurrentRoomID(messengerSnapshot.rooms[0].id);
-      }
-      setConversations(conversationList.conversations ?? []);
-      setArchivedConversations(archivedConversationList.conversations ?? []);
-      setTrashedConversations(trashedConversationList.conversations ?? []);
       setCapabilities(capabilityList.capabilities ?? []);
       setWorkflows(workflowList.workflows ?? []);
       setMCPServers(mcpServerList.servers ?? []);
       setSkills(skillList.skills ?? []);
+      setPlugins(pluginList.plugins ?? []);
       setToolRuns(toolRunList.tool_runs ?? []);
       setWorkspaceSettings(workspaceConfig);
       setHealth(systemHealth);
       setClosureReport(runClosureReport);
       setExternalHandoffAudit(handoffAudit);
       setMemories(memoryList.memories ?? []);
+      setMemoryMetrics(memoryList.metrics ?? null);
       setProductTasks(taskList.tasks ?? []);
       setArtifacts(artifactList.artifacts ?? []);
       setOpenLoops(openLoopList.open_loops ?? []);
@@ -900,12 +1289,8 @@ export default function App() {
       setNodes(nodeList.nodes ?? []);
       setGatewayAudit(gatewayAuditList.items ?? []);
       setUsage(modelUsage.items ?? []);
-      setSavedModels(savedModelList.models ?? []);
       setConfirmations(confirmationList.items ?? []);
       setBackups(backupList.backups ?? []);
-      setSettings(desktopSettings);
-      setSecretStatus(secrets);
-      setOnboarding(onboardingStatus);
     } catch (err) {
       showError(err instanceof Error ? err.message : String(err));
     }
@@ -954,15 +1339,18 @@ export default function App() {
     setError('');
     setNotice('');
     const prompt = message.trim();
-    if (!prompt) return;
+    const attachments = composerAttachments;
+    const requestMessage = prompt || attachmentOnlyPrompt(attachments);
+    if (!requestMessage && attachments.length === 0) return;
     const currentActiveRunID = latestActiveRunId(runEventsByRunId) || chat?.run_id || trace?.id || '';
     if (isSubmitting && currentActiveRunID) {
       setMessage('');
+      clearComposerAttachments();
       showNotice('已追加到当前任务。');
       try {
         const redirected = await desktopApi.redirectRun({
           run_id: currentActiveRunID,
-          message: prompt,
+          message: requestMessage,
           reason: 'steer_in_desktop',
           requested_mode: inputMode,
           product_task_id: activeProductTaskID || undefined,
@@ -974,45 +1362,55 @@ export default function App() {
         }
         await refreshAll();
       } catch (err) {
+        setMessage(prompt);
+        setComposerAttachments(attachments);
         showError(err instanceof Error ? err.message : String(err));
       }
       return;
     }
     setTrace(null);
+    resetStreamingAssistantQueue();
+    resetLiveProcessEventQueue();
     setStreamingAssistantMessage(null);
     setActiveExecutionActions([]);
     setActiveExecutionStatus('pending');
     if (isSubmitting) return;
-    const optimisticActions = createOptimisticExecutionActions(prompt);
-    const roomConversationID = activeRoom?.conversation_id || '';
-    const pendingConversationID = currentConversationID || roomConversationID || 'pending-conversation';
+    const optimisticActions = createOptimisticExecutionActions(requestMessage);
+    const pendingConversationID = currentConversationID || 'pending-conversation';
     pendingConversationIDRef.current = pendingConversationID;
     pendingAssistantIDRef.current = '';
     receivedAssistantDeltaRef.current = false;
     receivedAssistantDeltaRunIDRef.current = '';
     Object.keys(runCompletedFallbackTimersRef.current).forEach(clearRunCompletedFallback);
-    setLastPrompt(prompt);
+    setLastPrompt(requestMessage);
     setPendingUserMessage({
       id: `pending-${Date.now()}`,
       conversation_id: pendingConversationID,
       role: 'user',
       content: prompt,
+      attachments,
     });
     setMessage('');
+    clearComposerAttachments();
     setActiveExecutionActions(optimisticActions);
     setActiveExecutionStatus(optimisticActions.length > 0 ? 'running' : 'pending');
     setIsSubmitting(true);
-    const routing = executionTargetOptions.find((item) => item.value === executionTarget) ?? executionTargetOptions[0];
-    const modelName = selectedModelName || settings?.model_name || 'deepseek-v4-flash';
+    const routing = executionRoutingForSettings(workspaceSettings);
+    const personaModelName = activeRoom?.type === 'project_dm' ? configuredPersonaModelName(activePersona?.model_strategy) : '';
+    const modelName = personaModelName || selectedModelName || settings?.model_name || 'deepseek-v4-flash';
     try {
-      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      await Promise.race([
+        new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())),
+        sleep(120),
+      ]);
       const result = await desktopApi.sendChat({
-        conversation_id: currentConversationID || roomConversationID || undefined,
+        conversation_id: currentConversationID || undefined,
         room_id: activeRoom?.id,
         channel: 'desktop',
         user_id: 'desktop_user',
-        message: prompt,
-        mentions: extractPersonaMentions(prompt, messenger?.personas ?? []),
+        message: requestMessage,
+        attachments: attachments.map(attachmentForRequest),
+        mentions: [],
         scope_override: composerScope,
         route_lock_action: roomRouteLock ? 'lock' : 'none',
         preferred_node: routing.preferredNode,
@@ -1021,11 +1419,12 @@ export default function App() {
         input_mode: inputMode,
         product_task_id: activeProductTaskID || undefined,
         runtime_mode: 'tool_calling',
-        permission_profile: permissionProfileForPrompt(inputMode, prompt),
+        permission_profile: permissionProfileForPrompt(inputMode, requestMessage),
       });
       setChat(result);
       pendingAssistantIDRef.current = result.assistant_message_id;
       pendingConversationIDRef.current = result.conversation_id;
+      newThreadRequestedRef.current = false;
       setCurrentConversationID(result.conversation_id);
       if (result.product_task?.id) {
         setActiveProductTaskID(result.product_task.id);
@@ -1036,20 +1435,15 @@ export default function App() {
       }
       setMessage('');
       const runTrace = await desktopApi.getRunTrace(result.run_id);
+      await waitForLiveProcessEventQueueIdle();
       setTrace(runTrace);
       setRunEventsByRunId((current) => mergeRunEvents(current, result.run_id, normalizeTraceEvents(runTrace)));
       const visibleActions = visibleExecutionActions(projectRunTraceToActions(runTrace));
       setActiveExecutionActions(visibleActions);
       setActiveExecutionStatus(normalizeRunExecutionStatus(runTrace.status));
       if (receivedAssistantDeltaRef.current && (!receivedAssistantDeltaRunIDRef.current || receivedAssistantDeltaRunIDRef.current === result.run_id)) {
-        setStreamingAssistantMessage((current) => ({
-          id: current?.id || result.assistant_message_id,
-          conversation_id: current?.conversation_id || result.conversation_id,
-          role: 'assistant',
-          content: userFacingAssistantText(result.response || String(current?.content || '')),
-          run_id: result.run_id,
-          complete: true,
-        }));
+        completeStreamingAssistant(result.run_id, result.response || undefined);
+        await waitForStreamingAssistantIdle();
         await sleep(120);
       } else if (userFacingAssistantText(result.response)) {
         await streamAssistantText({
@@ -1065,6 +1459,7 @@ export default function App() {
       const detail = await desktopApi.getConversation(result.conversation_id);
       setConversationMessages(detail.messages ?? []);
       setPendingUserMessage(null);
+      resetStreamingAssistantQueue();
       setStreamingAssistantMessage(null);
       setActiveExecutionActions([]);
       setActiveExecutionStatus('pending');
@@ -1074,12 +1469,15 @@ export default function App() {
       setActiveTab('chat');
     } catch (err) {
       setPendingUserMessage(null);
+      resetStreamingAssistantQueue();
+      resetLiveProcessEventQueue();
       setStreamingAssistantMessage(null);
       setActiveExecutionActions([]);
       setActiveExecutionStatus('failed');
       pendingAssistantIDRef.current = '';
       pendingConversationIDRef.current = '';
       setMessage(prompt);
+      setComposerAttachments(attachments);
       showError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsSubmitting(false);
@@ -1097,10 +1495,36 @@ export default function App() {
     for (const chunk of chunks) {
       next += chunk;
       setStreamingAssistantMessage({ ...base, content: next.trimStart(), complete: false });
-      await sleep(Math.min(90, Math.max(28, chunk.length * 8)));
+      await sleep(streamingChunkDelay(chunk));
     }
     setStreamingAssistantMessage({ ...base, content: fullText, complete: true });
     await sleep(120);
+  }
+
+  async function applyLoadedConversation(detail: ConversationDetail, requestID: number): Promise<boolean> {
+    if (loadConversationRequestRef.current !== requestID) return false;
+    const messages = detail.messages ?? [];
+    const latestRunID = detail.conversation.latest_run_id || undefined;
+    newThreadRequestedRef.current = false;
+    setCurrentConversationID(detail.conversation.id);
+    setConversationMessages(messages);
+    setChat(null);
+    const runTraces = await loadConversationRunTraces(messages, latestRunID);
+    if (loadConversationRequestRef.current !== requestID) return false;
+    const focusedTrace = latestRunID
+      ? runTraces.find((runTrace) => runTrace.id === latestRunID) || null
+      : runTraces[runTraces.length - 1] || null;
+    setTrace(focusedTrace);
+    if (runTraces.length > 0) {
+      setRunEventsByRunId((current) => (
+        runTraces.reduce(
+          (next, runTrace) => mergeRunEvents(next, runTrace.id, normalizeTraceEvents(runTrace)),
+          current,
+        )
+      ));
+    }
+    setActiveTab('chat');
+    return true;
   }
 
   async function loadConversation(conversationID: string) {
@@ -1108,6 +1532,7 @@ export default function App() {
     loadConversationRequestRef.current = requestID;
     setError('');
     setNotice('');
+    newThreadRequestedRef.current = false;
     setCurrentConversationID(conversationID);
     setConversationMessages([]);
     setChat(null);
@@ -1120,21 +1545,40 @@ export default function App() {
     pendingConversationIDRef.current = '';
     try {
       const detail = await desktopApi.getConversation(conversationID);
-      if (loadConversationRequestRef.current !== requestID) return;
-      setCurrentConversationID(detail.conversation.id);
-      setConversationMessages(detail.messages ?? []);
-      setChat(null);
-      if (detail.conversation.latest_run_id) {
-        const runTrace = await desktopApi.getRunTrace(detail.conversation.latest_run_id);
-        if (loadConversationRequestRef.current !== requestID) return;
-        setTrace(runTrace);
-        setRunEventsByRunId((current) => mergeRunEvents(current, detail.conversation.latest_run_id || '', normalizeTraceEvents(runTrace)));
-      } else {
-        setTrace(null);
-      }
-      setActiveTab('chat');
+      await applyLoadedConversation(detail, requestID);
     } catch (err) {
       showError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function loadConversationForMessage(messageID: string): Promise<boolean> {
+    const requestID = loadConversationRequestRef.current + 1;
+    loadConversationRequestRef.current = requestID;
+    setError('');
+    setNotice('');
+    setConversationMessages([]);
+    setChat(null);
+    setTrace(null);
+    setPendingUserMessage(null);
+    setStreamingAssistantMessage(null);
+    setActiveExecutionActions([]);
+    setActiveExecutionStatus('pending');
+    pendingAssistantIDRef.current = '';
+    pendingConversationIDRef.current = '';
+    const detail = await findConversationDetailForMessage(messageID);
+    return applyLoadedConversation(detail, requestID);
+  }
+
+  async function findConversationDetailForMessage(messageID: string): Promise<ConversationDetail> {
+    try {
+      return await desktopApi.getConversationForMessage(messageID);
+    } catch (directError) {
+      const listed = await desktopApi.listConversations({ view: 'all', limit: 200 });
+      for (const conversation of listed.conversations ?? []) {
+        const detail = await desktopApi.getConversation(conversation.id);
+        if (detail.messages.some((item) => item.id === messageID)) return detail;
+      }
+      throw directError;
     }
   }
 
@@ -1280,21 +1724,6 @@ export default function App() {
     }
   }
 
-  async function exportCurrentMessengerData() {
-    try {
-      const result = await desktopApi.exportPersonaMessengerData({
-        room_id: activeRoom?.id,
-        project_id: activeRoom?.project_id || activePersona?.project_id,
-        persona_id: activePersona?.id,
-        include_messages: true,
-        include_trace: true,
-      });
-      showNotice(`Persona Messenger 数据已导出：${result.path}`);
-    } catch (err) {
-      showError(err instanceof Error ? err.message : String(err));
-    }
-  }
-
   async function decideConfirmation(id: string, approve: boolean, scope: 'one_call' | 'current_run' = 'one_call') {
     const runID = confirmations.find((item) => item.id === id)?.run_id || trace?.id || chat?.run_id || '';
     await desktopApi.decideConfirmation({
@@ -1367,6 +1796,7 @@ export default function App() {
 
   function startNewChat() {
     loadConversationRequestRef.current += 1;
+    newThreadRequestedRef.current = true;
     Object.keys(runCompletedFallbackTimersRef.current).forEach(clearRunCompletedFallback);
     setActiveTab('chat');
     setChat(null);
@@ -1382,6 +1812,8 @@ export default function App() {
     setArtifactViewer(null);
     setLastPrompt('');
     setMessage('');
+    setThreadSearchOpen(false);
+    setThreadQuery('');
     pendingAssistantIDRef.current = '';
     pendingConversationIDRef.current = '';
     receivedAssistantDeltaRef.current = false;
@@ -1389,7 +1821,7 @@ export default function App() {
   }
 
   function toggleSidebarCollapsed() {
-    setManualSidebarCollapsed(sidebarCollapsed ? false : true);
+    setSidebarPreference(sidebarCollapsed ? 'expanded' : 'collapsed');
   }
 
   function startSidebarResize(event: ReactPointerEvent<HTMLDivElement>) {
@@ -1503,8 +1935,9 @@ export default function App() {
       ) : (
         <SidebarTopControls
           collapsed={sidebarCollapsed}
-          openProjectCreator={openProjectCreator}
-          setActiveTab={setActiveTab}
+          newThread={startNewChat}
+          searchOpen={threadSearchOpen}
+          toggleSearch={() => setThreadSearchOpen((current) => !current)}
           toggleCollapsed={toggleSidebarCollapsed}
         />
       )}
@@ -1520,12 +1953,12 @@ export default function App() {
           archiveConversation={archiveConversation}
           chat={chat}
           collapsed={sidebarCollapsed}
-          conversations={conversations}
-          currentRoomID={currentRoomID}
+          conversations={filteredConversations}
           currentConversationID={currentConversationID}
           loadConversation={loadConversation}
-          loadRoom={loadRoom}
-          messenger={messenger}
+          query={threadQuery}
+          searchOpen={threadSearchOpen}
+          setQuery={setThreadQuery}
           setActiveTab={setActiveTab}
           trace={trace}
         />
@@ -1552,9 +1985,13 @@ export default function App() {
             surface="chat"
           >
             <ChatHome
+              key={currentConversationID || chat?.conversation_id || 'new'}
               activePersona={activePersona}
               activeProductTask={activeProductTaskDetail}
               activeRoom={activeRoom}
+              currentThreadChannel={currentConversation?.channel || ''}
+              currentThreadTitle={currentConversation ? conversationTitle(currentConversation) : ''}
+              attachments={composerAttachments}
               artifacts={artifacts}
               activeExecutionActions={activeExecutionActions}
               autoRightPanelCollapsed={autoRightPanelCollapsed}
@@ -1564,7 +2001,6 @@ export default function App() {
               continueProductTask={continueProductTask}
               decideConfirmation={decideConfirmation}
               decideProactiveMessage={decideProactiveMessage}
-              exportCurrentMessengerData={exportCurrentMessengerData}
               health={health}
               inputMode={inputMode}
               isSubmitting={isSubmitting}
@@ -1573,6 +2009,7 @@ export default function App() {
               openArtifact={openArtifact}
               openLoops={openLoops}
               openRunTrace={openRunTrace}
+              loadConversationForMessage={loadConversationForMessage}
               lastPrompt={lastPrompt}
               message={message}
               pendingUserMessage={pendingUserMessage}
@@ -1581,22 +2018,26 @@ export default function App() {
               productTasks={productTasks}
               runEventsByRunId={runEventsByRunId}
               savedModels={savedModels}
+              sidebarCollapsed={sidebarCollapsed}
               selectProductTask={selectProductTask}
-              selectedModelName={selectedModelName || settings?.model_name || 'deepseek-v4-flash'}
+              settings={settings}
               roomRouteLock={roomRouteLock}
               setActiveTab={setActiveTab}
-              setInputMode={setInputMode}
+              addAttachments={addComposerAttachments}
               setMessage={setMessage}
-              setSelectedModelName={setSelectedModelName}
-              settings={settings}
+              removeAttachment={removeComposerAttachment}
               startRightPanelResize={startRightPanelResize}
               updateMemory={updateMemory}
               submit={submit}
+              toggleSidebarCollapsed={toggleSidebarCollapsed}
               trace={trace}
               traceSpanAudit={traceSpanAudit}
+              updateMessengerProject={updateMessengerProject}
+              updateMessengerRoom={updateMessengerRoom}
+              updateProjectPersona={updateProjectPersona}
+              workspaceSettings={workspaceSettings}
               rollbackPersonaVersion={rollbackPersonaVersion}
               retryExternalConnectorEvent={retryExternalConnectorEvent}
-              toggleRouteLock={toggleActiveRouteLock}
             />
           </RenderCrashBoundary>
         )}
@@ -1658,9 +2099,11 @@ export default function App() {
               firstModelCall={firstModelCall}
               health={health}
               memories={memories}
+              memoryMetrics={memoryMetrics}
               memoryQuery={memoryQuery}
               mcpServers={mcpServers}
               nodes={nodes}
+              plugins={plugins}
               refreshAll={refreshAll}
               restoreBackup={restoreBackup}
               restoreConversation={restoreConversation}
@@ -1876,7 +2319,7 @@ function ModelSettingsDialog({
             <input inputMode="decimal" value={draft.temperature} onChange={(event) => setDraft({ temperature: event.target.value })} />
           </label>
           <label className="field-row">
-            <span>最大输出 Tokens</span>
+            <span>最大回复长度</span>
             <input inputMode="numeric" value={draft.max_output_tokens} onChange={(event) => setDraft({ max_output_tokens: event.target.value })} />
           </label>
           <label className="field-row">
@@ -1890,17 +2333,11 @@ function ModelSettingsDialog({
           <div className="field-row model-toggle-row">
             <span>能力开关</span>
             <div className="model-toggle-list">
-              <label><input checked={draft.supports_json_mode} type="checkbox" onChange={(event) => setDraft({ supports_json_mode: event.target.checked })} /> JSON 模式</label>
-              <label><input checked={draft.supports_tool_calling} type="checkbox" onChange={(event) => setDraft({ supports_tool_calling: event.target.checked })} /> Tool Calling</label>
+              <label><input checked={draft.supports_json_mode} type="checkbox" onChange={(event) => setDraft({ supports_json_mode: event.target.checked })} /> 结构化输出</label>
+              <label><input checked={draft.supports_tool_calling} type="checkbox" onChange={(event) => setDraft({ supports_tool_calling: event.target.checked })} /> 使用工具</label>
               <label><input checked={draft.supports_reasoning} type="checkbox" onChange={(event) => setDraft({ supports_reasoning: event.target.checked })} /> 推理能力</label>
             </div>
           </div>
-        </div>
-
-        <div className="supported-param-list">
-          {supportedParams.length > 0
-            ? supportedParams.map((item) => <span key={item}>{item}</span>)
-            : <span>提供方未返回 supported_parameters</span>}
         </div>
 
         <footer className="settings-modal-footer">
@@ -2015,9 +2452,11 @@ function SettingsConsole({
   firstModelCall,
   health,
   memories,
+  memoryMetrics,
   memoryQuery,
   mcpServers,
   nodes,
+  plugins,
   refreshAll,
   restoreBackup,
   restoreConversation,
@@ -2063,9 +2502,11 @@ function SettingsConsole({
   firstModelCall?: ModelCall;
   health: SystemHealth | null;
   memories: MemoryRecord[];
+  memoryMetrics: MemoryQualityMetrics | null;
   memoryQuery: string;
   mcpServers: MCPServerRecord[];
   nodes: NodeRecord[];
+  plugins: PluginRecord[];
   refreshAll: () => Promise<void>;
   restoreBackup: (path: string) => Promise<void>;
   restoreConversation: (conversationID: string) => Promise<void>;
@@ -2100,13 +2541,13 @@ function SettingsConsole({
   const [modelBaseURL, setModelBaseURL] = useState(modelPreset.baseURL);
   const [modelName, setModelName] = useState(modelPreset.defaultModel);
   const [reasoningModel, setReasoningModel] = useState(modelPreset.reasoningModel);
+  const [modelReasoningEffort, setModelReasoningEffort] = useState(settings?.model_reasoning_effort || 'low');
   const [modelApiKey, setModelApiKey] = useState('');
   const [modelApiKeyVisible, setModelApiKeyVisible] = useState(false);
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [modelSettingsDraft, setModelSettingsDraft] = useState<ModelSettingsDraft | null>(null);
   const [modelTimeout, setModelTimeout] = useState('60');
   const [modelRetryCount, setModelRetryCount] = useState('3');
-  const [modelTemperature, setModelTemperature] = useState('0.7');
   const [testStatus, setTestStatus] = useState('');
   const [xaiLoginBusy, setXAILoginBusy] = useState(false);
   const [telegramEnabled, setTelegramEnabled] = useState(settings?.telegram_enabled ?? false);
@@ -2132,6 +2573,35 @@ function SettingsConsole({
   const [secretName, setSecretName] = useState('MODEL_API_KEY');
   const [secretValue, setSecretValue] = useState('');
   const [secretValueVisible, setSecretValueVisible] = useState(false);
+  const [webSearchProvider, setWebSearchProvider] = useState(workspaceSettings?.web_search_provider || 'auto');
+  const [braveSearchApiKey, setBraveSearchApiKey] = useState('');
+  const [braveSearchApiKeyVisible, setBraveSearchApiKeyVisible] = useState(false);
+  const [webSearchTestQuery, setWebSearchTestQuery] = useState('OpenAI news');
+  const [allowedRootsText, setAllowedRootsText] = useState((workspaceSettings?.allowed_roots ?? []).join('\n'));
+  const [defaultRoot, setDefaultRoot] = useState(workspaceSettings?.default_root ?? '');
+  const [fileMaxBytes, setFileMaxBytes] = useState(String(workspaceSettings?.file_analyze_max_bytes ?? 10_485_760));
+  const [browserEnabled, setBrowserEnabled] = useState(workspaceSettings?.browser_enabled ?? true);
+  const [browserHostsText, setBrowserHostsText] = useState((workspaceSettings?.browser_allowed_hosts ?? []).join(', '));
+  const [browserPrivateHosts, setBrowserPrivateHosts] = useState(workspaceSettings?.web_research_allow_private_hosts ?? false);
+  const [githubDefaultRepo, setGithubDefaultRepo] = useState(workspaceSettings?.github_default_repo ?? '');
+  const [githubApiBaseURL, setGithubApiBaseURL] = useState(workspaceSettings?.github_api_base_url ?? 'https://api.github.com');
+  const [githubToken, setGithubToken] = useState('');
+  const [githubTokenVisible, setGithubTokenVisible] = useState(false);
+  const [pluginManifestPath, setPluginManifestPath] = useState('');
+  const [pluginGitHubSource, setPluginGitHubSource] = useState('https://github.com/poer2023/joi-codex-acp-plugin');
+  const [pluginBusy, setPluginBusy] = useState('');
+  const [pluginTestStatus, setPluginTestStatus] = useState<Record<string, string>>({});
+  const [pluginProviderModels, setPluginProviderModels] = useState<Record<string, ACPPluginModelOption[]>>({});
+  const [pluginSelectedModels, setPluginSelectedModels] = useState<Record<string, string>>({});
+  const [mcpDraft, setMCPDraft] = useState({ id: '', name: '', command: '', args: '' });
+  const [nodeAssignmentPolicy, setNodeAssignmentPolicy] = useState(workspaceSettings?.node_assignment_policy ?? 'main_first');
+  const [allowRemoteExecution, setAllowRemoteExecution] = useState(workspaceSettings?.allow_remote_execution ?? false);
+  const [privacyLocalOnly, setPrivacyLocalOnly] = useState(workspaceSettings?.privacy_local_only ?? true);
+  const [remoteExecutionRequiresConfirmation, setRemoteExecutionRequiresConfirmation] = useState(workspaceSettings?.remote_execution_requires_confirmation ?? true);
+  const [diagnosticRedactionEnabled, setDiagnosticRedactionEnabled] = useState(workspaceSettings?.diagnostic_redaction_enabled ?? true);
+  const [desktopNotificationsEnabled, setDesktopNotificationsEnabled] = useState(workspaceSettings?.desktop_notifications_enabled ?? true);
+  const [desktopNotificationSound, setDesktopNotificationSound] = useState(workspaceSettings?.desktop_notification_sound ?? true);
+  const [githubTestStatus, setGithubTestStatus] = useState('');
   const [workerGatewayEnabled, setWorkerGatewayEnabled] = useState(settings?.worker_gateway_enabled ?? true);
   const [restorePath, setRestorePath] = useState('');
   const [automationName, setAutomationName] = useState('');
@@ -2145,8 +2615,21 @@ function SettingsConsole({
   const [automationTimezone, setAutomationTimezone] = useState('');
   const [automationDedupField, setAutomationDedupField] = useState('event_id');
   const [automationPrompt, setAutomationPrompt] = useState('请处理这个自动化任务。payload 摘要：{{payload}}');
+  const [automationTelegramNotify, setAutomationTelegramNotify] = useState(false);
+  const [automationTelegramTarget, setAutomationTelegramTarget] = useState('');
   const [automationEndpoint, setAutomationEndpoint] = useState<AutomationWebhookEndpoint | null>(null);
   const [automationBusy, setAutomationBusy] = useState('');
+  const automationTelegramReadiness = getAutomationTelegramReadiness({
+    telegramEnabled: Boolean(settings?.telegram_enabled),
+    tokenStatusKnown: Boolean(secretStatus),
+    tokenConfigured: Boolean(secretStatus?.secrets?.TELEGRAM_BOT_TOKEN),
+    allowedUserIDs: settings?.telegram_allowed_user_ids || '',
+  });
+  const automationTelegramTargetError = getAutomationTelegramTargetError({
+    enabled: automationTelegramNotify,
+    chatID: automationTelegramTarget,
+    allowedChatIDs: automationTelegramReadiness.allowedChatIDs,
+  });
   const inbox = memories.filter((memory) => memory.status !== 'rejected' && !isMemoryDisabled(memory) && (memory.status !== 'confirmed' || memory.confidence < 0.6 || Boolean(memory.conflict_group_id) || Boolean(memory.merged_into_memory_id)));
   const confirmedMemories = memories.filter((memory) => memory.status === 'confirmed' && !memory.disabled);
   const conflictedMemories = memories.filter((memory) => Boolean(memory.conflict_group_id));
@@ -2166,9 +2649,10 @@ function SettingsConsole({
     setModelBaseURL(nextBaseURL);
     setModelName(models.length > 0 && !models.some((model) => model.id === configuredDefaultModel) ? preferredDefaultModel(models) : configuredDefaultModel);
     setReasoningModel(models.length > 0 && !models.some((model) => model.id === configuredReasoningModel) ? preferredReasoningModel(models) : configuredReasoningModel);
+    setModelReasoningEffort(normalizeReasoningEffortValue(settings?.model_reasoning_effort || 'low'));
     setAvailableModels(models);
     setTestStatus('');
-  }, [activeObject.id, savedModels, settings?.model_base_url, settings?.model_name, settings?.model_reasoning_name]);
+  }, [activeObject.id, savedModels, settings?.model_base_url, settings?.model_name, settings?.model_reasoning_effort, settings?.model_reasoning_name]);
 
   useEffect(() => {
     setTelegramEnabled(settings?.telegram_enabled ?? false);
@@ -2185,10 +2669,30 @@ function SettingsConsole({
   }, [settings?.imessage_allowed_users, settings?.imessage_assigned_number, settings?.imessage_enabled, settings?.imessage_home_channel, settings?.imessage_operator_phone, settings?.imessage_project_id, settings?.imessage_require_mention, settings?.imessage_sidecar_port, settings?.telegram_allowed_user_ids, settings?.telegram_enabled, settings?.worker_gateway_enabled]);
 
   useEffect(() => {
+    setWebSearchProvider(workspaceSettings?.web_search_provider || 'auto');
+    setAllowedRootsText((workspaceSettings?.allowed_roots ?? []).join('\n'));
+    setDefaultRoot(workspaceSettings?.default_root ?? '');
+    setFileMaxBytes(String(workspaceSettings?.file_analyze_max_bytes ?? 10_485_760));
+    setBrowserEnabled(workspaceSettings?.browser_enabled ?? true);
+    setBrowserHostsText((workspaceSettings?.browser_allowed_hosts ?? []).join(', '));
+    setBrowserPrivateHosts(workspaceSettings?.web_research_allow_private_hosts ?? false);
+    setGithubDefaultRepo(workspaceSettings?.github_default_repo ?? '');
+    setGithubApiBaseURL(workspaceSettings?.github_api_base_url ?? 'https://api.github.com');
+    setNodeAssignmentPolicy(workspaceSettings?.node_assignment_policy ?? 'main_first');
+    setAllowRemoteExecution(workspaceSettings?.allow_remote_execution ?? false);
+    setPrivacyLocalOnly(workspaceSettings?.privacy_local_only ?? true);
+    setRemoteExecutionRequiresConfirmation(workspaceSettings?.remote_execution_requires_confirmation ?? true);
+    setDiagnosticRedactionEnabled(workspaceSettings?.diagnostic_redaction_enabled ?? true);
+    setDesktopNotificationsEnabled(workspaceSettings?.desktop_notifications_enabled ?? true);
+    setDesktopNotificationSound(workspaceSettings?.desktop_notification_sound ?? true);
+  }, [workspaceSettings]);
+
+  useEffect(() => {
     setAutomationEndpoint(null);
     const selected = automations.find((automation) => automation.id === activeObject.id);
     if (!selected) {
       const isWebhook = activeObject.id === 'new-webhook';
+      const notificationDraft = getAutomationTelegramNotificationDraft(undefined, settings?.telegram_allowed_user_ids || '');
       setAutomationName(isWebhook ? 'Webhook 自动化' : '定时自动化');
       setAutomationSlug('');
       setAutomationScheduleType('interval');
@@ -2200,9 +2704,12 @@ function SettingsConsole({
       setAutomationTimezone('');
       setAutomationDedupField(isWebhook ? 'event_id' : '');
       setAutomationPrompt(isWebhook ? '请处理这个 webhook 自动化任务。事件：{{payload.event_id}}' : '请处理这个定时自动化任务。payload 摘要：{{payload}}');
+      setAutomationTelegramNotify(notificationDraft.enabled);
+      setAutomationTelegramTarget(notificationDraft.chatID);
       return;
     }
     const config = selected.trigger_config ?? {};
+    const notificationDraft = getAutomationTelegramNotificationDraft(selected, settings?.telegram_allowed_user_ids || '');
     setAutomationName(selected.name);
     setAutomationSlug(selected.slug);
     setAutomationScheduleType(String(config.type || (selected.kind === 'webhook' ? 'webhook' : 'interval')));
@@ -2214,7 +2721,9 @@ function SettingsConsole({
     setAutomationTimezone(String(config.timezone || ''));
     setAutomationDedupField(String(selected.dedup_policy?.dedup_json_field || config.dedup_json_field || 'event_id'));
     setAutomationPrompt(selected.prompt_template || '请处理这个自动化任务。payload 摘要：{{payload}}');
-  }, [activeObject.id, automations]);
+    setAutomationTelegramNotify(notificationDraft.enabled);
+    setAutomationTelegramTarget(notificationDraft.chatID);
+  }, [activeObject.id, automations, settings?.telegram_allowed_user_ids]);
 
   async function saveModelDetail() {
     await desktopApi.saveModelConfig({
@@ -2222,6 +2731,7 @@ function SettingsConsole({
       base_url: modelBaseURL,
       name: modelName,
       reasoning_name: reasoningModel,
+      reasoning_effort: modelReasoningEffort,
       timeout_seconds: Number(modelTimeout) || 60,
       max_retries: Number(modelRetryCount) || 1,
     });
@@ -2279,6 +2789,7 @@ function SettingsConsole({
       setModelBaseURL(result.base_url);
       setModelName(result.model_name);
       setReasoningModel(result.model_name);
+      setModelReasoningEffort('low');
       setTestStatus(`xAI：已登录 · ${result.scope}`);
       setNotice(`xAI OAuth 已登录并切换到 ${result.model_name}`);
       await refreshAll();
@@ -2300,7 +2811,7 @@ function SettingsConsole({
       display_name: model.display_name || model.id,
       role: config?.role || (model.id === modelName ? 'default' : model.id === reasoningModel ? 'reasoning' : 'general'),
       enabled: config?.enabled ?? true,
-      temperature: String(config?.temperature ?? modelTemperature),
+      temperature: String(config?.temperature ?? 0.7),
       max_output_tokens: String(config?.max_output_tokens || model.max_output_tokens || ''),
       timeout_seconds: String(config?.timeout_seconds ?? modelTimeout),
       max_retries: String(config?.max_retries ?? modelRetryCount),
@@ -2461,6 +2972,200 @@ function SettingsConsole({
     await refreshAll();
   }
 
+  async function saveWebSearchSettings() {
+    const base = workspaceSettings ?? defaultWorkspaceSettings();
+    await desktopApi.saveWorkspaceSettings({
+      ...base,
+      web_search_provider: webSearchProvider,
+    });
+    if (braveSearchApiKey.trim()) {
+      await desktopApi.saveSecret({ name: 'BRAVE_SEARCH_API_KEY', value: braveSearchApiKey.trim() });
+      setBraveSearchApiKey('');
+    }
+    setNotice('网页搜索设置已保存');
+    await refreshAll();
+  }
+
+  async function saveWorkspacePatch(patch: Partial<WorkspaceSettings>, message: string) {
+    await desktopApi.saveWorkspaceSettings({
+      ...(workspaceSettings ?? defaultWorkspaceSettings()),
+      ...patch,
+    });
+    setNotice(message);
+    await refreshAll();
+  }
+
+  async function toggleCapability(capability: CapabilityRecord) {
+    await desktopApi.setCapabilityEnabled({ id: capability.id, enabled: !capability.enabled });
+    setNotice(`${capability.name || capability.id} 已${capability.enabled ? '停用' : '启用'}`);
+    await refreshAll();
+  }
+
+  async function toggleSkill(skill: SkillRecord) {
+    await desktopApi.setSkillEnabled({ id: skill.id, enabled: !skill.enabled });
+    setNotice(`${skill.name} 已${skill.enabled ? '停用' : '启用'}`);
+    await refreshAll();
+  }
+
+  async function installPlugin() {
+    const path = pluginManifestPath.trim();
+    if (!path) {
+      setNotice('请输入本地 plugin.json 路径');
+      return;
+    }
+    const result = await desktopApi.installPluginFromManifest(path);
+    setPluginManifestPath('');
+    setNotice(`${result.plugin.name} 已安装`);
+    await refreshAll();
+  }
+
+  async function installPluginFromGitHub() {
+    const source = pluginGitHubSource.trim();
+    if (!source) {
+      setNotice('请输入 GitHub 插件地址');
+      return;
+    }
+    setPluginBusy('github-install');
+    try {
+      const result = await desktopApi.installPluginFromGitHub({ source });
+      setNotice(`${result.plugin.name} 已从 GitHub 安装`);
+      await refreshAll();
+    } catch (error) {
+      setNotice(`GitHub 安装失败 · ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setPluginBusy('');
+    }
+  }
+
+  async function testPluginProvider(plugin: PluginRecord, provider: PluginProviderConfig) {
+    const key = `${plugin.id}:${provider.id}`;
+    setPluginBusy(`test:${key}`);
+    setPluginTestStatus((current) => ({ ...current, [key]: '测试中' }));
+    try {
+      const result = await desktopApi.testPluginProvider({ plugin_id: plugin.id, provider_id: provider.id });
+      const testedModels = mergeACPPluginModels(result.models);
+      if (result.ok && testedModels.length > 0) {
+        setPluginProviderModels((current) => ({ ...current, [key]: testedModels }));
+        setPluginSelectedModels((current) => ({
+          ...current,
+          [key]: selectACPPluginModel(testedModels, [
+            current[key],
+            settings?.model_provider === provider.id ? settings.model_name : undefined,
+            result.current_model,
+            provider.default_model,
+          ]),
+        }));
+      }
+      const models = testedModels.length > 0
+        ? `${testedModels.length} 个模型${result.current_model ? ` · 当前 ${result.current_model}` : ''}`
+        : '由 Codex 账户决定';
+      const message = result.ok
+        ? `可用 · ${result.agent_name || 'ACP agent'} ${result.agent_version || ''} · ${models}`
+        : `失败 · ${result.error_summary || result.status}`;
+      setPluginTestStatus((current) => ({ ...current, [key]: message }));
+      setNotice(`${provider.name}：${message}`);
+    } finally {
+      setPluginBusy('');
+    }
+  }
+
+  async function usePluginProvider(plugin: PluginRecord, provider: PluginProviderConfig) {
+    const key = `${plugin.id}:${provider.id}`;
+    const configuredModel = settings?.model_provider === provider.id ? settings.model_name : undefined;
+    const models = mergeACPPluginModels(
+      pluginProviderModels[key],
+      provider.models,
+      configuredModel ? [{ id: configuredModel, name: configuredModel }] : undefined,
+    );
+    const selectedModel = selectACPPluginModel(models, [pluginSelectedModels[key], configuredModel, provider.default_model]);
+    await desktopApi.saveModelConfig(acpPluginModelConfig(provider.id, selectedModel));
+    setPluginSelectedModels((current) => ({ ...current, [key]: selectedModel }));
+    setNotice(`${provider.name} · ${selectedModel} 已设为当前模型入口`);
+    await refreshAll();
+  }
+
+  async function togglePlugin(plugin: PluginRecord) {
+    await desktopApi.setPluginEnabled({ id: plugin.id, enabled: !plugin.enabled });
+    setNotice(`${plugin.name} 已${plugin.enabled ? '停用' : '启用'}`);
+    await refreshAll();
+  }
+
+  async function removePlugin(plugin: PluginRecord) {
+    if (!window.confirm(`移除插件“${plugin.name}”？插件注册的能力、Skill 与 MCP 配置也会一并移除。`)) return;
+    await desktopApi.removePlugin(plugin.id);
+    setNotice(`${plugin.name} 已移除`);
+    await refreshAll();
+  }
+
+  async function saveMCPDraft() {
+    const command = mcpDraft.command.trim();
+    if (!command) {
+      setNotice('MCP stdio server 必须填写命令');
+      return;
+    }
+    const id = mcpDraft.id.trim() || `mcp_${command.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase()}`;
+    await desktopApi.saveMCPServer({
+      id,
+      name: mcpDraft.name.trim() || id,
+      transport: 'stdio',
+      command,
+      args: mcpDraft.args.trim().split(/\s+/).filter(Boolean),
+      enabled: true,
+      trust: 'untrusted_until_wrapped',
+    });
+    setMCPDraft({ id: '', name: '', command: '', args: '' });
+    setNotice('MCP Server 已保存，可点击同步读取工具清单');
+    await refreshAll();
+  }
+
+  async function testDesktopNotification() {
+    if (!desktopNotificationsEnabled) {
+      setNotice('桌面通知已停用，请先启用并保存');
+      return;
+    }
+    if (typeof Notification === 'undefined') {
+      setNotice('当前渲染环境不支持系统通知');
+      return;
+    }
+    const permission = Notification.permission === 'default' ? await Notification.requestPermission() : Notification.permission;
+    if (permission !== 'granted') {
+      setNotice('macOS 未授予 Joi 通知权限');
+      return;
+    }
+    new Notification('Joi 通知测试', { body: '桌面通知入口工作正常', silent: !desktopNotificationSound });
+    setNotice('已发送桌面通知测试');
+  }
+
+  async function testWebSearchSettings() {
+    const result = await desktopApi.testWebSearch({
+      query: webSearchTestQuery.trim() || 'Brave Search API',
+      max_results: 3,
+    });
+    const status = String(result.status || 'unknown');
+    const providerLabel = String(result.provider || result.mode || webSearchProvider);
+    const count = Number(result.result_count || 0);
+    const summary = String(result.summary || '');
+    setTestStatus(`网页搜索：${formatStatus(status)} · ${providerLabel} · ${count} 条${summary ? ` · ${summary}` : ''}`);
+  }
+
+  async function testGitHubSettings() {
+    if (githubToken.trim()) {
+      await desktopApi.saveSecret({ name: 'GITHUB_TOKEN', value: githubToken.trim() });
+      setGithubToken('');
+    }
+    await desktopApi.saveWorkspaceSettings({
+      ...(workspaceSettings ?? defaultWorkspaceSettings()),
+      github_default_repo: githubDefaultRepo.trim(),
+      github_api_base_url: githubApiBaseURL.trim() || 'https://api.github.com',
+    });
+    const result = await desktopApi.testGitHubConnection();
+    const message = result.status === 'ok'
+      ? `GitHub 已连接${result.login ? ` · ${result.login}` : ''}${result.repository ? ` · ${result.repository}` : ''}${result.rate_limit_remaining !== undefined ? ` · 剩余 ${result.rate_limit_remaining}` : ''}`
+      : `GitHub 连接失败 · ${result.error_summary || formatStatus(result.status)}`;
+    setGithubTestStatus(message);
+    setNotice(message);
+  }
+
   async function editAndConfirm(memory: MemoryRecord) {
     const edited = window.prompt('确认前编辑记忆', memory.content);
     if (edited === null) return;
@@ -2484,6 +3189,14 @@ function SettingsConsole({
   }
 
   async function saveAutomation(kind: 'schedule' | 'webhook') {
+    if (automationTelegramNotify && !automationTelegramReadiness.ready) {
+      setNotice(`Telegram 推送未就绪 · ${automationTelegramReadiness.message}`);
+      return;
+    }
+    if (automationTelegramTargetError) {
+      setNotice(automationTelegramTargetError);
+      return;
+    }
     setAutomationBusy('save');
     try {
       const existing = selectedAutomation();
@@ -2502,6 +3215,11 @@ function SettingsConsole({
         dedup_policy: kind === 'webhook' && automationDedupField.trim() ? { dedup_json_field: automationDedupField.trim() } : {},
         retry_policy: { max_attempts: 2, backoff_seconds: [60, 300], no_retry_error_codes: ['POLICY_DENIED', 'INVALID_PAYLOAD', 'PENDING_CONFIRMATION'] },
         max_concurrency: 1,
+        notification_policy: buildAutomationTelegramNotificationPolicy({
+          enabled: automationTelegramNotify,
+          chatID: automationTelegramTarget,
+          allowedUserIDs: settings?.telegram_allowed_user_ids || '',
+        }),
       });
       setNotice(`${automation.name} 已保存`);
       selectSettingsObject('automations', automation.id);
@@ -2581,45 +3299,111 @@ function SettingsConsole({
   }
 
   function renderModelDetail() {
+    if (activeObject.id === 'codex-acp') {
+      const providers = plugins.flatMap((plugin) => (
+        pluginProviderConfigs(plugin).map((provider) => ({ plugin, provider }))
+      )).filter(({ provider }) => provider.protocol === 'acp');
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="Codex ACP" description="使用本机 Codex 登录，通过 ACP 测试连接并获取账户可用模型" />
+          <RecordList
+            emptyText="尚未安装 Codex ACP provider。请先在“能力与工具 → Plugins”安装 Codex ACP 插件。"
+            items={providers}
+            renderItem={({ plugin, provider }) => {
+              const key = `${plugin.id}:${provider.id}`;
+              const providerActive = settings?.model_provider === provider.id;
+              const configuredModel = providerActive ? settings?.model_name : undefined;
+              const modelOptions = mergeACPPluginModels(
+                pluginProviderModels[key],
+                provider.models,
+                configuredModel ? [{ id: configuredModel, name: configuredModel }] : undefined,
+              );
+              const selectedModel = selectACPPluginModel(modelOptions, [
+                pluginSelectedModels[key],
+                configuredModel,
+                provider.default_model,
+              ]);
+              const active = providerActive && settings?.model_name === selectedModel;
+              return (
+                <article className="row-card" key={key}>
+                  <div>
+                    <strong>{provider.name}</strong>
+                    <p>{provider.description || '认证沿用本机 Codex 登录，无需 API Key 或接口地址。'}</p>
+                    <small>{plugin.name} · {provider.protocol.toUpperCase()} · {plugin.enabled ? '已启用' : '已停用'}</small>
+                    <label className="field-row">
+                      <span>模型</span>
+                      <select
+                        aria-label={`${provider.name} 模型`}
+                        disabled={!plugin.enabled || Boolean(pluginBusy)}
+                        value={selectedModel}
+                        onChange={(event) => setPluginSelectedModels((current) => ({ ...current, [key]: event.target.value }))}
+                      >
+                        {modelOptions.map((model) => <option key={model.id} value={model.id}>{model.name || model.id}</option>)}
+                      </select>
+                    </label>
+                    {pluginTestStatus[key] ? <small role="status">{pluginTestStatus[key]}</small> : null}
+                  </div>
+                  <div className="row-actions">
+                    <button type="button" className="secondary-button" disabled={!plugin.enabled || Boolean(pluginBusy)} onClick={() => void testPluginProvider(plugin, provider)}>测试连接</button>
+                    <button type="button" className="secondary-button" disabled={!plugin.enabled || Boolean(pluginBusy)} onClick={() => void testPluginProvider(plugin, provider)}>获取模型</button>
+                    <button type="button" disabled={!plugin.enabled || active || Boolean(pluginBusy)} onClick={() => void usePluginProvider(plugin, provider)}>{active ? '使用中' : providerActive ? '切换模型' : '设为当前'}</button>
+                  </div>
+                </article>
+              );
+            }}
+          />
+        </section>
+      );
+    }
     const visibleAvailableModels = savedModelsForProvider(availableModels, provider, modelBaseURL);
     return (
       <section className="settings-detail-panel">
         <DetailHeader title={activeObject.label} description={`配置 ${activeObject.label} API 连接与模型参数`} />
-        <div className="settings-form">
-          <label className="field-row">
-            <span>接口地址</span>
-            <input value={modelBaseURL} onChange={(event) => setModelBaseURL(event.target.value)} />
-          </label>
-          <label className="field-row">
-            <span>API Key</span>
-            <SecretInput
-              placeholder="留空表示使用已保存密钥"
-              value={modelApiKey}
-              visible={modelApiKeyVisible}
-              onChange={setModelApiKey}
-              onToggleVisible={() => setModelApiKeyVisible((value) => !value)}
-            />
-          </label>
-          <div className="field-row">
-            <span>连接状态</span>
-            <div className="connection-status">
-              <span className={`live-dot ${settings?.model_name ? 'on' : ''}`} />
-              <strong>{settings?.model_name ? '已配置' : '未配置'}</strong>
-              <button type="button" onClick={testModelDetail}>测试连接</button>
-              <button type="button" onClick={fetchModelList}>获取模型</button>
-              {activeObject.id === 'grok' && (
-                <button type="button" onClick={loginXAIOAuthDetail} disabled={xaiLoginBusy}>
-                  {xaiLoginBusy ? '等待 xAI 授权' : '登录 xAI'}
-                </button>
-              )}
+        <div className="model-settings-stack">
+          <div className="settings-form model-settings-form">
+            <label className="field-row">
+              <span>接口地址</span>
+              <input value={modelBaseURL} onChange={(event) => setModelBaseURL(event.target.value)} />
+            </label>
+            <label className="field-row">
+              <span>API Key</span>
+              <SecretInput
+                placeholder="留空表示使用已保存密钥"
+                value={modelApiKey}
+                visible={modelApiKeyVisible}
+                onChange={setModelApiKey}
+                onToggleVisible={() => setModelApiKeyVisible((value) => !value)}
+              />
+            </label>
+            <label className="field-row">
+              <span>思考等级</span>
+              <select value={modelReasoningEffort} onChange={(event) => setModelReasoningEffort(event.target.value)}>
+                {reasoningEffortOptions.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+            <div className="field-row">
+              <span>连接状态</span>
+              <div className="connection-status">
+                <span className={`live-dot ${settings?.model_name ? 'on' : ''}`} />
+                <strong>{settings?.model_name ? '已配置' : '未配置'}</strong>
+                <button type="button" onClick={testModelDetail}>测试连接</button>
+                <button type="button" onClick={fetchModelList}>获取模型</button>
+                {activeObject.id === 'grok' && (
+                  <button type="button" onClick={loginXAIOAuthDetail} disabled={xaiLoginBusy}>
+                    {xaiLoginBusy ? '等待 xAI 授权' : '登录 xAI'}
+                  </button>
+                )}
+              </div>
             </div>
+            {visibleAvailableModels.length > 0 && (
+              <div className="field-row model-list-row">
+                <span>可用模型</span>
+                <ModelList models={visibleAvailableModels} onConfigure={openModelSettings} />
+              </div>
+            )}
           </div>
-          {visibleAvailableModels.length > 0 && (
-            <div className="field-row model-list-row">
-              <span>可用模型</span>
-              <ModelList models={visibleAvailableModels} onConfigure={openModelSettings} />
-            </div>
-          )}
           {modelSettingsDraft && (
             <ModelSettingsDialog
               draft={modelSettingsDraft}
@@ -2629,7 +3413,7 @@ function SettingsConsole({
               onSave={saveModelSettings}
             />
           )}
-          <div className="detail-actions">
+          <div className="detail-actions model-settings-actions">
             <button className="secondary-button" type="button" onClick={() => {
               setModelBaseURL(modelPreset.baseURL);
               setModelName(modelPreset.defaultModel);
@@ -2637,7 +3421,7 @@ function SettingsConsole({
             }}>重置</button>
             <button type="button" onClick={saveModelDetail}>保存</button>
           </div>
-          <details className="settings-advanced">
+          <details className="settings-advanced model-settings-advanced">
             <summary>高级参数</summary>
             <div className="settings-form compact">
               <label className="field-row">
@@ -2647,10 +3431,6 @@ function SettingsConsole({
               <label className="field-row">
                 <span>重试次数</span>
                 <input value={modelRetryCount} onChange={(event) => setModelRetryCount(event.target.value)} />
-              </label>
-              <label className="field-row">
-                <span>温度</span>
-                <input value={modelTemperature} onChange={(event) => setModelTemperature(event.target.value)} />
               </label>
               <label className="field-row">
                 <span>协议类型</span>
@@ -2767,31 +3547,43 @@ function SettingsConsole({
       );
     }
 
-    if (activeObject.id !== 'telegram') {
+    if (activeObject.id === 'desktop-notify') {
       return (
         <section className="settings-detail-panel">
-          <DetailHeader title={activeObject.label} description={`${activeObject.label} 入口配置`} />
+          <DetailHeader title="桌面通知" description="配置并测试 macOS Notification Center 权限、声音与显示效果" />
           <div className="settings-form">
-            <label className="field-row">
-              <span>启用入口</span>
-              <input type="checkbox" />
-            </label>
-            <label className="field-row">
-              <span>入口标识</span>
-              <input placeholder={`${activeObject.label} 暂未配置`} />
-            </label>
-            <div className="field-row">
-              <span>连接状态</span>
-              <div className="connection-status">
-                <span className="live-dot" />
-                <strong>未配置</strong>
-                <small>该入口后续接入真实配置项</small>
-              </div>
-            </div>
+            <label className="field-row"><span>启用通知</span><input checked={desktopNotificationsEnabled} type="checkbox" onChange={(event) => setDesktopNotificationsEnabled(event.target.checked)} /></label>
+            <label className="field-row"><span>播放声音</span><input checked={desktopNotificationSound} type="checkbox" onChange={(event) => setDesktopNotificationSound(event.target.checked)} /></label>
             <div className="detail-actions">
-              <button className="secondary-button" type="button">重置</button>
-              <button type="button">保存</button>
+              <button className="secondary-button" type="button" onClick={testDesktopNotification}>发送测试通知</button>
+              <button type="button" onClick={() => saveWorkspacePatch({ desktop_notifications_enabled: desktopNotificationsEnabled, desktop_notification_sound: desktopNotificationSound }, '桌面通知设置已保存')}>保存</button>
             </div>
+          </div>
+        </section>
+      );
+    }
+
+    if (activeObject.id === 'webhook') {
+      const webhookAutomations = automations.filter((automation) => automation.kind === 'webhook');
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="Webhook" description="查看真实的 HMAC 自动化 Hook；Endpoint、Secret 与运行记录由自动化 Runtime 管理" />
+          <dl className="metrics">
+            <KV label="Hook 数量" value={`${webhookAutomations.length} 个`} />
+            <KV label="已启用" value={`${webhookAutomations.filter((automation) => automation.enabled).length} 个`} />
+          </dl>
+          <RecordList
+            emptyText="暂无 Webhook。点击下方按钮创建真实 HMAC Hook。"
+            items={webhookAutomations}
+            renderItem={(automation) => (
+              <article key={automation.id} className="row-card compact">
+                <div><strong>{automation.name}</strong><p>{automation.slug} · {automation.enabled ? '已启用' : '已停用'}</p></div>
+                <button type="button" onClick={() => selectSettingsObject('automations', automation.id)}>管理</button>
+              </article>
+            )}
+          />
+          <div className="detail-actions">
+            <button type="button" onClick={() => selectSettingsObject('automations', 'new-webhook')}>新建 HMAC Hook</button>
           </div>
         </section>
       );
@@ -2855,26 +3647,22 @@ function SettingsConsole({
     const { recentTriggers, recentRuns } = automationState;
     return (
       <section className="settings-detail-panel">
-        <DetailHeader title={existing ? existing.name : kind === 'webhook' ? '新建 Hook 任务' : '新建定时任务'} description={kind === 'webhook' ? '本地 HMAC Webhook 触发后台任务' : 'Joi.app 打开时运行的定时后台任务'} />
+        <DetailHeader title={existing ? existing.name : kind === 'webhook' ? '新建外部触发任务' : '新建定时任务'} description={kind === 'webhook' ? '收到指定外部事件后自动执行任务' : 'Joi 打开时按设定时间自动运行'} />
         <div className="settings-form">
           <label className="field-row">
             <span>名称</span>
             <input value={automationName} onChange={(event) => setAutomationName(event.target.value)} />
           </label>
-          <label className="field-row">
-            <span>Slug</span>
-            <input placeholder="留空自动生成" value={automationSlug} onChange={(event) => setAutomationSlug(event.target.value)} />
-          </label>
           {kind === 'schedule' ? (
             <>
               <label className="field-row">
-                <span>触发类型</span>
+                <span>运行方式</span>
                 <select value={automationScheduleType} onChange={(event) => setAutomationScheduleType(event.target.value)}>
-                  <option value="interval">Interval</option>
-                  <option value="daily">Daily</option>
-                  <option value="weekly">Weekly</option>
-                  <option value="cron">Cron</option>
-                  <option value="once">Once</option>
+                  <option value="interval">每隔一段时间</option>
+                  <option value="daily">每天</option>
+                  <option value="weekly">每周</option>
+                  <option value="cron">自定义时间规则</option>
+                  <option value="once">仅运行一次</option>
                 </select>
               </label>
               {automationScheduleType === 'interval' && (
@@ -2885,7 +3673,7 @@ function SettingsConsole({
               )}
               {automationScheduleType === 'cron' && (
                 <label className="field-row">
-                  <span>Cron</span>
+                  <span>自定义时间规则</span>
                   <input value={automationCron} onChange={(event) => setAutomationCron(event.target.value)} />
                 </label>
               )}
@@ -2920,18 +3708,51 @@ function SettingsConsole({
                 <input placeholder="默认本机时区" value={automationTimezone} onChange={(event) => setAutomationTimezone(event.target.value)} />
               </label>
             </>
-          ) : (
+          ) : null}
+          <label className="field-row">
+            <span>任务说明</span>
+            <textarea value={automationPromptForDisplay(automationPrompt)} onChange={(event) => setAutomationPrompt(event.target.value)} rows={5} />
+          </label>
+          <div className="field-row">
+            <span>完成后通知</span>
+            <div className="connection-status">
+              <label className="automation-notification-toggle">
+                <input
+                  checked={automationTelegramNotify}
+                  disabled={!automationTelegramReadiness.ready}
+                  type="checkbox"
+                  onChange={(event) => {
+                    setAutomationTelegramNotify(event.target.checked);
+                    if (event.target.checked && !automationTelegramTarget.trim()) {
+                      setAutomationTelegramTarget(automationTelegramReadiness.defaultChatID);
+                    }
+                  }}
+                />
+                <strong>完成后推送到 Telegram</strong>
+              </label>
+              <small>{automationTelegramReadiness.message}</small>
+            </div>
+          </div>
+          {automationTelegramNotify && (
             <label className="field-row">
-              <span>Dedup JSON 字段</span>
-              <input placeholder="event_id" value={automationDedupField} onChange={(event) => setAutomationDedupField(event.target.value)} />
+              <span>目标用户 / Chat ID</span>
+              <input
+                inputMode="numeric"
+                placeholder={`默认 ${automationTelegramReadiness.defaultChatID || '白名单首位用户'}`}
+                value={automationTelegramTarget}
+                onChange={(event) => setAutomationTelegramTarget(event.target.value)}
+              />
             </label>
           )}
-          <label className="field-row">
-            <span>Prompt</span>
-            <textarea value={automationPrompt} onChange={(event) => setAutomationPrompt(event.target.value)} rows={5} />
-          </label>
+          {automationTelegramTargetError && <p className="terminal-error" role="alert">{automationTelegramTargetError}</p>}
           <div className="detail-actions">
-            <button type="button" onClick={() => void saveAutomation(kind)} disabled={automationBusy === 'save'}>{automationBusy === 'save' ? '保存中' : '保存'}</button>
+            <button
+              type="button"
+              onClick={() => void saveAutomation(kind)}
+              disabled={automationBusy === 'save' || Boolean(automationTelegramTargetError) || (automationTelegramNotify && !automationTelegramReadiness.ready)}
+            >
+              {automationBusy === 'save' ? '保存中' : '保存'}
+            </button>
             {existing && (
               <>
                 <button className="secondary-button" type="button" onClick={() => void setAutomationEnabled(existing.id, !existing.enabled)} disabled={automationBusy === `enable:${existing.id}`}>
@@ -2947,11 +3768,9 @@ function SettingsConsole({
           <>
             <dl className="compact-kv">
               <KV label="状态" value={existing.enabled ? '已启用' : '已停用'} />
-              <KV label="权限" value={existing.permission_profile} />
-              <KV label="输入模式" value={existing.input_mode} />
-              <KV label="下次触发" value={existing.next_fire_at || '未计算'} />
-              <KV label="上次触发" value={existing.last_fire_at || '无'} />
-              <KV label="最近运行" value={formatStatus(automationState.lastRunStatus)} />
+              <KV label="下次运行" value={existing.next_fire_at || '未计算'} />
+              <KV label="上次运行" value={existing.last_fire_at || '无'} />
+              <KV label="最近结果" value={formatStatus(automationState.lastRunStatus)} />
             </dl>
             {automationState.banner && (
               <p className={automationState.banner.tone === 'error' ? 'terminal-error' : 'logs-notice'}>
@@ -2960,49 +3779,46 @@ function SettingsConsole({
             )}
             {existing.kind === 'webhook' && (
               <section>
-                <h3>Webhook</h3>
+                <h3>外部触发地址</h3>
                 <div className="detail-actions">
-                  <button type="button" onClick={() => void loadAutomationEndpoint(existing.id)}>显示 URL</button>
-                  <button type="button" onClick={() => void copyAutomationEndpoint(existing.id)}>复制 URL</button>
-                  <button type="button" onClick={() => void rotateAutomationWebhookSecret(existing.id)}>轮换 Secret</button>
-                  {automationState.secretValueAvailable && <button type="button" onClick={() => void copyAutomationSecret()}>复制 Secret</button>}
-                  <button type="button" onClick={() => void testAutomationWebhook(existing.id)}>测试 Hook</button>
+                  <button type="button" onClick={() => void loadAutomationEndpoint(existing.id)}>显示地址</button>
+                  <button type="button" onClick={() => void copyAutomationEndpoint(existing.id)}>复制地址</button>
+                  <button type="button" onClick={() => void rotateAutomationWebhookSecret(existing.id)}>更新验证密钥</button>
+                  {automationState.secretValueAvailable && <button type="button" onClick={() => void copyAutomationSecret()}>复制新密钥</button>}
+                  <button type="button" onClick={() => void testAutomationWebhook(existing.id)}>测试触发</button>
                 </div>
                 {automationEndpoint?.automation_id === existing.id && (
                   <dl className="compact-kv">
-                    <KV label="URL" value={automationState.webhookUrl || automationEndpoint.url} />
-                    <KV label="Secret Ref" value={automationEndpoint.secret_ref || '未设置'} />
-                    <KV label="Secret" value={automationState.secretConfigured ? '已配置' : '未配置'} />
-                    {automationState.secretValueAvailable && <KV label="New Secret" value="已生成并可复制一次" />}
+                    <KV label="触发地址" value={automationState.webhookUrl || automationEndpoint.url} />
+                    <KV label="验证密钥" value={automationState.secretConfigured ? '已配置' : '未配置'} />
+                    {automationState.secretValueAvailable && <KV label="新密钥" value="已生成，只能复制一次" />}
                   </dl>
                 )}
               </section>
             )}
             <section>
-              <h3>Recent Triggers</h3>
+              <h3>最近触发</h3>
               <RecordList
-                emptyText="暂无 trigger。"
+                emptyText="暂无触发记录。"
                 items={recentTriggers}
                 renderItem={(trigger) => (
                   <article key={trigger.id} className="row-card compact">
                     <strong>{formatStatus(trigger.status)}</strong>
-                    <small>{trigger.trigger_type} · {trigger.dedup_key}</small>
-                    <small>{trigger.created_at || ''}</small>
-                    {trigger.error_message && <small>{trigger.error_code || 'ERROR'} · {trigger.error_message}</small>}
-                    <CollapsedData label="Payload" value={trigger.payload} />
+                    <small>{formatAutomationTriggerType(trigger.trigger_type)} · {formatShortTime(trigger.created_at)}</small>
+                    {trigger.error_message && <small>{trigger.error_message}</small>}
                   </article>
                 )}
               />
             </section>
             <section>
-              <h3>Recent Runs</h3>
+              <h3>最近运行</h3>
               <RecordList
-                emptyText="暂无 run。"
+                emptyText="暂无运行记录。"
                 items={recentRuns}
                 renderItem={(run) => (
                   <article key={run.id} className="row-card compact">
                     <strong>{formatStatus(run.status)}</strong>
-                    <small>attempt {run.attempt_number} · run {run.run_id || 'pending'}</small>
+                    <small>第 {run.attempt_number} 次尝试 · {formatShortTime(run.created_at)}</small>
                     <small>{run.output_summary || run.error_message || run.created_at || ''}</small>
                   </article>
                 )}
@@ -3025,20 +3841,66 @@ function SettingsConsole({
     if (activeObject.id === 'log-cleanup') {
       return (
         <section className="settings-detail-panel">
-          <DetailHeader title="日志清理" description="预览并清理日志、Run Trace、tool/model 与 worker audit 记录" />
+          <DetailHeader title="清理运行记录" description="先预览范围，再清理不再需要的本地运行记录" />
           <DiagnosticsLogCleanup onNotice={setNotice} />
         </section>
       );
     }
     return (
       <section className="settings-detail-panel">
-        <DetailHeader title="日志" description="筛选本地 app logs、Run Trace 与 worker audit 记录" />
+        <DetailHeader title="运行记录" description="按结果、风险和功能查看本机最近活动" />
         <CompanionLogsPanel runID={trace?.id} />
       </section>
     );
   }
 
   function renderMemoryDetail() {
+    if (activeObject.id === 'memory-health') {
+      const metrics = memoryMetrics;
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="记忆健康" description="查看召回质量、作用域隔离和候选生命周期，不自动删除数据" />
+          <dl className="compact-kv">
+            <KV label="已确认" value={`${metrics?.confirmed_count ?? 0} 条`} />
+            <KV label="待处理" value={`${metrics?.candidate_count ?? 0} 条`} />
+            <KV label="召回 / 注入" value={`${metrics?.recalled_count ?? 0} / ${metrics?.injected_count ?? 0}`} />
+            <KV label="确认用于回答" value={`${metrics?.used_in_answer_count ?? 0} 条 · ${formatRatio(metrics?.injection_use_rate ?? 0)}`} />
+            <KV label="未确认使用" value={`${metrics?.unused_injection_count ?? 0} 条`} />
+            <KV label="反馈" value={`有效 ${metrics?.positive_feedback_count ?? 0} · 无效 ${metrics?.negative_feedback_count ?? 0}`} />
+          </dl>
+          <section>
+            <h3>作用域分布</h3>
+            <div className="table">
+              {Object.entries(metrics?.scope_counts ?? {}).length > 0
+                ? Object.entries(metrics?.scope_counts ?? {}).map(([scope, count]) => (
+                  <article className="row-card compact" key={scope}>
+                    <strong>{formatMemoryScope(scope)}</strong>
+                    <small>{count} 条已确认记忆</small>
+                  </article>
+                ))
+                : <p className="empty">暂无已确认记忆。</p>}
+            </div>
+          </section>
+          <section>
+            <h3>生命周期提示</h3>
+            <div className="table">
+              <article className="row-card compact">
+                <strong>{metrics?.old_candidate_count ? `${metrics.old_candidate_count} 条候选等待超过 7 天` : '没有超期候选'}</strong>
+                <small>{metrics?.oldest_candidate_at ? `最早候选 ${formatShortTime(metrics.oldest_candidate_at)}` : '候选队列当前为空或都很新'}</small>
+              </article>
+              <article className="row-card compact">
+                <strong>{metrics?.duplicate_candidate_count ? `${metrics.duplicate_candidate_count} 条重复候选需要合并` : '没有重复候选'}</strong>
+                <small>重复项仍通过确认、纠正、合并或删除流程治理。</small>
+              </article>
+              <article className="row-card compact">
+                <strong>{metrics?.stale_confirmed_count ? `${metrics.stale_confirmed_count} 条确认记忆超过 90 天未使用` : '没有长期未使用记忆'}</strong>
+                <small>这里只提示，不自动停用或物理删除。</small>
+              </article>
+            </div>
+          </section>
+        </section>
+      );
+    }
     if (activeObject.id === 'memory-inbox') {
       return (
         <MemoryObjectDetail
@@ -3152,6 +4014,397 @@ function SettingsConsole({
   }
 
   function renderCapabilitiesDetail() {
+    if (activeObject.id === 'builtin') {
+      const latestRuns = toolRuns.slice(0, 8);
+      const enabledCapabilities = capabilities.filter((capability) => capability.enabled);
+      const connectedExtensions = mcpServers.filter((server) => server.status === 'active' || server.status === 'connected');
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="能力概览" description="查看 Joi 可以完成的任务、已连接扩展和允许访问的范围" />
+          <dl className="metrics">
+            <KV label="可用能力" value={`${enabledCapabilities.length} 项`} />
+            <KV label="任务流程" value={`${workflows.filter((workflow) => workflow.enabled).length} 项`} />
+            <KV label="已连接扩展" value={`${connectedExtensions.length} 个`} />
+            <KV label="已启用技能" value={`${skills.filter((skill) => skill.enabled).length} 个`} />
+            <KV label="最近使用" value={`${toolRuns.length} 次`} />
+            <KV label="默认文件夹" value={displayPathName(workspaceSettings?.default_root)} />
+          </dl>
+
+          <h3>可用能力</h3>
+          <div className="capability-grid">
+            {capabilities.map((capability) => (
+              <article key={capability.id} className="row-card compact capability-contract-card">
+                <div className="capability-contract-title">
+                  <strong>{capabilityDisplayName(capability.id, capability.description)}</strong>
+                  <small>{capability.enabled ? '已启用' : '已停用'}</small>
+                </div>
+                <p>{capabilityUserDescription(capability.id, capability.description)}</p>
+                <small>风险：{formatRiskLevel(capability.risk_level)}</small>
+              </article>
+            ))}
+            {capabilities.length === 0 && <p className="empty">暂无可用能力。</p>}
+          </div>
+
+          <h3>已连接扩展</h3>
+          <RecordList
+            emptyText="暂无已连接扩展。"
+            items={mcpServers}
+            renderItem={(server) => (
+              <article key={server.id} className="row-card">
+                <div>
+                  <strong>{extensionDisplayName(server.name)}</strong>
+                  <p>{formatConnectionStatus(server.status)}</p>
+                  <small>{server.tools.length} 项功能 · {server.tools.filter((tool) => Boolean(tool.wrapped_as)).length} 项已授权</small>
+                </div>
+                <div className="row-actions">
+                  <button type="button" onClick={() => syncMCPServer(server.id)}>重新检查</button>
+                </div>
+              </article>
+            )}
+          />
+
+          <h3>技能</h3>
+          <RecordList
+            emptyText="暂无已安装技能。"
+            items={skills}
+            renderItem={(skill) => (
+              <article key={skill.id} className="row-card compact">
+                <strong>{skillDisplayName(skill.name)}</strong>
+                <p>{skillUserDescription(skill.name, skill.description)}</p>
+                <small>{skill.enabled ? '已启用' : '已停用'} · 需要 {skill.required_capabilities.length} 项能力</small>
+              </article>
+            )}
+          />
+
+          <h3>访问范围</h3>
+          <div className="settings-form compact">
+            <div className="field-row">
+              <span>可访问文件夹</span>
+              <div className="connection-status">
+                <strong>{workspaceSettings?.allowed_roots?.length ?? 0} 个</strong>
+                <small>{workspaceSettings?.allowed_roots?.map(displayPathName).join('、') || '未设置'}</small>
+              </div>
+            </div>
+            <div className="field-row">
+              <span>可访问网站</span>
+              <div className="connection-status">
+                <strong>{workspaceSettings?.browser_allowed_hosts?.length ?? 0} 个</strong>
+                <small>{workspaceSettings?.browser_allowed_hosts?.join('、') || '未单独授权'}</small>
+              </div>
+            </div>
+          </div>
+
+          <h3>最近使用</h3>
+          <RecordList
+            emptyText="暂无能力使用记录。"
+            items={latestRuns}
+            renderItem={(run) => (
+              <article key={run.id} className="row-card compact">
+                <strong>{capabilityDisplayName(run.capability_id || run.tool_name)} · {formatStatus(run.status)}</strong>
+                <small>{formatRiskLevel(run.risk_level)} · {formatMilliseconds(run.duration_ms ?? 0)} · {formatShortTime(run.finished_at || run.created_at)}</small>
+              </article>
+            )}
+          />
+        </section>
+      );
+    }
+    if (activeObject.id === 'builtin') {
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="内置能力" description="启用或停用 Joi Runtime 已注册的受控能力" />
+          <dl className="metrics">
+            <KV label="能力总数" value={`${capabilities.length} 个`} />
+            <KV label="已启用" value={`${capabilities.filter((item) => item.enabled).length} 个`} />
+            <KV label="需要确认" value={`${capabilities.filter((item) => item.risk_level !== 'read_only').length} 个`} />
+          </dl>
+          <RecordList
+            emptyText="暂无已注册能力。"
+            items={capabilities}
+            renderItem={(capability) => {
+              const backend = capabilityBackend(capability);
+              return (
+                <article key={capability.id} className="row-card compact">
+                  <div>
+                    <strong>{capability.name || capability.id}</strong>
+                    <p>{capability.description || '无描述'}</p>
+                    <small>{capability.id} · {formatRiskLevel(capability.risk_level)} · {capabilityBackendLabel(backend)}</small>
+                  </div>
+                  <button type="button" className={capability.enabled ? 'secondary-button' : ''} disabled={backend !== 'implemented'} onClick={() => void toggleCapability(capability)}>{backend === 'planned' ? '未接后端' : backend === 'alias' ? '随主能力' : capability.enabled ? '停用' : '启用'}</button>
+                </article>
+              );
+            }}
+          />
+        </section>
+      );
+    }
+
+    if (activeObject.id === 'skills') {
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="Skills" description="管理可被 Joi 匹配的技能包、触发语和能力依赖" />
+          <dl className="metrics"><KV label="已安装" value={`${skills.length} 个`} /><KV label="已启用" value={`${skills.filter((item) => item.enabled).length} 个`} /></dl>
+          <RecordList
+            emptyText="尚未安装 Skill。可通过 Plugin manifest 安装包含 skills 的插件。"
+            items={skills}
+            renderItem={(skill) => (
+              <article key={skill.id} className="row-card">
+                <div>
+                  <strong>{skill.name} · {skill.version}</strong>
+                  <p>{skill.description || '无描述'}</p>
+                  <small>触发：{skill.trigger_phrases.join('、') || '由 Agent 自动判断'}</small>
+                  <small>依赖能力：{skill.required_capabilities.join('、') || '无'}</small>
+                  <CollapsedData label="输出契约" value={{ output_contract: skill.output_contract, forbidden_capabilities: skill.forbidden_capabilities, metadata: skill.metadata }} />
+                </div>
+                <button type="button" className={skill.enabled ? 'secondary-button' : ''} onClick={() => void toggleSkill(skill)}>{skill.enabled ? '停用' : '启用'}</button>
+              </article>
+            )}
+          />
+        </section>
+      );
+    }
+
+    if (activeObject.id === 'plugins') {
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="Plugins" description="从 GitHub 或本地 manifest 安装插件，并统一管理 provider、能力、Skill 与 MCP" />
+          <div className="detail-toolbar">
+            <input aria-label="GitHub 插件地址" placeholder="https://github.com/owner/repo" value={pluginGitHubSource} onChange={(event) => setPluginGitHubSource(event.target.value)} />
+            <button type="button" disabled={!pluginGitHubSource.trim() || Boolean(pluginBusy)} onClick={() => void installPluginFromGitHub()}>{pluginBusy === 'github-install' ? '安装中…' : '从 GitHub 安装'}</button>
+          </div>
+          <div className="detail-toolbar">
+            <input placeholder="/absolute/path/to/plugin.json" value={pluginManifestPath} onChange={(event) => setPluginManifestPath(event.target.value)} />
+            <button type="button" disabled={!pluginManifestPath.trim()} onClick={() => void installPlugin()}>安装本地插件</button>
+          </div>
+          <p className="empty">GitHub 安装只接受 github.com 仓库并使用锁文件安装依赖；卸载只清理 Joi 受管插件目录，不删除 Codex 登录或用户工作区。</p>
+          <RecordList
+            emptyText="暂无插件。"
+            items={plugins}
+            renderItem={(plugin) => {
+              const core = plugin.metadata?.core === true;
+              const providers = pluginProviderConfigs(plugin);
+              return (
+                <article key={plugin.id} className="row-card">
+                  <div>
+                    <strong>{plugin.name} · {plugin.version}</strong>
+                    <p>{plugin.description || '无描述'}</p>
+                    <small>{plugin.status} · Provider {plugin.provider_ids.length} · 能力 {plugin.capability_ids.length} · Skills {plugin.skill_ids.length} · MCP {plugin.mcp_server_ids.length}</small>
+                    {plugin.manifest_path ? <small>{plugin.manifest_path}</small> : null}
+                    {typeof plugin.metadata?.source_url === 'string' ? <small>{plugin.metadata.source_url}{plugin.metadata.revision ? ` · ${String(plugin.metadata.revision).slice(0, 12)}` : ''}</small> : null}
+                    {providers.map((provider) => {
+                      const key = `${plugin.id}:${provider.id}`;
+                      const providerActive = settings?.model_provider === provider.id;
+                      const configuredModel = providerActive ? settings?.model_name : undefined;
+                      const modelOptions = mergeACPPluginModels(
+                        pluginProviderModels[key],
+                        provider.models,
+                        configuredModel ? [{ id: configuredModel, name: configuredModel }] : undefined,
+                      );
+                      const selectedModel = selectACPPluginModel(modelOptions, [
+                        pluginSelectedModels[key],
+                        configuredModel,
+                        provider.default_model,
+                      ]);
+                      const active = providerActive && settings?.model_name === selectedModel;
+                      return (
+                        <div className="plugin-provider-row" key={provider.id}>
+                          <div>
+                            <strong>{provider.name}</strong>
+                            <small>{provider.protocol.toUpperCase()} · {providerActive ? `当前 ${settings?.model_name}` : selectedModel}</small>
+                            {modelOptions.length > 0 ? (
+                              <select
+                                aria-label={`${provider.name} 模型`}
+                                disabled={!plugin.enabled || Boolean(pluginBusy)}
+                                value={selectedModel}
+                                onChange={(event) => setPluginSelectedModels((current) => ({ ...current, [key]: event.target.value }))}
+                              >
+                                {modelOptions.map((model) => (
+                                  <option key={model.id} value={model.id}>{model.name || model.id}</option>
+                                ))}
+                              </select>
+                            ) : null}
+                            {pluginTestStatus[key] ? <small>{pluginTestStatus[key]}</small> : null}
+                          </div>
+                          <div className="row-actions">
+                            <button type="button" className="secondary-button" disabled={!plugin.enabled || Boolean(pluginBusy)} onClick={() => void testPluginProvider(plugin, provider)}>测试</button>
+                            <button type="button" disabled={!plugin.enabled || active || Boolean(pluginBusy)} onClick={() => void usePluginProvider(plugin, provider)}>{active ? '使用中' : providerActive ? '切换模型' : '设为当前'}</button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <CollapsedData label="注册清单" value={{ provider_ids: plugin.provider_ids, capability_ids: plugin.capability_ids, skill_ids: plugin.skill_ids, mcp_server_ids: plugin.mcp_server_ids }} />
+                  </div>
+                  <div className="row-actions">
+                    <button type="button" className={plugin.enabled ? 'secondary-button' : ''} disabled={core} onClick={() => void togglePlugin(plugin)}>{core ? '核心插件' : plugin.enabled ? '停用' : '启用'}</button>
+                    {!core ? <button type="button" onClick={() => void removePlugin(plugin)}>移除</button> : null}
+                  </div>
+                </article>
+              );
+            }}
+          />
+        </section>
+      );
+    }
+
+    if (activeObject.id === 'mcp') {
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="MCP" description="配置 stdio MCP Server、同步清单，并将工具包装成受控 Capability" />
+          <div className="settings-form compact">
+            <label className="field-row"><span>ID</span><input placeholder="留空自动生成" value={mcpDraft.id} onChange={(event) => setMCPDraft((current) => ({ ...current, id: event.target.value }))} /></label>
+            <label className="field-row"><span>名称</span><input value={mcpDraft.name} onChange={(event) => setMCPDraft((current) => ({ ...current, name: event.target.value }))} /></label>
+            <label className="field-row"><span>命令</span><input placeholder="npx" value={mcpDraft.command} onChange={(event) => setMCPDraft((current) => ({ ...current, command: event.target.value }))} /></label>
+            <label className="field-row"><span>参数</span><input placeholder="-y @modelcontextprotocol/server-filesystem /path" value={mcpDraft.args} onChange={(event) => setMCPDraft((current) => ({ ...current, args: event.target.value }))} /></label>
+            <div className="detail-actions"><button type="button" onClick={() => void saveMCPDraft()}>保存 Server</button></div>
+          </div>
+          <RecordList
+            emptyText="暂无 MCP Server。"
+            items={mcpServers}
+            renderItem={(server) => (
+              <article key={server.id} className="row-card">
+                <div>
+                  <strong>{server.name} · {formatStatus(server.status)}</strong>
+                  <p>{server.command ? `${server.command} ${(server.args ?? []).join(' ')}` : '未配置 stdio 命令'}</p>
+                  <small>{server.transport} · {server.trust} · 工具 {server.tools.length} · 资源 {server.resources.length} · Prompt {server.prompts.length}</small>
+                  {server.last_sync_error ? <small className="error-text">{server.last_sync_error}</small> : null}
+                  {server.tools.map((tool) => (
+                    <div key={tool.name} className="connection-status">
+                      <strong>{tool.name}</strong>
+                      <small>{tool.description || '无描述'}{tool.wrapped_as ? ` · 已包装 ${tool.wrapped_as}` : ''}</small>
+                      {!tool.wrapped_as ? <button type="button" onClick={() => void wrapMCPTool(server, tool.name)}>包装为 Capability</button> : null}
+                    </div>
+                  ))}
+                </div>
+                <div className="row-actions">
+                  <button type="button" onClick={() => void syncMCPServer(server.id)}>同步</button>
+                  <button type="button" className="secondary-button" onClick={async () => { await desktopApi.setMCPServerEnabled({ id: server.id, enabled: server.enabled === false }); await refreshAll(); }}>{server.enabled === false ? '启用' : '停用'}</button>
+                  <button type="button" onClick={async () => { if (!window.confirm(`删除 MCP Server“${server.name}”？`)) return; await desktopApi.deleteMCPServer(server.id); await refreshAll(); }}>删除</button>
+                </div>
+              </article>
+            )}
+          />
+        </section>
+      );
+    }
+
+    if (activeObject.id === 'filesystem') {
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="文件系统" description="限定 Joi 可读取或写入的工作区根目录和单文件大小" />
+          <div className="settings-form">
+            <label className="field-row"><span>允许根目录</span><textarea rows={5} value={allowedRootsText} onChange={(event) => setAllowedRootsText(event.target.value)} /></label>
+            <label className="field-row"><span>默认根目录</span><input value={defaultRoot} onChange={(event) => setDefaultRoot(event.target.value)} /></label>
+            <label className="field-row"><span>单文件上限 (bytes)</span><input inputMode="numeric" value={fileMaxBytes} onChange={(event) => setFileMaxBytes(event.target.value)} /></label>
+            <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ allowed_roots: splitSettingsList(allowedRootsText), default_root: defaultRoot.trim(), file_analyze_max_bytes: Math.max(1, Number(fileMaxBytes) || 1) }, '文件系统边界已保存')}>保存</button></div>
+          </div>
+        </section>
+      );
+    }
+
+    if (activeObject.id === 'browser') {
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="浏览器" description="管理浏览器工具开关、允许域名和私网访问边界" />
+          <div className="settings-form">
+            <label className="field-row"><span>启用浏览器能力</span><input checked={browserEnabled} type="checkbox" onChange={(event) => setBrowserEnabled(event.target.checked)} /></label>
+            <label className="field-row"><span>允许 Host</span><textarea rows={4} placeholder="example.com, docs.example.com" value={browserHostsText} onChange={(event) => setBrowserHostsText(event.target.value)} /></label>
+            <label className="field-row"><span>允许私有 Host</span><input checked={browserPrivateHosts} type="checkbox" onChange={(event) => setBrowserPrivateHosts(event.target.checked)} /></label>
+            <p className="empty">私网访问仍只允许上方白名单，不能绕过 Runtime 的 URL 与风险校验。</p>
+            <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ browser_enabled: browserEnabled, browser_allowed_hosts: splitSettingsList(browserHostsText), web_research_allow_private_hosts: browserPrivateHosts }, '浏览器能力设置已保存')}>保存</button></div>
+          </div>
+        </section>
+      );
+    }
+
+    if (activeObject.id === 'github') {
+      const tokenConfigured = Boolean(secretStatus?.secrets?.GITHUB_TOKEN);
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="GitHub" description="配置 GitHub API、默认仓库与本地钥匙串令牌" />
+          <div className="settings-form">
+            <label className="field-row"><span>API Base URL</span><input value={githubApiBaseURL} onChange={(event) => setGithubApiBaseURL(event.target.value)} /></label>
+            <label className="field-row"><span>默认仓库</span><input placeholder="owner/repo" value={githubDefaultRepo} onChange={(event) => setGithubDefaultRepo(event.target.value)} /></label>
+            <label className="field-row"><span>Token</span><SecretInput placeholder={tokenConfigured ? '已配置；留空不更新' : 'ghp_...'} value={githubToken} visible={githubTokenVisible} onChange={setGithubToken} onToggleVisible={() => setGithubTokenVisible((value) => !value)} /></label>
+            <div className="connection-status"><span className={`live-dot ${tokenConfigured || githubToken.trim() ? 'on' : ''}`} /><strong>{tokenConfigured ? 'Token 已配置' : 'Token 未配置'}</strong><small>令牌只写入 macOS Keychain，不进入 SQLite。</small></div>
+            {githubTestStatus ? <p className="empty">{githubTestStatus}</p> : null}
+            <div className="detail-actions">
+              <button className="secondary-button" type="button" onClick={() => void testGitHubSettings()}>测试连接</button>
+              <button type="button" onClick={async () => { if (githubToken.trim()) { await desktopApi.saveSecret({ name: 'GITHUB_TOKEN', value: githubToken.trim() }); setGithubToken(''); } await saveWorkspacePatch({ github_default_repo: githubDefaultRepo.trim(), github_api_base_url: githubApiBaseURL.trim() || 'https://api.github.com' }, 'GitHub 设置已保存'); }}>保存</button>
+            </div>
+          </div>
+        </section>
+      );
+    }
+
+    if (activeObject.id === 'custom-tools') {
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="自定义工具" description="管理 Capability Runtime 已编译的 Tool Workflow" />
+          <p className="empty">新工具通过 Plugin manifest 或 MCP 包装注册；模型不能绕过 Workflow 直接执行底层命令。</p>
+          <RecordList
+            emptyText="暂无 Tool Workflow。"
+            items={workflows}
+            renderItem={(workflow) => (
+              <article key={workflow.id} className="row-card">
+                <div><strong>{workflow.name} · {workflow.version}</strong><p>{workflow.capability_id} · {formatRiskLevel(workflow.risk_level)}</p><small>{workflow.steps.map((step) => step.tool).join(' → ')}</small><CollapsedData label="Workflow" value={workflow} /></div>
+                <button type="button" className={workflow.enabled ? 'secondary-button' : ''} onClick={() => void setWorkflowEnabled(workflow.name, !workflow.enabled)}>{workflow.enabled ? '停用' : '启用'}</button>
+              </article>
+            )}
+          />
+        </section>
+      );
+    }
+
+    if (activeObject.id === 'web-search') {
+      const braveConfigured = Boolean(secretStatus?.secrets?.BRAVE_SEARCH_API_KEY);
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="网页搜索" description="配置 web_research 查询使用的搜索服务" />
+          <div className="settings-form">
+            <label className="field-row">
+              <span>搜索服务</span>
+              <select value={webSearchProvider} onChange={(event) => setWebSearchProvider(event.target.value)}>
+                {webSearchProviderOptions.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+            <label className="field-row">
+              <span>Brave API Key</span>
+              <SecretInput
+                placeholder="留空表示使用已保存密钥"
+                value={braveSearchApiKey}
+                visible={braveSearchApiKeyVisible}
+                onChange={setBraveSearchApiKey}
+                onToggleVisible={() => setBraveSearchApiKeyVisible((value) => !value)}
+              />
+            </label>
+            <div className="field-row">
+              <span>连接状态</span>
+              <div className="connection-status">
+                <span className={`live-dot ${webSearchProvider !== 'brave' || braveConfigured || braveSearchApiKey.trim() ? 'on' : ''}`} />
+                <strong>{braveConfigured ? 'Brave 已配置' : 'Brave 未配置'}</strong>
+                <small>Auto 会在 Brave key 可用时优先使用 Brave，否则回落 DuckDuckGo。</small>
+              </div>
+            </div>
+            <label className="field-row">
+              <span>测试查询</span>
+              <input value={webSearchTestQuery} onChange={(event) => setWebSearchTestQuery(event.target.value)} />
+            </label>
+            <div className="detail-actions">
+              <button type="button" onClick={saveWebSearchSettings}>保存</button>
+              <button type="button" onClick={testWebSearchSettings}>测试搜索</button>
+            </div>
+          </div>
+          <dl className="metrics">
+            <KV label="当前 provider" value={workspaceSettings?.web_search_provider || 'auto'} />
+            <KV label="Brave Key" value={braveConfigured ? '已配置' : '缺失'} />
+            <KV label="私有 host" value={workspaceSettings?.web_research_allow_private_hosts ? '允许 allowlist' : '默认拒绝'} />
+            <KV label="结果上限" value={`${workspaceSettings?.workspace_search_max_results ?? 0} 条`} />
+          </dl>
+          {testStatus && <p className="empty">{testStatus}</p>}
+        </section>
+      );
+    }
     const latestRuns = toolRuns.slice(0, 8);
     const metadataValue = (capability: CapabilityRecord, key: string) => {
       const metadata = capability.metadata ?? {};
@@ -3179,30 +4432,37 @@ function SettingsConsole({
 
         <h3>Native Capabilities</h3>
         <div className="capability-grid">
-          {nativeCapabilities.map((capability) => (
-            <article key={capability.id} className="row-card compact capability-contract-card">
-              <div className="capability-contract-title">
-                <strong>{capability.id}</strong>
-                <small>{capability.enabled ? '已启用' : '已停用'}</small>
-              </div>
-              <p>{capability.description || '未记录描述'}</p>
-              <dl className="compact-kv">
-                <KV label="intent" value={String(metadataValue(capability, 'intent_domain') ?? '未设置')} />
-                <KV label="risk" value={formatRiskLevel(String(metadataValue(capability, 'risk_level') ?? capability.risk_level))} />
-                <KV label="privacy" value={String(metadataValue(capability, 'privacy_level') ?? 'public')} />
-                <KV label="workflow" value={String(metadataValue(capability, 'workflow_id') ?? '未绑定')} />
-              </dl>
-              <CollapsedData
-                label="查看 contract"
-                value={{
-                  positive_examples: metadataArray(capability, 'positive_examples'),
-                  negative_examples: metadataArray(capability, 'negative_examples'),
-                  input_schema: metadataValue(capability, 'input_schema') ?? {},
-                  output_schema: metadataValue(capability, 'output_schema') ?? {},
-                }}
-              />
-            </article>
-          ))}
+          {nativeCapabilities.map((capability) => {
+            const backend = capabilityBackend(capability);
+            return (
+              <article key={capability.id} className={`row-card compact capability-contract-card capability-backend-${backend}`}>
+                <div className="capability-contract-title">
+                  <strong>{capability.id}</strong>
+                  <small className={`capability-backend-status ${capability.enabled ? '' : 'is-disabled'}`}>
+                    {capabilityStatusLabel(capability)}
+                  </small>
+                </div>
+                <p>{capability.description || '未记录描述'}</p>
+                <dl className="compact-kv">
+                  <KV label="backend" value={capabilityBackendLabel(backend)} />
+                  <KV label="intent" value={String(metadataValue(capability, 'intent_domain') ?? '未设置')} />
+                  <KV label="risk" value={formatRiskLevel(String(metadataValue(capability, 'risk_level') ?? capability.risk_level))} />
+                  <KV label="privacy" value={String(metadataValue(capability, 'privacy_level') ?? 'public')} />
+                  <KV label="workflow" value={String(metadataValue(capability, 'workflow_id') ?? '未绑定')} />
+                </dl>
+                <CollapsedData
+                  label="查看 contract"
+                  value={{
+                    backend,
+                    positive_examples: metadataArray(capability, 'positive_examples'),
+                    negative_examples: metadataArray(capability, 'negative_examples'),
+                    input_schema: metadataValue(capability, 'input_schema') ?? {},
+                    output_schema: metadataValue(capability, 'output_schema') ?? {},
+                  }}
+                />
+              </article>
+            );
+          })}
           {nativeCapabilities.length === 0 && <p className="empty">暂无 Native capability。</p>}
         </div>
 
@@ -3343,7 +4603,7 @@ function SettingsConsole({
               <div className="connection-status">
                 <span className={`live-dot ${workerGatewayEnabled ? 'on' : ''}`} />
                 <strong>{workerGatewayEnabled ? '已启用' : '已停用'}</strong>
-                <small>工作节点通过网关注册并获取任务</small>
+                <small>工作节点通过网关注册并获取任务；网关开关在下次启动 Joi 时生效</small>
                 <button type="button" onClick={rotateWorkerToken}>重置工作节点令牌</button>
               </div>
             </div>
@@ -3355,26 +4615,36 @@ function SettingsConsole({
       );
     }
     if (activeObject.id === 'assignment-policy') {
+      const effectiveRouting = executionRoutingForSettings({
+        ...(workspaceSettings ?? defaultWorkspaceSettings()),
+        node_assignment_policy: nodeAssignmentPolicy,
+        allow_remote_execution: allowRemoteExecution,
+        privacy_local_only: privacyLocalOnly,
+        remote_execution_requires_confirmation: remoteExecutionRequiresConfirmation,
+      });
       return (
         <section className="settings-detail-panel">
           <DetailHeader title="分配策略" description="控制主节点和工作节点如何接收任务" />
           <div className="settings-form">
             <label className="field-row">
               <span>默认策略</span>
-              <select defaultValue="main-first">
-                <option value="main-first">主节点优先</option>
+              <select value={nodeAssignmentPolicy} onChange={(event) => setNodeAssignmentPolicy(event.target.value)}>
+                <option value="main_first">主节点优先</option>
                 <option value="auto">高峰期自动派发</option>
                 <option value="manual">仅手动指定</option>
               </select>
             </label>
             <label className="field-row">
               <span>允许远端执行</span>
-              <input type="checkbox" />
+              <input checked={allowRemoteExecution} type="checkbox" onChange={(event) => setAllowRemoteExecution(event.target.checked)} />
             </label>
-            <details className="settings-advanced">
-              <summary>高级参数</summary>
-              <p className="empty">后续可加入队列阈值、重试策略和最小上下文策略。</p>
-            </details>
+            <p className="empty">主节点始终具备完整任务能力；Worker 只接收最小必要上下文，不接收长期记忆或 Secret。</p>
+            <div className="connection-status">
+              <span className={`live-dot ${effectiveRouting.allowWorker ? 'on' : ''}`} />
+              <strong>{effectiveRouting.allowWorker ? '允许自动派发' : '当前固定主节点'}</strong>
+              <small>生效原因：{effectiveRouting.reason}</small>
+            </div>
+            <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ node_assignment_policy: nodeAssignmentPolicy, allow_remote_execution: allowRemoteExecution }, '节点分配策略已保存')}>保存</button></div>
           </div>
         </section>
       );
@@ -3444,7 +4714,11 @@ function SettingsConsole({
               <span>密钥类型</span>
               <select value={secretName} onChange={(event) => setSecretName(event.target.value)}>
                 <option value="MODEL_API_KEY">MODEL_API_KEY</option>
+                <option value="BRAVE_SEARCH_API_KEY">BRAVE_SEARCH_API_KEY</option>
+                <option value="GITHUB_TOKEN">GITHUB_TOKEN</option>
                 <option value="TELEGRAM_BOT_TOKEN">TELEGRAM_BOT_TOKEN</option>
+                <option value="PHOTON_PROJECT_SECRET">PHOTON_PROJECT_SECRET</option>
+                <option value="PHOTON_DASHBOARD_TOKEN">PHOTON_DASHBOARD_TOKEN</option>
                 <option value="WORKER_TOKEN">WORKER_TOKEN</option>
                 <option value="NODE_SECRET">NODE_SECRET</option>
                 <option value="ADMIN_TOKEN">ADMIN_TOKEN</option>
@@ -3498,20 +4772,82 @@ function SettingsConsole({
         </section>
       );
     }
+    if (activeObject.id === 'privacy-policy') {
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="隐私策略" description="控制数据处理边界和破坏性操作底线" />
+          <div className="settings-form">
+            <label className="field-row"><span>本地优先</span><input checked={privacyLocalOnly} type="checkbox" onChange={(event) => setPrivacyLocalOnly(event.target.checked)} /></label>
+            <label className="field-row"><span>禁止破坏性操作</span><input checked readOnly type="checkbox" /></label>
+            <p className="empty">关闭“本地优先”只允许明确配置的远端模型或 Worker；不会自动扩大文件、记忆或 Secret 范围。</p>
+            <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ privacy_local_only: privacyLocalOnly, destructive_operations_disabled: true }, '隐私策略已保存')}>保存</button></div>
+          </div>
+        </section>
+      );
+    }
+    if (activeObject.id === 'remote-permission') {
+      const effectiveRouting = executionRoutingForSettings({
+        ...(workspaceSettings ?? defaultWorkspaceSettings()),
+        node_assignment_policy: nodeAssignmentPolicy,
+        allow_remote_execution: allowRemoteExecution,
+        privacy_local_only: privacyLocalOnly,
+        remote_execution_requires_confirmation: remoteExecutionRequiresConfirmation,
+      });
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="远端执行权限" description="远端 Worker 的总开关与确认策略" />
+          <div className="settings-form">
+            <label className="field-row"><span>允许远端执行</span><input checked={allowRemoteExecution} type="checkbox" onChange={(event) => setAllowRemoteExecution(event.target.checked)} /></label>
+            <label className="field-row"><span>远端执行需确认</span><input checked={remoteExecutionRequiresConfirmation} type="checkbox" onChange={(event) => setRemoteExecutionRequiresConfirmation(event.target.checked)} /></label>
+            <p className="empty">即使允许远端执行，高风险 Capability 仍按各自风险等级进入确认队列。</p>
+            <div className="connection-status">
+              <span className={`live-dot ${effectiveRouting.allowWorker ? 'on' : ''}`} />
+              <strong>{effectiveRouting.allowWorker ? '自动 Worker 路由已生效' : '自动 Worker 路由已阻止'}</strong>
+              <small>{effectiveRouting.reason}</small>
+            </div>
+            <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ allow_remote_execution: allowRemoteExecution, remote_execution_requires_confirmation: remoteExecutionRequiresConfirmation }, '远端执行权限已保存')}>保存</button></div>
+          </div>
+        </section>
+      );
+    }
     return (
       <section className="settings-detail-panel">
-        <DetailHeader title={activeObject.label} description={`${activeObject.label} 配置`} />
-        <div className="capability-grid">
-          <CapabilityToggle label="默认本地优先" enabled />
-          <CapabilityToggle label="远端执行需确认" enabled />
-          <CapabilityToggle label="诊断信息脱敏" enabled={activeObject.id === 'diagnostic-redaction'} />
-          <CapabilityToggle label="破坏性操作禁止" enabled />
+        <DetailHeader title="诊断脱敏" description="导出日志和诊断包前移除 Secret、Token 与敏感路径" />
+        <div className="settings-form">
+          <label className="field-row"><span>启用诊断脱敏</span><input checked={diagnosticRedactionEnabled} type="checkbox" onChange={(event) => setDiagnosticRedactionEnabled(event.target.checked)} /></label>
+          <p className="empty">导出过程保留错误码、Run ID 和组件状态；密钥值、Authorization Header 与用户目录会被替换。</p>
+          <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ diagnostic_redaction_enabled: diagnosticRedactionEnabled }, '诊断脱敏设置已保存')}>保存</button></div>
         </div>
       </section>
     );
   }
 
   function renderAdvancedDetail() {
+    {
+      return (
+        <section className="settings-detail-panel">
+          <DetailHeader title="诊断与支持" description="检查本机状态；需要技术支持时再导出脱敏诊断包" />
+          <dl className="metrics">
+            <KV label="本地数据" value={Boolean(health?.service_status?.sqlite) ? '正常' : '需要检查'} />
+            <KV label="今日模型调用" value={String(health?.model_latency?.model_calls_today ?? 0)} />
+            <KV label="已连接执行器" value={String(health?.worker_status?.length ?? 0)} />
+            <KV label="待处理问题" value={String(health?.warnings?.length ?? 0)} />
+          </dl>
+          <div className="detail-actions">
+            <button type="button" onClick={async () => {
+              const result = await desktopApi.exportDiagnostics();
+              setNotice(`诊断包已导出：${result.path}`);
+            }}>导出脱敏诊断包</button>
+          </div>
+          <DiagnosticsLogCleanup onNotice={setNotice} />
+          <ClosureReportPanel
+            continueProductTaskByID={continueProductTaskByID}
+            externalHandoffAudit={externalHandoffAudit}
+            report={closureReport}
+          />
+        </section>
+      );
+    }
     if (activeObject.id === 'diagnostics') {
       return (
         <section className="settings-detail-panel">
@@ -3677,11 +5013,11 @@ const modelProviderPresets: Record<string, ModelProviderPreset> = {
     models: ['claude-4-sonnet', 'claude-4-opus'],
   },
   grok: {
-    provider: 'xai_oauth',
+    provider: 'grok_build',
     baseURL: 'https://api.x.ai/v1',
-    defaultModel: 'grok-4.3',
-    reasoningModel: 'grok-4.3',
-    models: ['grok-4.3'],
+    defaultModel: 'grok-4.5',
+    reasoningModel: 'grok-4.5',
+    models: ['grok-4.5'],
   },
   local: {
     provider: 'local',
@@ -3710,7 +5046,7 @@ function modelPresetMatchesSavedSettings(activeObjectID: string, preset: ModelPr
   const savedProvider = settings?.model_provider?.trim();
   const savedBaseURL = settings?.model_base_url?.trim();
   if (!savedProvider || !savedBaseURL) return false;
-  const providerMatches = savedProvider === preset.provider || (activeObjectID === 'grok' && ['xai', 'xai_oauth', 'xai-oauth'].includes(savedProvider));
+  const providerMatches = savedProvider === preset.provider || (activeObjectID === 'grok' && ['xai', 'xai_oauth', 'xai-oauth', 'grok_build', 'grok-build'].includes(savedProvider));
   return providerMatches && normalizeModelBaseURL(savedBaseURL) === normalizeModelBaseURL(preset.baseURL);
 }
 
@@ -3721,11 +5057,12 @@ function normalizeModelBaseURL(value: string): string {
 function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], automations: AutomationDefinition[] = []) {
   if (category === 'models') {
     return [
+      { id: 'codex-acp', label: 'Codex ACP', description: '本机 Codex 登录、连接测试与模型发现' },
       { id: 'openai', label: 'OpenAI', description: 'OpenAI API 与模型参数' },
       { id: 'deepseek', label: 'DeepSeek', description: 'DeepSeek API 连接与模型参数' },
       { id: 'gemini', label: 'Gemini', description: 'Google Gemini 模型配置' },
       { id: 'claude', label: 'Claude', description: 'Anthropic Claude 模型配置' },
-      { id: 'grok', label: 'Grok', description: 'xAI Grok 模型配置' },
+      { id: 'grok', label: 'Grok Build', description: 'xAI OAuth · Grok 4.5 agent runtime' },
       { id: 'local', label: '本地模型', description: '本地推理服务与模型' },
       { id: 'openrouter', label: 'OpenRouter', description: '多模型路由服务' },
       { id: 'compatible', label: '自定义兼容', description: 'OpenAI Compatible 接口' },
@@ -3735,9 +5072,7 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
     return [
       { id: 'telegram', label: 'Telegram', description: 'Telegram Bot 入口' },
       { id: 'imessage', label: 'iMessage', description: 'Photon 托管 iMessage 入口' },
-      { id: 'wechat-claw', label: '微信 Claw', description: '微信入口与桥接配置' },
       { id: 'desktop-notify', label: '桌面通知', description: '本机通知入口' },
-      { id: 'cli', label: 'CLI', description: '命令行入口' },
       { id: 'webhook', label: 'Webhook', description: '外部 HTTP 入口' },
     ];
   }
@@ -3746,13 +5081,14 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
   }
   if (category === 'observability') {
     return [
-      { id: 'logs', label: '日志', description: '按等级、风险、来源与 Run 筛选日志' },
-      { id: 'token-usage', label: 'Token 用量', description: '模型调用、Token、缓存命中与成本' },
-      { id: 'log-cleanup', label: '日志清理', description: '预览并清理日志与执行记录' },
+      { id: 'logs', label: '运行记录', description: '查看最近活动、结果与问题' },
+      { id: 'token-usage', label: '用量统计', description: '模型用量、缓存命中与成本' },
+      { id: 'log-cleanup', label: '清理记录', description: '预览并清理本地运行记录' },
     ];
   }
   if (category === 'dataMemory') {
     return [
+      { id: 'memory-health', label: '记忆健康', description: '召回质量、作用域与生命周期' },
       { id: 'memory-inbox', label: '待确认记忆', description: '审核记忆候选' },
       { id: 'confirmed-memory', label: '已确认记忆', description: '长期记忆库' },
       { id: 'conflict-memory', label: '冲突记忆', description: '需要处理的记忆冲突' },
@@ -3765,14 +5101,8 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
   }
   if (category === 'capabilities') {
     return [
-      { id: 'builtin', label: '内置能力', description: 'Joi 内置能力开关' },
-      { id: 'skills', label: 'Skills', description: '技能包管理' },
-      { id: 'plugins', label: 'Plugins', description: '插件管理' },
-      { id: 'mcp', label: 'MCP', description: 'MCP Server 配置' },
-      { id: 'filesystem', label: '文件系统', description: '本地文件访问能力' },
-      { id: 'browser', label: '浏览器', description: '浏览器自动化能力' },
-      { id: 'github', label: 'GitHub', description: '代码仓库连接能力' },
-      { id: 'custom-tools', label: '自定义工具', description: '自定义能力注册' },
+      { id: 'builtin', label: '能力概览', description: '查看 Joi 可以做什么以及访问范围' },
+      { id: 'plugins', label: 'Plugins', description: '安装并管理 provider 与扩展' },
     ];
   }
   if (category === 'nodesExecution') {
@@ -3797,11 +5127,7 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
     ];
   }
   return [
-    { id: 'diagnostics', label: '诊断包', description: '导出运行诊断' },
-    { id: 'raw-data', label: '原始数据', description: '系统调试数据' },
-    { id: 'prompt-assembly', label: 'Prompt Assembly', description: '提示词组装详情' },
-    { id: 'memory-context-pack', label: 'Memory Context Pack', description: '记忆上下文包' },
-    { id: 'tool-io', label: 'Tool I/O', description: '工具输入输出' },
+    { id: 'diagnostics', label: '诊断与支持', description: '检查状态、导出诊断和修复问题' },
   ];
 }
 
@@ -3861,6 +5187,7 @@ function MemoryObjectDetail({
               <strong>{memory.summary || memory.type}</strong>
               <p>{memory.content}</p>
               <small>{formatStatus(memory.status)} · 置信度 {memory.confidence.toFixed(2)} · 命中 {memory.usage_count}</small>
+              <small>作用域：{formatMemoryScope(memory.scope_type)}{memory.scope_id ? ` · ${memory.scope_id}` : ''}{memoryAgeLabel(memory) ? ` · ${memoryAgeLabel(memory)}` : ''}</small>
               {memory.conflict_group_id && <small>冲突：{memory.conflict_group_id} {memory.conflict_reason}</small>}
               {memory.source_event_ids?.length ? <small>来源：{memory.source_event_ids.join(', ')}</small> : null}
               {memory.metadata ? <CollapsedData label="高级详情" value={memory.metadata} /> : null}
@@ -3880,6 +5207,24 @@ function MemoryObjectDetail({
       />
     </section>
   );
+}
+
+function formatMemoryScope(scope?: string): string {
+  if (scope === 'global') return '全局';
+  if (scope === 'user') return '当前用户';
+  if (scope === 'room') return '当前房间';
+  if (scope === 'project') return '项目';
+  return scope || '全局';
+}
+
+function memoryAgeLabel(memory: MemoryRecord): string {
+  const timestamp = memory.last_used_at || memory.updated_at || memory.created_at;
+  if (!timestamp) return '';
+  const time = new Date(timestamp).getTime();
+  if (!Number.isFinite(time)) return '';
+  const days = Math.max(0, Math.floor((Date.now() - time) / 86_400_000));
+  if (['pending', 'candidate', 'proposed', 'conflicted'].includes(memory.status)) return `已等待 ${days} 天`;
+  return memory.last_used_at ? `${days} 天前使用` : `${days} 天前更新`;
 }
 
 function ConversationLifecycleSettingsList({
@@ -3940,11 +5285,11 @@ function ConversationSidebar({
   chat,
   collapsed,
   conversations,
-  currentRoomID,
   currentConversationID,
   loadConversation,
-  loadRoom,
-  messenger,
+  query,
+  searchOpen,
+  setQuery,
   setActiveTab,
   trace,
 }: {
@@ -3953,11 +5298,11 @@ function ConversationSidebar({
   chat: ChatResponse | null;
   collapsed: boolean;
   conversations: ConversationSummary[];
-  currentRoomID: string;
   currentConversationID: string;
   loadConversation: (conversationID: string) => Promise<void>;
-  loadRoom: (room: MessengerRoom) => Promise<void>;
-  messenger: PersonaMessengerSnapshot | null;
+  query: string;
+  searchOpen: boolean;
+  setQuery: (query: string) => void;
   setActiveTab: (tab: Tab) => void;
   trace: RunTrace | null;
 }) {
@@ -3965,44 +5310,22 @@ function ConversationSidebar({
     return <aside aria-hidden="true" className="im-sidebar sidebar-placeholder app__sidebar tk-sidebar" />;
   }
 
-  const rooms = messenger?.rooms ?? [];
-  const groupedRooms = groupMessengerRooms(rooms);
   const isRoomContext = activeTab === 'chat' || activeTab === 'trace';
 
   return (
     <aside className="im-sidebar app__sidebar tk-sidebar">
+      <div className="thread-sidebar-heading">
+        <strong>线程</strong>
+        <span>{conversations.length}</span>
+      </div>
+      {searchOpen ? (
+        <label className="thread-search-field">
+          <span className="sr-only">搜索线程</span>
+          <input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索线程" />
+        </label>
+      ) : null}
       <ScrollArea className="conversation-list tk-sidebar-scroll">
-        {rooms.length ? (
-          <>
-            {groupedRooms.map((group) => (
-              <section key={group.id} className="messenger-room-section">
-                {group.rooms.map((room) => {
-                  const active = currentRoomID === room.id || (!currentRoomID && currentConversationID && room.conversation_id === currentConversationID);
-                  return (
-                    <div key={room.id} className={`conversation-row-wrap messenger-room-wrap ${active && isRoomContext ? 'active' : ''}`}>
-                      <button
-                        className={`conversation-item conversation-chat-item messenger-room-item ${active && isRoomContext ? 'active' : ''}`}
-                        type="button"
-                        onClick={() => void loadRoom(room)}
-                      >
-                        <RoomAvatar room={room} personas={messenger?.personas ?? []} />
-                        <span className="room-list-copy">
-                          <strong>{room.title}</strong>
-                          <em>{compactRoomLastMessage(room.last_message)}</em>
-                        </span>
-                      </button>
-                      {room.conversation_id && room.type === 'project_dm' ? (
-                        <div className="conversation-row-actions">
-                          <button type="button" onClick={() => void archiveConversation(room.conversation_id!)}>归档</button>
-                        </div>
-                      ) : null}
-                    </div>
-                  );
-                })}
-              </section>
-            ))}
-          </>
-        ) : conversations.length ? conversations.map((item) => {
+        {conversations.length ? conversations.map((item) => {
           const active = currentConversationID === item.id || (!currentConversationID && chat?.conversation_id === item.id);
           return (
             <div key={item.id} className={`conversation-row-wrap ${active && isRoomContext ? 'active' : ''}`}>
@@ -4011,10 +5334,12 @@ function ConversationSidebar({
                 type="button"
                 onClick={() => loadConversation(item.id)}
               >
-                <span>
+                <span className="thread-list-copy">
                   <strong>{conversationTitle(item)}</strong>
                 </span>
-                <time>{formatShortTime(item.updated_at)}</time>
+                <span className="thread-list-meta">
+                  <time>{formatShortTime(item.updated_at)}</time>
+                </span>
               </button>
               <div className="conversation-row-actions">
                 <button type="button" onClick={() => void archiveConversation(item.id)}>归档</button>
@@ -4022,12 +5347,10 @@ function ConversationSidebar({
             </div>
           );
         }) : (
-          <button className={`conversation-item conversation-chat-item ${activeTab === 'chat' || activeTab === 'trace' ? 'active' : ''}`} type="button" onClick={() => setActiveTab('chat')}>
-            <span>
-              <strong>{chat ? '当前对话' : '新对话'}</strong>
-            </span>
-            <time>{trace ? '刚刚' : ''}</time>
-          </button>
+          <div className="thread-list-empty">
+            <strong>{query ? '没有匹配线程' : (chat ? '当前线程' : '还没有线程')}</strong>
+            <small>{query ? '换个关键词试试' : '点击左上角 + 创建新线程'}</small>
+          </div>
         )}
       </ScrollArea>
       <footer className="sidebar-footer">
@@ -4109,13 +5432,131 @@ function compactRoomLastMessage(value?: string) {
 
 function RoomAvatar({ room, personas }: { room: MessengerRoom; personas: ProjectPersona[] }) {
   const persona = room.persona_id ? personas.find((item) => item.id === room.persona_id) : undefined;
-  const label = room.type === 'private_hub' ? '总' : (persona?.display_name || room.title || '房').slice(0, 1);
+  const avatar = roomAvatarValue(room) || persona?.avatar || '';
+  const label = avatar && !isImageAvatar(avatar)
+    ? avatar.slice(0, 2)
+    : room.type === 'private_hub' ? '总' : (persona?.display_name || room.title || '房').slice(0, 1);
   const showPersonaIndicator = Boolean(persona) && room.type === 'project_dm';
   return (
     <span className={`room-avatar room-avatar-${classToken(room.type)}`}>
-      {label}
+      {avatar && isImageAvatar(avatar) ? <img src={avatar} alt="" /> : label}
       {showPersonaIndicator ? <i aria-label="项目人格" title="项目人格" /> : null}
     </span>
+  );
+}
+
+function roomAvatarValue(room: MessengerRoom | null | undefined) {
+  const avatar = typeof room?.avatar === 'string' ? room.avatar.trim() : '';
+  if (avatar) return avatar;
+  const metadataAvatar = room?.metadata?.avatar;
+  return typeof metadataAvatar === 'string' ? metadataAvatar.trim() : '';
+}
+
+function memoriesForPrivateProject(
+  memories: MemoryRecord[],
+  persona: ProjectPersona,
+  project: PersonaMessengerSnapshot['projects'][number] | null,
+) {
+  const projectID = project?.id || persona.project_id;
+  const entityHints = new Set([
+    persona.id,
+    persona.display_name,
+    persona.handle,
+    projectID,
+    project?.name || '',
+  ].filter(Boolean));
+  return memories.filter((memory) => {
+    if (memory.scope_id === persona.id || memory.scope_id === projectID) return true;
+    if (memory.metadata?.persona_id === persona.id || memory.metadata?.project_id === projectID) return true;
+    return (memory.entities ?? []).some((entity) => entityHints.has(entity));
+  });
+}
+
+function isImageAvatar(value: string) {
+  return /^https?:\/\//i.test(value) || value.startsWith('data:image/') || value.startsWith('file:');
+}
+
+function readFileAsDataURL(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+    reader.onerror = () => reject(reader.error ?? new Error('Failed to read avatar file'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function attachmentKind(file: File): ComposerAttachment['kind'] {
+  if (file.type.startsWith('image/')) return 'image';
+  if (file.type.startsWith('video/')) return 'video';
+  const extension = file.name.split('.').pop()?.toLowerCase() || '';
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic', 'heif', 'svg'].includes(extension)) return 'image';
+  if (['mp4', 'mov', 'webm', 'm4v', 'avi', 'mkv'].includes(extension)) return 'video';
+  return 'file';
+}
+
+function attachmentForRequest(attachment: ComposerAttachment) {
+  return {
+    id: attachment.id,
+    name: attachment.name,
+    size: attachment.size,
+    mime_type: attachment.mime_type,
+    kind: attachment.kind,
+    preview_url: attachment.preview_url,
+    last_modified: attachment.last_modified,
+  };
+}
+
+function attachmentOnlyPrompt(attachments: ComposerAttachment[]) {
+  if (attachments.length === 0) return '';
+  const names = attachments.map((item) => item.name).slice(0, 3).join('、');
+  const suffix = attachments.length > 3 ? ` 等 ${attachments.length} 个附件` : '';
+  return `请查看我上传的${attachments.length}个附件：${names}${suffix}`;
+}
+
+function formatAttachmentSize(size: number) {
+  if (!size) return '附件';
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
+  return `${(size / 1024 / 1024).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function ComposerAttachmentPreview({ attachment }: { attachment: ComposerAttachment }) {
+  if (attachment.kind === 'image' && attachment.preview_url) {
+    return <img className="composer-attachment-preview" src={attachment.preview_url} alt="" />;
+  }
+  if (attachment.kind === 'video' && attachment.preview_url) {
+    return <video className="composer-attachment-preview" src={attachment.preview_url} muted playsInline preload="metadata" />;
+  }
+  return (
+    <span className="composer-attachment-preview composer-attachment-glyph" aria-hidden="true">
+      <AttachmentKindIcon kind={attachment.kind} />
+    </span>
+  );
+}
+
+function AttachmentKindIcon({ kind }: { kind: ComposerAttachment['kind'] }) {
+  if (kind === 'image') {
+    return (
+      <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+        <path d="M5 5h14v14H5z" />
+        <path d="m7 16 4-4 3 3 2-2 3 3" />
+        <path d="M9 9h.01" />
+      </svg>
+    );
+  }
+  if (kind === 'video') {
+    return (
+      <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+        <path d="M5 7h10v10H5z" />
+        <path d="m15 10 4-2v8l-4-2" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+      <path d="M7 3h7l4 4v14H7z" />
+      <path d="M14 3v5h5" />
+    </svg>
   );
 }
 
@@ -4128,36 +5569,59 @@ function handleTopControlClickAction(
   action();
 }
 
+function handleTitlebarControlPointerAction(
+  event: ReactPointerEvent<HTMLButtonElement>,
+  action: () => void,
+) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  action();
+}
+
+function handleTitlebarControlClickAction(
+  event: ReactMouseEvent<HTMLButtonElement>,
+  action: () => void,
+) {
+  event.preventDefault();
+  event.stopPropagation();
+  // Pointer activation is handled on pointerdown so Electron's draggable
+  // titlebar cannot swallow the matching click. A zero-detail click is a
+  // keyboard or accessibility activation and still needs to run the action.
+  if (event.detail === 0) action();
+}
+
 function SidebarTopControls({
   collapsed,
-  openProjectCreator,
-  setActiveTab,
+  newThread,
+  searchOpen,
+  toggleSearch,
   toggleCollapsed,
 }: {
   collapsed: boolean;
-  openProjectCreator: () => void;
-  setActiveTab: (tab: Tab) => void;
+  newThread: () => void;
+  searchOpen: boolean;
+  toggleSearch: () => void;
   toggleCollapsed: () => void;
 }) {
-  const openSearch = () => setActiveTab('memory');
-
   return (
     <div className="sidebar-top-controls">
       <button
-        aria-label="新建项目人格"
+        aria-label="新建线程"
         className="round-icon-button"
-        title="新建项目人格"
+        title="新建线程"
         type="button"
-        onClick={(event) => handleTopControlClickAction(event, openProjectCreator)}
+        onClick={(event) => handleTopControlClickAction(event, newThread)}
       >
         <SidebarIcon name="plus" />
       </button>
       <button
-        aria-label="搜索"
-        className="round-icon-button"
-        title="搜索"
+        aria-label="搜索线程"
+        aria-pressed={searchOpen}
+        className={`round-icon-button ${searchOpen ? 'active' : ''}`}
+        title="搜索线程"
         type="button"
-        onClick={(event) => handleTopControlClickAction(event, openSearch)}
+        onClick={(event) => handleTopControlClickAction(event, toggleSearch)}
       >
         <SidebarIcon name="search" />
       </button>
@@ -4166,7 +5630,8 @@ function SidebarTopControls({
         className="round-icon-button collapse-sidebar-button"
         title={collapsed ? '展开侧边栏' : '折叠侧边栏'}
         type="button"
-        onClick={(event) => handleTopControlClickAction(event, toggleCollapsed)}
+        onClick={(event) => handleTitlebarControlClickAction(event, toggleCollapsed)}
+        onPointerDown={(event) => handleTitlebarControlPointerAction(event, toggleCollapsed)}
       >
         <SidebarIcon name={collapsed ? 'expand' : 'collapse'} />
       </button>
@@ -4277,7 +5742,8 @@ function SettingsTopControls({
         className="round-icon-button collapse-sidebar-button"
         title={toggleLabel}
         type="button"
-        onClick={(event) => handleTopControlClickAction(event, toggleCollapsed)}
+        onClick={(event) => handleTitlebarControlClickAction(event, toggleCollapsed)}
+        onPointerDown={(event) => handleTitlebarControlPointerAction(event, toggleCollapsed)}
       >
         <SidebarIcon name={collapsed ? 'expand' : 'collapse'} />
       </button>
@@ -4320,19 +5786,22 @@ function SidebarIcon({ name }: { name: 'plus' | 'search' | 'collapse' | 'expand'
 }
 
 function ChatHome({
+  addAttachments,
   activePersona,
   activeProductTask,
   activeRoom,
   activeExecutionActions,
+  attachments,
   artifacts,
   autoRightPanelCollapsed,
   chat,
   conversationMessages,
+  currentThreadChannel,
+  currentThreadTitle,
   cancelRun,
   continueProductTask,
   decideConfirmation,
   decideProactiveMessage,
-  exportCurrentMessengerData,
   health,
   inputMode,
   isSubmitting,
@@ -4343,42 +5812,49 @@ function ChatHome({
   openArtifact,
   openLoops,
   openRunTrace,
+  loadConversationForMessage,
   pendingUserMessage,
   streamingAssistantMessage,
   proactiveMessages,
   productTasks,
   runEventsByRunId,
   savedModels,
+  sidebarCollapsed,
   selectProductTask,
-  selectedModelName,
+  settings,
   roomRouteLock,
   rollbackPersonaVersion,
   retryExternalConnectorEvent,
+  removeAttachment,
   setActiveTab,
-  setInputMode,
   setMessage,
-  setSelectedModelName,
-  settings,
   startRightPanelResize,
   updateMemory,
   submit,
+  toggleSidebarCollapsed,
   trace,
   traceSpanAudit,
-  toggleRouteLock,
+  updateMessengerProject,
+  updateMessengerRoom,
+  updateProjectPersona,
+  workspaceSettings,
 }: {
+  addAttachments: (files: FileList | File[]) => void;
   activePersona: ProjectPersona | null;
   activeProductTask: ProductTaskDetail | null;
   activeRoom: MessengerRoom | null;
   activeExecutionActions: ExecutionAction[];
+  attachments: ComposerAttachment[];
   artifacts: ArtifactSummary[];
   autoRightPanelCollapsed: boolean;
   chat: ChatResponse | null;
   conversationMessages: ConversationMessage[];
+  currentThreadChannel: string;
+  currentThreadTitle: string;
   cancelRun: (runID: string) => Promise<void>;
   continueProductTask: (task: ProductTask) => Promise<void>;
   decideConfirmation: (id: string, approve: boolean, scope?: 'one_call' | 'current_run') => Promise<void>;
   decideProactiveMessage: (id: string, action: string, feedback?: string) => Promise<void>;
-  exportCurrentMessengerData: () => Promise<void>;
   health: SystemHealth | null;
   inputMode: InputMode;
   isSubmitting: boolean;
@@ -4389,58 +5865,126 @@ function ChatHome({
   openArtifact: (id: string) => Promise<void>;
   openLoops: OpenLoop[];
   openRunTrace: (runID: string, destination?: 'panel' | 'stage') => Promise<void>;
+  loadConversationForMessage: (messageID: string) => Promise<boolean>;
   pendingUserMessage: ConversationMessage | null;
   streamingAssistantMessage: StreamingAssistantMessage | null;
   proactiveMessages: ProactiveMessage[];
   productTasks: ProductTask[];
   runEventsByRunId: Record<string, NormalizedRunEvent[]>;
   savedModels: AvailableModel[];
+  sidebarCollapsed: boolean;
   selectProductTask: (id: string) => Promise<void>;
-  selectedModelName: string;
+  settings: SettingsRecord | null;
   roomRouteLock: PersonaMessengerSnapshot['route_locks'][number] | null;
   rollbackPersonaVersion: (personaID: string, targetVersion: number) => Promise<void>;
   retryExternalConnectorEvent: (eventID: string) => Promise<void>;
+  removeAttachment: (id: string) => void;
   setActiveTab: (tab: Tab) => void;
-  setInputMode: (value: InputMode) => void;
   setMessage: (value: string) => void;
-  setSelectedModelName: (value: string) => void;
-  settings: SettingsRecord | null;
   startRightPanelResize: (event: ReactPointerEvent<HTMLDivElement>) => void;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
   submit: (event?: FormEvent) => Promise<void>;
+  toggleSidebarCollapsed: () => void;
   trace: RunTrace | null;
   traceSpanAudit: { spans: RunTraceSpan[]; summary: RunTraceSpanSummary };
-  toggleRouteLock: () => Promise<void>;
+  updateMessengerProject: (req: UpdateMessengerProjectRequest) => Promise<void>;
+  updateMessengerRoom: (req: UpdateMessengerRoomRequest) => Promise<void>;
+  updateProjectPersona: (req: UpdateProjectPersonaRequest) => Promise<void>;
+  workspaceSettings: WorkspaceSettings | null;
 }) {
-  const settledMessages: ConversationMessage[] = conversationMessages.length
-    ? conversationMessages
-    : chat
+  const fallbackSettledMessages = useMemo<ConversationMessage[]>(() => chat
       ? [
         { id: chat.user_message_id, conversation_id: chat.conversation_id, role: 'user', content: lastPrompt },
         ...(streamingAssistantMessage ? [] : [{ id: chat.assistant_message_id, conversation_id: chat.conversation_id, role: 'assistant' as const, content: chat.response, run_id: chat.run_id }]),
       ]
-      : [];
-  const candidateRunIds = new Set<string>();
-  for (const message of settledMessages) {
-    const runId = getMessageRunId(message);
-    if (runId) candidateRunIds.add(runId);
-  }
+      : [], [chat, lastPrompt, Boolean(streamingAssistantMessage)]);
+  const settledMessages = conversationMessages.length ? conversationMessages : fallbackSettledMessages;
+  const visibleThreads = useMemo(
+    () => currentThreadTitle ? visibleMessengerThreads(messenger, activeRoom) : [],
+    [activeRoom, currentThreadTitle, messenger],
+  );
+  const visibleThreadSourceSignature = useMemo(
+    () => visibleThreads.map(threadContentSignature).join('|'),
+    [visibleThreads],
+  );
+  const threadMessageAnnotations = useMemo(
+    () => buildThreadMessageAnnotations(visibleThreads, messenger?.recent_thread_events ?? []),
+    [messenger?.recent_thread_events, visibleThreads],
+  );
+  const [restoredThreadMessages, setRestoredThreadMessages] = useState<ConversationMessage[]>([]);
+  const [threadRestoreStatus, setThreadRestoreStatus] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!shouldRestoreThreadMessages(settledMessages.length, visibleThreads.length)) {
+      setRestoredThreadMessages([]);
+      setThreadRestoreStatus('');
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setRestoredThreadMessages([]);
+    setThreadRestoreStatus('正在从线程恢复聊天内容...');
+    void restoreMessagesForThreads(visibleThreads)
+      .then((messages) => {
+        if (cancelled) return;
+        setRestoredThreadMessages(messages);
+        setThreadRestoreStatus(messages.length ? '' : '当前线程没有可渲染的源消息。');
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setRestoredThreadMessages([]);
+        setThreadRestoreStatus(err instanceof Error ? err.message : '无法恢复线程内容。');
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [settledMessages.length, visibleThreads, visibleThreadSourceSignature]);
+
+  const projectionMessages = useMemo(
+    () => messagesForConversationHydration(settledMessages, restoredThreadMessages),
+    [restoredThreadMessages, settledMessages],
+  );
+  const assetConversationID = settledMessages[0]?.conversation_id || chat?.conversation_id || activeRoom?.conversation_id || '';
   const streamingRunId = streamingAssistantMessage ? getMessageRunId(streamingAssistantMessage) : '';
-  if (streamingRunId) candidateRunIds.add(streamingRunId);
-  if (chat?.run_id) candidateRunIds.add(chat.run_id);
-  if (trace?.id) candidateRunIds.add(trace.id);
   const pendingLiveRunId = (isSubmitting || pendingUserMessage) ? latestActiveRunId(runEventsByRunId) : '';
   const activeRunId = streamingRunId || chat?.run_id || trace?.id || pendingLiveRunId;
-  if (activeRunId) candidateRunIds.add(activeRunId);
-  const threadRunEventsByRunId = pickRunEvents(runEventsByRunId, candidateRunIds);
+  const { assetRunIds, candidateRunIds } = useMemo(() => {
+    const candidates = new Set<string>();
+    const assets = new Set<string>();
+    for (const item of projectionMessages) {
+      const runId = getMessageRunId(item);
+      if (runId) candidates.add(runId);
+    }
+    for (const item of settledMessages) {
+      const runId = getMessageRunId(item);
+      if (runId) assets.add(runId);
+    }
+    if (streamingRunId) {
+      candidates.add(streamingRunId);
+      assets.add(streamingRunId);
+    }
+    if (chat?.run_id) candidates.add(chat.run_id);
+    if (chat?.run_id && (!assetConversationID || !chat.conversation_id || chat.conversation_id === assetConversationID)) assets.add(chat.run_id);
+    if (trace?.id) candidates.add(trace.id);
+    if (activeRunId) candidates.add(activeRunId);
+    return { assetRunIds: assets, candidateRunIds: candidates };
+  }, [activeRunId, assetConversationID, chat?.conversation_id, chat?.run_id, projectionMessages, settledMessages, streamingRunId, trace?.id]);
+  const threadRunEventsByRunId = useMemo(
+    () => pickRunEvents(runEventsByRunId, candidateRunIds),
+    [candidateRunIds, runEventsByRunId],
+  );
+  const currentAssetRunIds = useMemo(() => Array.from(assetRunIds), [assetRunIds]);
   const conversationProjection = useMemo(() => buildConversationRenderItems({
-    messages: settledMessages,
+    messages: projectionMessages,
     pendingUserMessage,
     streamingAssistant: streamingAssistantMessage,
     runEventsByRunId: threadRunEventsByRunId,
     activeRunId,
     mode: inputMode,
-  }), [activeRunId, inputMode, pendingUserMessage, threadRunEventsByRunId, settledMessages, streamingAssistantMessage]);
+  }), [activeRunId, inputMode, pendingUserMessage, projectionMessages, threadRunEventsByRunId, streamingAssistantMessage]);
   const renderItems = conversationProjection.items;
   const hasThread = renderItems.length > 0;
   const activeTaskBelongsToCurrentRun = Boolean(activeProductTask?.task.latest_run_id && activeProductTask.task.latest_run_id === (chat?.run_id || trace?.id));
@@ -4449,36 +5993,41 @@ function ChatHome({
   const visibleTraceActions = useMemo(() => visibleExecutionActions(executionActions), [executionActions]);
   const liveExecutionActions = activeExecutionActions.length > 0 ? activeExecutionActions : visibleTraceActions;
   const showInlineTaskCard = false;
-  const runSummaries = useMemo(() => buildRunSummaryLabels(traceSpanAudit.spans), [traceSpanAudit.spans]);
   const [manualRightPanelCollapsed, setManualRightPanelCollapsed] = useState(true);
   const [rightInspectorTab, setRightInspectorTab] = useState<RightInspectorTab>('overview');
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const modelControlRef = useRef<HTMLDivElement | null>(null);
-  const modelOptions = composerModelOptions(settings, selectedModelName, savedModels);
+  const [selectedThreadID, setSelectedThreadID] = useState('');
+  const [focusedMessageID, setFocusedMessageID] = useState('');
+  const [focusMessageSerial, setFocusMessageSerial] = useState(0);
+  const [threadLocateStatus, setThreadLocateStatus] = useState('');
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const rightPanelCollapsed = manualRightPanelCollapsed || autoRightPanelCollapsed;
 
   useEffect(() => {
-    if (!modelMenuOpen) return;
-
-    function closeOnPointerDown(event: globalThis.PointerEvent) {
-      const target = event.target;
-      if (target instanceof Node && modelControlRef.current?.contains(target)) return;
-      setModelMenuOpen(false);
-    }
-
-    function closeOnEscape(event: globalThis.KeyboardEvent) {
-      if (event.key === 'Escape') {
-        setModelMenuOpen(false);
+    if (!focusedMessageID) return undefined;
+    let clearTimer = 0;
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.querySelector<HTMLElement>(messageAnchorSelector(focusedMessageID));
+      if (!target) {
+        setThreadLocateStatus('源消息暂未出现在当前聊天');
+        return;
       }
-    }
-
-    window.addEventListener('pointerdown', closeOnPointerDown, true);
-    window.addEventListener('keydown', closeOnEscape, true);
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      setThreadLocateStatus('已定位到原聊天');
+      clearTimer = window.setTimeout(() => {
+        setFocusedMessageID((current) => current === focusedMessageID ? '' : current);
+      }, 6000);
+    });
     return () => {
-      window.removeEventListener('pointerdown', closeOnPointerDown, true);
-      window.removeEventListener('keydown', closeOnEscape, true);
+      window.cancelAnimationFrame(frame);
+      if (clearTimer) window.clearTimeout(clearTimer);
     };
-  }, [modelMenuOpen]);
+  }, [focusedMessageID, focusMessageSerial, renderItems.length]);
+
+  useEffect(() => {
+    if (selectedThreadID && !visibleThreads.some((thread) => thread.id === selectedThreadID)) {
+      setSelectedThreadID('');
+    }
+  }, [selectedThreadID, visibleThreadSourceSignature, visibleThreads]);
 
   function handleComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
@@ -4487,35 +6036,62 @@ function ChatHome({
     void submit();
   }
 
+  function handleAttachmentChange(event: ChangeEvent<HTMLInputElement>) {
+    const files = event.currentTarget.files;
+    if (files?.length) addAttachments(files);
+    event.currentTarget.value = '';
+  }
+
+  async function locateThreadSource(thread: MessengerThread) {
+    const sourceMessageID = firstThreadSourceMessageID(thread);
+    if (!sourceMessageID) {
+      setThreadLocateStatus('此线程尚未记录源消息');
+      return;
+    }
+    setThreadLocateStatus('正在定位原聊天...');
+    try {
+      await loadConversationForMessage(sourceMessageID);
+      setFocusedMessageID(sourceMessageID);
+      setFocusMessageSerial((current) => current + 1);
+    } catch (err) {
+      setThreadLocateStatus(err instanceof Error ? err.message : '无法定位原聊天');
+    }
+  }
+
+  function openThreadDetail(threadID: string) {
+    if (!threadID) return;
+    setSelectedThreadID(threadID);
+    setManualRightPanelCollapsed(false);
+    setRightInspectorTab('threads');
+  }
+
   return (
     <section className={`chat-home companion-layout tk-workspace${rightPanelCollapsed ? ' companion-layout-right-collapsed' : ''}`}>
       <section className="chat-main-column tk-content-panel">
         <MessengerChatHeader
-          room={activeRoom}
-          persona={activePersona}
-          personas={messenger?.personas ?? []}
-          project={activeRoom?.project_id ? messenger?.projects.find((item) => item.id === activeRoom.project_id) ?? null : null}
-          routeLock={roomRouteLock}
-          toggleRouteLock={toggleRouteLock}
+          sidebarCollapsed={sidebarCollapsed}
+          threadChannel={currentThreadChannel}
+          threadTitle={currentThreadTitle}
+          toggleSidebarCollapsed={toggleSidebarCollapsed}
           onOpenInspector={() => setManualRightPanelCollapsed((current) => !current)}
         />
 
-        <ScrollArea
-          className={hasThread ? 'chat-thread' : 'chat-empty-state'}
-          stickToBottom={hasThread}
-          stickToBottomKey={hasThread ? conversationMessages[0]?.conversation_id || chat?.conversation_id || activeRunId || 'thread' : undefined}
-        >
-          {hasThread ? (
+        {hasThread ? (
+          <ChatMessageScroller key={projectionMessages[0]?.conversation_id || chat?.conversation_id || activeRunId || 'thread'}>
             <>
               <MessageList
                 assistantAvatarSrc={joiAvatar}
                 formatAssistantContent={userFacingAssistantText}
                 items={renderItems}
+                highlightedMessageId={focusedMessageID}
                 onOpenArtifact={(artifactId) => void openArtifact(artifactId)}
                 onOpenTask={(taskId) => void selectProductTask(taskId)}
+                onOpenThread={openThreadDetail}
                 onOpenTrace={(runID) => void openRunTrace(runID, 'stage')}
                 onResolveApproval={(approvalId, approve, scope) => void decideConfirmation(approvalId, approve, scope)}
-                runSummaries={runSummaries}
+                selectedThreadId={selectedThreadID}
+                threadAnnotations={threadMessageAnnotations}
+                useMessageScrollerItems
               />
               {isSubmitting && !streamingAssistantMessage && !renderItems.some((item) => item.type === 'message' && item.role === 'assistant') && (
                 <article className="message-row assistant-message pending-message">
@@ -4527,73 +6103,61 @@ function ChatHome({
               )}
               {showInlineTaskCard && <TaskCard detail={latestTask!} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />}
             </>
-          ) : (
-            null
-          )}
-        </ScrollArea>
+          </ChatMessageScroller>
+        ) : (
+          <ScrollArea className="chat-empty-state">
+            {threadRestoreStatus ? <p className="empty">{threadRestoreStatus}</p> : null}
+          </ScrollArea>
+        )}
 
         <form className="composer tk-floating-panel" aria-busy={isSubmitting} onSubmit={submit}>
           <textarea
-            placeholder={isSubmitting ? '补充或修改当前任务...' : composerPlaceholder(activeRoom, activePersona)}
+            placeholder={isSubmitting ? '补充或修改当前任务...' : '和 Joi 说点什么，或交给她一个任务...'}
             value={message}
             onChange={(event) => setMessage(event.target.value)}
             onKeyDown={handleComposerKeyDown}
           />
-          <div
-            className="composer-tools"
-            onBlur={(event) => {
-              const nextFocus = event.relatedTarget;
-              if (!(nextFocus instanceof Node) || !event.currentTarget.contains(nextFocus)) {
-                setModelMenuOpen(false);
-              }
-            }}
-          >
-            <div className="composer-mode-control" role="group" aria-label="输入模式">
-              {inputModeOptions.map((item) => (
-                <button
-                  key={item.value}
-                  className={item.value === inputMode ? 'active' : ''}
-                  type="button"
-                  title={item.title}
-                  aria-pressed={item.value === inputMode}
-                  onClick={() => setInputMode(item.value)}
-                >
-                  {item.label}
-                </button>
+          {attachments.length ? (
+            <div className="composer-attachment-list" aria-label="已选择附件">
+              {attachments.map((attachment) => (
+                <div key={attachment.id} className={`composer-attachment-chip composer-attachment-${attachment.kind}`}>
+                  <ComposerAttachmentPreview attachment={attachment} />
+                  <span className="composer-attachment-copy">
+                    <strong>{attachment.name}</strong>
+                    <small>{formatAttachmentSize(attachment.size)}</small>
+                  </span>
+                  <button
+                    aria-label={`移除${attachment.name}`}
+                    className="composer-attachment-remove"
+                    title="移除"
+                    type="button"
+                    onClick={() => removeAttachment(attachment.id)}
+                  >
+                    <CloseTabIcon />
+                  </button>
+                </div>
               ))}
             </div>
-            <div ref={modelControlRef} className="composer-model-control">
-              <button
-                aria-expanded={modelMenuOpen}
-                className="composer-model-trigger"
-                title="选择本次发送使用的模型"
-                type="button"
-                onClick={() => setModelMenuOpen((current) => !current)}
-              >
-                <span>{selectedModelName}</span>
-                <SidebarIcon name="down" />
-              </button>
-              {modelMenuOpen && (
-                <div className="composer-model-menu">
-                  {modelOptions.map((item) => (
-                    <button
-                      key={item}
-                      className={item === selectedModelName ? 'active' : ''}
-                      aria-pressed={item === selectedModelName}
-                      type="button"
-                      onClick={() => {
-                        setSelectedModelName(item);
-                        setModelMenuOpen(false);
-                      }}
-                    >
-                      {item}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+          ) : null}
+          <div className="composer-tools">
+            <input
+              ref={attachmentInputRef}
+              className="visually-hidden"
+              type="file"
+              multiple
+              onChange={handleAttachmentChange}
+            />
+            <button
+              aria-label="上传文件、图片或视频"
+              className="composer-attachment-button"
+              title="上传文件、图片或视频"
+              type="button"
+              onClick={() => attachmentInputRef.current?.click()}
+            >
+              <PaperclipIcon />
+            </button>
           </div>
-          {isSubmitting && !message.trim() ? (
+          {isSubmitting && !message.trim() && attachments.length === 0 ? (
             <button
               className="send-button stop-button"
               disabled={!activeRunId}
@@ -4606,7 +6170,7 @@ function ChatHome({
           ) : (
             <button
               className="send-button"
-              disabled={!message.trim()}
+              disabled={!message.trim() && attachments.length === 0}
               type="button"
               title={isSubmitting ? '追加到当前任务' : '发送'}
               onClick={() => void submit()}
@@ -4635,19 +6199,32 @@ function ChatHome({
               activeRoom={activeRoom}
               activePersona={activePersona}
               artifacts={artifacts}
+              conversationMessages={settledMessages}
+              currentConversationID={assetConversationID}
+              currentRunIDs={currentAssetRunIds}
               decideProactiveMessage={decideProactiveMessage}
               messenger={messenger}
               memories={memories}
               openLoops={openLoops}
+              onOpenModelSettings={() => setActiveTab('settings')}
               proactiveMessages={proactiveMessages}
               rollbackPersonaVersion={rollbackPersonaVersion}
               retryExternalConnectorEvent={retryExternalConnectorEvent}
+              savedModels={savedModels}
               setActiveTab={setRightInspectorTab}
+              settings={settings}
               trace={trace}
               traceSpanAudit={traceSpanAudit}
-              exportCurrentMessengerData={exportCurrentMessengerData}
               openRunTrace={openRunTrace}
+              onLocateThreadSource={(thread) => void locateThreadSource(thread)}
+              onSelectThread={setSelectedThreadID}
+              selectedThreadID={selectedThreadID}
+              threadLocateStatus={threadLocateStatus}
               updateMemory={updateMemory}
+              updateMessengerProject={updateMessengerProject}
+              updateMessengerRoom={updateMessengerRoom}
+              updateProjectPersona={updateProjectPersona}
+              workspaceSettings={workspaceSettings}
             />
           </ScrollArea>
         </>
@@ -4658,53 +6235,79 @@ function ChatHome({
 
 function MessengerChatHeader({
   onOpenInspector,
-  persona,
-  personas,
-  project,
-  room,
-  routeLock,
-  toggleRouteLock,
+  sidebarCollapsed,
+  threadChannel,
+  threadTitle,
+  toggleSidebarCollapsed,
 }: {
   onOpenInspector: () => void;
-  persona: ProjectPersona | null;
-  personas: ProjectPersona[];
-  project: PersonaMessengerSnapshot['projects'][number] | null;
-  room: MessengerRoom | null;
-  routeLock: PersonaMessengerSnapshot['route_locks'][number] | null;
-  toggleRouteLock: () => Promise<void>;
+  sidebarCollapsed: boolean;
+  threadChannel: string;
+  threadTitle: string;
+  toggleSidebarCollapsed: () => void;
 }) {
-  const activePersonas = room?.members?.filter((member) => member.type === 'persona') ?? [];
-  const lockedPersona = routeLock ? personas.find((item) => item.id === routeLock.persona_id) : null;
   return (
     <header className="messenger-chat-header breadcrumb-bar">
+      {sidebarCollapsed && (
+        <button
+          aria-label="展开侧边栏"
+          className="round-icon-button messenger-sidebar-expand-button"
+          title="展开侧边栏"
+          type="button"
+          onClick={(event) => handleTitlebarControlClickAction(event, toggleSidebarCollapsed)}
+          onPointerDown={(event) => handleTitlebarControlPointerAction(event, toggleSidebarCollapsed)}
+        >
+          <SidebarIcon name="expand" />
+        </button>
+      )}
       <div className="messenger-chat-identity">
-        {room ? <RoomAvatar room={room} personas={personas} /> : <span className="room-avatar">J</span>}
+        <img className="joi-thread-header-avatar" src={joiAvatar} alt="" />
         <div>
-          <strong>{room?.title || '私人总群'}</strong>
-          <small>
-            {room?.type === 'project_dm'
-              ? `${project?.name || room.subtitle || 'Project'} · ${persona?.status || 'active'}`
-              : `${room?.members?.filter((member) => member.type !== 'persona').length ?? 1} 位真人 · ${activePersonas.length} 个项目人格 · ${room?.running_run_count ?? 0} 个活跃任务`}
-          </small>
+          <strong>Joi</strong>
+          <small>{threadTitle || '新线程'}{threadChannel ? ` · ${conversationChannelLabel(threadChannel)}` : ''}</small>
         </div>
       </div>
-      {room?.type !== 'project_dm' && activePersonas.length > 0 ? (
-        <div className="active-persona-stack" aria-label="活跃项目人格">
-          {activePersonas.slice(0, 4).map((member) => (
-            <span key={member.id} title={`${member.display_name} · 项目人格`}>{member.display_name.slice(0, 1)}</span>
-          ))}
-        </div>
-      ) : null}
-      {lockedPersona ? (
-        <span className="route-lock-chip">@{lockedPersona.display_name} 已锁定</span>
-      ) : null}
-      {room?.persona_id || lockedPersona ? (
-        <button className="route-lock-button" type="button" onClick={() => void toggleRouteLock()}>
-          {lockedPersona ? '解除锁定' : '锁定'}
-        </button>
-      ) : null}
-      <button className="observe-button" type="button" onClick={onOpenInspector}>观察</button>
+      <button className="observe-button" type="button" aria-label="展开观察面板" title="展开观察面板" onClick={onOpenInspector}>
+        <ExpandPanelIcon />
+      </button>
     </header>
+  );
+}
+
+function ExpandPanelIcon() {
+  return (
+    <svg className="observe-button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M9 5H5v4" />
+      <path d="M5 5l6 6" />
+      <path d="M15 19h4v-4" />
+      <path d="M19 19l-6-6" />
+    </svg>
+  );
+}
+
+function PaperclipIcon() {
+  return (
+    <svg className="composer-attachment-button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="m21.4 11.6-8.8 8.8a6 6 0 0 1-8.5-8.5l9.4-9.4a4 4 0 0 1 5.7 5.7l-9.4 9.4a2 2 0 1 1-2.8-2.8l8.8-8.8" />
+    </svg>
+  );
+}
+
+function EditIcon() {
+  return (
+    <svg className="overview-room-edit-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  );
+}
+
+function CloseTabIcon() {
+  return (
+    <svg className="right-inspector-tab-close-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M6 6l12 12" />
+      <path d="M18 6L6 18" />
+    </svg>
   );
 }
 
@@ -4737,14 +6340,155 @@ function TaskCard({ detail, openArtifact, openTrace }: { detail: ProductTaskDeta
   );
 }
 
-function dedupeConversationMessages(messages: ConversationMessage[]) {
-  const seen = new Set<string>();
-  return messages.filter((message) => {
-    const key = message.id || `${message.role}:${message.run_id || ''}:${message.content}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+type RestoredThreadMessage = {
+  key: string;
+  message: ConversationMessage;
+  threadIndex: number;
+  messageIndex: number;
+};
+
+function visibleMessengerThreads(messenger: PersonaMessengerSnapshot | null, room: MessengerRoom | null): MessengerThread[] {
+  return (messenger?.threads ?? []).filter((thread) => (
+    !room || thread.room_id === room.id || thread.source_room_ids.includes(room.id)
+  ));
+}
+
+function threadContentSignature(thread: MessengerThread): string {
+  return [
+    thread.id,
+    thread.updated_at || '',
+    thread.source_message_ids.join(','),
+    thread.run_ids.join(','),
+  ].join(':');
+}
+
+function buildThreadMessageAnnotations(
+  threads: MessengerThread[],
+  events: PersonaMessengerSnapshot['recent_thread_events'],
+): Record<string, MessageThreadAnnotation> {
+  const threadByID = new Map(threads.map((thread) => [thread.id, thread]));
+  const annotations: Record<string, MessageThreadAnnotation> = {};
+
+  for (const event of [...events].reverse()) {
+    const messageID = event.message_id || '';
+    const thread = threadByID.get(event.thread_id);
+    if (!messageID || !thread) continue;
+    const kind = threadAnnotationKind(event.event_type);
+    if (!kind) continue;
+    annotations[messageID] = {
+      threadId: thread.id,
+      kind,
+      label: kind === 'created' ? '新线程' : '继续线程',
+      title: thread.title || event.summary || '线程',
+    };
+  }
+
+  return annotations;
+}
+
+function threadAnnotationKind(eventType: string): MessageThreadAnnotation['kind'] | '' {
+  if (eventType === 'thread.created') return 'created';
+  if (eventType === 'thread.continued') return 'continued';
+  return '';
+}
+
+async function restoreMessagesForThreads(threads: MessengerThread[]): Promise<ConversationMessage[]> {
+  const batches = await Promise.all(threads.map((thread, threadIndex) => restoreMessagesForThread(thread, threadIndex)));
+  const byKey = new Map<string, RestoredThreadMessage>();
+  for (const batch of batches) {
+    for (const item of batch) {
+      const existing = byKey.get(item.key);
+      if (!existing || compareRestoredThreadMessages(item, existing) < 0) {
+        byKey.set(item.key, item);
+      }
+    }
+  }
+  return [...byKey.values()]
+    .sort(compareRestoredThreadMessages)
+    .map((item) => item.message);
+}
+
+async function restoreMessagesForThread(thread: MessengerThread, threadIndex: number): Promise<RestoredThreadMessage[]> {
+  const detail = await conversationDetailForThread(thread);
+  if (!detail) {
+    return fallbackThreadMessages(thread).map((message, messageIndex) => ({
+      key: message.id,
+      message,
+      threadIndex,
+      messageIndex,
+    }));
+  }
+
+  const sourceMessageIDs = new Set(thread.source_message_ids.filter(Boolean));
+  const runIDs = new Set(thread.run_ids.filter(Boolean));
+  const messages = detail.messages.filter((message) => {
+    const runID = getMessageRunId(message);
+    return sourceMessageIDs.has(message.id) || Boolean(runID && runIDs.has(runID));
   });
+
+  return messages.map((message, messageIndex) => ({
+    key: message.id || `${thread.id}:${message.role}:${messageIndex}`,
+    message,
+    threadIndex,
+    messageIndex,
+  }));
+}
+
+async function conversationDetailForThread(thread: MessengerThread): Promise<ConversationDetail | null> {
+  for (const messageID of thread.source_message_ids) {
+    if (!messageID) continue;
+    try {
+      return await desktopApi.getConversationForMessage(messageID);
+    } catch {
+      // Threads can outlive individual source messages; try the next recorded anchor.
+    }
+  }
+  return null;
+}
+
+function fallbackThreadMessages(thread: MessengerThread): ConversationMessage[] {
+  if (!thread.title && !thread.goal && !thread.next_action) return [];
+  const createdAt = thread.created_at || thread.updated_at;
+  const updatedAt = thread.updated_at || thread.created_at;
+  const conversationID = `thread:${thread.id}`;
+  const messages: ConversationMessage[] = [];
+  if (thread.title || thread.goal) {
+    messages.push({
+      id: `${thread.id}:thread-user`,
+      conversation_id: conversationID,
+      role: 'user',
+      content: [thread.title, thread.goal].filter(Boolean).join('\n\n'),
+      created_at: createdAt,
+    });
+  }
+  if (thread.next_action) {
+    messages.push({
+      id: `${thread.id}:thread-assistant`,
+      conversation_id: conversationID,
+      role: 'assistant',
+      content: thread.next_action,
+      run_id: thread.run_ids.find(Boolean),
+      created_at: updatedAt,
+    });
+  }
+  return messages;
+}
+
+function compareRestoredThreadMessages(a: RestoredThreadMessage, b: RestoredThreadMessage): number {
+  const timeA = a.message.created_at || '';
+  const timeB = b.message.created_at || '';
+  if (timeA !== timeB) return timeA.localeCompare(timeB);
+  if (a.threadIndex !== b.threadIndex) return a.threadIndex - b.threadIndex;
+  if (a.messageIndex !== b.messageIndex) return a.messageIndex - b.messageIndex;
+  return a.key.localeCompare(b.key);
+}
+
+function firstThreadSourceMessageID(thread: MessengerThread): string {
+  return thread.source_message_ids.find(Boolean) || '';
+}
+
+function messageAnchorSelector(messageID: string): string {
+  return `[data-message-id="${messageID.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`;
 }
 
 function CompanionInspectorPanel({
@@ -4752,92 +6496,200 @@ function CompanionInspectorPanel({
   activeRoom,
   activePersona,
   artifacts,
+  conversationMessages,
+  currentConversationID,
+  currentRunIDs,
   decideProactiveMessage,
   messenger,
   memories,
   openLoops,
+  onOpenModelSettings,
   proactiveMessages,
   rollbackPersonaVersion,
-  exportCurrentMessengerData,
   retryExternalConnectorEvent,
+  savedModels,
   setActiveTab,
+  settings,
+  onLocateThreadSource,
+  onSelectThread,
+  selectedThreadID,
+  threadLocateStatus,
   trace,
   traceSpanAudit,
   openRunTrace,
   updateMemory,
+  updateMessengerProject,
+  updateMessengerRoom,
+  updateProjectPersona,
+  workspaceSettings,
 }: {
   activeTab: RightInspectorTab;
   activeRoom: MessengerRoom | null;
   activePersona: ProjectPersona | null;
   artifacts: ArtifactSummary[];
+  conversationMessages: ConversationMessage[];
+  currentConversationID: string;
+  currentRunIDs: string[];
   decideProactiveMessage: (id: string, action: string, feedback?: string) => Promise<void>;
   messenger: PersonaMessengerSnapshot | null;
   memories: MemoryRecord[];
   openLoops: OpenLoop[];
+  onOpenModelSettings: () => void;
   proactiveMessages: ProactiveMessage[];
   rollbackPersonaVersion: (personaID: string, targetVersion: number) => Promise<void>;
-  exportCurrentMessengerData: () => Promise<void>;
   retryExternalConnectorEvent: (eventID: string) => Promise<void>;
+  savedModels: AvailableModel[];
   setActiveTab: (tab: RightInspectorTab) => void;
+  settings: SettingsRecord | null;
+  onLocateThreadSource: (thread: MessengerThread) => void;
+  onSelectThread: (threadID: string) => void;
+  selectedThreadID: string;
+  threadLocateStatus: string;
   trace: RunTrace | null;
   traceSpanAudit: { spans: RunTraceSpan[]; summary: RunTraceSpanSummary };
   openRunTrace: (runID: string, destination?: 'panel' | 'stage') => Promise<void>;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
+  updateMessengerProject: (req: UpdateMessengerProjectRequest) => Promise<void>;
+  updateMessengerRoom: (req: UpdateMessengerRoomRequest) => Promise<void>;
+  updateProjectPersona: (req: UpdateProjectPersonaRequest) => Promise<void>;
+  workspaceSettings: WorkspaceSettings | null;
 }) {
-  const identityLabel = activeRoom?.type === 'project_dm' ? '身份' : '成员';
+  const [selectedMemberKey, setSelectedMemberKey] = useState<string | null>(null);
+  const selectedMember = useMemo(() => {
+    const members = activeRoom?.members ?? [];
+    return members.find((member) => memberKey(member) === selectedMemberKey) ?? null;
+  }, [activeRoom?.members, selectedMemberKey]);
+  const selectedMemberPersona = selectedMember ? resolveMemberPersona(selectedMember, messenger, activePersona) : null;
+  const effectiveTab: RightInspectorTab = activeTab === 'member' && !selectedMember ? 'overview' : activeTab;
+  const staticTabs: Array<[RightInspectorTab, string]> = [
+    ['overview', '概览'],
+    ['runs', '运行'],
+    ['threads', '线程'],
+    ['assets', '文件'],
+    ['memory', '记忆'],
+  ];
+  const memberTabLabel = selectedMember ? (selectedMemberPersona?.display_name || selectedMember.display_name || '成员') : '';
+  const rightInspectorTabs: Array<[RightInspectorTab, string]> = selectedMember
+    ? [...staticTabs, ['member', memberTabLabel]]
+    : staticTabs;
+
+  useEffect(() => {
+    setSelectedMemberKey(null);
+  }, [activeRoom?.id]);
+
+  useEffect(() => {
+    if (activeTab === 'member' && !selectedMember) {
+      setActiveTab('overview');
+    }
+  }, [activeTab, selectedMember, setActiveTab]);
+
+  function openMemberTab(member: MessengerRoomMember) {
+    setSelectedMemberKey(memberKey(member));
+    setActiveTab('member');
+  }
+
+  function closeMemberTab() {
+    setSelectedMemberKey(null);
+    if (activeTab === 'member') {
+      setActiveTab('overview');
+    }
+  }
+
   return (
     <section className="right-inspector-shell tk-right-panel">
       <header className="right-inspector-header tk-panel-header">
         <div className="right-inspector-tabs tk-tabs-list" role="tablist" aria-label="右侧栏视图">
-          {([
-            ['overview', '概览'],
-            ['runs', '运行'],
-            ['threads', '线程'],
-            ['assets', '资产'],
-            ['memory', '记忆'],
-            ['identity', identityLabel],
-          ] as Array<[RightInspectorTab, string]>).map(([tab, label]) => (
-            <button
-              key={tab}
-              id={`right-inspector-tab-${tab}`}
-              aria-controls={`right-inspector-${tab}`}
-              aria-selected={activeTab === tab}
-              className={`tk-tab ${activeTab === tab ? 'active' : ''}`}
-              role="tab"
-              type="button"
-              onClick={() => setActiveTab(tab)}
-            >
-              <span>{label}</span>
-            </button>
-          ))}
+          {rightInspectorTabs.map(([tab, label]) => {
+            const isTemporaryMemberTab = tab === 'member';
+            const tabPanelID = isTemporaryMemberTab ? 'right-inspector-member-detail' : `right-inspector-${tab}`;
+            const selected = effectiveTab === tab;
+            return (
+              <span
+                key={tab}
+                className={`right-inspector-tab-slot ${isTemporaryMemberTab ? 'right-inspector-tab-slot-temporary' : ''} ${selected ? 'active' : ''}`}
+                role="presentation"
+              >
+                <button
+                  id={`right-inspector-tab-${tab}`}
+                  aria-controls={tabPanelID}
+                  aria-selected={selected}
+                  className={`tk-tab right-inspector-tab ${selected ? 'active' : ''}`}
+                  role="tab"
+                  title={label}
+                  type="button"
+                  onClick={() => setActiveTab(tab)}
+                >
+                  <span>{label}</span>
+                </button>
+                {isTemporaryMemberTab ? (
+                  <button
+                    aria-label={`关闭${label}详情`}
+                    className="right-inspector-tab-close"
+                    title="关闭"
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      closeMemberTab();
+                    }}
+                  >
+                    <CloseTabIcon />
+                  </button>
+                ) : null}
+              </span>
+            );
+          })}
         </div>
         <div className="right-inspector-header-drag-spacer" aria-hidden="true" />
       </header>
-      {activeTab === 'overview' ? (
-        <MessengerOverviewPanel
-          checkpoint={messenger?.checkpoint ?? null}
-          exportCurrentMessengerData={exportCurrentMessengerData}
+      {effectiveTab === 'member' && selectedMember ? (
+        <MessengerMemberDetailPanel
+          member={selectedMember}
+          messenger={messenger}
+          persona={selectedMemberPersona}
+          rollbackPersonaVersion={rollbackPersonaVersion}
+          retryExternalConnectorEvent={retryExternalConnectorEvent}
           room={activeRoom}
-          trace={trace}
         />
-      ) : activeTab === 'runs' ? (
+      ) : effectiveTab === 'overview' ? (
+        <MessengerOverviewPanel
+          messenger={messenger}
+          memories={memories}
+          onOpenModelSettings={onOpenModelSettings}
+          onSelectMember={openMemberTab}
+          onSaveProject={updateMessengerProject}
+          onSaveRoom={updateMessengerRoom}
+          onSavePersona={updateProjectPersona}
+          onOpenMemory={() => setActiveTab('memory')}
+          room={activeRoom}
+          savedModels={savedModels}
+          settings={settings}
+          workspaceSettings={workspaceSettings}
+        />
+      ) : effectiveTab === 'runs' ? (
         <MessengerRunsPanel
           messenger={messenger}
           openRunTrace={openRunTrace}
           trace={trace}
           traceSpanAudit={traceSpanAudit}
         />
-      ) : activeTab === 'threads' ? (
-        <MessengerThreadsPanel messenger={messenger} room={activeRoom} trace={trace} />
-      ) : activeTab === 'assets' ? (
-        <MessengerAssetsPanel artifacts={artifacts} room={activeRoom} />
-      ) : activeTab === 'identity' ? (
-        <MessengerIdentityPanel
+      ) : effectiveTab === 'threads' ? (
+        <MessengerThreadsPanel
+          locateStatus={threadLocateStatus}
           messenger={messenger}
-          persona={activePersona}
-          rollbackPersonaVersion={rollbackPersonaVersion}
-          retryExternalConnectorEvent={retryExternalConnectorEvent}
+          onLocateThreadSource={onLocateThreadSource}
+          onSelectThread={onSelectThread}
+          openRunTrace={openRunTrace}
           room={activeRoom}
+          selectedThreadID={selectedThreadID}
+          trace={trace}
+        />
+      ) : effectiveTab === 'assets' ? (
+        <MessengerAssetsPanel
+          artifacts={artifacts}
+          conversationID={currentConversationID}
+          messages={conversationMessages}
+          room={activeRoom}
+          runIDs={currentRunIDs}
         />
       ) : (
         <CompanionInsightPanel
@@ -4867,16 +6719,167 @@ function CompanionTerminalPanel() {
 }
 
 function MessengerOverviewPanel({
-  checkpoint,
-  exportCurrentMessengerData,
+  memories,
+  messenger,
+  onOpenMemory,
+  onOpenModelSettings,
+  onSelectMember,
+  onSavePersona,
+  onSaveProject,
+  onSaveRoom,
   room,
-  trace,
+  savedModels,
+  settings,
+  workspaceSettings,
 }: {
-  checkpoint: PersonaMessengerSnapshot['checkpoint'] | null;
-  exportCurrentMessengerData: () => Promise<void>;
+  memories: MemoryRecord[];
+  messenger: PersonaMessengerSnapshot | null;
+  onOpenMemory: () => void;
+  onOpenModelSettings: () => void;
+  onSelectMember: (member: MessengerRoomMember) => void;
+  onSavePersona: (req: UpdateProjectPersonaRequest) => Promise<void>;
+  onSaveProject: (req: UpdateMessengerProjectRequest) => Promise<void>;
+  onSaveRoom: (req: UpdateMessengerRoomRequest) => Promise<void>;
   room: MessengerRoom | null;
-  trace: RunTrace | null;
+  savedModels: AvailableModel[];
+  settings: SettingsRecord | null;
+  workspaceSettings: WorkspaceSettings | null;
 }) {
+  const members = room?.members ?? [];
+  const activePersona = room?.persona_id
+    ? messenger?.personas.find((persona) => persona.id === room.persona_id) ?? null
+    : null;
+  const activeProject = activePersona?.project_id
+    ? messenger?.projects.find((project) => project.id === activePersona.project_id) ?? null
+    : room?.project_id
+      ? messenger?.projects.find((project) => project.id === room.project_id) ?? null
+      : null;
+  const currentAvatarValue = roomAvatarValue(room);
+  const [roomTitleDraft, setRoomTitleDraft] = useState(room?.title ?? '');
+  const [roomAvatarDraft, setRoomAvatarDraft] = useState(currentAvatarValue);
+  const [roomTitleEditing, setRoomTitleEditing] = useState(false);
+  const [savingRoom, setSavingRoom] = useState(false);
+  const titleControlRef = useRef<HTMLSpanElement | null>(null);
+  const titleInputRef = useRef<HTMLInputElement | null>(null);
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
+  const normalizedTitleDraft = roomTitleDraft.trim();
+  const normalizedAvatarDraft = roomAvatarDraft.trim();
+  const avatarPreviewRoom = room ? {
+    ...room,
+    title: normalizedTitleDraft || room.title,
+    avatar: normalizedAvatarDraft,
+    metadata: {
+      ...(room.metadata ?? {}),
+      avatar: normalizedAvatarDraft,
+    },
+  } : null;
+
+  useEffect(() => {
+    setRoomTitleDraft(room?.title ?? '');
+    setRoomAvatarDraft(roomAvatarValue(room));
+    setRoomTitleEditing(false);
+  }, [room?.id, room?.title, room?.avatar, room?.metadata]);
+
+  function startRoomTitleEdit() {
+    if (!room || savingRoom) return;
+    setRoomTitleEditing(true);
+    window.requestAnimationFrame(() => {
+      titleInputRef.current?.focus();
+      titleInputRef.current?.select();
+    });
+  }
+
+  async function saveRoomProfile(next: { title?: string; avatar?: string }) {
+    if (!room) return;
+    const title = next.title ?? normalizedTitleDraft;
+    const avatar = next.avatar ?? normalizedAvatarDraft;
+    if (!title.trim()) {
+      setRoomTitleDraft(room.title);
+      setRoomTitleEditing(false);
+      return;
+    }
+    if (title.trim() === (room.title ?? '').trim() && avatar.trim() === currentAvatarValue) {
+      setRoomTitleEditing(false);
+      return;
+    }
+    setSavingRoom(true);
+    try {
+      await onSaveRoom({
+        room_id: room.id,
+        title: title.trim(),
+        avatar: avatar.trim(),
+      });
+      setRoomTitleDraft(title.trim());
+      setRoomAvatarDraft(avatar.trim());
+      setRoomTitleEditing(false);
+    } finally {
+      setSavingRoom(false);
+    }
+  }
+
+  async function saveRoomTitleOnBlur() {
+    if (!roomTitleEditing) return;
+    await saveRoomProfile({ title: normalizedTitleDraft });
+  }
+
+  function handleRoomTitleKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      titleInputRef.current?.blur();
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      setRoomTitleDraft(room?.title ?? '');
+      setRoomTitleEditing(false);
+      titleInputRef.current?.blur();
+    }
+  }
+
+  async function handleRoomAvatarUpload(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (!room || !file || !file.type.startsWith('image/')) return;
+    setSavingRoom(true);
+    try {
+      const dataURL = await readFileAsDataURL(file);
+      setRoomAvatarDraft(dataURL);
+      await saveRoomProfile({ title: normalizedTitleDraft || room.title, avatar: dataURL });
+    } finally {
+      setSavingRoom(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!roomTitleEditing) return;
+
+    function saveOnOutsidePointerDown(event: globalThis.PointerEvent) {
+      const target = event.target;
+      if (target instanceof Node && titleControlRef.current?.contains(target)) return;
+      void saveRoomProfile({ title: normalizedTitleDraft });
+    }
+
+    window.addEventListener('pointerdown', saveOnOutsidePointerDown, true);
+    return () => window.removeEventListener('pointerdown', saveOnOutsidePointerDown, true);
+  }, [normalizedTitleDraft, roomTitleEditing]);
+
+  if (room?.type === 'project_dm' && activePersona) {
+    return (
+      <PrivateProjectOverviewPanel
+        memories={memories}
+        onOpenModelSettings={onOpenModelSettings}
+        onOpenMemory={onOpenMemory}
+        onSavePersona={onSavePersona}
+        onSaveProject={onSaveProject}
+        persona={activePersona}
+        project={activeProject}
+        room={room}
+        savedModels={savedModels}
+        settings={settings}
+        workspaceSettings={workspaceSettings}
+      />
+    );
+  }
+
   return (
     <section
       id="right-inspector-overview"
@@ -4885,28 +6888,601 @@ function MessengerOverviewPanel({
       aria-labelledby="right-inspector-tab-overview"
     >
       <header>
-        <small>Overview</small>
+        <small>对话概览</small>
         <h2>{room?.title || '当前聊天'}</h2>
       </header>
-      <div className="inspector-metric-grid">
-        <KV label="当前运行" value={trace?.status || '空闲'} />
-        <KV label="待审批" value={String(room?.pending_approval_count ?? checkpoint?.pending_approval_count ?? 0)} />
-        <KV label="失败" value={String(room?.failed_run_count ?? checkpoint?.failed_count ?? 0)} />
-        <KV label="成本" value={checkpoint ? `¥${checkpoint.model_cost_estimate.toFixed(4)}` : '¥0.0000'} />
-      </div>
-      <div className="messenger-overview-actions">
-        <button type="button" onClick={() => void exportCurrentMessengerData()}>
-          导出数据
+      <div className="overview-room-editor">
+        <button
+          aria-label="上传群头像"
+          className="overview-room-avatar-preview"
+          disabled={!room || savingRoom}
+          title="上传群头像"
+          type="button"
+          onClick={() => avatarInputRef.current?.click()}
+        >
+          {avatarPreviewRoom ? <RoomAvatar room={avatarPreviewRoom} personas={messenger?.personas ?? []} /> : <span className="room-avatar">J</span>}
         </button>
+        <input
+          ref={avatarInputRef}
+          className="visually-hidden"
+          type="file"
+          accept="image/*"
+          onChange={(event) => void handleRoomAvatarUpload(event)}
+        />
+        <div className="overview-room-fields">
+          <label className={`overview-room-title-field ${roomTitleEditing ? 'editing' : ''}`}>
+            <span>群名</span>
+            <span ref={titleControlRef} className="overview-room-title-control">
+            <input
+              ref={titleInputRef}
+              disabled={!room}
+              readOnly={!roomTitleEditing}
+              type="text"
+              value={roomTitleDraft}
+              onChange={(event) => setRoomTitleDraft(event.target.value)}
+              onBlur={() => void saveRoomTitleOnBlur()}
+              onKeyDown={handleRoomTitleKeyDown}
+            />
+            <button
+              aria-label="编辑群名"
+              className="overview-room-edit-button"
+              disabled={!room || savingRoom}
+              title="编辑群名"
+              type="button"
+              onClick={startRoomTitleEdit}
+            >
+              <EditIcon />
+            </button>
+            </span>
+          </label>
+        </div>
       </div>
-      <div className="checkpoint-list">
-        {(checkpoint?.items ?? []).map((item) => (
-          <article key={item.id} className={`checkpoint-item checkpoint-${classToken(item.severity || item.kind)}`}>
-            <strong>{item.title}</strong>
-            {item.body ? <p>{item.body}</p> : null}
-          </article>
-        ))}
+      {room ? (
+        <RoomPersonaModelSettings
+          messenger={messenger}
+          onOpenModelSettings={onOpenModelSettings}
+          onSavePersona={onSavePersona}
+          room={room}
+          savedModels={savedModels}
+          settings={settings}
+        />
+      ) : null}
+      {members.length > 0 ? (
+        <section className="overview-member-section">
+          <h3>已加入成员（{members.length}）</h3>
+          <div className="member-list overview-member-list">
+            {members.map((member) => {
+              const persona = resolveMemberPersona(member, messenger, null);
+              return (
+                <button key={memberKey(member)} className="member-row member-row-button member-profile-row" type="button" onClick={() => onSelectMember(member)}>
+                  <MemberProfileSummary member={member} persona={persona} room={room} />
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+    </section>
+  );
+}
+
+function RoomPersonaModelSettings({
+  messenger,
+  onOpenModelSettings,
+  onSavePersona,
+  room,
+  savedModels,
+  settings,
+}: {
+  messenger: PersonaMessengerSnapshot | null;
+  onOpenModelSettings: () => void;
+  onSavePersona: (req: UpdateProjectPersonaRequest) => Promise<void>;
+  room: MessengerRoom;
+  savedModels: AvailableModel[];
+  settings: SettingsRecord | null;
+}) {
+  const modelOptions = useMemo(() => connectedModelOptions(savedModels, settings), [savedModels, settings]);
+  const defaultModelID = settings?.model_name || modelOptions[0]?.id || '';
+  const personas = useMemo(() => {
+    const byID = new Map((messenger?.personas ?? []).map((persona) => [persona.id, persona]));
+    return (room.members ?? [])
+      .filter((member) => member.type === 'persona')
+      .map((member) => byID.get(member.persona_id || member.id))
+      .filter((persona): persona is ProjectPersona => Boolean(persona));
+  }, [messenger?.personas, room.members]);
+  const [savingPersonaID, setSavingPersonaID] = useState('');
+  const [openModelMenu, setOpenModelMenu] = useState<{ personaID: string; top: number; right: number } | null>(null);
+
+  useEffect(() => {
+    if (!openModelMenu) return;
+
+    function handlePointerDown(event: globalThis.PointerEvent) {
+      const target = event.target;
+      if (target instanceof Element && (target.closest('.overview-model-menu') || target.closest('.overview-model-trigger'))) return;
+      setOpenModelMenu(null);
+    }
+
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === 'Escape') setOpenModelMenu(null);
+    }
+
+    function handleScroll() {
+      setOpenModelMenu(null);
+    }
+
+    window.addEventListener('pointerdown', handlePointerDown, true);
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('scroll', handleScroll, true);
+    window.addEventListener('resize', handleScroll);
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown, true);
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('scroll', handleScroll, true);
+      window.removeEventListener('resize', handleScroll);
+    };
+  }, [openModelMenu]);
+
+  if (personas.length === 0) return null;
+
+  async function savePersonaModel(persona: ProjectPersona, modelID: string) {
+    const selectedModelID = normalizePersonaModelSelection(modelID, modelOptions, defaultModelID);
+    if (!selectedModelID) return;
+    const currentModelID = normalizePersonaModelSelection(persona.model_strategy, modelOptions, defaultModelID);
+    if (selectedModelID === currentModelID) return;
+    setSavingPersonaID(persona.id);
+    try {
+      await onSavePersona({
+        persona_id: persona.id,
+        base_version: persona.version,
+        actor_id: 'desktop_user',
+        actor_role: 'project_owner',
+        room_id: room.id,
+        model_strategy: selectedModelID,
+        change_reason: 'Update persona model from room overview',
+      });
+    } finally {
+      setSavingPersonaID('');
+    }
+  }
+
+  async function savePersonaReasoningEffort(persona: ProjectPersona, effort: string) {
+    const selectedEffort = normalizeReasoningEffortValue(effort);
+    const currentEffort = normalizeReasoningEffortValue(persona.model_reasoning_effort || settings?.model_reasoning_effort || 'low');
+    if (selectedEffort === currentEffort) return;
+    setSavingPersonaID(persona.id);
+    try {
+      await onSavePersona({
+        persona_id: persona.id,
+        base_version: persona.version,
+        actor_id: 'desktop_user',
+        actor_role: 'project_owner',
+        room_id: room.id,
+        model_reasoning_effort: selectedEffort,
+        change_reason: 'Update persona reasoning effort from room overview',
+      });
+    } finally {
+      setSavingPersonaID('');
+    }
+  }
+
+  function toggleModelMenu(persona: ProjectPersona, event: ReactMouseEvent<HTMLButtonElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const menuHeight = Math.min(520, Math.max(240, window.innerHeight - 24));
+    const menuTop = Math.max(12, Math.min(rect.bottom + 6, window.innerHeight - menuHeight - 12));
+    setOpenModelMenu((current) => (
+      current?.personaID === persona.id
+        ? null
+        : {
+          personaID: persona.id,
+          top: menuTop,
+          right: Math.max(window.innerWidth - rect.right, 12),
+        }
+    ));
+  }
+
+  return (
+    <section className="overview-model-section" aria-label="项目人格模型">
+      <div className="overview-model-section-heading">
+        <h3>模型</h3>
+        <button type="button" onClick={onOpenModelSettings}>设置</button>
       </div>
+      {modelOptions.length === 0 ? (
+        <p className="empty">设置中还没有可选模型。</p>
+      ) : (
+        <div className="overview-model-list">
+          {personas.map((persona) => {
+            const selectedModelID = normalizePersonaModelSelection(persona.model_strategy, modelOptions, defaultModelID);
+            const selectedModel = modelOptions.find((model) => model.id === selectedModelID);
+            const saving = savingPersonaID === persona.id;
+            return (
+              <div key={persona.id} className="overview-model-row">
+                <span className="overview-model-persona">
+                  <strong>{persona.display_name}</strong>
+                  <small>{persona.handle || persona.tagline || '项目人格'}</small>
+                </span>
+                <button
+                  className="overview-model-trigger"
+                  type="button"
+                  aria-expanded={openModelMenu?.personaID === persona.id}
+                  aria-haspopup="menu"
+                  disabled={saving}
+                  onClick={(event) => toggleModelMenu(persona, event)}
+                >
+                  <span>{selectedModel ? modelDisplayName(selectedModel) : selectedModelID || '未接入模型'}</span>
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {openModelMenu ? (
+        <OverviewPersonaModelMenu
+          defaultModelID={defaultModelID}
+          menu={openModelMenu}
+          modelOptions={modelOptions}
+          onSelectModel={savePersonaModel}
+          onSelectReasoning={savePersonaReasoningEffort}
+          personas={personas}
+          savingPersonaID={savingPersonaID}
+          settings={settings}
+        />
+      ) : null}
+    </section>
+  );
+}
+
+function OverviewPersonaModelMenu({
+  defaultModelID,
+  menu,
+  modelOptions,
+  onSelectModel,
+  onSelectReasoning,
+  personas,
+  savingPersonaID,
+  settings,
+}: {
+  defaultModelID: string;
+  menu: { personaID: string; top: number; right: number };
+  modelOptions: AvailableModel[];
+  onSelectModel: (persona: ProjectPersona, modelID: string) => Promise<void>;
+  onSelectReasoning: (persona: ProjectPersona, effort: string) => Promise<void>;
+  personas: ProjectPersona[];
+  savingPersonaID: string;
+  settings: SettingsRecord | null;
+}) {
+  const persona = personas.find((item) => item.id === menu.personaID);
+  if (!persona) return null;
+
+  const selectedModelID = normalizePersonaModelSelection(persona.model_strategy, modelOptions, defaultModelID);
+  const selectedModel = modelOptions.find((model) => model.id === selectedModelID);
+  const canSelectReasoning = selectedModel ? modelSupportsReasoningEffort(selectedModel, settings) : false;
+  const selectedReasoningEffort = normalizeReasoningEffortValue(persona.model_reasoning_effort || settings?.model_reasoning_effort || 'low');
+  const saving = savingPersonaID === persona.id;
+  const menuStyle: CSSProperties = {
+    top: menu.top,
+    right: menu.right,
+  };
+
+  return (
+    <div className="overview-model-menu" style={menuStyle} role="menu" aria-label={`${persona.display_name} 模型与思考等级`}>
+      <div className="overview-model-menu-column overview-model-menu-models">
+        <strong>模型</strong>
+        <div>
+          {modelOptions.map((model) => {
+            const selected = model.id === selectedModelID;
+            return (
+              <button
+                key={modelOptionKey(model)}
+                type="button"
+                role="menuitemradio"
+                aria-checked={selected}
+                className={selected ? 'selected' : ''}
+                disabled={saving}
+                onClick={() => void onSelectModel(persona, model.id)}
+              >
+                {modelDisplayName(model)}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="overview-model-menu-column overview-model-menu-reasoning" aria-label="思考程度">
+        <strong>思考程度</strong>
+        {canSelectReasoning ? (
+          <div>
+            {reasoningEffortOptions.map((option) => {
+              const selected = option.value === selectedReasoningEffort;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={selected}
+                  className={selected ? 'selected' : ''}
+                  disabled={saving}
+                  onClick={() => void onSelectReasoning(persona, option.value)}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <p>当前模型不支持思考等级</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PrivateProjectOverviewPanel({
+  memories,
+  onOpenModelSettings,
+  onOpenMemory,
+  onSavePersona,
+  onSaveProject,
+  persona,
+  project,
+  room,
+  savedModels,
+  settings,
+  workspaceSettings,
+}: {
+  memories: MemoryRecord[];
+  onOpenModelSettings: () => void;
+  onOpenMemory: () => void;
+  onSavePersona: (req: UpdateProjectPersonaRequest) => Promise<void>;
+  onSaveProject: (req: UpdateMessengerProjectRequest) => Promise<void>;
+  persona: ProjectPersona;
+  project: PersonaMessengerSnapshot['projects'][number] | null;
+  room: MessengerRoom;
+  savedModels: AvailableModel[];
+  settings: SettingsRecord | null;
+  workspaceSettings: WorkspaceSettings | null;
+}) {
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
+  const modelOptions = useMemo(() => connectedModelOptions(savedModels, settings), [savedModels, settings]);
+  const modelOptionIds = useMemo(() => modelOptions.map((model) => model.id).join('|'), [modelOptions]);
+  const defaultModelID = settings?.model_name || modelOptions[0]?.id || '';
+  const currentProjectName = project?.name || '';
+  const currentProjectLocalPath = projectLocalPathValue(project);
+  const localPathPlaceholder = workspaceSettings?.default_root || '/Users/hao/project/...';
+  const [saving, setSaving] = useState(false);
+  const [draft, setDraft] = useState({
+    display_name: persona.display_name,
+    avatar: persona.avatar || '',
+    tagline: persona.tagline || '',
+    self_intro: persona.self_intro || '',
+    project_name: currentProjectName,
+    project_local_path: currentProjectLocalPath,
+    permission_summary: persona.permission_summary || '',
+    model_strategy: normalizePersonaModelSelection(persona.model_strategy, modelOptions, defaultModelID),
+  });
+  const scopedMemories = useMemo(
+    () => memoriesForPrivateProject(memories, persona, project),
+    [memories, persona, project],
+  );
+
+  useEffect(() => {
+    setDraft({
+      display_name: persona.display_name,
+      avatar: persona.avatar || '',
+      tagline: persona.tagline || '',
+      self_intro: persona.self_intro || '',
+      project_name: project?.name || '',
+      project_local_path: projectLocalPathValue(project),
+      permission_summary: persona.permission_summary || '',
+      model_strategy: normalizePersonaModelSelection(persona.model_strategy, modelOptions, defaultModelID),
+    });
+  }, [
+    defaultModelID,
+    modelOptionIds,
+    persona.id,
+    persona.version,
+    persona.display_name,
+    persona.avatar,
+    persona.tagline,
+    persona.self_intro,
+    persona.permission_summary,
+    persona.model_strategy,
+    project?.id,
+    project?.name,
+    project?.metadata,
+  ]);
+
+  function updateDraft(field: keyof typeof draft, value: string) {
+    setDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  async function savePrivateProjectProfile(next: Partial<typeof draft> = {}) {
+    const merged = { ...draft, ...next };
+    const displayName = merged.display_name.trim();
+    const projectName = merged.project_name.trim();
+    if (!displayName) return;
+    setSaving(true);
+    try {
+      const nextPersona = {
+        display_name: displayName,
+        avatar: merged.avatar.trim(),
+        tagline: merged.tagline.trim(),
+        self_intro: merged.self_intro.trim(),
+        permission_summary: merged.permission_summary.trim(),
+        model_strategy: merged.model_strategy.trim(),
+      };
+      const currentPersonaModel = normalizePersonaModelSelection(persona.model_strategy, modelOptions, defaultModelID);
+      const personaChanged = nextPersona.display_name !== persona.display_name
+        || nextPersona.avatar !== (persona.avatar || '')
+        || nextPersona.tagline !== (persona.tagline || '')
+        || nextPersona.self_intro !== (persona.self_intro || '')
+        || nextPersona.permission_summary !== (persona.permission_summary || '')
+        || nextPersona.model_strategy !== currentPersonaModel;
+      if (personaChanged) {
+        await onSavePersona({
+          persona_id: persona.id,
+          base_version: persona.version,
+          actor_id: 'desktop_user',
+          actor_role: 'project_owner',
+          room_id: room.id,
+          ...nextPersona,
+          change_reason: 'Update private project profile',
+        });
+      }
+      const projectChanged = Boolean(project)
+        && (projectName !== currentProjectName || merged.project_local_path.trim() !== currentProjectLocalPath);
+      if (project && projectChanged) {
+        await onSaveProject({
+          project_id: project.id,
+          name: projectName || currentProjectName,
+          local_path: merged.project_local_path.trim(),
+          actor_id: 'desktop_user',
+        });
+      }
+      setDraft(merged);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handlePersonaAvatarUpload(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (!file || !file.type.startsWith('image/')) return;
+    setSaving(true);
+    try {
+      const dataURL = await readFileAsDataURL(file);
+      updateDraft('avatar', dataURL);
+      await savePrivateProjectProfile({ avatar: dataURL });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section
+      id="right-inspector-overview"
+      className="right-panel-section private-project-overview-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-overview"
+    >
+      <header className="private-project-overview-header">
+        <button
+          aria-label="上传头像"
+          className="private-project-avatar-button private-project-header-avatar-button"
+          disabled={saving}
+          title="上传头像"
+          type="button"
+          onClick={() => avatarInputRef.current?.click()}
+        >
+          <span className="room-avatar room-avatar-project_dm">
+            {draft.avatar && isImageAvatar(draft.avatar)
+              ? <img src={draft.avatar} alt="" />
+              : (draft.display_name || persona.display_name || 'J').slice(0, 2)}
+          </span>
+        </button>
+        <div className="private-project-overview-heading">
+          <small>私聊</small>
+          <h2>{persona.display_name}</h2>
+        </div>
+      </header>
+      <input
+        ref={avatarInputRef}
+        className="visually-hidden private-project-avatar-input"
+        type="file"
+        accept="image/*"
+        onChange={(event) => void handlePersonaAvatarUpload(event)}
+      />
+      <form className="private-project-editor" onSubmit={(event) => {
+        event.preventDefault();
+        void savePrivateProjectProfile();
+      }}>
+        <label className="private-project-field private-project-name-field">
+          <span>名称</span>
+          <input
+            disabled={saving}
+            value={draft.display_name}
+            onChange={(event) => updateDraft('display_name', event.target.value)}
+          />
+        </label>
+        <section className="private-project-section private-project-association" aria-label="项目关联">
+          <div className="private-project-section-heading">
+            <span>项目关联</span>
+            <small>{project ? '已关联' : '未关联'}</small>
+          </div>
+          <label className="private-project-field">
+            <span>项目名</span>
+            <input
+              disabled={saving || !project}
+              placeholder="项目名称"
+              value={draft.project_name}
+              onChange={(event) => updateDraft('project_name', event.target.value)}
+            />
+          </label>
+          <label className="private-project-field">
+            <span>本地路径</span>
+            <input
+              disabled={saving || !project}
+              placeholder={localPathPlaceholder}
+              value={draft.project_local_path}
+              onChange={(event) => updateDraft('project_local_path', event.target.value)}
+            />
+          </label>
+        </section>
+        <label className="private-project-field">
+          <span>描述</span>
+          <textarea
+            disabled={saving}
+            rows={3}
+            value={draft.tagline}
+            onChange={(event) => updateDraft('tagline', event.target.value)}
+          />
+        </label>
+        <label className="private-project-field">
+          <span>自述</span>
+          <textarea
+            disabled={saving}
+            rows={4}
+            value={draft.self_intro}
+            onChange={(event) => updateDraft('self_intro', event.target.value)}
+          />
+        </label>
+        <div className="inspector-metric-grid private-project-metrics">
+          <KV label="状态" value={formatStatus(persona.status)} />
+          <KV label="记忆" value={`${scopedMemories.length} 条`} />
+        </div>
+        <label className="private-project-field">
+          <span>规则</span>
+          <textarea
+            disabled={saving}
+            rows={3}
+            value={draft.permission_summary}
+            onChange={(event) => updateDraft('permission_summary', event.target.value)}
+          />
+        </label>
+        <label className="private-project-field">
+          <span>模型</span>
+          <div className="private-project-model-row">
+            <select
+              disabled={saving || modelOptions.length === 0}
+              value={draft.model_strategy}
+              onChange={(event) => updateDraft('model_strategy', event.target.value)}
+            >
+              {modelOptions.length === 0 ? (
+                <option value="">未接入模型</option>
+              ) : modelOptions.map((model) => (
+                <option key={modelOptionKey(model)} value={model.id}>
+                  {modelOptionLabel(model)}
+                </option>
+              ))}
+            </select>
+            <button type="button" onClick={onOpenModelSettings}>设置</button>
+          </div>
+          <small>接入、密钥和模型列表在设置中维护。</small>
+        </label>
+        <div className="messenger-overview-actions">
+          <button type="submit" disabled={saving}>{saving ? '保存中' : '保存'}</button>
+          <button type="button" onClick={onOpenMemory}>记忆</button>
+        </div>
+      </form>
     </section>
   );
 }
@@ -4983,27 +7559,6 @@ function checkpointItemMark(kind: string) {
   return '○';
 }
 
-function buildRunSummaryLabels(spans: RunTraceSpan[]): Record<string, string> {
-  const grouped = new Map<string, RunTraceSpan[]>();
-  for (const span of spans) {
-    if (!span.run_id) continue;
-    grouped.set(span.run_id, [...(grouped.get(span.run_id) ?? []), span]);
-  }
-  const labels: Record<string, string> = {};
-  for (const [runID, runSpans] of grouped) {
-    const summary = summarizeTraceSpansForDisplay(runSpans);
-    const parts = [
-      `${summary.model_count} 次模型`,
-      `${summary.tool_count} 个工具`,
-      formatTokenCount(summary.total_tokens),
-      formatCost(summary.total_cost_estimate),
-    ];
-    if (summary.error_count > 0) parts.push(`${summary.error_count} 个错误`);
-    labels[runID] = parts.join(' · ');
-  }
-  return labels;
-}
-
 function summarizeTraceSpansForDisplay(spans: RunTraceSpan[]): RunTraceSpanSummary {
   return spans.reduce<RunTraceSpanSummary>((summary, span) => {
     summary.total += 1;
@@ -5026,10 +7581,10 @@ function summarizeTraceSpansForDisplay(spans: RunTraceSpan[]): RunTraceSpanSumma
 }
 
 function formatSpanTypeLabel(type: string) {
-  if (type === 'model_span') return 'Model Span';
-  if (type === 'tool_span') return 'Tool Span';
-  if (type === 'run_event') return 'Run Event';
-  return type;
+  if (type === 'model_span') return '模型调用';
+  if (type === 'tool_span') return '能力调用';
+  if (type === 'run_event') return '运行步骤';
+  return '运行记录';
 }
 
 function MessengerRunsPanel({
@@ -5072,76 +7627,75 @@ function MessengerRunsPanel({
       aria-labelledby="right-inspector-tab-runs"
     >
       <header>
-        <small>Runs</small>
+        <small>处理过程</small>
         <h2>运行</h2>
       </header>
       {trace ? (
         <>
           <div className="inspector-metric-grid">
-            <KV label="Run" value={trace.id} />
             <KV label="状态" value={formatStatus(trace.status)} />
             <KV label="模型调用" value={String(trace.model_calls?.length ?? 0)} />
             <KV label="步骤" value={String(trace.steps?.length ?? 0)} />
           </div>
           <TraceDrawer events={sortBySeq(normalizeTraceEvents(trace))} />
         </>
-      ) : <p className="empty">当前聊天还没有 Run。</p>}
+      ) : <p className="empty">当前对话还没有运行记录。</p>}
       <section className="run-audit-panel">
         <header>
-          <small>Audit</small>
-          <h3>可观测审计</h3>
+          <small>运行明细</small>
+          <h3>活动与用量</h3>
         </header>
         <div className="inspector-metric-grid">
-          <KV label="Span" value={String(filteredSummary.total)} />
+          <KV label="记录" value={String(filteredSummary.total)} />
           <KV label="模型" value={String(filteredSummary.model_count)} />
-          <KV label="工具" value={String(filteredSummary.tool_count)} />
+          <KV label="能力" value={String(filteredSummary.tool_count)} />
           <KV label="错误" value={String(filteredSummary.error_count)} />
-          <KV label="Token" value={formatTokenCount(filteredSummary.total_tokens)} />
+          <KV label="令牌" value={formatTokenCount(filteredSummary.total_tokens)} />
           <KV label="成本" value={formatCost(filteredSummary.total_cost_estimate)} />
         </div>
         <div className="run-audit-filters">
           <label>
-            <span>Room</span>
+            <span>对话</span>
             <select value={roomFilter} onChange={(event) => setRoomFilter(event.target.value)}>
               <option value="">全部</option>
               {(messenger?.rooms ?? []).map((room) => <option key={room.id} value={room.id}>{room.title}</option>)}
             </select>
           </label>
           <label>
-            <span>Project</span>
+            <span>项目</span>
             <select value={projectFilter} onChange={(event) => setProjectFilter(event.target.value)}>
               <option value="">全部</option>
               {(messenger?.projects ?? []).map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
             </select>
           </label>
           <label>
-            <span>Persona</span>
+            <span>项目人格</span>
             <select value={personaFilter} onChange={(event) => setPersonaFilter(event.target.value)}>
               <option value="">全部</option>
               {(messenger?.personas ?? []).map((persona) => <option key={persona.id} value={persona.id}>{persona.display_name}</option>)}
             </select>
           </label>
           <label>
-            <span>Model</span>
+            <span>模型</span>
             <select value={modelFilter} onChange={(event) => setModelFilter(event.target.value)}>
               <option value="">全部</option>
               {modelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
             </select>
           </label>
           <label>
-            <span>Status</span>
+            <span>状态</span>
             <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
               <option value="">全部</option>
               {statusOptions.map((status) => <option key={status} value={status}>{formatStatus(status)}</option>)}
             </select>
           </label>
           <label>
-            <span>Type</span>
+            <span>类型</span>
             <select value={spanTypeFilter} onChange={(event) => setSpanTypeFilter(event.target.value)}>
               <option value="">全部</option>
-              <option value="model_span">Model Span</option>
-              <option value="tool_span">Tool Span</option>
-              <option value="run_event">Run Event</option>
+              <option value="model_span">模型调用</option>
+              <option value="tool_span">能力调用</option>
+              <option value="run_event">运行步骤</option>
             </select>
           </label>
           <button className={errorOnly ? 'active' : ''} type="button" onClick={() => setErrorOnly((value) => !value)}>只看错误</button>
@@ -5151,53 +7705,143 @@ function MessengerRunsPanel({
           {filteredSpans.slice(0, 80).map((span) => (
             <article key={span.id} className={`run-audit-row ${span.has_error ? 'has-error' : ''}`}>
               <div>
-                <strong>{span.title}</strong>
+                <strong>{userFacingSpanTitle(span)}</strong>
                 <small>
                   {formatSpanTypeLabel(span.span_type)} · {formatStatus(span.status)}
                   {span.model_name ? ` · ${span.model_provider || 'model'} / ${span.model_name}` : ''}
-                  {span.tool_name ? ` · ${span.tool_name}` : ''}
+                  {span.tool_name ? ` · ${capabilityDisplayName(span.tool_name)}` : ''}
                 </small>
                 <small>
-                  {span.persona_name || span.persona_id || '无 Persona'}
+                  {span.persona_name || '未指定项目人格'}
                   {span.project_name ? ` · ${span.project_name}` : ''}
                   {span.room_title ? ` · ${span.room_title}` : ''}
                 </small>
-                {span.error ? <p>{span.error}</p> : null}
+                {span.error ? <p>本步骤遇到问题，可在“支持”中导出诊断包继续排查。</p> : null}
               </div>
               <div className="run-audit-meta">
                 <time>{formatShortTime(span.created_at)}</time>
                 <span>{formatTokenCount(span.total_tokens ?? 0)}</span>
                 <span>{formatCost(span.cost_estimate ?? 0)}</span>
-                <button type="button" onClick={() => void openRunTrace(span.run_id, 'panel')}>查看 Run</button>
+                <button type="button" onClick={() => void openRunTrace(span.run_id, 'panel')}>查看详情</button>
               </div>
             </article>
           ))}
-          {filteredSpans.length === 0 ? <p className="empty">没有匹配当前过滤条件的 Span。</p> : null}
+          {filteredSpans.length === 0 ? <p className="empty">没有匹配当前筛选条件的运行记录。</p> : null}
         </div>
       </section>
-      <details className="inspector-subtool" open={false}>
-        <summary>Terminal</summary>
-        <CompanionTerminalPanel />
-      </details>
-      <details className="inspector-subtool">
-        <summary>Logs</summary>
-        <CompanionLogsPanel runID={trace?.id} />
-      </details>
     </section>
   );
 }
 
-function MessengerThreadsPanel({ messenger, room, trace }: { messenger: PersonaMessengerSnapshot | null; room: MessengerRoom | null; trace: RunTrace | null }) {
+function MessengerThreadsPanel({
+  locateStatus,
+  messenger,
+  onLocateThreadSource,
+  onSelectThread,
+  openRunTrace,
+  room,
+  selectedThreadID,
+  trace,
+}: {
+  locateStatus: string;
+  messenger: PersonaMessengerSnapshot | null;
+  onLocateThreadSource: (thread: MessengerThread) => void;
+  onSelectThread: (threadID: string) => void;
+  openRunTrace: (runID: string, destination?: 'panel' | 'stage') => Promise<void>;
+  room: MessengerRoom | null;
+  selectedThreadID: string;
+  trace: RunTrace | null;
+}) {
   const threadAction = trace?.route_result && typeof trace.route_result === 'object'
     ? trace.route_result
     : {};
-  const visibleThreads = (messenger?.threads ?? [])
-    .filter((thread) => !room || thread.room_id === room.id || thread.source_room_ids.includes(room.id))
-    .slice(0, 8);
+  const visibleThreads = visibleMessengerThreads(messenger, room);
+  const visibleThreadIDs = visibleThreads.map((thread) => thread.id).join('|');
+  const selectedThread = visibleThreads.find((thread) => thread.id === selectedThreadID) ?? null;
   const eventsByThread = new Map<string, PersonaMessengerSnapshot['recent_thread_events']>();
   for (const event of messenger?.recent_thread_events ?? []) {
     eventsByThread.set(event.thread_id, [...(eventsByThread.get(event.thread_id) ?? []), event]);
   }
+
+  useEffect(() => {
+    if (selectedThreadID && !visibleThreads.some((thread) => thread.id === selectedThreadID)) {
+      onSelectThread('');
+    }
+  }, [onSelectThread, selectedThreadID, visibleThreadIDs]);
+
+  if (selectedThread) {
+    const events = eventsByThread.get(selectedThread.id) ?? [];
+    const sourceMessageID = firstThreadSourceMessageID(selectedThread);
+    return (
+      <section
+        id="right-inspector-threads"
+        className="right-panel-section messenger-thread-panel messenger-thread-detail"
+        role="tabpanel"
+        aria-labelledby="right-inspector-tab-threads"
+      >
+        <header className="thread-detail-header">
+          <button className="thread-detail-back" type="button" onClick={() => onSelectThread('')}>返回线程列表</button>
+          <div>
+            <small>线程详情</small>
+            <h2>{displayThreadTitle(selectedThread.title)}</h2>
+          </div>
+        </header>
+        <p>{selectedThread.goal || '这条线程汇总同一段聊天、运行和交付物。'}</p>
+        <div className="thread-detail-actions">
+          <button
+            type="button"
+            disabled={!sourceMessageID}
+            onClick={() => onLocateThreadSource(selectedThread)}
+          >
+            回到聊天位置
+          </button>
+          <span>{sourceMessageID ? locateStatus || '已关联原聊天位置' : '此线程尚未关联原聊天位置'}</span>
+        </div>
+        <div className="inspector-metric-grid">
+          <KV label="状态" value={formatStatus(selectedThread.status)} />
+          <KV label="优先级" value={formatThreadPriority(selectedThread.priority)} />
+          <KV label="消息" value={String(selectedThread.message_count || selectedThread.source_message_ids.length)} />
+          <KV label="运行" value={String(selectedThread.run_count || selectedThread.run_ids.length)} />
+          <KV label="产物" value={String(selectedThread.artifact_count || selectedThread.artifact_ids.length)} />
+          <KV label="最近运行" value={formatStatus(selectedThread.latest_run_status || 'none')} />
+        </div>
+        {selectedThread.next_action ? <p className="thread-next-action">{selectedThread.next_action}</p> : null}
+        <section className="thread-detail-section">
+          <h3>原聊天锚点</h3>
+          <div className="thread-source-list">
+            {selectedThread.source_message_ids.length === 0 ? <small>暂无聊天来源。</small> : selectedThread.source_message_ids.map((messageID, index) => (
+              <button key={messageID} type="button" onClick={() => onLocateThreadSource({ ...selectedThread, source_message_ids: [messageID] })}>
+                聊天位置 {index + 1}
+              </button>
+            ))}
+          </div>
+        </section>
+        <section className="thread-detail-section">
+          <h3>运行记录</h3>
+          <div className="thread-source-list">
+            {selectedThread.run_ids.length === 0 ? <small>暂无运行记录。</small> : selectedThread.run_ids.map((runID, index) => (
+              <button key={runID} type="button" onClick={() => void openRunTrace(runID, 'panel')}>
+                运行 {index + 1}
+              </button>
+            ))}
+          </div>
+        </section>
+        <section className="thread-detail-section">
+          <h3>事件</h3>
+          {events.length === 0 ? <p className="empty">暂无线程事件。</p> : (
+            <div className="thread-event-list">
+              {events.slice(0, 12).map((event) => (
+                <small key={event.id}>
+                  {threadEventLabel(event.event_type)}
+                </small>
+              ))}
+            </div>
+          )}
+        </section>
+      </section>
+    );
+  }
+
   return (
     <section
       id="right-inspector-threads"
@@ -5206,13 +7850,12 @@ function MessengerThreadsPanel({ messenger, room, trace }: { messenger: PersonaM
       aria-labelledby="right-inspector-tab-threads"
     >
       <header>
-        <small>Threads</small>
+        <small>工作脉络</small>
         <h2>线程</h2>
       </header>
       <article className="thread-observer-card">
-        <strong>{room?.subtitle || room?.title || 'Room Scope'}</strong>
-        <p>聊天不被线程拥有；这里展示由消息、Run 和产物组织出的工作视图。</p>
-        <CollapsedData label="路由/线程依据" value={threadAction} />
+        <strong>{displayThreadTitle(room?.subtitle || room?.title || '当前对话')}</strong>
+        <p>这里按消息、运行和交付物整理持续工作的脉络。</p>
       </article>
       <div className="thread-observer-list">
         {visibleThreads.length === 0 ? <p className="empty">当前房间还没有项目线程。</p> : visibleThreads.map((thread) => {
@@ -5221,26 +7864,30 @@ function MessengerThreadsPanel({ messenger, room, trace }: { messenger: PersonaM
             <article key={thread.id} className={`thread-observer-card thread-status-${classToken(thread.status)}`}>
               <div className="thread-observer-row">
                 <div>
-                  <strong>{thread.title}</strong>
-                  <small>{thread.project_name || thread.project_id || 'Room Scope'} · {formatStatus(thread.status)}</small>
+                  <button className="thread-title-button" type="button" onClick={() => onSelectThread(thread.id)}>
+                    <strong>{displayThreadTitle(thread.title)}</strong>
+                  </button>
+                  <small>{thread.project_name || '当前对话'} · {formatStatus(thread.status)}</small>
                 </div>
-                <span>{thread.priority}</span>
+                <span>{formatThreadPriority(thread.priority)}</span>
               </div>
               {thread.goal ? <p>{compactRoomLastMessage(thread.goal)}</p> : null}
               <div className="inspector-metric-grid">
                 <KV label="消息" value={String(thread.message_count || thread.source_message_ids.length)} />
-                <KV label="Run" value={String(thread.run_count || thread.run_ids.length)} />
+                <KV label="运行" value={String(thread.run_count || thread.run_ids.length)} />
                 <KV label="产物" value={String(thread.artifact_count || thread.artifact_ids.length)} />
-                <KV label="最近 Run" value={formatStatus(thread.latest_run_status || 'none')} />
+                <KV label="最近运行" value={formatStatus(thread.latest_run_status || 'none')} />
               </div>
               {thread.next_action ? <small>{thread.next_action}</small> : null}
+              <div className="thread-card-actions">
+                <button type="button" onClick={() => onSelectThread(thread.id)}>查看线程</button>
+                <button type="button" disabled={!firstThreadSourceMessageID(thread)} onClick={() => onLocateThreadSource(thread)}>定位原聊天</button>
+              </div>
               {events.length ? (
                 <div className="thread-event-list">
                   {events.map((event) => (
                     <small key={event.id}>
-                      {event.event_type}
-                      {event.run_id ? ` · ${event.run_id}` : ''}
-                      {event.artifact_id ? ` · ${event.artifact_id}` : ''}
+                      {threadEventLabel(event.event_type)}
                     </small>
                   ))}
                 </div>
@@ -5253,8 +7900,32 @@ function MessengerThreadsPanel({ messenger, room, trace }: { messenger: PersonaM
   );
 }
 
-function MessengerAssetsPanel({ artifacts, room }: { artifacts: ArtifactSummary[]; room: MessengerRoom | null }) {
-  const visible = artifacts.slice(0, 12);
+type ConversationAssetItem = {
+  id: string;
+  title: string;
+  source: 'uploaded' | 'generated';
+  detail: string;
+  previewUrl?: string;
+  createdAt?: string;
+};
+
+function MessengerAssetsPanel({
+  artifacts,
+  conversationID,
+  messages,
+  room,
+  runIDs,
+}: {
+  artifacts: ArtifactSummary[];
+  conversationID: string;
+  messages: ConversationMessage[];
+  room: MessengerRoom | null;
+  runIDs: string[];
+}) {
+  const visible = useMemo(
+    () => currentConversationAssets({ artifacts, conversationID, messages, runIDs }).slice(0, 24),
+    [artifacts, conversationID, messages, runIDs],
+  );
   return (
     <section
       id="right-inspector-assets"
@@ -5263,15 +7934,18 @@ function MessengerAssetsPanel({ artifacts, room }: { artifacts: ArtifactSummary[
       aria-labelledby="right-inspector-tab-assets"
     >
       <header>
-        <small>Assets</small>
-        <h2>资产</h2>
+        <small>会话内容</small>
+        <h2>文件与交付物</h2>
       </header>
-      {visible.length === 0 ? <p className="empty">{room?.title || '当前房间'} 暂无产物。</p> : (
+      {visible.length === 0 ? <p className="empty">{room?.title || '当前会话'} 暂无上传或生成资产。</p> : (
         <div className="asset-mini-list">
-          {visible.map((artifact) => (
-            <article key={artifact.id} className="asset-mini-row">
-              <strong>{artifact.title}</strong>
-              <small>{artifact.type} · {artifact.source_run_id || '无 Run'}</small>
+          {visible.map((asset) => (
+            <article key={asset.id} className={`asset-mini-row asset-source-${asset.source}${asset.previewUrl ? ' has-preview' : ''}`}>
+              {asset.previewUrl ? <img className="asset-mini-preview" src={asset.previewUrl} alt="" /> : null}
+              <div>
+                <strong>{asset.title}</strong>
+                <small>{asset.detail}</small>
+              </div>
             </article>
           ))}
         </div>
@@ -5280,35 +7954,167 @@ function MessengerAssetsPanel({ artifacts, room }: { artifacts: ArtifactSummary[
   );
 }
 
-function MessengerIdentityPanel({
+function currentConversationAssets({
+  artifacts,
+  conversationID,
+  messages,
+  runIDs,
+}: {
+  artifacts: ArtifactSummary[];
+  conversationID: string;
+  messages: ConversationMessage[];
+  runIDs: string[];
+}): ConversationAssetItem[] {
+  const messageIDs = new Set(messages.map((message) => message.id).filter(Boolean));
+  const runIDSet = new Set(runIDs.filter(Boolean));
+  for (const message of messages) {
+    const runID = getMessageRunId(message);
+    if (runID) runIDSet.add(runID);
+  }
+
+  const uploads = messages.flatMap((message) => attachmentAssetsForMessage(message));
+  const generated = artifacts
+    .filter((artifact) => artifactBelongsToCurrentConversation(artifact, conversationID, messageIDs, runIDSet))
+    .filter(generatedArtifactIsFileAsset)
+    .map((artifact): ConversationAssetItem => ({
+      id: `generated:${artifact.id}`,
+      title: artifact.title,
+      source: 'generated',
+      detail: `生成 · ${artifactAssetKindLabel(artifact)}`,
+      previewUrl: generatedArtifactPreviewUrl(artifact),
+      createdAt: artifact.updated_at || artifact.created_at,
+    }));
+
+  return [...uploads, ...generated].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+}
+
+function attachmentAssetsForMessage(message: ConversationMessage): ConversationAssetItem[] {
+  if (!Array.isArray(message.attachments)) return [];
+  return message.attachments.flatMap((item, index) => {
+    if (!item || typeof item !== 'object') return [];
+    const raw = item as Record<string, unknown>;
+    const name = assetString(raw.name) || assetString(raw.filename) || `附件 ${index + 1}`;
+    const mimeType = assetString(raw.mimeType) || assetString(raw.mime_type) || assetString(raw.type);
+    const rawKind = assetString(raw.kind);
+    const kind = rawKind || (mimeType.startsWith('image/') ? 'image' : mimeType.startsWith('video/') ? 'video' : 'file');
+    const size = assetNumber(raw.size);
+    return [{
+      id: `uploaded:${message.id}:${assetString(raw.id) || index}`,
+      title: name,
+      source: 'uploaded' as const,
+      detail: `上传 · ${assetKindLabel(kind)}${size ? ` · ${formatAttachmentSize(size)}` : ''}`,
+      previewUrl: assetString(raw.previewUrl) || assetString(raw.preview_url) || assetString(raw.url),
+      createdAt: message.created_at,
+    }];
+  });
+}
+
+function artifactBelongsToCurrentConversation(
+  artifact: ArtifactSummary,
+  conversationID: string,
+  messageIDs: Set<string>,
+  runIDs: Set<string>,
+): boolean {
+  if (artifact.source_conversation_id && conversationID && artifact.source_conversation_id === conversationID) return true;
+  if (artifact.source_message_id && messageIDs.has(artifact.source_message_id)) return true;
+  if (artifact.source_run_id && runIDs.has(artifact.source_run_id)) return true;
+  return false;
+}
+
+function generatedArtifactIsFileAsset(artifact: ArtifactSummary): boolean {
+  const type = normalizeAssetToken(artifact.type);
+  const format = normalizeAssetToken(artifact.content_format);
+  const metadata = artifact.metadata ?? {};
+  const mimeType = normalizeAssetToken(assetString(metadata.mime_type) || assetString(metadata.mimeType) || assetString(metadata.content_type) || assetString(metadata.contentType));
+  const fileRef = assetString(metadata.file_name)
+    || assetString(metadata.filename)
+    || assetString(metadata.file_path)
+    || assetString(metadata.path)
+    || assetString(metadata.download_url)
+    || assetString(metadata.downloadUrl)
+    || assetString(metadata.preview_url)
+    || assetString(metadata.previewUrl)
+    || assetString(metadata.url);
+
+  if (type.includes('image') || type.includes('file') || type.includes('attachment') || type.includes('media')) return true;
+  if (format.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf', 'binary', 'file'].includes(format)) return true;
+  if (mimeType.startsWith('image/') || (mimeType && !mimeType.startsWith('text/') && mimeType !== 'text/markdown' && mimeType !== 'application/json')) return true;
+  return Boolean(fileRef);
+}
+
+function generatedArtifactPreviewUrl(artifact: ArtifactSummary): string | undefined {
+  const metadata = artifact.metadata ?? {};
+  const url = assetString(metadata.preview_url) || assetString(metadata.previewUrl) || assetString(metadata.url) || assetString(metadata.download_url) || assetString(metadata.downloadUrl);
+  return url || undefined;
+}
+
+function artifactAssetKindLabel(artifact: ArtifactSummary): string {
+  const type = normalizeAssetToken(artifact.type);
+  const format = normalizeAssetToken(artifact.content_format);
+  const metadata = artifact.metadata ?? {};
+  const mimeType = normalizeAssetToken(assetString(metadata.mime_type) || assetString(metadata.mimeType) || assetString(metadata.content_type) || assetString(metadata.contentType));
+  if (type.includes('image') || format.startsWith('image/') || mimeType.startsWith('image/')) return '图片';
+  return '文件';
+}
+
+function normalizeAssetToken(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function assetKindLabel(kind: string): string {
+  if (kind === 'image') return '图片';
+  if (kind === 'video') return '视频';
+  return '文件';
+}
+
+function assetString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function assetNumber(value: unknown): number {
+  const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : 0;
+  return Number.isFinite(number) ? number : 0;
+}
+
+function MessengerMemberDetailPanel({
+  member,
   messenger,
   persona,
   rollbackPersonaVersion,
   retryExternalConnectorEvent,
   room,
 }: {
+  member: MessengerRoomMember;
   messenger: PersonaMessengerSnapshot | null;
   persona: ProjectPersona | null;
   rollbackPersonaVersion: (personaID: string, targetVersion: number) => Promise<void>;
   retryExternalConnectorEvent: (eventID: string) => Promise<void>;
   room: MessengerRoom | null;
 }) {
-  const project = persona ? messenger?.projects.find((item) => item.id === persona.project_id) : null;
+  const project = persona
+    ? messenger?.projects.find((item) => item.id === persona.project_id)
+    : member.project_id
+      ? messenger?.projects.find((item) => item.id === member.project_id)
+      : null;
   const versions = persona
     ? (messenger?.persona_versions ?? []).filter((version) => version.persona_id === persona.id).sort((a, b) => b.version - a.version)
     : [];
   const roomConnectors = room ? (messenger?.room_connectors ?? []).filter((connector) => connector.room_id === room.id) : [];
+  const visibleConnectors = persona
+    ? roomConnectors.filter((connector) => connector.visible_persona_ids.includes(persona.id))
+    : roomConnectors;
   const externalEvents = room ? (messenger?.recent_external_events ?? []).filter((event) => event.room_id === room.id).slice(0, 5) : [];
+  const activity = memberActivityState(member, room, persona);
   return (
     <section
-      id="right-inspector-identity"
-      className="right-panel-section messenger-identity-panel"
+      id="right-inspector-member-detail"
+      className="right-panel-section messenger-member-detail-panel"
       role="tabpanel"
-      aria-labelledby="right-inspector-tab-identity"
+      aria-labelledby="right-inspector-tab-member"
     >
-      <header>
-        <small>{room?.type === 'project_dm' ? 'Identity' : 'Members'}</small>
-        <h2>{persona?.display_name || room?.title || '成员'}</h2>
+      <header className="member-detail-header">
+        <small>{persona ? 'Project Persona' : 'Member'}</small>
+        <h2>{persona?.display_name || member.display_name}</h2>
       </header>
       {persona ? (
         <>
@@ -5320,12 +8126,13 @@ function MessengerIdentityPanel({
           <PermissionAuditCard room={room} />
           <div className="inspector-metric-grid">
             <KV label="版本" value={String(persona.version)} />
-            <KV label="状态" value={persona.status} />
+            <KV label="状态" value={formatStatus(persona.status)} />
+            <KV label="活跃状态" value={activity.label} />
             <KV label="权限" value={persona.permission_summary || '按项目权限'} />
             <KV label="模型策略" value={persona.model_strategy || '默认'} />
           </div>
           <CollapsedData label="性格维度" value={persona.traits} />
-          <RoomConnectorList connectors={roomConnectors} events={externalEvents} onRetry={retryExternalConnectorEvent} />
+          <RoomConnectorList connectors={visibleConnectors} events={externalEvents} onRetry={retryExternalConnectorEvent} />
           <div className="persona-version-list">
             <h3>身份版本</h3>
             {versions.length === 0 ? <p className="empty">暂无版本记录。</p> : versions.map((version) => (
@@ -5347,24 +8154,163 @@ function MessengerIdentityPanel({
         </>
       ) : (
         <>
-          <PermissionAuditCard room={room} />
-          <div className="member-list">
-            {(room?.members ?? []).map((member) => (
-              <article key={`${member.type}:${member.id}`} className="member-row">
-                <strong>{member.display_name}</strong>
-                <small>
-                  {member.type} · {member.role || 'member'}
-                  {member.visible_project_ids?.length ? ` · ${member.visible_project_ids.length} 个授权项目` : ''}
-                  {member.can_approve_high_risk ? ' · 可批高风险' : ''}
-                </small>
-              </article>
-            ))}
+          <div className="member-row member-detail-card member-profile-row">
+            <MemberProfileSummary member={member} persona={null} room={room} />
           </div>
-          <RoomConnectorList connectors={roomConnectors} events={externalEvents} onRetry={retryExternalConnectorEvent} />
+          <PermissionAuditCard room={room} />
+          <div className="inspector-metric-grid member-detail-facts">
+            <KV label="类型" value={formatMemberType(member.type)} />
+            <KV label="角色" value={formatMemberRole(member.role) || '成员'} />
+            <KV label="活跃状态" value={activity.label} />
+            <KV label="可见项目" value={memberVisibleProjectsLabel(member, messenger)} />
+            <KV label="审批" value={member.can_approve_high_risk ? '可批高风险' : '普通成员'} />
+          </div>
+          {member.visibility_scope ? <CollapsedData label="可见范围" value={{ visibility_scope: member.visibility_scope, visible_project_ids: member.visible_project_ids ?? [] }} /> : null}
+          {member.metadata ? <CollapsedData label="成员元数据" value={member.metadata} /> : null}
+          <RoomConnectorList connectors={visibleConnectors} events={externalEvents} onRetry={retryExternalConnectorEvent} />
         </>
       )}
     </section>
   );
+}
+
+function memberKey(member: MessengerRoomMember) {
+  return [member.type, member.id, member.persona_id ?? '', member.project_id ?? ''].join(':');
+}
+
+function resolveMemberPersona(member: MessengerRoomMember, messenger: PersonaMessengerSnapshot | null, fallback: ProjectPersona | null) {
+  const personaID = member.persona_id || (member.type === 'persona' ? member.id : '');
+  if (!personaID) return null;
+  return messenger?.personas.find((item) => item.id === personaID) ?? (fallback?.id === personaID ? fallback : null);
+}
+
+function MemberProfileSummary({
+  member,
+  persona,
+  room,
+}: {
+  member: MessengerRoomMember;
+  persona: ProjectPersona | null;
+  room: MessengerRoom | null;
+}) {
+  const activity = memberActivityState(member, room, persona);
+  return (
+    <>
+      <MemberAvatar member={member} persona={persona} />
+      <span className="member-profile-copy">
+        <strong>{persona?.display_name || member.display_name}</strong>
+        <small>{memberDescriptionLine(member, persona, room)}</small>
+      </span>
+      <span className={`member-activity-badge member-activity-${activity.tone}`}>{activity.label}</span>
+    </>
+  );
+}
+
+function MemberAvatar({ member, persona }: { member: MessengerRoomMember; persona: ProjectPersona | null }) {
+  const avatar = memberAvatarValue(member, persona);
+  const label = avatar && !isImageAvatar(avatar)
+    ? avatar.slice(0, 2)
+    : (persona?.display_name || member.display_name || '成').slice(0, 1);
+  return (
+    <span className={`member-avatar member-avatar-${classToken(member.type)}`} aria-hidden="true">
+      {avatar && isImageAvatar(avatar) ? <img src={avatar} alt="" /> : label}
+    </span>
+  );
+}
+
+function memberAvatarValue(member: MessengerRoomMember, persona: ProjectPersona | null) {
+  const metadataAvatar = member.metadata?.avatar;
+  if (typeof metadataAvatar === 'string' && metadataAvatar.trim()) return metadataAvatar.trim();
+  return persona?.avatar?.trim() || '';
+}
+
+type MemberActivityTone = 'active' | 'locked' | 'idle' | 'owner';
+
+function memberActivityState(
+  member: MessengerRoomMember,
+  room: MessengerRoom | null,
+  persona: ProjectPersona | null,
+): { label: string; tone: MemberActivityTone } {
+  if (isRoomOwnerMember(member, room)) {
+    return { label: '群主', tone: 'owner' };
+  }
+  const personaID = member.persona_id || (member.type === 'persona' ? member.id : '');
+  if (personaID && room?.route_lock_persona_id === personaID) {
+    return { label: '已锁定', tone: 'locked' };
+  }
+  if (personaID && room?.floor_holder_persona_id === personaID) {
+    return { label: '当前发言', tone: 'active' };
+  }
+  if (persona?.status) {
+    return {
+      label: formatStatus(persona.status),
+      tone: persona.status === 'active' || persona.status === 'running' ? 'active' : 'idle',
+    };
+  }
+  const metadataStatus = memberMetadataStatus(member);
+  if (metadataStatus) return metadataStatus;
+  return {
+    label: member.type === 'user' || member.type === 'human' ? '已加入' : '待命',
+    tone: 'idle',
+  };
+}
+
+function memberMetadataStatus(member: MessengerRoomMember): { label: string; tone: MemberActivityTone } | null {
+  const raw = member.metadata?.presence ?? member.metadata?.status ?? member.metadata?.activity;
+  if (typeof raw === 'string' && raw.trim()) {
+    const value = raw.trim();
+    return {
+      label: formatStatus(value),
+      tone: value === 'active' || value === 'online' || value === 'running' ? 'active' : 'idle',
+    };
+  }
+  if (typeof member.metadata?.active === 'boolean') {
+    return member.metadata.active ? { label: '活跃', tone: 'active' } : { label: '空闲', tone: 'idle' };
+  }
+  return null;
+}
+
+function memberDescriptionLine(member: MessengerRoomMember, persona: ProjectPersona | null, room: MessengerRoom | null) {
+  if (isRoomOwnerMember(member, room) && (member.type === 'user' || member.type === 'human')) {
+    return '登录用户 · 真人';
+  }
+  if (persona) {
+    return persona.tagline || `${formatMemberType(member.type)} · ${persona.handle}`;
+  }
+  const parts = [
+    formatMemberType(member.type),
+    formatMemberRole(member.role),
+    member.visible_project_ids?.length ? `${member.visible_project_ids.length} 个授权项目` : '',
+    member.can_approve_high_risk ? '可批高风险' : '',
+  ].filter(Boolean);
+  return parts.join(' · ');
+}
+
+function isRoomOwnerMember(member: MessengerRoomMember, room: MessengerRoom | null) {
+  const role = member.role?.trim().toLowerCase();
+  if (role === 'owner' || role === 'room_owner') return true;
+  return Boolean(room?.owner_user_id && member.id === room.owner_user_id);
+}
+
+function formatMemberRole(role?: string) {
+  if (!role) return '';
+  if (role === 'owner' || role === 'room_owner') return '群主';
+  if (role === 'persona') return '';
+  if (role === 'human_member') return '成员';
+  return role;
+}
+
+function formatMemberType(type: string) {
+  if (type === 'persona') return '项目人格';
+  if (type === 'user' || type === 'human') return '真人';
+  return type;
+}
+
+function memberVisibleProjectsLabel(member: MessengerRoomMember, messenger: PersonaMessengerSnapshot | null) {
+  const ids = member.visible_project_ids ?? [];
+  if (ids.length === 0) return member.project_id || '仅房间上下文';
+  const projects = ids.map((id) => messenger?.projects.find((project) => project.id === id)?.name || id);
+  return projects.join('、');
 }
 
 function PermissionAuditCard({ room }: { room: MessengerRoom | null }) {
@@ -5380,7 +8326,6 @@ function PermissionAuditCard({ room }: { room: MessengerRoom | null }) {
         <KV label="AI 参与" value={audit.multi_human_ai_throttle ? `${audit.ai_participation} · 多真人节制` : audit.ai_participation} />
       </div>
       <small>{audit.summary}</small>
-      {audit.reason_codes.length ? <small>{audit.reason_codes.join('、')}</small> : null}
     </div>
   );
 }
@@ -5396,12 +8341,12 @@ function RoomConnectorList({
 }) {
   return (
     <div className="room-connector-list">
-      <h3>连接器</h3>
-      {connectors.length === 0 ? <p className="empty">暂无外部映射。</p> : connectors.map((connector) => (
+      <h3>外部连接</h3>
+      {connectors.length === 0 ? <p className="empty">暂无外部连接。</p> : connectors.map((connector) => (
         <article key={connector.id} className="connector-row">
           <div>
-            <strong>{connector.provider}</strong>
-            <small>{connector.external_room_id} · {connector.status}</small>
+            <strong>{formatChannelLabel(connector.provider)}</strong>
+            <small>{formatStatus(connector.status)}</small>
           </div>
           <span>{connector.visible_persona_ids.length} 个项目人格</span>
         </article>
@@ -5414,8 +8359,8 @@ function RoomConnectorList({
               <article key={event.id} className={`external-event-row event-${classToken(event.status)}`}>
                 <div className="external-event-row-header">
                   <div>
-                    <strong>{event.status}</strong>
-                    <small>{event.provider} · {event.external_event_id}</small>
+                    <strong>{formatStatus(event.status)}</strong>
+                    <small>{formatChannelLabel(event.provider)}</small>
                   </div>
                   {retryable ? (
                     <button className="external-event-retry" type="button" onClick={() => void onRetry(event.id)}>
@@ -5423,7 +8368,7 @@ function RoomConnectorList({
                     </button>
                   ) : null}
                 </div>
-                {event.error ? <p>{event.error}</p> : <p>{compactRoomLastMessage(event.text)}</p>}
+                {event.error ? <p>发送遇到问题，可以重试。</p> : <p>{compactRoomLastMessage(event.text)}</p>}
               </article>
             );
           })}
@@ -5507,66 +8452,48 @@ function CompanionLogsPanel({ runID }: { runID?: string }) {
       aria-labelledby="right-inspector-tab-logs"
     >
       <header>
-        <small>Logs</small>
-        <h2>日志</h2>
+        <small>本机活动</small>
+        <h2>运行记录</h2>
       </header>
       <div className="logs-filter-grid">
         <label className="field-row compact">
           <span>搜索</span>
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="message / feature / run" />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索结果或功能" />
         </label>
         <label className="field-row compact">
-          <span>Level</span>
+          <span>重要程度</span>
           <select value={level} onChange={(event) => setLevel(event.target.value)}>
             <option value="">全部</option>
-            {logLevelOptions.map((item) => <option key={item} value={item}>{item}</option>)}
+            {logLevelOptions.map((item) => <option key={item} value={item}>{formatLogLevel(item)}</option>)}
           </select>
         </label>
         <label className="field-row compact">
-          <span>Risk</span>
+          <span>风险</span>
           <select value={risk} onChange={(event) => setRisk(event.target.value)}>
             <option value="">全部</option>
             {logRiskOptions.map((item) => <option key={item} value={item}>{formatRiskLevel(item)}</option>)}
           </select>
         </label>
         <label className="field-row compact">
-          <span>Category</span>
+          <span>类型</span>
           <select value={category} onChange={(event) => setCategory(event.target.value)}>
             <option value="">全部</option>
-            {logCategoryOptions.map((item) => <option key={item} value={item}>{item}</option>)}
+            {logCategoryOptions.map((item) => <option key={item} value={item}>{formatLogCategory(item)}</option>)}
           </select>
-        </label>
-        <label className="field-row compact">
-          <span>Source</span>
-          <input value={source} onChange={(event) => setSource(event.target.value)} placeholder="electron_ipc" />
-        </label>
-        <label className="field-row compact">
-          <span>Run</span>
-          <input value={runFilter} onChange={(event) => setRunFilter(event.target.value)} placeholder={runID || 'run id'} />
-        </label>
-      </div>
-      <div className="logs-toggle-row">
-        <label>
-          <input type="checkbox" checked={includeTrace} onChange={(event) => setIncludeTrace(event.target.checked)} />
-          <span>Trace delta</span>
-        </label>
-        <label>
-          <input type="checkbox" checked={includeWorkerHeartbeat} onChange={(event) => setIncludeWorkerHeartbeat(event.target.checked)} />
-          <span>Worker heartbeat</span>
         </label>
       </div>
       <div className="logs-toolbar">
         <button type="button" onClick={() => setRefreshNonce((value) => value + 1)} disabled={loading}>
           {loading ? '刷新中' : '刷新'}
         </button>
-        {runID ? <button type="button" onClick={() => setRunFilter(runID)}>当前 Run</button> : null}
-        <button type="button" onClick={() => void exportVisibleLogs()}>导出</button>
+        {runID ? <button type="button" onClick={() => setRunFilter(runID)}>只看本次运行</button> : null}
+        <button type="button" onClick={() => void exportVisibleLogs()}>导出诊断记录</button>
       </div>
       {error ? <p className="terminal-error">{error}</p> : null}
       {notice ? <p className="logs-notice">{notice}</p> : null}
       <div className="log-entry-list">
         {logs.length === 0 ? (
-          <p className="empty">暂无日志。</p>
+          <p className="empty">暂无运行记录。</p>
         ) : logs.map((log) => (
           <LogEntryRow key={`${log.source_table}:${log.id}`} log={log} />
         ))}
@@ -5579,29 +8506,13 @@ function LogEntryRow({ log }: { log: LogEntry }) {
   return (
     <article className={`log-entry-row log-level-${classToken(log.level)}`}>
       <header>
-        <span className="log-level-pill">{log.level}</span>
+        <span className="log-level-pill">{formatLogLevel(log.level)}</span>
         <span>{formatRiskLevel(log.risk_level)}</span>
         <time>{formatShortTime(log.created_at)}</time>
       </header>
-      <strong>{log.message || log.feature_key || log.event_type || log.id}</strong>
-      <small>
-        {[log.category, log.source, log.feature_key].filter(Boolean).join(' · ')}
-        {log.run_id ? ` · ${log.run_id}` : ''}
-      </small>
-      <details>
-        <summary>详情</summary>
-        <pre>{formatRawData({
-          id: log.id,
-          source_table: log.source_table,
-          event_type: log.event_type,
-          item_type: log.item_type,
-          item_id: log.item_id,
-          duration_ms: log.duration_ms,
-          status: log.status,
-          payload: log.payload,
-          error: log.error,
-        })}</pre>
-      </details>
+      <strong>{friendlyLogSummary(log)}</strong>
+      <small>{[formatLogCategory(log.category), log.status ? formatStatus(log.status) : '', log.duration_ms ? formatMilliseconds(log.duration_ms) : ''].filter(Boolean).join(' · ')}</small>
+      {log.error ? <small className="terminal-error">本次运行遇到问题，可导出诊断记录后继续排查。</small> : null}
     </article>
   );
 }
@@ -5673,9 +8584,9 @@ function DiagnosticsLogCleanup({ onNotice }: { onNotice?: (message: string) => v
 
   return (
     <section className="diagnostics-log-cleanup">
-      <h3>日志清理</h3>
+      <h3>清理运行记录</h3>
       <dl className="metrics">
-        <KV label="范围" value="系统日志、Run Trace、tool/model、worker audit、文件日志" />
+        <KV label="范围" value="本机活动、运行事件、模型与能力使用记录" />
         <KV label="保留" value="对话、记忆、设置、密钥" />
       </dl>
       <div className="logs-toggle-row">
@@ -5688,7 +8599,7 @@ function DiagnosticsLogCleanup({ onNotice }: { onNotice?: (message: string) => v
               invalidatePreview();
             }}
           />
-          <span>Trace delta</span>
+          <span>包含详细过程</span>
         </label>
         <label>
           <input
@@ -5699,7 +8610,7 @@ function DiagnosticsLogCleanup({ onNotice }: { onNotice?: (message: string) => v
               invalidatePreview();
             }}
           />
-          <span>Worker heartbeat</span>
+          <span>包含执行器状态记录</span>
         </label>
       </div>
       {preview ? (
@@ -5707,7 +8618,7 @@ function DiagnosticsLogCleanup({ onNotice }: { onNotice?: (message: string) => v
           <strong>{preview.total_count} 项</strong>
           <div>
             {Object.entries(preview.counts).map(([scope, count]) => (
-              <span key={scope}>{scope}: {count}</span>
+              <span key={scope}>{formatCleanupScope(scope)}：{count}</span>
             ))}
           </div>
           {preview.warnings.length > 0 ? <p>{preview.warnings.join(' · ')}</p> : null}
@@ -5715,9 +8626,9 @@ function DiagnosticsLogCleanup({ onNotice }: { onNotice?: (message: string) => v
       ) : null}
       {error ? <p className="terminal-error">{error}</p> : null}
       <div className="detail-actions">
-        <button type="button" onClick={() => void previewCleanup()} disabled={busy}>Preview</button>
+        <button type="button" onClick={() => void previewCleanup()} disabled={busy}>预览清理范围</button>
         <button type="button" onClick={() => void clearLogs()} disabled={busy || !previewIsCurrent || !preview?.safe_to_clear}>
-          Clear Logs
+          清理记录
         </button>
       </div>
     </section>
@@ -5974,7 +8885,7 @@ function CompanionInsightPanel({
       <InsightList empty="本轮没有召回 confirmed memory。">
         {usedMemories.map((result) => (
           <InsightItem key={`used-${result.memory.id}`} title={result.memory.summary || result.memory.type} body={result.memory.content}>
-            <small>score {result.score.toFixed(2)} · {formatMemoryReason(result.reason)}</small>
+            <small>匹配度 {Math.round(result.score * 100)}% · {formatMemoryReason(result.reason)}</small>
             <button type="button" onClick={() => updateMemory(result.memory.id, 'feedback_positive')}>准确</button>
             <button type="button" onClick={() => updateMemory(result.memory.id, 'feedback_negative')}>不准确</button>
             <button type="button" onClick={() => updateMemory(result.memory.id, 'disable')}>停用</button>
@@ -6155,17 +9066,30 @@ function ArtifactViewer({ artifact, close }: { artifact: ArtifactDetail; close: 
       <section className="artifact-viewer" role="dialog" aria-modal="true" aria-labelledby="artifact-title">
         <header>
           <div>
-            <small>{formatArtifactType(artifact.type)} · v{artifact.version} · {artifact.source_run_id || '无来源'}</small>
+            <small>{formatArtifactType(artifact.type)} · 版本 {artifact.version}</small>
             <h2 id="artifact-title">{artifact.title}</h2>
           </div>
           <button type="button" aria-label="关闭交付物" onClick={close}>×</button>
         </header>
         <ScrollArea className="artifact-content">
-          <pre>{artifact.content}</pre>
+          <ArtifactContent content={artifact.content} />
         </ScrollArea>
       </section>
     </div>
   );
+}
+
+function ArtifactContent({ content }: { content: string }) {
+  const parsed = parseStructuredText(content);
+  if (parsed && typeof parsed === 'object') {
+    const rows = userFacingDetailRows(parsed);
+    return rows.length ? (
+      <dl className="compact-kv artifact-detail-grid">
+        {rows.map((row, index) => <KV key={`${row.label}-${index}`} label={row.label} value={row.value} />)}
+      </dl>
+    ) : <p className="empty">该交付物只包含内部诊断数据，已在普通视图中隐藏。</p>;
+  }
+  return <div className="artifact-copy">{content || '暂无内容。'}</div>;
 }
 
 function InsightList({ children, empty }: { children: ReactNode; empty: string }) {
@@ -6366,7 +9290,7 @@ function ExecutionInlineDetails({ action, openTrace }: { action: ExecutionAction
       {sections.map((detail) => (
         <ExecutionActionDetailBlock key={`${action.id}-${detail.label}`} detail={detail} />
       ))}
-      {openTrace ? <button className="developer-diagnostics-link" type="button" onClick={openTrace}>开发者诊断</button> : null}
+      {openTrace ? <button className="developer-diagnostics-link" type="button" onClick={openTrace}>查看完整过程</button> : null}
     </div>
   );
 }
@@ -6393,8 +9317,8 @@ function ExecutionActionCard({ action, defaultOpen = false }: { action: Executio
       <summary>
         <span className="execution-action-dot" />
         <span className="execution-action-copy">
-          <strong>{action.title}</strong>
-          <small>{action.description}</small>
+          <strong>{executionActionTitle(action)}</strong>
+          <small>{executionActionDescription(action)}</small>
         </span>
         <span className="execution-action-meta">
           <strong>{formatStatus(action.status)}</strong>
@@ -6413,16 +9337,37 @@ function ExecutionActionCard({ action, defaultOpen = false }: { action: Executio
 }
 
 function ExecutionActionDetailBlock({ detail }: { detail: ExecutionActionDetail }) {
+  if (isInternalExecutionDetail(detail.label)) return null;
+  const rows = userFacingDetailRows(detail.value);
+  const primitive = typeof detail.value === 'string' || typeof detail.value === 'number' || typeof detail.value === 'boolean';
+  if (!primitive && rows.length === 0) return null;
   return (
     <section className="execution-action-detail">
-      <h4>{detail.label}</h4>
-      {typeof detail.value === 'string' || typeof detail.value === 'number' || typeof detail.value === 'boolean' ? (
-        <pre>{String(detail.value)}</pre>
+      <h4>{executionDetailLabel(detail.label)}</h4>
+      {primitive ? (
+        <p className="execution-detail-copy">{formatDetailValue(detail.value, detail.label)}</p>
       ) : (
-        <pre>{formatRawData(detail.value)}</pre>
+        <dl className="compact-kv execution-detail-grid">
+          {rows.map((row, index) => <KV key={`${row.label}-${index}`} label={row.label} value={row.value} />)}
+        </dl>
       )}
     </section>
   );
+}
+
+function isInternalExecutionDetail(label: string) {
+  return /^(COMMAND|INPUT|REQUEST|ARGS|ARGUMENTS|METADATA|RAW)$/i.test(label.trim());
+}
+
+function executionDetailLabel(label: string) {
+  const labels: Record<string, string> = {
+    ERROR: '问题说明',
+    LIMITATIONS: '限制',
+    OUTPUT: '结果摘要',
+    RESULT: '结果摘要',
+    SOURCES: '参考来源',
+  };
+  return labels[label.toUpperCase()] || label;
 }
 
 function hasActionDetails(action: ExecutionAction) {
@@ -6436,7 +9381,33 @@ function actionLineTitle(action: ExecutionAction, running: boolean) {
     if (action.kind === 'workspace') return `搜索工作区${suffix}`;
     if (action.kind === 'file') return `读取文件${suffix}`;
   }
-  return `${action.title}${suffix}`;
+  return `${executionActionTitle(action)}${suffix}`;
+}
+
+function executionActionTitle(action: ExecutionAction) {
+  const title = action.title.trim();
+  if (!/[_]|\b(?:tool|browser|runtime|trace|preview)\b/i.test(title)) return title;
+  if (action.kind === 'web') return '浏览网页';
+  if (action.kind === 'workspace') return '搜索工作区';
+  if (action.kind === 'file') return '读取文件';
+  if (action.kind === 'command') return '执行受控操作';
+  if (action.kind === 'confirmation') return '等待你的确认';
+  return '使用受控能力';
+}
+
+function executionActionDescription(action: ExecutionAction) {
+  const description = action.description.trim();
+  if (!description) return formatStatus(action.status);
+  if (/[_]|\b(?:tool|browser|runtime|trace|preview|payload)\b/i.test(description)) return '已在授权范围内完成处理。';
+  return description;
+}
+
+function userFacingSpanTitle(span: RunTraceSpan) {
+  const title = span.title.trim();
+  if (!/[_]|\b(?:tool|browser|runtime|trace|preview)\b/i.test(title)) return title;
+  if (span.span_type === 'model_span') return '生成回复';
+  if (span.span_type === 'tool_span') return span.tool_name ? capabilityDisplayName(span.tool_name) : '使用受控能力';
+  return '处理任务';
 }
 
 function actionRowSummary(action: ExecutionAction, running: boolean) {
@@ -6604,8 +9575,24 @@ function formatDuration(value: number) {
 function splitStreamingChunks(value: string) {
   const text = value.trim();
   if (!text) return [];
-  const chunks = text.match(/[^。！？.!?\n]+[。！？.!?\n]?\s*/g);
-  return chunks?.filter(Boolean) ?? [text];
+  const parts = text.match(/[\u4e00-\u9fff]|[^\S\r\n]+|[\r\n]+|[A-Za-z0-9_'-]+|./gu) ?? [text];
+  const chunks: string[] = [];
+  let current = '';
+  for (const part of parts) {
+    current += part;
+    const hasCjk = /[\u4e00-\u9fff]/u.test(current);
+    const limit = hasCjk ? 8 : 24;
+    if (/[。！？.!?\n]$/u.test(part) || current.length >= limit) {
+      chunks.push(current);
+      current = '';
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.filter(Boolean);
+}
+
+function streamingChunkDelay(chunk: string) {
+  return Math.min(80, Math.max(18, chunk.length * 6));
 }
 
 function sleep(ms: number) {
@@ -6639,30 +9626,6 @@ function shouldShowInlineRunDetails(chat: ChatResponse | null, trace: RunTrace |
   return !['', 'chat_assist', 'clarify'].includes(interactionClass);
 }
 
-function composerModelOptions(settings: SettingsRecord | null, selectedModelName: string, savedModels: AvailableModel[]) {
-  const configured = settings?.model_name || 'deepseek-v4-flash';
-  const options = new Set<string>();
-  const providerModels = savedModelsForProvider(savedModels, settings?.model_provider, settings?.model_base_url);
-  const configuredIsSaved = providerModels.some((model) => model.id === configured);
-  if (selectedModelName) options.add(selectedModelName);
-  if (providerModels.length === 0 || configuredIsSaved) options.add(configured);
-  for (const model of providerModels) {
-    if (model.config?.enabled === false) continue;
-    if (model.id) options.add(model.id);
-  }
-  const preset = Object.values(modelProviderPresets).find((item) => (
-    item.provider === settings?.model_provider && item.baseURL === settings?.model_base_url
-  )) ?? (settings?.model_base_url?.includes('deepseek.com') ? modelProviderPresets.deepseek : undefined);
-
-  for (const item of preset?.models ?? []) {
-    if (item) options.add(item);
-  }
-  if (preset?.reasoningModel) {
-    options.add(preset.reasoningModel);
-  }
-  return Array.from(options).filter(Boolean);
-}
-
 function savedModelsForProvider(models: AvailableModel[], provider?: string, baseURL?: string) {
   const normalizedProvider = normalizeProvider(provider || '');
   const normalizedBaseURL = normalizeBaseURL(baseURL || '');
@@ -6674,13 +9637,130 @@ function savedModelsForProvider(models: AvailableModel[], provider?: string, bas
   });
 }
 
+function pluginProviderConfigs(plugin: PluginRecord): PluginProviderConfig[] {
+  const value = plugin.metadata?.providers;
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const provider = item as Record<string, unknown>;
+    const id = String(provider.id || '').trim();
+    const name = String(provider.name || id).trim();
+    const protocol = String(provider.protocol || '').trim();
+    const command = String(provider.command || '').trim();
+    if (!id || !name || !protocol || !command) return [];
+    const models = Array.isArray(provider.models)
+      ? provider.models.flatMap((model) => {
+        if (!model || typeof model !== 'object' || Array.isArray(model)) return [];
+        const record = model as Record<string, unknown>;
+        const modelID = String(record.id || '').trim();
+        return modelID ? [{ id: modelID, name: String(record.name || modelID) }] : [];
+      })
+      : [];
+    return [{
+      id,
+      name,
+      protocol,
+      command,
+      args: Array.isArray(provider.args) ? provider.args.map(String) : [],
+      runtime: typeof provider.runtime === 'string' ? provider.runtime : undefined,
+      default_model: typeof provider.default_model === 'string' ? provider.default_model : undefined,
+      auth_method: typeof provider.auth_method === 'string' ? provider.auth_method : undefined,
+      description: typeof provider.description === 'string' ? provider.description : undefined,
+      models,
+      plugin_id: plugin.id,
+    }];
+  });
+}
+
+function connectedModelOptions(models: AvailableModel[], settings: SettingsRecord | null) {
+  const byID = new Map<string, AvailableModel>();
+  for (const model of models) {
+    if (!model.id || model.config?.enabled === false) continue;
+    if (isNonUserSelectableModel(model, settings)) continue;
+    const existing = byID.get(model.id);
+    const matchesCurrent = model.id === settings?.model_name
+      && (!settings?.model_provider || providerMatches(model.provider, settings.model_provider))
+      && (!settings?.model_base_url || normalizeBaseURL(model.base_url || '') === normalizeBaseURL(settings.model_base_url));
+    if (!existing || matchesCurrent) {
+      byID.set(model.id, model);
+    }
+  }
+  if (settings?.model_name && !byID.has(settings.model_name)) {
+    byID.set(settings.model_name, {
+      provider: settings.model_provider,
+      base_url: settings.model_base_url,
+      id: settings.model_name,
+      display_name: settings.model_name,
+      owner: settings.model_provider,
+      config: {
+        role: 'default',
+        enabled: true,
+        temperature: 0.7,
+        timeout_seconds: 60,
+        max_retries: 1,
+        supports_json_mode: true,
+        supports_tool_calling: true,
+        supports_reasoning: false,
+      },
+    });
+  }
+  return Array.from(byID.values()).sort((a, b) => {
+    if (a.id === settings?.model_name) return -1;
+    if (b.id === settings?.model_name) return 1;
+    return modelOptionLabel(a).localeCompare(modelOptionLabel(b));
+  });
+}
+
+function isNonUserSelectableModel(model: AvailableModel, settings: SettingsRecord | null) {
+  if (model.id === settings?.model_name) return false;
+  const provider = normalizeProvider(model.provider || model.owner || '');
+  return provider.includes('mock') || provider.includes('deterministic');
+}
+
+function normalizePersonaModelSelection(value: string | undefined, models: AvailableModel[], fallback: string) {
+  const modelID = value?.trim() || '';
+  if (modelID && models.some((model) => model.id === modelID)) return modelID;
+  return fallback;
+}
+
+function configuredPersonaModelName(value: string | undefined) {
+  const modelID = value?.trim() || '';
+  if (!modelID || /^使用.*模型/.test(modelID)) return '';
+  return modelID;
+}
+
+function modelOptionKey(model: AvailableModel) {
+  return [model.provider || '', model.base_url || '', model.id].join(':');
+}
+
+function modelOptionLabel(model: AvailableModel) {
+  return model.display_name || model.id;
+}
+
+function modelDisplayName(model: AvailableModel) {
+  return model.display_name || model.id;
+}
+
+function modelSupportsReasoningEffort(model: AvailableModel, settings: SettingsRecord | null) {
+  if (model.supports_reasoning || model.config?.supports_reasoning) return true;
+  const provider = normalizeProvider(model.provider || model.owner || settings?.model_provider || '');
+  const modelID = model.id.trim().toLowerCase();
+  if (providerAliases('grok_build').has(provider) && modelID.startsWith('grok-4.')) return true;
+  return modelID.includes('reasoning') && !modelID.includes('non-reasoning');
+}
+
+function projectLocalPathValue(project: PersonaMessengerSnapshot['projects'][number] | null) {
+  const value = project?.metadata?.local_path;
+  return typeof value === 'string' ? value : '';
+}
+
 function normalizeProvider(value: string) {
   return value.trim().toLowerCase();
 }
 
 function providerAliases(provider: string): Set<string> {
-  if (['xai', 'xai_oauth', 'xai-oauth'].includes(provider)) {
-    return new Set(['xai', 'xai_oauth', 'xai-oauth']);
+  if (['xai', 'xai_oauth', 'xai-oauth', 'grok_build', 'grok-build'].includes(provider)) {
+    return new Set(['xai', 'xai_oauth', 'xai-oauth', 'grok_build', 'grok-build']);
   }
   return new Set([provider]);
 }
@@ -6706,6 +9786,8 @@ const knownProviderOwnerValues = new Set([
   'xai',
   'xai-oauth',
   'xai_oauth',
+  'grok_build',
+  'grok-build',
 ]);
 
 function normalizeBaseURL(value: string) {
@@ -6725,6 +9807,43 @@ function preferredReasoningModel(models: AvailableModel[]) {
     || models.find((model) => model.id.toLowerCase().includes('pro'))?.id
     || models[0]?.id
     || '';
+}
+
+function normalizeReasoningEffortValue(value: string | undefined) {
+  return value && reasoningEffortOptions.some((option) => option.value === value) ? value : 'low';
+}
+
+function splitSettingsList(value: string): string[] {
+  return value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
+}
+
+function defaultWorkspaceSettings(): WorkspaceSettings {
+  return {
+    allowed_roots: ['/Users/hao/project/Joi'],
+    default_root: '/Users/hao/project/Joi',
+    browser_allowed_hosts: [],
+    web_research_allow_private_hosts: false,
+    web_search_provider: 'auto',
+    file_analyze_max_bytes: 256 * 1024,
+    workspace_search_max_results: 50,
+    browser_enabled: true,
+    github_api_base_url: 'https://api.github.com',
+    node_assignment_policy: 'main_first',
+    allow_remote_execution: false,
+    privacy_local_only: true,
+    remote_execution_requires_confirmation: true,
+    diagnostic_redaction_enabled: true,
+    destructive_operations_disabled: true,
+    desktop_notifications_enabled: true,
+    desktop_notification_sound: true,
+    cli_enabled: false,
+    cli_socket_path: '',
+    webhook_chat_enabled: false,
+    webhook_chat_path: '/hooks/joi-chat',
+    wechat_claw_enabled: false,
+    wechat_claw_endpoint: '',
+    wechat_claw_allowed_senders: [],
+  };
 }
 
 function OnboardingPanel({
@@ -7038,28 +10157,31 @@ function ClosureReportPanel({
   const handoffStatus = externalHandoffAudit?.status || 'unknown';
   const handoffReadiness = externalHandoffAudit?.readiness;
   const pendingExternalHandoffs = externalHandoffAudit?.pending_external_handoffs ?? [];
+  const readinessCredentials = Object.values(handoffReadiness?.credentials ?? {});
+  const readinessChecks = Object.values(handoffReadiness?.checks ?? {});
+  const readinessServices = Object.values(handoffReadiness?.services ?? {});
 
   return (
     <section className="settings-data-panel closure-report-panel">
-      <h3>最近运行闭环报告</h3>
+      <h3>最近运行完整性</h3>
       <article className="row-card compact closure-run-card">
-        <strong>外部入口 Handoff</strong>
+        <strong>外部入口接续</strong>
         <small>
           状态：{formatExternalHandoffStatus(handoffStatus)}
-          {handoffReadiness?.checked ? ` · 连接：${handoffReadiness.ok ? 'ready' : 'not ready'}` : ''}
+          {handoffReadiness?.checked ? ` · 连接：${handoffReadiness.ok ? '正常' : '需要检查'}` : ''}
         </small>
         <div className="closure-report-signals">
-          <span>外部运行：{externalHandoffAudit?.metrics.external_runs ?? 0}</span>
-          <span>Desktop 运行：{externalHandoffAudit?.metrics.desktop_runs ?? 0}</span>
-          <span>已链接任务：{externalHandoffAudit?.metrics.linked_external_desktop_tasks ?? 0}</span>
-          <span>入口：{externalHandoffAudit?.external_channels_seen.length ? externalHandoffAudit.external_channels_seen.join(', ') : '暂无'}</span>
+          <span>外部触发：{externalHandoffAudit?.metrics.external_runs ?? 0}</span>
+          <span>桌面任务：{externalHandoffAudit?.metrics.desktop_runs ?? 0}</span>
+          <span>已关联：{externalHandoffAudit?.metrics.linked_external_desktop_tasks ?? 0}</span>
+          <span>来源：{externalHandoffAudit?.external_channels_seen.length ? externalHandoffAudit.external_channels_seen.map(formatChannelLabel).join('、') : '暂无'}</span>
         </div>
         {pendingExternalHandoffs.length ? (
           <div className="closure-report-signals">
             {pendingExternalHandoffs.slice(0, 3).map((handoff) => (
               <span className="closure-report-action-signal" key={handoff.external_run_id}>
                 <span>
-                  待接续：{formatChannelLabel(handoff.external_channel)} · {compactIdentifier(handoff.product_task_id)}
+                  待接续：{formatChannelLabel(handoff.external_channel)}
                   {handoff.latest_task_status ? ` · ${formatStatus(handoff.latest_task_status)}` : ''}
                 </span>
                 <button type="button" onClick={() => void continueProductTaskByID(handoff.product_task_id)}>继续</button>
@@ -7068,57 +10190,46 @@ function ClosureReportPanel({
             {pendingExternalHandoffs.length > 3 ? <span>另 {pendingExternalHandoffs.length - 3} 条待接续</span> : null}
           </div>
         ) : null}
-        {externalHandoffAudit?.next_action ? <p>{externalHandoffAudit.next_action}</p> : null}
+        {externalHandoffAudit?.next_action ? <p>{userFacingNextAction(externalHandoffAudit.next_action)}</p> : null}
         {handoffReadiness?.checked ? (
           <div className="closure-report-signals">
-            {Object.entries(handoffReadiness.credentials).map(([name, credential]) => (
-              <span key={name}>{name}：{credential.present ? credential.source : 'missing'}</span>
-            ))}
-            {Object.entries(handoffReadiness.checks).map(([name, check]) => (
-              <span key={name}>{name}：{check.ok ? 'passed' : check.status}</span>
-            ))}
-            {Object.entries(handoffReadiness.services).map(([name, service]) => (
-              <span key={`service-${name}`}>{service.label || name}：{formatExternalServiceStatus(service)}</span>
-            ))}
+            <span>连接凭证：{readinessCredentials.filter((item) => item.present).length}/{readinessCredentials.length}</span>
+            <span>连接检查：{readinessChecks.filter((item) => item.ok).length}/{readinessChecks.length}</span>
+            <span>相关服务：{readinessServices.filter((item) => formatExternalServiceStatus(item) === '正常').length}/{readinessServices.length}</span>
           </div>
         ) : null}
       </article>
       <dl className="metrics closure-report-metrics">
         <KV label="最近运行" value={`${metrics.total_runs} 条`} />
-        <KV label="终态事件" value={`${metrics.terminal_event_runs} 条`} />
-        <KV label="任务覆盖" value={`${metrics.execution_runs_with_task_or_refusal}/${metrics.execution_runs}`} />
-        <KV label="任务证据" value={`${metrics.completed_tasks_with_evidence}/${metrics.completed_tasks}`} />
-        <KV label="工具证据" value={`${metrics.runs_with_tool_evidence} 条`} />
-        <KV label="记忆使用" value={`${metrics.runs_with_memory_events} 条`} />
-        <KV label="主动闭环" value={`${metrics.runs_with_proactive_events} 条`} />
-        <KV label="Handoff" value={`${metrics.runs_with_handoff_events} 条`} />
+        <KV label="完整记录" value={`${metrics.terminal_event_runs} 条`} />
+        <KV label="任务记录" value={`${metrics.execution_runs_with_task_or_refusal}/${metrics.execution_runs}`} />
+        <KV label="结果依据" value={`${metrics.completed_tasks_with_evidence}/${metrics.completed_tasks}`} />
+        <KV label="使用能力" value={`${metrics.runs_with_tool_evidence} 条`} />
+        <KV label="参考记忆" value={`${metrics.runs_with_memory_events} 条`} />
+        <KV label="主动跟进" value={`${metrics.runs_with_proactive_events} 条`} />
+        <KV label="外部接续" value={`${metrics.runs_with_handoff_events} 条`} />
         <KV label="需恢复" value={`${metrics.recoverable_runs} 条`} />
       </dl>
       <RecordList
         emptyText="暂无运行闭环报告。"
         items={items.slice(0, 12)}
         renderItem={(item) => {
-          const terminalLabel = item.terminal_event_present
-            ? (item.terminal_event_type || item.terminal_status || '已记录')
-            : '缺失';
           const updatedAt = formatShortTime(item.updated_at || item.created_at) || '未知时间';
           return (
             <article key={item.run_id} className="row-card compact closure-run-card">
-              <strong>{compactIdentifier(item.run_id) || '未知运行'}</strong>
+              <strong>运行记录 · {updatedAt}</strong>
               <small>
                 状态：{formatStatus(item.status)}
-                {item.terminal_status ? ` · 终态：${formatStatus(item.terminal_status)}` : ''}
-                {item.task_id ? ` · 任务：${compactIdentifier(item.task_id)}` : ''}
+                {item.terminal_status ? ` · 完成状态：${formatStatus(item.terminal_status)}` : ''}
               </small>
               <div className="closure-report-signals">
-                <span>终态事件：{terminalLabel}</span>
-                <span>任务证据：{item.has_task_evidence ? '有' : '无'}</span>
-                <span>工具：{item.tool_run_count} 次</span>
-                <span>终态工具：{item.terminal_tool_event_count}</span>
-                <span>记忆：{item.memory_event_count}</span>
-                <span>主动：{item.proactive_event_count}</span>
-                <span>Handoff：{item.handoff_event_count}</span>
-                <span>恢复：{item.recovery_required ? '需要' : '无需'}</span>
+                <span>完整记录：{item.terminal_event_present ? '有' : '无'}</span>
+                <span>结果依据：{item.has_task_evidence ? '有' : '无'}</span>
+                <span>能力调用：{item.tool_run_count} 次</span>
+                <span>参考记忆：{item.memory_event_count} 条</span>
+                <span>主动跟进：{item.proactive_event_count} 条</span>
+                <span>外部接续：{item.handoff_event_count} 条</span>
+                <span>需要恢复：{item.recovery_required ? '是' : '否'}</span>
               </div>
               {item.task_status || item.terminal_reason ? (
                 <small>
@@ -7128,12 +10239,10 @@ function ClosureReportPanel({
                 </small>
               ) : null}
               {item.task_evidence_summary ? <p>{item.task_evidence_summary}</p> : null}
-              <small>更新：{updatedAt}</small>
             </article>
           );
         }}
       />
-      <CollapsedData label="闭环报告 JSON" value={report ?? {}} />
     </section>
   );
 }
@@ -7417,7 +10526,7 @@ function SettingsPanel({
       setBaseURL(result.base_url);
       setModelName(result.model_name);
       setTestStatus(`xAI：已登录 · ${result.scope}`);
-      setNotice('xAI OAuth 已登录并切换到 grok-4.3');
+      setNotice('Grok Build 已登录并切换到 grok-4.5');
       await refreshAll();
     } catch (error) {
       setTestStatus(`xAI：登录失败 · ${error instanceof Error ? error.message : String(error)}`);
@@ -7553,6 +10662,7 @@ function SettingsPanel({
               类型
               <select value={secretName} onChange={(event) => setSecretName(event.target.value)}>
                 <option value="MODEL_API_KEY">MODEL_API_KEY</option>
+                <option value="BRAVE_SEARCH_API_KEY">BRAVE_SEARCH_API_KEY</option>
                 <option value="TELEGRAM_BOT_TOKEN">TELEGRAM_BOT_TOKEN</option>
                 <option value="PHOTON_PROJECT_SECRET">PHOTON_PROJECT_SECRET</option>
                 <option value="PHOTON_DASHBOARD_TOKEN">PHOTON_DASHBOARD_TOKEN</option>
@@ -7672,7 +10782,7 @@ function TraceRuntimeSummary({ trace }: { trace: RunTrace }) {
       <InsightList empty="本次没有注入 confirmed memory。">
         {usedMemories.map((result) => (
           <InsightItem key={`trace-memory-${result.memory.id}`} title={result.memory.summary || result.memory.type} body={result.memory.content}>
-            <small>score {result.score.toFixed(2)} · {formatMemoryReason(result.reason)}</small>
+            <small>匹配度 {Math.round(result.score * 100)}% · {formatMemoryReason(result.reason)}</small>
           </InsightItem>
         ))}
       </InsightList>
@@ -7714,12 +10824,274 @@ function TraceRuntimeSummary({ trace }: { trace: RunTrace }) {
 }
 
 function CollapsedData({ label, value }: { label: string; value: unknown }) {
+  const rows = userFacingDetailRows(value);
+  if (rows.length === 0) return null;
   return (
-    <details className="json-details">
-      <summary>{label}</summary>
-      <pre>{formatRawData(value)}</pre>
+    <details className="json-details user-facing-details">
+      <summary>{userFacingDisclosureLabel(label)}</summary>
+      <dl className="compact-kv user-facing-detail-grid">
+        {rows.map((row, index) => (
+          <KV key={`${row.label}-${index}`} label={row.label} value={row.value} />
+        ))}
+      </dl>
     </details>
   );
+}
+
+type UserFacingDetailRow = { label: string; value: string };
+
+const hiddenDetailKeyPattern = /(^|_)(id|ids|token|secret|key|hash|schema|metadata|raw|payload|prompt|input|output|header|headers|sql|trace|contract|cache|internal|debug|stack|source_event|dedup|route|scope)(_|$)/i;
+
+function userFacingDetailRows(value: unknown): UserFacingDetailRow[] {
+  const parsed = parseStructuredText(value);
+  return collectUserFacingDetailRows(parsed).slice(0, 18);
+}
+
+function collectUserFacingDetailRows(value: unknown, parentLabel = '', depth = 0): UserFacingDetailRow[] {
+  if (value === null || value === undefined || depth > 2) return [];
+  if (Array.isArray(value)) {
+    if (value.length === 0) return parentLabel ? [{ label: parentLabel, value: '暂无' }] : [];
+    if (value.every((item) => ['string', 'number', 'boolean'].includes(typeof item))) {
+      return [{ label: parentLabel || '内容', value: value.slice(0, 8).map((item) => formatDetailValue(item, parentLabel)).join('、') }];
+    }
+    return [{ label: parentLabel || '项目', value: `${value.length} 项` }];
+  }
+  if (typeof value !== 'object') {
+    return parentLabel ? [{ label: parentLabel, value: formatDetailValue(value, parentLabel) }] : [];
+  }
+  const rows: UserFacingDetailRow[] = [];
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (shouldHideDetailKey(key) || item === null || item === undefined || item === '') continue;
+    const label = userFacingFieldLabel(key);
+    if (Array.isArray(item)) {
+      rows.push(...collectUserFacingDetailRows(item, label, depth + 1));
+      continue;
+    }
+    if (typeof item === 'object') {
+      rows.push(...collectUserFacingDetailRows(item, label, depth + 1));
+      continue;
+    }
+    rows.push({ label, value: formatDetailValue(item, key) });
+  }
+  return rows;
+}
+
+function shouldHideDetailKey(key: string) {
+  const normalized = key.trim().toLowerCase();
+  return !normalized
+    || normalized.startsWith('_')
+    || hiddenDetailKeyPattern.test(normalized)
+    || ['preview', 'entities', 'recent_usage', 'positive_examples', 'negative_examples', 'dynamic_tail', 'prefix'].includes(normalized);
+}
+
+function userFacingFieldLabel(key: string) {
+  const labels: Record<string, string> = {
+    active_tasks: '运行中任务',
+    allowed: '是否允许',
+    count: '数量',
+    created_at: '创建时间',
+    description: '说明',
+    duration_ms: '耗时',
+    enabled: '是否启用',
+    error: '问题',
+    error_code: '问题类型',
+    error_message: '问题说明',
+    futureEffect: '后续作用',
+    item_count: '项目数量',
+    message: '说明',
+    model: '模型',
+    model_name: '模型',
+    name: '名称',
+    provider: '服务',
+    reason: '原因',
+    require_mention: '群聊需唤醒',
+    risk_level: '风险',
+    sqlite: '本地数据',
+    status: '状态',
+    summary: '摘要',
+    title: '标题',
+    total_count: '总数',
+    type: '类型',
+    updated_at: '更新时间',
+    url: '地址',
+    version: '版本',
+    why: '记住原因',
+  };
+  return labels[key] ?? formatFieldName(key);
+}
+
+function formatDetailValue(value: unknown, key: string) {
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  if (typeof value === 'number') return key.toLowerCase().includes('duration') ? formatMilliseconds(value) : String(value);
+  const text = String(value).trim();
+  if (!text) return '未设置';
+  if (key.toLowerCase().includes('risk')) return formatRiskLevel(text);
+  if (key.toLowerCase().includes('status')) return formatStatus(text);
+  if (/(?:_at|time|date)$/i.test(key) && !Number.isNaN(Date.parse(text))) return formatShortTime(text);
+  return text.length > 220 ? `${text.slice(0, 217)}…` : text;
+}
+
+function parseStructuredText(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const text = value.trim();
+  if (!text || (!text.startsWith('{') && !text.startsWith('['))) return value;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return value;
+  }
+}
+
+function userFacingDisclosureLabel(label: string) {
+  if (/输出|结果/i.test(label)) return '结果摘要';
+  if (/备份|清单/i.test(label)) return '内容摘要';
+  if (/性格|范围/i.test(label)) return label;
+  return '补充信息';
+}
+
+function capabilityDisplayName(id: string, fallbackDescription = '') {
+  const labels: Record<string, string> = {
+    bash: '运行受控命令',
+    browser_open: '打开网页',
+    browser_scroll: '浏览网页',
+    debugger_attach: '连接调试器',
+    desktop_app_list: '查看已安装应用',
+    execute_code: '运行代码',
+    file_analyze: '分析文件',
+    github: '访问 GitHub',
+    image_generate: '生成图片',
+    ls: '查看文件夹',
+    mcp_tool_call: '使用已授权扩展',
+    read_file: '读取文件',
+    session_search: '搜索历史会话',
+    text_to_speech: '生成语音',
+    video_generate: '生成视频',
+    web_extract: '读取网页内容',
+    web_search: '搜索网页',
+    workspace_search: '搜索工作区',
+    x_search: '搜索 X',
+  };
+  if (labels[id]) return labels[id];
+  const description = fallbackDescription.trim();
+  if (description && !/[{}\[\]_]/.test(description)) return description.length > 56 ? `${description.slice(0, 53)}…` : description;
+  return '受控扩展能力';
+}
+
+function capabilityUserDescription(id: string, fallbackDescription = '') {
+  const descriptions: Record<string, string> = {
+    desktop_app_list: '查看本机已安装应用的名称和基本信息，不读取应用内容。',
+    file_analyze: '在已授权文件夹内读取并分析你指定的文件。',
+    workspace_search: '在已授权工作区中查找文件和内容。',
+  };
+  return descriptions[id] || (/[\u4e00-\u9fff]/.test(fallbackDescription) ? fallbackDescription : '在授权范围内完成任务；涉及写入或高风险操作时会先请求确认。');
+}
+
+function extensionDisplayName(value: string) {
+  const labels: Record<string, string> = { 'Local MCP Registry': '本地扩展中心' };
+  return labels[value] || (/[\u4e00-\u9fff]/.test(value) ? value : '外部扩展');
+}
+
+function formatConnectionStatus(value?: string) {
+  const labels: Record<string, string> = {
+    active: '已连接',
+    connected: '已连接',
+    inactive: '未连接',
+    not_configured: '尚未配置',
+    offline: '离线',
+  };
+  return labels[value || ''] || '状态未知';
+}
+
+function skillDisplayName(value: string) {
+  const labels: Record<string, string> = { 'Desktop Inventory': '本机应用清单' };
+  return labels[value] || (/[\u4e00-\u9fff]/.test(value) ? value : '扩展技能');
+}
+
+function skillUserDescription(name: string, description: string) {
+  if (name === 'Desktop Inventory') return '列出本机已安装应用的名称和基本信息，不读取应用内容。';
+  return /[\u4e00-\u9fff]/.test(description) ? description : '按需组合已授权能力完成特定任务。';
+}
+
+function displayPathName(value?: string) {
+  const text = value?.trim();
+  if (!text) return '未设置';
+  const parts = text.split('/').filter(Boolean);
+  return parts[parts.length - 1] || text;
+}
+
+function automationPromptForDisplay(value: string) {
+  return value
+    .replace(/\{\{\s*payload(?:\.[^}]+)?\s*\}\}/gi, '收到的事件信息')
+    .replace(/payload\s*摘要\s*[:：]?/gi, '收到的信息：')
+    .replace(/webhook/gi, '外部事件')
+    .replace(/^Preview\b/i, '检查');
+}
+
+function formatAutomationTriggerType(value?: string) {
+  const labels: Record<string, string> = {
+    cron: '自定义时间', daily: '每天', interval: '定时间隔', manual: '手动运行', once: '单次运行', webhook: '外部事件', weekly: '每周',
+  };
+  return labels[value || ''] || '自动触发';
+}
+
+function threadEventLabel(value: string) {
+  if (value.includes('artifact')) return '交付物已更新';
+  if (value.includes('message')) return '聊天内容已关联';
+  if (value.includes('run') || value.includes('task')) return '运行状态已更新';
+  if (value.includes('complete')) return '工作已完成';
+  return '线程已更新';
+}
+
+function displayThreadTitle(value: string) {
+  return value.replace(/\s*[·|]\s*[a-z][a-z0-9_-]*$/i, '').trim() || '未命名线程';
+}
+
+function formatThreadPriority(value?: string) {
+  const labels: Record<string, string> = { high: '高', low: '低', normal: '普通', urgent: '紧急' };
+  return labels[value || ''] || '普通';
+}
+
+function formatLogLevel(value?: string) {
+  const labels: Record<string, string> = {
+    debug: '调试', error: '错误', fatal: '严重错误', info: '正常', trace: '详细过程', warn: '提醒', warning: '提醒',
+  };
+  return labels[value || ''] || '记录';
+}
+
+function formatLogCategory(value?: string) {
+  const labels: Record<string, string> = {
+    external: '外部连接', ipc: '桌面操作', model: '模型调用', run: '任务运行', runtime: 'Joi 运行', settings: '设置变更', system: '系统状态', terminal: '命令执行', tool: '能力调用', worker_gateway: '执行器连接',
+  };
+  return labels[value || ''] || 'Joi 活动';
+}
+
+function friendlyLogSummary(log: LogEntry) {
+  const message = log.message?.trim() || '';
+  if (message && /[\u4e00-\u9fff]/.test(message) && !/[{\[]/.test(message)) {
+    return message.length > 140 ? `${message.slice(0, 137)}…` : message;
+  }
+  const category = formatLogCategory(log.category);
+  if (log.error || ['failed', 'error', 'fatal'].includes(String(log.status || log.level).toLowerCase())) return `${category}遇到问题`;
+  return `${category}已记录`;
+}
+
+function formatCleanupScope(value: string) {
+  const labels: Record<string, string> = {
+    app_logs: '应用活动',
+    log_files: '本地记录文件',
+    model_calls: '模型调用',
+    run_events: '运行事件',
+    run_steps: '运行步骤',
+    tool_runs: '能力调用',
+    worker_gateway_audit_logs: '执行器连接',
+  };
+  return labels[value] || '运行记录';
+}
+
+function userFacingNextAction(value: string) {
+  const text = value.trim();
+  if (!text) return '';
+  return /[\u4e00-\u9fff]/.test(text) ? text : '外部入口还有后续操作需要处理。';
 }
 
 function formatRawData(value: unknown) {
@@ -7817,6 +11189,15 @@ function formatStatus(status: string) {
     blocked: '已阻止',
     disabled: '已停用',
     enabled: '已启用',
+    active: '活跃',
+    inactive: '未连接',
+    online: '在线',
+    offline: '离线',
+    idle: '空闲',
+    warm: '就绪',
+    dormant: '休眠',
+    reviewing: '复核中',
+    none: '暂无',
     configured: '已配置',
     missing: '缺失',
     required: '必填',
@@ -7838,7 +11219,7 @@ function formatUsageStatus(status?: string) {
 
 function formatChannelLabel(channel?: string) {
   const labels: Record<string, string> = {
-    desktop: 'Desktop',
+    desktop: '桌面',
     telegram: 'Telegram',
     imessage: 'iMessage',
   };
@@ -7848,10 +11229,10 @@ function formatChannelLabel(channel?: string) {
 function formatExternalHandoffStatus(status: string) {
   const labels: Record<string, string> = {
     sqlite_missing: '数据库缺失',
-    schema_missing: 'Schema 缺失',
+    schema_missing: '数据结构缺失',
     external_not_ready: '外部入口未就绪',
     awaiting_external_input: '等待外部消息',
-    awaiting_desktop_continuation: '等待 Desktop 继续',
+    awaiting_desktop_continuation: '等待桌面继续',
     live_handoff_linked: '已链接',
     unknown: '未知',
   };
@@ -7859,12 +11240,12 @@ function formatExternalHandoffStatus(status: string) {
 }
 
 function formatExternalServiceStatus(service: ExternalHandoffAudit['readiness']['services'][string]) {
-  if (service.ready) return 'ready';
-  if (!service.enabled) return 'disabled';
-  if (!service.configured) return 'not configured';
-  if (!service.running) return 'not running';
-  if (service.last_error) return `failed: ${compactInlineText(service.last_error, 80)}`;
-  return 'not ready';
+  if (service.ready) return '正常';
+  if (!service.enabled) return '未启用';
+  if (!service.configured) return '未配置';
+  if (!service.running) return '未运行';
+  if (service.last_error) return '需要检查';
+  return '未就绪';
 }
 
 function compactInlineText(value: string, maxLength: number) {
