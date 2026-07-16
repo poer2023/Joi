@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import {
+  automationTaskCompletionFailure,
   apiErrorShape,
   apiShape,
   computeNextAutomationFire,
+  computeNextRRuleFire,
   createWebhookSignature,
   renderAutomationPrompt,
   scheduleDedupKey,
@@ -12,6 +14,17 @@ import {
 } from '../src/automation.ts';
 
 const base = new Date('2026-01-01T00:00:00.000Z');
+
+assert.equal(automationTaskCompletionFailure(undefined), undefined);
+assert.equal(automationTaskCompletionFailure({ status: 'completed', verification: { status: 'passed' } }), undefined);
+assert.deepEqual(
+  automationTaskCompletionFailure({
+    status: 'blocked',
+    terminal_status: 'blocked',
+    verification: { status: 'failed', summary: 'Verification failed.' },
+  }),
+  { code: 'TASK_VERIFICATION_FAILED', message: 'Verification failed.' },
+);
 
 assert.equal(
   computeNextAutomationFire({ type: 'cron', expression: '*/5 * * * *', timezone: 'UTC' }, base),
@@ -31,6 +44,23 @@ assert.equal(
 assert.equal(
   computeNextAutomationFire({ type: 'weekly', weekday: 'friday', time: '10:00', timezone: 'UTC' }, base),
   '2026-01-02T10:00:00.000Z',
+);
+
+assert.equal(
+  computeNextRRuleFire('FREQ=DAILY;BYHOUR=9;BYMINUTE=30;BYSECOND=0', base, { timezone: 'UTC' }),
+  '2026-01-01T09:30:00.000Z',
+);
+assert.equal(
+  computeNextRRuleFire('DTSTART:20260101T013000\nRRULE:FREQ=HOURLY;INTERVAL=6;BYMINUTE=30;BYSECOND=0', new Date('2026-01-01T02:00:00.000Z'), { timezone: 'UTC' }),
+  '2026-01-01T07:30:00.000Z',
+);
+assert.equal(
+  computeNextRRuleFire('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0;BYSECOND=0', new Date('2026-01-02T09:00:00.000Z'), { timezone: 'UTC' }),
+  '2026-01-05T08:00:00.000Z',
+);
+assert.equal(
+  computeNextRRuleFire('DTSTART:20260102T120000\nRRULE:FREQ=DAILY;COUNT=1', base, { timezone: 'UTC' }),
+  '2026-01-02T12:00:00.000Z',
 );
 
 assert.equal(computeNextAutomationFire({ type: 'once', run_at: '2025-12-31T00:00:00.000Z' }, base), undefined);

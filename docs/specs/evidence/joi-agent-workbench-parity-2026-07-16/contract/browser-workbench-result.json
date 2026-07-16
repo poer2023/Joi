@@ -1,0 +1,313 @@
+{
+  "opened": {
+    "session_id": "browser_mrmi8z73_1",
+    "action": "open",
+    "active_tab_id": 1,
+    "url": "http://127.0.0.1:49629/",
+    "title": "Joi Browser Harness",
+    "tabs": [
+      {
+        "id": 1,
+        "title": "Joi Browser Harness",
+        "url": "http://127.0.0.1:49629/",
+        "active": true
+      }
+    ]
+  },
+  "observed": {
+    "session_id": "browser_mrmi8z73_1",
+    "action": "observe",
+    "active_tab_id": 1,
+    "url": "http://127.0.0.1:49629/",
+    "title": "Joi Browser Harness",
+    "tabs": [
+      {
+        "id": 1,
+        "title": "Joi Browser Harness",
+        "url": "http://127.0.0.1:49629/",
+        "active": true
+      }
+    ],
+    "text": "JOI BROWSER REAL CONTROL\nApply Popup\nidle",
+    "result": {
+      "title": "Joi Browser Harness",
+      "url": "http://127.0.0.1:49629/",
+      "text": "JOI BROWSER REAL CONTROL\nApply Popup\nidle",
+      "interactive": [
+        {
+          "index": 0,
+          "tag": "input",
+          "role": "",
+          "text": "type here",
+          "id": "name",
+          "name": "",
+          "type": "",
+          "href": ""
+        },
+        {
+          "index": 1,
+          "tag": "button",
+          "role": "",
+          "text": "Apply",
+          "id": "submit",
+          "name": "",
+          "type": "",
+          "href": ""
+        },
+        {
+          "index": 2,
+          "tag": "input",
+          "role": "",
+          "text": "",
+          "id": "file",
+          "name": "",
+          "type": "file",
+          "href": ""
+        },
+        {
+          "index": 3,
+          "tag": "button",
+          "role": "",
+          "text": "Popup",
+          "id": "popup",
+          "name": "",
+          "type": "",
+          "href": ""
+        }
+      ]
+    }
+  },
+  "vision": {
+    "status": "completed",
+    "capability": "image_analyze",
+    "mode": "macos_vision_ffprobe_v1",
+    "source_path": "/Users/hao/Library/Application Support/Electron/browser-captures/browser-browser_mrmi8z73_1-1-1784145641311.png",
+    "preview_url": "file:///Users/hao/Library/Application%20Support/Electron/browser-captures/browser-browser_mrmi8z73_1-1-1784145641311.png",
+    "width": 1180,
+    "height": 748,
+    "text": "",
+    "observations": [],
+    "media": {
+      "streams": [
+        {
+          "index": 0,
+          "codec_name": "png",
+          "codec_long_name": "PNG (Portable Network Graphics) image",
+          "codec_type": "video",
+          "codec_tag_string": "[0][0][0][0]",
+          "codec_tag": "0x0000",
+          "width": 1180,
+          "height": 748,
+          "coded_width": 1180,
+          "coded_height": 748,
+          "has_b_frames": 0,
+          "pix_fmt": "rgb24",
+          "level": -99,
+          "color_range": "pc",
+          "color_space": "gbr",
+          "refs": 1,
+          "r_frame_rate": "25/1",
+          "avg_frame_rate": "25/1",
+          "time_base": "1/25",
+          "disposition": {
+            "default": 0,
+            "dub": 0,
+            "original": 0,
+            "comment": 0,
+            "lyrics": 0,
+            "karaoke": 0,
+            "forced": 0,
+            "hearing_impaired": 0,
+            "visual_impaired": 0,
+            "clean_effects": 0,
+            "attached_pic": 0,
+            "timed_thumbnails": 0,
+            "non_diegetic": 0,
+            "captions": 0,
+            "descriptions": 0,
+            "metadata": 0,
+            "dependent": 0,
+            "still_image": 0,
+            "multilayer": 0
+          }
+        }
+      ],
+      "format": {
+        "filename": "/Users/hao/Library/Application Support/Electron/browser-captures/browser-browser_mrmi8z73_1-1-1784145641311.png",
+        "nb_streams": 1,
+        "nb_programs": 0,
+        "nb_stream_groups": 0,
+        "format_name": "png_pipe",
+        "format_long_name": "piped png sequence",
+        "size": "4461",
+        "probe_score": 99
+      }
+    },
+    "summary": "Analyzed image; no readable text was detected."
+  },
+  "console": [
+    {
+      "level": 1,
+      "message": "harness-ready",
+      "line": 9,
+      "source_id": "http://127.0.0.1:49629/",
+      "at": "2026-07-15T20:00:41.264Z"
+    },
+    {
+      "method": "Runtime.consoleAPICalled",
+      "params": {
+        "args": [
+          {
+            "type": "string",
+            "value": "harness-ready"
+          }
+        ],
+        "executionContextId": 3,
+        "stackTrace": {
+          "callFrames": [
+            {
+              "columnNumber": 12,
+              "functionName": "",
+              "lineNumber": 8,
+              "scriptId": "7",
+              "url": "http://127.0.0.1:49629/"
+            }
+          ]
+        },
+        "timestamp": 1784145641263.973,
+        "type": "log"
+      },
+      "at": "2026-07-15T20:00:41.265Z"
+    },
+    {
+      "level": 1,
+      "message": "api:true",
+      "line": 10,
+      "source_id": "http://127.0.0.1:49629/",
+      "at": "2026-07-15T20:00:41.281Z"
+    },
+    {
+      "method": "Runtime.consoleAPICalled",
+      "params": {
+        "args": [
+          {
+            "type": "string",
+            "value": "api:true"
+          }
+        ],
+        "executionContextId": 3,
+        "stackTrace": {
+          "callFrames": [
+            {
+              "columnNumber": 56,
+              "functionName": "",
+              "lineNumber": 9,
+              "scriptId": "7",
+              "url": "http://127.0.0.1:49629/"
+            }
+          ]
+        },
+        "timestamp": 1784145641281.291,
+        "type": "log"
+      },
+      "at": "2026-07-15T20:00:41.281Z"
+    },
+    {
+      "level": 1,
+      "message": "button:full-control",
+      "line": 14,
+      "source_id": "http://127.0.0.1:49629/",
+      "at": "2026-07-15T20:00:41.285Z"
+    },
+    {
+      "method": "Runtime.consoleAPICalled",
+      "params": {
+        "args": [
+          {
+            "type": "string",
+            "value": "button:full-control"
+          }
+        ],
+        "executionContextId": 3,
+        "stackTrace": {
+          "callFrames": [
+            {
+              "columnNumber": 14,
+              "functionName": "document.querySelector.onclick",
+              "lineNumber": 13,
+              "scriptId": "7",
+              "url": "http://127.0.0.1:49629/"
+            },
+            {
+              "columnNumber": 11,
+              "functionName": "",
+              "lineNumber": 4,
+              "scriptId": "10",
+              "url": ""
+            },
+            {
+              "columnNumber": 8,
+              "functionName": "",
+              "lineNumber": 6,
+              "scriptId": "10",
+              "url": ""
+            },
+            {
+              "columnNumber": 103460,
+              "functionName": "",
+              "lineNumber": 1,
+              "scriptId": "4",
+              "url": "node:electron/js2c/sandbox_bundle"
+            },
+            {
+              "columnNumber": 97964,
+              "functionName": "",
+              "lineNumber": 1,
+              "scriptId": "4",
+              "url": "node:electron/js2c/sandbox_bundle"
+            },
+            {
+              "columnNumber": 38965,
+              "functionName": "emit",
+              "lineNumber": 1,
+              "scriptId": "4",
+              "url": "node:electron/js2c/sandbox_bundle"
+            },
+            {
+              "columnNumber": 97030,
+              "functionName": "onMessage",
+              "lineNumber": 1,
+              "scriptId": "4",
+              "url": "node:electron/js2c/sandbox_bundle"
+            }
+          ]
+        },
+        "timestamp": 1784145641285.011,
+        "type": "log"
+      },
+      "at": "2026-07-15T20:00:41.285Z"
+    }
+  ],
+  "network_event_count": 9,
+  "cdp": {
+    "result": {
+      "description": "42",
+      "type": "number",
+      "value": 42
+    }
+  },
+  "tabs": [
+    {
+      "id": 1,
+      "title": "Joi Browser Harness",
+      "url": "http://127.0.0.1:49629/",
+      "active": false
+    },
+    {
+      "id": 2,
+      "title": "Second Tab",
+      "url": "http://127.0.0.1:49629/second",
+      "active": true
+    }
+  ]
+}

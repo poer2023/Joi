@@ -1,4 +1,20 @@
 packages:
-  - "apps/*"
-  - "apps/joi-desktop/frontend"
-  - "packages/*"
+  - apps/*
+  - apps/joi-desktop/frontend
+  - packages/*
+
+patchedDependencies:
+  '@injaneity/pi-computer-use@0.4.3': patches/@injaneity__pi-computer-use@0.4.3.patch
+
+# Joi bundles the Computer Use bridge and supplies the tiny Pi agent-dir
+# contract through a local shim. Mark the upstream host-runtime peers optional
+# so installing this focused extension does not pull the full Pi coding agent.
+packageExtensions:
+  '@injaneity/pi-computer-use@0.4.3':
+    peerDependenciesMeta:
+      '@earendil-works/pi-ai':
+        optional: true
+      '@earendil-works/pi-coding-agent':
+        optional: true
+      typebox:
+        optional: true

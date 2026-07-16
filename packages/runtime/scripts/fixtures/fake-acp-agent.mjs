@@ -224,6 +224,8 @@ new AgentSideConnection((connection) => ({
           mcp_server_names: sessionMcpServerNames,
           prompt_has_full_joi_web_names: promptText.includes('mcp__joi_web__web_search') && promptText.includes('mcp__joi_web__web_extract'),
           prompt_has_tool_search_fallback: promptText.includes('tool_search') && promptText.includes('joi_web web_search web_extract'),
+          prompt_has_joi_capability_names: promptText.includes('mcp__joi_capabilities__workspace_search') && promptText.includes('mcp__joi_capabilities__file_read'),
+          prompt_has_joi_capability_discovery: promptText.includes('tool_search') && promptText.includes('joi_capabilities file_read workspace_search'),
         },
       },
     });

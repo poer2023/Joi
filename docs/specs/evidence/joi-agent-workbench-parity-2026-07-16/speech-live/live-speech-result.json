@@ -1,0 +1,25 @@
+{
+  "tts": {
+    "status": "completed",
+    "capability": "text_to_speech",
+    "mode": "macos_say_ffmpeg_v1",
+    "provider": "local_macos",
+    "voice": "Samantha",
+    "format": "wav",
+    "duration_seconds": 4.539,
+    "file_path": "/Users/hao/project/Joi/docs/specs/evidence/joi-agent-workbench-parity-2026-07-16/speech-live/joi-speech-1784145653291-132404a7.wav",
+    "size": 200266,
+    "mime_type": "audio/wav"
+  },
+  "transcription": {
+    "status": "completed",
+    "capability": "speech_transcribe",
+    "mode": "local_whisper_cli_v1",
+    "provider": "local_whisper",
+    "model": "tiny.en",
+    "language": "en",
+    "duration_seconds": 4.539,
+    "transcript": "testing local speech recognition, the verification number is 42.",
+    "segment_count": 1
+  }
+}

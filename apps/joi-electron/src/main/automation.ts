@@ -10,6 +10,7 @@ import type {
 import type { JoiSQLiteStore } from '../../../../packages/store/src/sqlite';
 import type { KeychainSecretStore } from '../../../../packages/secrets/src/keychain';
 import {
+  automationTaskCompletionFailure,
   computeNextAutomationFire,
   renderAutomationPrompt,
   scheduleDedupKey,
@@ -25,7 +26,7 @@ import {
 } from './ipc';
 import type { JoiPluginManager } from './plugin-manager';
 import type { TelegramOutboundService } from './telegram-outbound';
-import { resolveAutomationModelRuntimeRoute } from './automation-runtime-route';
+import { resolveAutomationModelRuntimeRoute, resolveAutomationModelSettings } from './automation-runtime-route';
 export { AutomationWebhookServer, automationWebhookSecretRef, newAutomationWebhookSecret } from './automation-webhook';
 
 type AutomationAppLogInput = Parameters<JoiSQLiteStore['recordAppLog']>[0];
@@ -209,6 +210,9 @@ export class AutomationRunner {
         trigger_id: trigger.id,
         run_id: response.run_id,
         product_task_id: productTaskID,
+        conversation_id: response.conversation_id,
+        source_cwd: automation.cwds[0],
+        automation_name: automation.name,
       });
       const trace = this.store.getRunTrace(response.run_id);
       emitRunEventsIfPossible(this.getWindow(), this.store, response.run_id);
@@ -258,6 +262,35 @@ export class AutomationRunner {
           item_id: automationRun.id,
           payload: { automation_id: automation.id, trigger_id: trigger.id, product_task_id: productTaskID, retry_at: retryAt },
           error: { code: trace.status === 'cancelled' ? 'RUN_CANCELLED' : 'RUNTIME_FAILED', message: errorMessage },
+        });
+        emitRunEventsIfPossible(this.getWindow(), this.store, response.run_id);
+        return;
+      }
+      const productTask = response.product_task
+        || (productTaskID ? this.store.getProductTask(productTaskID).task : undefined);
+      const taskFailure = automationTaskCompletionFailure(productTask);
+      if (taskFailure) {
+        const retryAt = retryAtForAutomation(automation, trigger, taskFailure.code, taskFailure.message);
+        this.store.recordAutomationRunFailed({
+          automation_run_id: automationRun.id,
+          run_id: response.run_id,
+          product_task_id: productTaskID,
+          error_code: taskFailure.code,
+          error_message: taskFailure.message,
+          retry_at: retryAt,
+        });
+        recordAutomationAppLog(this.store, this.logger, {
+          level: 'error',
+          risk_level: 'state_change',
+          category: 'automation',
+          feature_key: 'automation.run.task_verification_failed',
+          source: 'electron_automation',
+          message: 'automation task verification failed',
+          run_id: response.run_id,
+          item_type: 'automation_run',
+          item_id: automationRun.id,
+          payload: { automation_id: automation.id, trigger_id: trigger.id, product_task_id: productTaskID, retry_at: retryAt },
+          error: taskFailure,
         });
         emitRunEventsIfPossible(this.getWindow(), this.store, response.run_id);
         return;
@@ -323,7 +356,11 @@ export class AutomationRunner {
       emitRunEventsIfPossible(this.getWindow(), this.store, response.run_id);
       return response;
     }
-    const settings = this.store.getSettings();
+    const settings = resolveAutomationModelSettings({
+      settings: this.store.getSettings(),
+      request: req,
+      availableModels: this.store.listSavedModels().models,
+    });
     const route = await resolveAutomationModelRuntimeRoute({
       settings,
       request: req,
@@ -368,13 +405,20 @@ export class AutomationRunner {
     });
     if (!message.trim()) throw codedAutomationError('INVALID_PAYLOAD', 'Automation prompt rendered empty.');
     return {
-      conversation_id: automation.conversation_id,
+      conversation_id: automation.execution_kind === 'heartbeat'
+        ? automation.target_thread_id || automation.conversation_id
+        : undefined,
       channel: automation.kind === 'webhook' ? 'webhook' : 'automation',
       user_id: `automation:${automation.id}`,
       principal_id: automation.principal_id,
       message,
       preferred_node: automation.preferred_node || 'main-node',
       allow_worker: automation.allow_worker,
+      model_provider: automation.model_provider,
+      model_name: automation.model,
+      model_base_url: automation.model_base_url,
+      reasoning_effort: automation.reasoning_effort,
+      workspace_root: automation.cwds[0],
       input_mode: automation.input_mode || 'background_task',
       runtime_mode: 'tool_calling',
       permission_profile: automation.permission_profile || 'read_only',

@@ -2,59 +2,100 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { HTMLAttributes, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 
 type ScrollAreaElement = 'div' | 'aside' | 'main' | 'section';
+type ScrollAreaAxes = 'vertical' | 'horizontal' | 'both';
+type ScrollAreaTrackVisibility = 'hover' | 'always';
 
 type ScrollAreaProps = HTMLAttributes<HTMLElement> & {
   as?: ScrollAreaElement;
+  axes?: ScrollAreaAxes;
   children: ReactNode;
   contentClassName?: string;
   stickToBottom?: boolean;
   stickToBottomKey?: string | number;
+  trackVisibility?: ScrollAreaTrackVisibility;
+  viewportAriaLabel?: string;
+  viewportTabIndex?: number;
 };
 
 const TRACK_INSET = 10;
 const MIN_THUMB_HEIGHT = 24;
-const THUMB_HEIGHT_SCALE = 0.62;
+const MIN_THUMB_WIDTH = 24;
+const THUMB_SIZE_SCALE = 0.62;
+
+type ScrollMetrics = {
+  canScrollX: boolean;
+  canScrollY: boolean;
+  thumbHeight: number;
+  thumbLeft: number;
+  thumbTop: number;
+  thumbWidth: number;
+};
+
+type ScrollDrag = {
+  axis: 'x' | 'y';
+  maxPosition: number;
+  maxScroll: number;
+  startPointer: number;
+  startScroll: number;
+};
 
 export function ScrollArea({
   as: Component = 'div',
+  axes = 'vertical',
   children,
   className = '',
   contentClassName = '',
   stickToBottom = false,
   stickToBottomKey,
+  trackVisibility = 'hover',
+  viewportAriaLabel,
+  viewportTabIndex,
   ...props
 }: ScrollAreaProps) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
-  const dragRef = useRef<{ maxScroll: number; maxTop: number; startScrollTop: number; startY: number } | null>(null);
+  const dragRef = useRef<ScrollDrag | null>(null);
   const programmaticScrollRef = useRef(false);
   const shouldStickToBottomRef = useRef(true);
   const [hovering, setHovering] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const [metrics, setMetrics] = useState({ canScroll: false, thumbHeight: MIN_THUMB_HEIGHT, thumbTop: TRACK_INSET });
+  const [metrics, setMetrics] = useState<ScrollMetrics>({
+    canScrollX: false,
+    canScrollY: false,
+    thumbHeight: MIN_THUMB_HEIGHT,
+    thumbLeft: TRACK_INSET,
+    thumbTop: TRACK_INSET,
+    thumbWidth: MIN_THUMB_WIDTH,
+  });
 
   const updateMetrics = useCallback(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
 
-    const { clientHeight, scrollHeight, scrollTop } = viewport;
+    const { clientHeight, clientWidth, scrollHeight, scrollLeft, scrollTop, scrollWidth } = viewport;
     if (stickToBottom && !programmaticScrollRef.current) {
       shouldStickToBottomRef.current = scrollHeight - clientHeight - scrollTop < 80;
     }
-    const canScroll = scrollHeight > clientHeight + 1;
-    if (!canScroll) {
-      setMetrics((current) => current.canScroll ? { canScroll: false, thumbHeight: MIN_THUMB_HEIGHT, thumbTop: TRACK_INSET } : current);
-      return;
-    }
+
+    const canScrollY = axes !== 'horizontal' && scrollHeight > clientHeight + 1;
+    const canScrollX = axes !== 'vertical' && scrollWidth > clientWidth + 1;
 
     const trackHeight = Math.max(0, clientHeight - TRACK_INSET * 2);
-    const proportionalHeight = (clientHeight / scrollHeight) * trackHeight;
-    const thumbHeight = Math.max(MIN_THUMB_HEIGHT, proportionalHeight * THUMB_HEIGHT_SCALE);
+    const proportionalHeight = canScrollY ? (clientHeight / scrollHeight) * trackHeight : MIN_THUMB_HEIGHT;
+    const thumbHeight = canScrollY ? Math.max(MIN_THUMB_HEIGHT, proportionalHeight * THUMB_SIZE_SCALE) : MIN_THUMB_HEIGHT;
     const maxTop = Math.max(0, trackHeight - thumbHeight);
-    const maxScroll = Math.max(1, scrollHeight - clientHeight);
-    const thumbTop = TRACK_INSET + (scrollTop / maxScroll) * maxTop;
-    setMetrics({ canScroll, thumbHeight, thumbTop });
-  }, [stickToBottom]);
+    const maxScrollTop = Math.max(1, scrollHeight - clientHeight);
+    const thumbTop = canScrollY ? TRACK_INSET + (scrollTop / maxScrollTop) * maxTop : TRACK_INSET;
+
+    const trackWidth = Math.max(0, clientWidth - TRACK_INSET * 2);
+    const proportionalWidth = canScrollX ? (clientWidth / scrollWidth) * trackWidth : MIN_THUMB_WIDTH;
+    const thumbWidth = canScrollX ? Math.max(MIN_THUMB_WIDTH, proportionalWidth * THUMB_SIZE_SCALE) : MIN_THUMB_WIDTH;
+    const maxLeft = Math.max(0, trackWidth - thumbWidth);
+    const maxScrollLeft = Math.max(1, scrollWidth - clientWidth);
+    const thumbLeft = canScrollX ? TRACK_INSET + (scrollLeft / maxScrollLeft) * maxLeft : TRACK_INSET;
+
+    setMetrics({ canScrollX, canScrollY, thumbHeight, thumbLeft, thumbTop, thumbWidth });
+  }, [axes, stickToBottom]);
 
   const scrollToBottom = useCallback(() => {
     const viewport = viewportRef.current;
@@ -96,18 +137,22 @@ export function ScrollArea({
     requestAnimationFrame(scrollToBottom);
   }, [scrollToBottom, stickToBottom, stickToBottomKey]);
 
-  function startThumbDrag(event: ReactPointerEvent<HTMLDivElement>) {
+  function startThumbDrag(event: ReactPointerEvent<HTMLDivElement>, axis: 'x' | 'y') {
     const viewport = viewportRef.current;
     if (!viewport) return;
 
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
-    const trackHeight = Math.max(0, viewport.clientHeight - TRACK_INSET * 2);
+    const trackLength = Math.max(0, (axis === 'y' ? viewport.clientHeight : viewport.clientWidth) - TRACK_INSET * 2);
+    const thumbSize = axis === 'y' ? metrics.thumbHeight : metrics.thumbWidth;
     dragRef.current = {
-      maxScroll: Math.max(1, viewport.scrollHeight - viewport.clientHeight),
-      maxTop: Math.max(1, trackHeight - metrics.thumbHeight),
-      startScrollTop: viewport.scrollTop,
-      startY: event.clientY,
+      axis,
+      maxPosition: Math.max(1, trackLength - thumbSize),
+      maxScroll: Math.max(1, axis === 'y'
+        ? viewport.scrollHeight - viewport.clientHeight
+        : viewport.scrollWidth - viewport.clientWidth),
+      startPointer: axis === 'y' ? event.clientY : event.clientX,
+      startScroll: axis === 'y' ? viewport.scrollTop : viewport.scrollLeft,
     };
     setHovering(true);
     setDragging(true);
@@ -118,8 +163,10 @@ export function ScrollArea({
     const drag = dragRef.current;
     if (!viewport || !drag) return;
 
-    const deltaY = event.clientY - drag.startY;
-    viewport.scrollTop = drag.startScrollTop + (deltaY / drag.maxTop) * drag.maxScroll;
+    const pointer = drag.axis === 'y' ? event.clientY : event.clientX;
+    const nextScroll = drag.startScroll + ((pointer - drag.startPointer) / drag.maxPosition) * drag.maxScroll;
+    if (drag.axis === 'y') viewport.scrollTop = nextScroll;
+    else viewport.scrollLeft = nextScroll;
   }
 
   function stopThumbDrag(event: ReactPointerEvent<HTMLDivElement>) {
@@ -130,48 +177,90 @@ export function ScrollArea({
     setDragging(false);
   }
 
-  function jumpToTrack(event: ReactPointerEvent<HTMLDivElement>) {
+  function jumpToTrack(event: ReactPointerEvent<HTMLDivElement>, axis: 'x' | 'y') {
     if (event.target !== event.currentTarget) return;
     const viewport = viewportRef.current;
     if (!viewport) return;
 
     const rect = event.currentTarget.getBoundingClientRect();
-    const y = event.clientY - rect.top - TRACK_INSET - metrics.thumbHeight / 2;
-    const trackHeight = Math.max(0, viewport.clientHeight - TRACK_INSET * 2);
-    const maxTop = Math.max(1, trackHeight - metrics.thumbHeight);
-    const ratio = Math.min(1, Math.max(0, y / maxTop));
-    viewport.scrollTop = ratio * Math.max(1, viewport.scrollHeight - viewport.clientHeight);
+    const thumbSize = axis === 'y' ? metrics.thumbHeight : metrics.thumbWidth;
+    const pointer = axis === 'y' ? event.clientY - rect.top : event.clientX - rect.left;
+    const trackLength = Math.max(0, (axis === 'y' ? viewport.clientHeight : viewport.clientWidth) - TRACK_INSET * 2);
+    const maxPosition = Math.max(1, trackLength - thumbSize);
+    const ratio = Math.min(1, Math.max(0, (pointer - TRACK_INSET - thumbSize / 2) / maxPosition));
+    if (axis === 'y') viewport.scrollTop = ratio * Math.max(1, viewport.scrollHeight - viewport.clientHeight);
+    else viewport.scrollLeft = ratio * Math.max(1, viewport.scrollWidth - viewport.clientWidth);
   }
 
-  const rootClassName = ['scroll-area', metrics.canScroll ? 'scroll-area-can-scroll' : '', (hovering || dragging) && metrics.canScroll ? 'scroll-area-visible' : '', className].filter(Boolean).join(' ');
+  const canScroll = metrics.canScrollX || metrics.canScrollY;
+  const rootClassName = [
+    'scroll-area',
+    `scroll-area-axes-${axes}`,
+    trackVisibility === 'always' ? 'scroll-area-tracks-always' : '',
+    canScroll ? 'scroll-area-can-scroll' : '',
+    metrics.canScrollX ? 'scroll-area-can-scroll-x' : '',
+    metrics.canScrollY ? 'scroll-area-can-scroll-y' : '',
+    (hovering || dragging) && canScroll ? 'scroll-area-visible' : '',
+    className,
+  ].filter(Boolean).join(' ');
 
   return (
     <Component className={rootClassName} {...props}>
-      <div ref={viewportRef} className="scroll-area-viewport" onScroll={updateMetrics}>
+      <div
+        ref={viewportRef}
+        aria-label={viewportAriaLabel}
+        className="scroll-area-viewport"
+        onScroll={updateMetrics}
+        tabIndex={viewportTabIndex}
+      >
         <div ref={contentRef} className={`scroll-area-content ${contentClassName}`.trim()}>
           {children}
         </div>
       </div>
-      <div
-        aria-hidden="true"
-        className="scroll-area-hover-zone"
-        onPointerEnter={() => setHovering(true)}
-        onPointerLeave={() => {
-          if (!dragging) setHovering(false);
-        }}
-        onPointerDown={jumpToTrack}
-      >
-        <div className="scroll-area-track">
-          <div
-            className="scroll-area-thumb"
-            style={{ height: metrics.thumbHeight, transform: `translateY(${metrics.thumbTop}px)` }}
-            onPointerDown={startThumbDrag}
-            onPointerMove={dragThumb}
-            onPointerUp={stopThumbDrag}
-            onPointerCancel={stopThumbDrag}
-          />
+      {axes !== 'horizontal' ? (
+        <div
+          aria-hidden="true"
+          className="scroll-area-hover-zone"
+          onPointerEnter={() => setHovering(true)}
+          onPointerLeave={() => {
+            if (!dragging) setHovering(false);
+          }}
+          onPointerDown={(event) => jumpToTrack(event, 'y')}
+        >
+          <div className="scroll-area-track">
+            <div
+              className="scroll-area-thumb"
+              style={{ height: metrics.thumbHeight, transform: `translateY(${metrics.thumbTop}px)` }}
+              onPointerDown={(event) => startThumbDrag(event, 'y')}
+              onPointerMove={dragThumb}
+              onPointerUp={stopThumbDrag}
+              onPointerCancel={stopThumbDrag}
+            />
+          </div>
         </div>
-      </div>
+      ) : null}
+      {axes !== 'vertical' ? (
+        <div
+          aria-hidden="true"
+          className="scroll-area-hover-zone scroll-area-hover-zone-horizontal"
+          onPointerEnter={() => setHovering(true)}
+          onPointerLeave={() => {
+            if (!dragging) setHovering(false);
+          }}
+          onPointerDown={(event) => jumpToTrack(event, 'x')}
+        >
+          <div className="scroll-area-track scroll-area-track-horizontal">
+            <div
+              className="scroll-area-thumb scroll-area-thumb-horizontal"
+              style={{ width: metrics.thumbWidth, transform: `translateX(${metrics.thumbLeft}px)` }}
+              onPointerDown={(event) => startThumbDrag(event, 'x')}
+              onPointerMove={dragThumb}
+              onPointerUp={stopThumbDrag}
+              onPointerCancel={stopThumbDrag}
+            />
+          </div>
+        </div>
+      ) : null}
     </Component>
   );
 }

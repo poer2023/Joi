@@ -6,6 +6,7 @@ export type AutomationScheduleConfig = {
   type?: 'cron' | 'once' | 'interval' | 'daily' | 'weekly' | string;
   cron?: string;
   expression?: string;
+  rrule?: string;
   run_at?: string;
   at?: string;
   every_seconds?: number;
@@ -40,13 +41,43 @@ export type ApiShape<T> = {
   trace_id: string;
 };
 
+export type AutomationTaskCompletion = {
+  status?: string;
+  terminal_status?: string;
+  terminal_reason?: string;
+  verification?: {
+    status?: string;
+    summary?: string;
+  };
+};
+
+export function automationTaskCompletionFailure(task: AutomationTaskCompletion | undefined): { code: string; message: string } | undefined {
+  if (!task) return undefined;
+  const status = String(task.status || '').trim().toLowerCase();
+  const terminalStatus = String(task.terminal_status || '').trim().toLowerCase();
+  const verificationStatus = String(task.verification?.status || '').trim().toLowerCase();
+  if (status !== 'blocked' && terminalStatus !== 'blocked' && verificationStatus !== 'failed') return undefined;
+  return {
+    code: 'TASK_VERIFICATION_FAILED',
+    message: task.verification?.summary?.trim()
+      || task.terminal_reason?.trim()
+      || 'Automation task verification failed.',
+  };
+}
+
 export function computeNextAutomationFire(
   config: AutomationScheduleConfig,
   from: Date = new Date(),
   options: { timezone?: string; last_fire_at?: string } = {},
 ): string | undefined {
-  const type = String(config.type || (config.cron || config.expression ? 'cron' : 'once')).toLowerCase();
+  const type = String(config.type || (config.rrule ? 'rrule' : config.cron || config.expression ? 'cron' : 'once')).toLowerCase();
   const timezone = String(config.timezone || options.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC');
+  if (type === 'rrule' || config.rrule) {
+    return computeNextRRuleFire(String(config.rrule || config.expression || ''), from, {
+      timezone,
+      last_fire_at: options.last_fire_at,
+    });
+  }
   if (type === 'cron') {
     const expression = String(config.cron || config.expression || '').trim();
     assertFiveFieldCron(expression);
@@ -74,6 +105,38 @@ export function computeNextAutomationFire(
     return CronExpressionParser.parse(`${minute} ${hour} * * ${weekday}`, { currentDate: from, tz: timezone }).next().toDate().toISOString();
   }
   throw new Error(`unsupported automation schedule type: ${type}`);
+}
+
+export function computeNextRRuleFire(
+  value: string,
+  from: Date = new Date(),
+  options: { timezone?: string; last_fire_at?: string } = {},
+): string | undefined {
+  const parsed = parseRRule(value);
+  if (!parsed.FREQ) throw new Error('automation RRULE requires FREQ');
+  const timezone = options.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const dtstart = parseRRuleDate(parsed.DTSTART, timezone);
+  const count = positiveRRuleInteger(parsed.COUNT, 0);
+  if (count === 1) {
+    if (options.last_fire_at) return undefined;
+    return dtstart && dtstart > from ? dtstart.toISOString() : undefined;
+  }
+  const until = parseRRuleDate(parsed.UNTIL, timezone);
+  const anchor = dtstart || parseDate(options.last_fire_at) || from;
+  const interval = positiveRRuleInteger(parsed.INTERVAL, 1);
+  const expression = cronExpressionForRRule(parsed, anchor, timezone);
+  let cursor = dtstart && dtstart > from
+    ? new Date(dtstart.getTime() - 60_000)
+    : from;
+  const iterator = CronExpressionParser.parse(expression, { currentDate: cursor, tz: timezone });
+  for (let attempt = 0; attempt < 20_000; attempt += 1) {
+    const candidate = iterator.next().toDate();
+    if (dtstart && candidate < dtstart) continue;
+    if (until && candidate > until) return undefined;
+    if (!rruleIntervalMatches(parsed.FREQ, candidate, anchor, interval, timezone)) continue;
+    return candidate.toISOString();
+  }
+  throw new Error('automation RRULE did not produce a bounded next occurrence');
 }
 
 export function shouldCoalesceMissedFire(nextFireAt: string | undefined, now: Date = new Date()): boolean {
@@ -177,6 +240,151 @@ export function apiErrorShape(traceID: string, code: string, message: string, de
 function assertFiveFieldCron(expression: string): void {
   const parts = expression.split(/\s+/).filter(Boolean);
   if (parts.length !== 5) throw new Error('automation cron expressions must use 5 fields');
+}
+
+type ParsedRRule = Record<string, string>;
+
+function parseRRule(value: string): ParsedRRule {
+  const parsed: ParsedRRule = {};
+  for (const rawLine of value.trim().split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/^DTSTART(?:;[^:]*)?:/i.test(line)) {
+      parsed.DTSTART = line.slice(line.indexOf(':') + 1).trim();
+      continue;
+    }
+    const body = line.replace(/^RRULE:/i, '');
+    for (const part of body.split(';')) {
+      const separator = part.indexOf('=');
+      if (separator < 1) continue;
+      parsed[part.slice(0, separator).trim().toUpperCase()] = part.slice(separator + 1).trim();
+    }
+  }
+  return parsed;
+}
+
+function cronExpressionForRRule(rule: ParsedRRule, anchor: Date, timezone: string): string {
+  const frequency = rule.FREQ.toUpperCase();
+  const anchorParts = zonedDateParts(anchor, timezone);
+  const minutes = rruleNumberList(rule.BYMINUTE, 0, 59, [anchorParts.minute]);
+  const hours = rruleNumberList(rule.BYHOUR, 0, 23, [anchorParts.hour]);
+  const weekdays = rruleWeekdays(rule.BYDAY);
+  const monthDays = rruleNumberList(rule.BYMONTHDAY, 1, 31, [anchorParts.day]);
+  if (frequency === 'MINUTELY') return `* * * * ${weekdays || '*'}`;
+  if (frequency === 'HOURLY') return `${minutes.join(',')} * * * ${weekdays || '*'}`;
+  if (frequency === 'DAILY') return `${minutes.join(',')} ${hours.join(',')} * * ${weekdays || '*'}`;
+  if (frequency === 'WEEKLY') return `${minutes.join(',')} ${hours.join(',')} * * ${weekdays || weekdayNumber(anchorParts.weekday)}`;
+  if (frequency === 'MONTHLY') return `${minutes.join(',')} ${hours.join(',')} ${monthDays.join(',')} * ${weekdays || '*'}`;
+  throw new Error(`unsupported automation RRULE frequency: ${frequency}`);
+}
+
+function rruleIntervalMatches(frequency: string, candidate: Date, anchor: Date, interval: number, timezone: string): boolean {
+  if (interval <= 1) return true;
+  const candidateParts = zonedDateParts(candidate, timezone);
+  const anchorParts = zonedDateParts(anchor, timezone);
+  const candidateDay = Date.UTC(candidateParts.year, candidateParts.month - 1, candidateParts.day) / 86_400_000;
+  const anchorDay = Date.UTC(anchorParts.year, anchorParts.month - 1, anchorParts.day) / 86_400_000;
+  let distance = 0;
+  switch (frequency.toUpperCase()) {
+    case 'MINUTELY':
+      distance = Math.floor((candidate.getTime() - anchor.getTime()) / 60_000);
+      break;
+    case 'HOURLY':
+      distance = Math.floor((candidate.getTime() - anchor.getTime()) / 3_600_000);
+      break;
+    case 'DAILY':
+      distance = candidateDay - anchorDay;
+      break;
+    case 'WEEKLY':
+      distance = Math.floor(candidateDay / 7) - Math.floor(anchorDay / 7);
+      break;
+    case 'MONTHLY':
+      distance = candidateParts.year * 12 + candidateParts.month - (anchorParts.year * 12 + anchorParts.month);
+      break;
+    default:
+      return false;
+  }
+  return distance >= 0 && distance % interval === 0;
+}
+
+function rruleNumberList(value: string | undefined, min: number, max: number, fallback: number[]): number[] {
+  const values = String(value || '').split(',')
+    .map((item) => Number(item.trim()))
+    .filter((item) => Number.isInteger(item) && item >= min && item <= max);
+  return values.length > 0 ? [...new Set(values)] : fallback;
+}
+
+function rruleWeekdays(value: string | undefined): string {
+  const mapped = String(value || '').split(',')
+    .map((item) => item.trim().toUpperCase().replace(/^[+-]?\d+/, ''))
+    .map((item) => ({ SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 })[item])
+    .filter((item): item is number => item !== undefined);
+  return [...new Set(mapped)].join(',');
+}
+
+function weekdayNumber(value: string): number {
+  return ({ Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 })[value] ?? 1;
+}
+
+function positiveRRuleInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseRRuleDate(value: string | undefined, timezone: string): Date | undefined {
+  if (!value) return undefined;
+  if (/^\d{8}T\d{6}Z$/i.test(value)) {
+    const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/i.exec(value);
+    if (!match) return undefined;
+    return new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6])));
+  }
+  const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/i.exec(value);
+  if (!match) return parseDate(value);
+  return zonedDateFromParts({
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+    hour: Number(match[4]),
+    minute: Number(match[5]),
+    second: Number(match[6]),
+  }, timezone);
+}
+
+function zonedDateFromParts(parts: { year: number; month: number; day: number; hour: number; minute: number; second: number }, timezone: string): Date {
+  const wallClockUTC = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+  let candidate = new Date(wallClockUTC);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const observed = zonedDateParts(candidate, timezone);
+    const observedUTC = Date.UTC(observed.year, observed.month - 1, observed.day, observed.hour, observed.minute, observed.second);
+    const correction = wallClockUTC - observedUTC;
+    if (correction === 0) break;
+    candidate = new Date(candidate.getTime() + correction);
+  }
+  return candidate;
+}
+
+function zonedDateParts(date: Date, timezone: string): { year: number; month: number; day: number; hour: number; minute: number; second: number; weekday: string } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    weekday: 'short',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === type)?.value || '';
+  return {
+    year: Number(value('year')),
+    month: Number(value('month')),
+    day: Number(value('day')),
+    hour: Number(value('hour')),
+    minute: Number(value('minute')),
+    second: Number(value('second')),
+    weekday: value('weekday'),
+  };
 }
 
 function positiveScheduleIntervalSeconds(config: AutomationScheduleConfig): number {

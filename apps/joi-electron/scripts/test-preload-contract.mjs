@@ -108,7 +108,7 @@ for (const required of ['allowed_capabilities: agentCapabilities', "tool_executi
   }
 }
 
-for (const required of ['executeWorkspaceSearch(', 'executeFileAnalyze(', 'executeFileRead(', 'executeWebResearch(', 'executeShellCommand(', 'executeTestCommand(', 'executeApplyPatch(', 'executeComputerObserve(', 'executeBrowserObserve(', 'executeBrowserNavigate(', 'executeBrowserClick(', 'executeBrowserType(', 'executeDesktopAppList(', 'executeDesktopAppInspect(', 'executeSystemHealthCheck(', 'executeServerDiagnose(']) {
+for (const required of ['executeWorkspaceSearch(', 'executeFileAnalyze(', 'executeFileRead(', 'executeWebResearch(', 'executeShellCommand(', 'executeTestCommand(', 'executeApplyPatch(', 'executeComputerObserve(', 'BrowserWorkbenchManager', 'executeBrowserWorkbenchAction(', 'browserRequestFromCapability(', 'executeDesktopAppList(', 'executeDesktopAppInspect(', 'executeSystemHealthCheck(', 'executeServerDiagnose(']) {
   if (!ipc.includes(required)) {
     fail(`main IPC router is missing real TS workspace/file capability integration: ${required}`);
   }

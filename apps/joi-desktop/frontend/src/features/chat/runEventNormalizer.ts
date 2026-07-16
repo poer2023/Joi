@@ -88,6 +88,7 @@ export function normalizeRunEvent(raw: unknown): NormalizedRunEvent {
   return {
     id,
     runId,
+    conversationId: stringValue(read('conversation_id', 'conversationId')) || undefined,
     seq,
     type,
     schemaVersion: numberValue(read('schema_version', 'schemaVersion')) || 1,

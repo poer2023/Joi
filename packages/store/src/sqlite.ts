@@ -13,12 +13,24 @@ import { arch, homedir, platform, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { inflateRawSync } from 'node:zlib';
+import {
+  readCodexSkill,
+  renderSelectedSkillInstructions,
+  renderSkillCatalog,
+  selectCodexSkills,
+  type DiscoveredSkill,
+  type SkillScope,
+  type SkillSelectionCandidate,
+} from '../../runtime/src/skills.ts';
 import type {
   AvailableModel,
+  AgentModelPolicy,
+  AgentModelPolicyRequest,
   ArtifactDetail,
   ArtifactSummary,
   AutomationDefinition,
   AutomationDefinitionRequest,
+  AutomationExecutionKind,
   AutomationKind,
   AutomationRunRecord,
   AutomationTriggerNowRequest,
@@ -33,12 +45,17 @@ import type {
   ConfirmationRecord,
   ConversationActionRequest,
   ConversationActionResponse,
+  ConversationCompactionRecord,
   ConversationDetail,
+  ConversationExportResult,
   ConversationFilter,
   ConversationGroup,
   ConversationGroupRequest,
   ConversationMessage,
   ConversationSummary,
+  ConversationTree,
+  ConversationTreeNode,
+  ConversationImportResult,
   CreateProjectPersonaRequest,
   CreateSharedRoomRequest,
   EvaluateRoomPermissionsRequest,
@@ -93,6 +110,7 @@ import type {
   RoutingFeedbackRequest,
   RunClosureReport,
   RunEvent,
+  RunQueuedMessage,
   RunTrace,
   RunTraceSpan,
   RunTraceSpanFilter,
@@ -111,6 +129,9 @@ import type {
   UpdateProjectPersonaRequest,
   WorkerGatewayAuditRecord,
   WorkspaceSettings,
+  AssistantWorkspaceSnapshot,
+  AssistantActionRequest,
+  AssistantActionResult,
 } from '../../shared-types/src/desktop-api';
 
 type SQLiteValue = string | number | bigint | null;
@@ -206,6 +227,9 @@ export type AutomationRunStartRequest = {
   trigger_id: string;
   run_id: string;
   product_task_id?: string;
+  conversation_id?: string;
+  source_cwd?: string;
+  automation_name?: string;
 };
 
 export type AutomationRunFinishRequest = {
@@ -395,10 +419,18 @@ export type ToolCallingPromptAssembly = {
   memory_scope: MemoryRetrievalScope;
   conversation_messages: Array<{ role: 'user' | 'assistant'; content: string }>;
   agent_capabilities: string[];
+  skill_catalog: string;
+  selected_skills: Array<{
+    id: string;
+    name: string;
+    path: string;
+    invocation: 'explicit' | 'implicit';
+    score: number;
+  }>;
   system_message: string;
 };
 
-type MemoryRetrievalScope = {
+export type MemoryRetrievalScope = {
   room_id: string;
   project_ids: string[];
   user_ids: string[];
@@ -512,6 +544,15 @@ export type ToolCallingEventCallbacks = {
   onUsage?: (event: { step: number; usage: ToolCallingCallbackUsage; usage_status: string }) => void;
   onRetry?: (event: { step: number; attempt: number; delay_ms: number; error: Error }) => void;
   onError?: (event: { step: number; error: Error }) => void;
+  onEvent?: (event: {
+    type: string;
+    step?: number;
+    attempt?: number;
+    status?: string;
+    tool_call_id?: string;
+    tool_name?: string;
+    detail?: Record<string, unknown>;
+  }) => void;
 };
 
 type ModeResolutionRecord = {
@@ -586,6 +627,8 @@ export class JoiSQLiteStore {
     this.ensurePreSchemaCompatibilityColumns();
     this.db.exec(options.schemaSql);
     this.ensureConversationClosureSchema();
+    this.ensureAdvancedAgentSchema();
+    this.ensureAgentWorkbenchSchema();
     this.ensurePersonaMessengerSchema();
     this.ensureTelegramDurabilitySchema();
     this.seedDefaults();
@@ -656,6 +699,12 @@ export class JoiSQLiteStore {
       ['error', 'TEXT'],
       ['duration_ms', 'INTEGER'],
     ] as const) ensure('app_logs', column, definition);
+
+    for (const [column, definition] of [
+      ['url', "TEXT NOT NULL DEFAULT ''"],
+      ['env', "TEXT NOT NULL DEFAULT '{}'"],
+      ['headers', "TEXT NOT NULL DEFAULT '{}'"],
+    ] as const) ensure('mcp_servers', column, definition);
   }
 
   recordAppLog(input: AppLogInput): LogEntry {
@@ -665,6 +714,7 @@ export class JoiSQLiteStore {
     const featureKey = normalizeFeatureKey(input.feature_key || category);
     const payload = sanitizeLogPayload(input.payload || {});
     const errorPayload = sanitizeLogPayload(errorObject(input.error));
+    const errorJSON = Object.keys(errorPayload).length > 0 ? json(errorPayload) : null;
     const message = redactSensitiveText(input.message || featureKey);
     const id = input.id || `log_${newID()}`;
     this.exec(
@@ -685,7 +735,7 @@ export class JoiSQLiteStore {
       input.item_type || '',
       input.item_id || '',
       json(payload),
-      json(errorPayload),
+      errorJSON,
       optionalNumber(input.duration_ms) ?? null,
       input.created_at || '',
     );
@@ -726,6 +776,15 @@ export class JoiSQLiteStore {
     listWhere('risk_level', filter.risk_levels);
     listWhere('category', filter.categories);
     listWhere('source', filter.sources);
+    const explicitDebug = (filter.levels || []).some((value) => value.trim().toLowerCase() === 'debug');
+    if (!explicitDebug) {
+      where.push(`NOT (
+        source_table='app_logs'
+        AND source='electron_ipc'
+        AND level='debug'
+        AND (feature_key GLOB 'ipc.*.started' OR feature_key GLOB 'ipc.*.succeeded')
+      )`);
+    }
     if (filter.query?.trim()) {
       const like = `%${escapeLike(filter.query.trim())}%`;
       where.push(`(message LIKE ? ESCAPE '\\' OR feature_key LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\' OR event_type LIKE ? ESCAPE '\\' OR action LIKE ? ESCAPE '\\')`);
@@ -1051,11 +1110,39 @@ export class JoiSQLiteStore {
     const slug = this.availableAutomationSlug(baseSlug, id);
     const kind = normalizeAutomationKind(req.kind || optionalString(existing?.kind) || 'schedule');
     const now = nowIso();
-    const triggerConfig = req.trigger_config ?? parseObject(existing?.trigger_config);
-    const metadata = {
-      ...parseObject(existing?.metadata),
-      ...(req.metadata || {}),
+    const triggerConfig = {
+      ...(req.trigger_config ?? parseObject(existing?.trigger_config)),
+      ...(req.rrule?.trim() ? { type: 'rrule', rrule: req.rrule.trim() } : {}),
     };
+    const existingMetadata = parseObject(existing?.metadata);
+    const executionKind = normalizeAutomationExecutionKind(
+      req.execution_kind
+        || req.metadata?.execution_kind
+        || existingMetadata.execution_kind
+        || (kind === 'webhook' ? 'webhook' : 'cron'),
+    );
+    const metadata = {
+      ...existingMetadata,
+      ...(req.metadata || {}),
+      execution_kind: executionKind,
+      ...(req.rrule?.trim() ? { rrule: req.rrule.trim() } : {}),
+      ...(req.model?.trim() ? { model: req.model.trim() } : {}),
+      ...(req.model_provider?.trim() ? { model_provider: req.model_provider.trim() } : {}),
+      ...(req.model_base_url?.trim() ? { model_base_url: req.model_base_url.trim() } : {}),
+      ...(req.reasoning_effort?.trim() ? { reasoning_effort: req.reasoning_effort.trim() } : {}),
+      execution_environment: req.execution_environment || optionalString(existingMetadata.execution_environment) || 'local',
+      ...(req.target ? { target: req.target } : {}),
+      ...(req.cwds ? { cwds: req.cwds.map(String).map((item) => item.trim()).filter(Boolean) } : {}),
+      ...(req.target_thread_id?.trim() ? { target_thread_id: req.target_thread_id.trim() } : {}),
+      ...(typeof req.is_draft === 'boolean' ? { is_draft: req.is_draft } : {}),
+    };
+    if (req.model !== undefined && !req.model_provider?.trim()) delete metadata.model_provider;
+    if (req.model !== undefined && !req.model_base_url?.trim()) delete metadata.model_base_url;
+    const targetThreadID = req.target_thread_id?.trim()
+      || optionalString(metadata.target_thread_id)
+      || req.conversation_id?.trim()
+      || optionalString(existing?.conversation_id)
+      || '';
     const retryPolicy = Object.keys(req.retry_policy || {}).length > 0
       ? req.retry_policy
       : Object.keys(parseObject(existing?.retry_policy)).length > 0
@@ -1081,7 +1168,7 @@ export class JoiSQLiteStore {
         normalizeAutomationPermissionProfile(req.permission_profile || optionalString(existing.permission_profile)),
         req.preferred_node?.trim() || optionalString(existing.preferred_node) || 'main-node',
         req.allow_worker ?? Boolean(Number(existing.allow_worker ?? 0)) ? 1 : 0,
-        req.conversation_id?.trim() || optionalString(existing.conversation_id) || '',
+        executionKind === 'heartbeat' ? targetThreadID : req.conversation_id?.trim() || optionalString(existing.conversation_id) || '',
         req.principal_id?.trim() || optionalString(existing.principal_id) || '',
         json(req.dedup_policy ?? parseObject(existing.dedup_policy)),
         json(retryPolicy),
@@ -1111,7 +1198,7 @@ export class JoiSQLiteStore {
       normalizeAutomationPermissionProfile(req.permission_profile),
       req.preferred_node?.trim() || 'main-node',
       req.allow_worker ? 1 : 0,
-      req.conversation_id?.trim() || '',
+      executionKind === 'heartbeat' ? targetThreadID : req.conversation_id?.trim() || '',
       req.principal_id?.trim() || '',
       json(req.dedup_policy || {}),
       json(retryPolicy),
@@ -1192,9 +1279,67 @@ export class JoiSQLiteStore {
     return { runs: rows.map(rowToAutomationRun) };
   }
 
+  setAutomationRunRead(req: { id: string; read: boolean }): AutomationRunRecord {
+    const run = this.requireAutomationRun(req.id);
+    this.exec(
+      req.read
+        ? `UPDATE automation_runs SET metadata=json_set(COALESCE(metadata, '{}'), '$.read_at', ?), updated_at=datetime('now') WHERE id=?`
+        : `UPDATE automation_runs SET metadata=json_remove(COALESCE(metadata, '{}'), '$.read_at'), updated_at=datetime('now') WHERE id=?`,
+      ...(req.read ? [nowIso(), run.id] : [run.id]),
+    );
+    return this.requireAutomationRun(run.id);
+  }
+
+  markAllAutomationRunsRead(req: { automation_id?: string } = {}): { updated: number } {
+    const automationID = req.automation_id?.trim() || '';
+    const result = this.db.prepare(
+      `UPDATE automation_runs
+       SET metadata=json_set(COALESCE(metadata, '{}'), '$.read_at', ?), updated_at=datetime('now')
+       WHERE json_extract(COALESCE(metadata, '{}'), '$.read_at') IS NULL
+         AND (?='' OR automation_id=?)`,
+    ).run(nowIso(), automationID, automationID);
+    return { updated: Number(result.changes ?? 0) };
+  }
+
+  setAutomationRunArchived(req: { id: string; archived: boolean }): AutomationRunRecord {
+    const run = this.requireAutomationRun(req.id);
+    const conversationID = run.conversation_id;
+    if (conversationID) {
+      try {
+        if (req.archived) this.archiveConversation({ id: conversationID, reason: 'automation_history' });
+        else this.restoreConversation({ id: conversationID, reason: 'automation_history' });
+      } catch {
+        // A run can outlive its conversation. Preserve the history state even when the linked task is unavailable.
+      }
+    }
+    this.exec(
+      req.archived
+        ? `UPDATE automation_runs SET metadata=json_set(COALESCE(metadata, '{}'), '$.archived_at', ?), updated_at=datetime('now') WHERE id=?`
+        : `UPDATE automation_runs SET metadata=json_remove(COALESCE(metadata, '{}'), '$.archived_at'), updated_at=datetime('now') WHERE id=?`,
+      ...(req.archived ? [nowIso(), run.id] : [run.id]),
+    );
+    return this.requireAutomationRun(run.id);
+  }
+
+  archiveAllAutomationRuns(req: { automation_id: string }): { succeeded_count: number; failed_count: number } {
+    const runs = this.listAutomationRuns({ automation_id: req.automation_id, limit: 500 }).runs
+      .filter((run) => !run.archived_at && run.status !== 'running');
+    let succeededCount = 0;
+    let failedCount = 0;
+    for (const run of runs) {
+      try {
+        this.setAutomationRunArchived({ id: run.id, archived: true });
+        succeededCount += 1;
+      } catch {
+        failedCount += 1;
+      }
+    }
+    return { succeeded_count: succeededCount, failed_count: failedCount };
+  }
+
   enqueueAutomationTrigger(req: AutomationTriggerEnqueueRequest): { trigger: AutomationTriggerRecord; deduped: boolean } {
     const automation = this.getAutomation(req.automation_id);
-    if (!automation.enabled) throw codedError('AUTOMATION_DISABLED', 'Automation is disabled');
+    if (!automation.enabled && req.trigger_type !== 'manual') throw codedError('AUTOMATION_DISABLED', 'Automation is disabled');
     const dedupKey = req.dedup_key.trim();
     if (!dedupKey) throw codedError('INVALID_PAYLOAD', 'automation trigger dedup_key is required');
     const triggerID = `autotrig_${newID()}`;
@@ -1281,7 +1426,7 @@ export class JoiSQLiteStore {
         `SELECT t.id
          FROM automation_triggers t
          JOIN automation_definitions a ON a.id=t.automation_id
-         WHERE a.enabled=1
+         WHERE (a.enabled=1 OR t.trigger_type='manual')
            AND a.deleted_at IS NULL
            AND t.status IN ('pending', 'retry_scheduled')
            AND datetime(COALESCE(t.next_attempt_at, t.fire_at, t.created_at)) <= datetime(?)
@@ -1331,7 +1476,13 @@ export class JoiSQLiteStore {
         runID,
         req.product_task_id || '',
         attempt,
-        json({ claim_token: trigger.claim_token || '', trigger_type: trigger.trigger_type }),
+        json({
+          claim_token: trigger.claim_token || '',
+          trigger_type: trigger.trigger_type,
+          conversation_id: req.conversation_id || '',
+          source_cwd: req.source_cwd || automation.cwds[0] || '',
+          automation_name: req.automation_name || automation.name,
+        }),
       );
       this.exec(
         `UPDATE automation_triggers
@@ -1782,6 +1933,27 @@ export class JoiSQLiteStore {
           payload: { step: event.step },
         });
       },
+      onEvent: (event) => {
+        if (!['work_summary.updated', 'plan.created', 'plan.updated'].includes(event.type)) return;
+        const detail = event.detail || {};
+        const phase = String(detail.phase || '').trim();
+        const userVisible = detail.user_visible === true;
+        append({
+          event_type: event.type,
+          item_type: event.type === 'work_summary.updated' ? 'work_summary' : 'plan',
+          item_id: `${started.run_id}:${event.type}:${phase || event.step || 0}`,
+          status: event.status || 'running',
+          phase: phase || undefined,
+          source: 'runtime',
+          visibility: userVisible ? 'transcript' : 'trace_only',
+          snapshot: detail,
+          payload: {
+            ...detail,
+            step: event.step,
+            attempt: event.attempt,
+          },
+        });
+      },
     };
   }
 
@@ -2042,6 +2214,16 @@ export class JoiSQLiteStore {
     const memoryResults = this.searchPromptMemories(req.message || '', 8, memoryScope);
     const memoryProfileVersion = memoryProfileVersionFor(memoryResults);
     const conversationContext = this.buildPromptConversationContext(req.conversation_id);
+    const skillCandidates = this.skillSelectionCandidates();
+    const skillCatalog = renderSkillCatalog(skillCandidates, 8_000);
+    const skillSelectionMessage = isSkillFollowupMessage(req.message || '')
+      ? `${conversationContext.messages.slice(-4).map((item) => item.content).join('\n')}\n${req.message || ''}`
+      : req.message || '';
+    const selectedSkills = selectCodexSkills(skillSelectionMessage, skillCandidates, {
+      max_selected: 3,
+      max_total_instruction_chars: 96_000,
+    });
+    const selectedSkillInstructions = renderSelectedSkillInstructions(selectedSkills);
     const cacheablePrefix = [
       'Joi Electron Tool Calling Runtime',
       '- You are running inside the local Electron-native Joi Desktop app.',
@@ -2049,6 +2231,11 @@ export class JoiSQLiteStore {
       `- The selected model id for this run is ${cleanModelName}. When asked what model is being used, answer from this selected model id.`,
       '- Do not claim to be Claude, ChatGPT, Anthropic, OpenAI, or another assistant brand unless the selected model id explicitly says so.',
       '- Use only the provided capability tools. Do not claim that a tool ran unless a tool result is present.',
+      '- When one independent bounded subtask clearly benefits from a specialist, proactively call delegate_task once; the child gets a separate run and cannot delegate recursively.',
+      '- Use session_branch when the user wants to explore an alternate path without altering the source transcript.',
+      '- Use session_compact only with a faithful self-contained checkpoint summary; compaction must preserve the original transcript.',
+      '- Use native LSP and debugger capabilities for code navigation and debugging when available instead of simulating their output.',
+      '- Treat generated speech, transcription, and video as complete only when the capability returns a verified local artifact or transcript.',
       '- Never request Docker/Postgres/NATS as a default prerequisite for this local desktop app.',
       '- For workspace writes, wait for confirmation before execution.',
       '- Treat the Current Run current_date as authoritative for all relative-date, release-date, schedule, and news comparisons.',
@@ -2071,6 +2258,8 @@ export class JoiSQLiteStore {
       '',
       'Tool Schema Version',
       toolSchemaVersion,
+      '',
+      skillCatalog,
     ].join('\n');
     const dynamicTail = [
       'Current Run',
@@ -2086,6 +2275,7 @@ export class JoiSQLiteStore {
       '',
       'User Message',
       req.message || '',
+      ...(selectedSkillInstructions ? ['', selectedSkillInstructions] : []),
       '',
       'Dynamic Memory Retrieval',
       JSON.stringify(memoryResults.map((result) => ({
@@ -2111,6 +2301,14 @@ export class JoiSQLiteStore {
       memory_scope: memoryScope,
       conversation_messages: conversationContext.messages,
       agent_capabilities: agentCapabilities,
+      skill_catalog: skillCatalog,
+      selected_skills: selectedSkills.map((skill) => ({
+        id: skill.id,
+        name: skill.name,
+        path: skill.path,
+        invocation: skill.invocation,
+        score: skill.score,
+      })),
       system_message: `${cacheablePrefix}\n\n${dynamicTail}`,
     };
   }
@@ -2122,26 +2320,505 @@ export class JoiSQLiteStore {
     return normalizeAgentCapabilityList(parseArray(row?.capabilities).map(String));
   }
 
+  resolveAgentIDForTool(requestedAgent: string, fallbackAgentID = 'research_agent'): string {
+    const rows = this.all(`SELECT id, name FROM agents WHERE enabled=1 ORDER BY id`);
+    const requested = requestedAgent.trim();
+    const fallback = fallbackAgentID.trim();
+    const normalized = normalizeAgentLookupToken(requested);
+    const withoutAgentSuffix = normalized.replace(/agent$/, '');
+    const matched = requested ? rows.find((row) => {
+      const id = optionalString(row.id) || '';
+      const name = optionalString(row.name) || '';
+      if (id === requested || name.toLowerCase() === requested.toLowerCase()) return true;
+      const normalizedID = normalizeAgentLookupToken(id);
+      const normalizedName = normalizeAgentLookupToken(name);
+      return normalizedID === normalized
+        || normalizedName === normalized
+        || normalizedID.replace(/agent$/, '') === withoutAgentSuffix
+        || normalizedName.replace(/agent$/, '') === withoutAgentSuffix;
+    }) : undefined;
+    if (matched) return optionalString(matched.id) || '';
+    return rows.some((row) => optionalString(row.id) === fallback) ? fallback : '';
+  }
+
+  branchConversationForTool(input: {
+    source_conversation_id: string;
+    from_message_id?: string;
+    title?: string;
+    source_run_id?: string;
+  }): {
+    source_conversation_id: string;
+    child_conversation_id: string;
+    from_message_id: string;
+    copied_message_count: number;
+    source_message_count: number;
+    source_unchanged: true;
+  } {
+    const sourceConversationID = input.source_conversation_id.trim();
+    if (!sourceConversationID) throw new Error('source conversation id is required');
+    const source = this.get(`SELECT * FROM conversations WHERE id=?`, sourceConversationID);
+    if (!source) throw new Error(`Conversation not found: ${sourceConversationID}`);
+    const requestedMessageID = input.from_message_id?.trim() || '';
+    let cutoffRowID = Number.MAX_SAFE_INTEGER;
+    let fromMessageID = requestedMessageID;
+    if (requestedMessageID) {
+      const cutoff = this.get(
+        `SELECT rowid, id FROM messages WHERE conversation_id=? AND id=?`,
+        sourceConversationID,
+        requestedMessageID,
+      );
+      if (!cutoff) throw new Error(`Message ${requestedMessageID} is not part of conversation ${sourceConversationID}`);
+      cutoffRowID = Number(cutoff.rowid);
+    } else {
+      const cutoff = this.get(
+        `SELECT rowid, id FROM messages WHERE conversation_id=? ORDER BY rowid DESC LIMIT 1`,
+        sourceConversationID,
+      );
+      cutoffRowID = Number(cutoff?.rowid ?? 0);
+      fromMessageID = optionalString(cutoff?.id) || '';
+    }
+    const sourceMessageCount = Number(this.get(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id=?`, sourceConversationID)?.count ?? 0);
+    const messages = this.all(
+      `SELECT id, role, content, attachments, metadata, created_at
+       FROM messages
+       WHERE conversation_id=? AND rowid<=?
+       ORDER BY rowid`,
+      sourceConversationID,
+      cutoffRowID,
+    );
+    const childConversationID = `conv_${newID()}`;
+    const branchID = `branch_${newID()}`;
+    const childTitle = input.title?.trim() || `${optionalString(source.title) || '会话'} · 分支`;
+    const sourceMetadata = parseObject(source.metadata);
+    this.transaction(() => {
+      this.exec(
+        `INSERT INTO conversations (
+           id, principal_id, channel, user_id, title, active_agent_id, active_project_id, topic,
+           lifecycle_status, group_id, pinned, metadata, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 0, ?, datetime('now'), datetime('now'))`,
+        childConversationID,
+        optionalString(source.principal_id) || null,
+        optionalString(source.channel) || 'desktop',
+        optionalString(source.user_id) || 'desktop_user',
+        childTitle,
+        optionalString(source.active_agent_id) || null,
+        optionalString(source.active_project_id) || null,
+        optionalString(source.topic) || null,
+        optionalString(source.group_id) || null,
+        json({
+          ...sourceMetadata,
+          branch: {
+            parent_conversation_id: sourceConversationID,
+            from_message_id: fromMessageID,
+            branch_id: branchID,
+          },
+        }),
+      );
+      for (const message of messages) {
+        const sourceMessageID = optionalString(message.id) || '';
+        this.exec(
+          `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `msg_${newID()}`,
+          childConversationID,
+          optionalString(message.role) || 'message',
+          optionalString(message.content) || '',
+          optionalString(message.attachments) || '[]',
+          json({
+            ...parseObject(message.metadata),
+            branched_from_conversation_id: sourceConversationID,
+            branched_from_message_id: sourceMessageID,
+          }),
+          optionalString(message.created_at) || nowIso(),
+        );
+      }
+      this.exec(
+        `INSERT INTO conversation_branches (
+           id, parent_conversation_id, child_conversation_id, from_message_id,
+           source_run_id, copied_message_count, metadata, created_at
+         ) VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, datetime('now'))`,
+        branchID,
+        sourceConversationID,
+        childConversationID,
+        fromMessageID,
+        input.source_run_id?.trim() || '',
+        messages.length,
+        json({ source_message_count: sourceMessageCount, source_unchanged: true }),
+      );
+    });
+    return {
+      source_conversation_id: sourceConversationID,
+      child_conversation_id: childConversationID,
+      from_message_id: fromMessageID,
+      copied_message_count: messages.length,
+      source_message_count: sourceMessageCount,
+      source_unchanged: true,
+    };
+  }
+
+  compactConversationForTool(input: {
+    conversation_id: string;
+    summary: string;
+    keep_recent_messages?: number;
+    reason?: string;
+    source_run_id?: string;
+  }): {
+    compaction_id: string;
+    conversation_id: string;
+    summary: string;
+    first_kept_message_id: string;
+    covered_message_count: number;
+    original_message_count: number;
+    original_char_count: number;
+    compacted_context_char_count: number;
+    transcript_preserved: true;
+  } {
+    const conversationID = input.conversation_id.trim();
+    const summary = input.summary.trim();
+    if (!conversationID) throw new Error('conversation id is required');
+    if (!summary) throw new Error('compaction summary is required');
+    if (summary.length > 30_000) throw new Error('compaction summary exceeds 30000 characters');
+    if (!this.get(`SELECT id FROM conversations WHERE id=?`, conversationID)) {
+      throw new Error(`Conversation not found: ${conversationID}`);
+    }
+    const keepRecentMessages = Math.max(2, Math.min(12, Math.round(input.keep_recent_messages || 6)));
+    const recentRows = this.all(
+      `SELECT id, content FROM messages WHERE conversation_id=? ORDER BY rowid DESC LIMIT ?`,
+      conversationID,
+      keepRecentMessages,
+    ).reverse();
+    if (recentRows.length === 0) throw new Error('conversation has no messages to compact');
+    const originalMessageCount = Number(this.get(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id=?`, conversationID)?.count ?? 0);
+    const originalCharCount = Number(this.get(`SELECT COALESCE(SUM(length(content)), 0) AS count FROM messages WHERE conversation_id=?`, conversationID)?.count ?? 0);
+    const firstKeptMessageID = optionalString(recentRows[0]?.id) || '';
+    const coveredMessageCount = Math.max(0, originalMessageCount - recentRows.length);
+    const compactedContextCharCount = summary.length + recentRows.reduce((total, row) => total + (optionalString(row.content) || '').length, 0);
+    const compactionID = `compact_${newID()}`;
+    this.exec(
+      `INSERT INTO conversation_compactions (
+         id, conversation_id, source_run_id, summary, first_kept_message_id,
+         covered_message_count, original_message_count, original_char_count,
+         compacted_context_char_count, reason, metadata, created_at
+       ) VALUES (?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+      compactionID,
+      conversationID,
+      input.source_run_id?.trim() || '',
+      summary,
+      firstKeptMessageID,
+      coveredMessageCount,
+      originalMessageCount,
+      originalCharCount,
+      compactedContextCharCount,
+      input.reason?.trim() || 'model_requested',
+      json({ transcript_preserved: true, keep_recent_messages: keepRecentMessages }),
+    );
+    return {
+      compaction_id: compactionID,
+      conversation_id: conversationID,
+      summary,
+      first_kept_message_id: firstKeptMessageID,
+      covered_message_count: coveredMessageCount,
+      original_message_count: originalMessageCount,
+      original_char_count: originalCharCount,
+      compacted_context_char_count: compactedContextCharCount,
+      transcript_preserved: true,
+    };
+  }
+
+  getConversationTree(conversationID: string): ConversationTree {
+    const activeConversationID = conversationID.trim();
+    if (!activeConversationID) throw new Error('conversation id is required');
+    if (!this.get(`SELECT id FROM conversations WHERE id=?`, activeConversationID)) {
+      throw new Error(`Conversation not found: ${activeConversationID}`);
+    }
+    let rootConversationID = activeConversationID;
+    const seenAncestors = new Set<string>();
+    for (let depth = 0; depth < 100; depth += 1) {
+      if (seenAncestors.has(rootConversationID)) throw new Error('Conversation branch cycle detected');
+      seenAncestors.add(rootConversationID);
+      const parent = this.get(`SELECT parent_conversation_id FROM conversation_branches WHERE child_conversation_id=?`, rootConversationID);
+      const parentID = optionalString(parent?.parent_conversation_id) || '';
+      if (!parentID) break;
+      rootConversationID = parentID;
+    }
+
+    const branchRows = this.all(`SELECT * FROM conversation_branches ORDER BY datetime(created_at), rowid`);
+    const childrenByParent = new Map<string, SQLiteRow[]>();
+    for (const branch of branchRows) {
+      const parentID = optionalString(branch.parent_conversation_id) || '';
+      const children = childrenByParent.get(parentID) || [];
+      children.push(branch);
+      childrenByParent.set(parentID, children);
+    }
+    const reachable: string[] = [];
+    const queue = [rootConversationID];
+    const visited = new Set<string>();
+    while (queue.length > 0) {
+      const id = queue.shift() || '';
+      if (!id || visited.has(id)) continue;
+      visited.add(id);
+      reachable.push(id);
+      for (const branch of childrenByParent.get(id) || []) {
+        const childID = optionalString(branch.child_conversation_id) || '';
+        if (childID) queue.push(childID);
+      }
+    }
+    const placeholders = reachable.map(() => '?').join(',');
+    const conversations = this.all(
+      `SELECT c.*,
+              (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id) AS message_count
+       FROM conversations c WHERE c.id IN (${placeholders})`,
+      ...reachable,
+    );
+    const conversationByID = new Map(conversations.map((row) => [optionalString(row.id) || '', row]));
+    const branchByChild = new Map(branchRows.map((row) => [optionalString(row.child_conversation_id) || '', row]));
+    const compactionByConversation = new Map<string, SQLiteRow>();
+    for (const id of reachable) {
+      const latest = this.get(
+        `SELECT * FROM conversation_compactions WHERE conversation_id=? ORDER BY datetime(created_at) DESC, rowid DESC LIMIT 1`,
+        id,
+      );
+      if (latest) compactionByConversation.set(id, latest);
+    }
+    const buildNode = (id: string, stack: Set<string>): ConversationTreeNode => {
+      if (stack.has(id)) throw new Error('Conversation branch cycle detected');
+      const row = conversationByID.get(id);
+      if (!row) throw new Error(`Conversation tree row missing: ${id}`);
+      const nextStack = new Set(stack).add(id);
+      const metadata = parseObject(row.metadata);
+      const workbench = parseObject(metadata.workbench);
+      const branch = branchByChild.get(id);
+      const children = (childrenByParent.get(id) || []).map((item) => buildNode(optionalString(item.child_conversation_id) || '', nextStack));
+      return {
+        conversation_id: id,
+        title: optionalString(row.title) || '未命名会话',
+        label: optionalString(workbench.label),
+        summary: optionalString(workbench.summary),
+        parent_conversation_id: optionalString(branch?.parent_conversation_id),
+        branch_id: optionalString(branch?.id),
+        from_message_id: optionalString(branch?.from_message_id),
+        source_run_id: optionalString(branch?.source_run_id),
+        copied_message_count: Number(branch?.copied_message_count || 0),
+        message_count: Number(row.message_count || 0),
+        child_count: children.length,
+        active: id === activeConversationID,
+        created_at: optionalString(row.created_at),
+        updated_at: optionalString(row.updated_at),
+        latest_compaction: compactionByConversation.has(id) ? rowToConversationCompaction(compactionByConversation.get(id) || {}) : undefined,
+        children,
+      };
+    };
+    return {
+      root_conversation_id: rootConversationID,
+      active_conversation_id: activeConversationID,
+      node_count: reachable.length,
+      root: buildNode(rootConversationID, new Set()),
+    };
+  }
+
+  updateConversationBranch(input: { conversation_id: string; label?: string; summary?: string }): ConversationTree {
+    const conversationID = input.conversation_id.trim();
+    const row = this.get(`SELECT metadata FROM conversations WHERE id=?`, conversationID);
+    if (!row) throw new Error(`Conversation not found: ${conversationID}`);
+    const metadata = parseObject(row.metadata);
+    const existing = parseObject(metadata.workbench);
+    const workbench = {
+      ...existing,
+      ...(typeof input.label === 'string' ? { label: input.label.trim().slice(0, 80) } : {}),
+      ...(typeof input.summary === 'string' ? { summary: input.summary.trim().slice(0, 4_000) } : {}),
+    };
+    this.exec(`UPDATE conversations SET metadata=?, updated_at=datetime('now') WHERE id=?`, json({ ...metadata, workbench }), conversationID);
+    return this.getConversationTree(conversationID);
+  }
+
+  exportConversation(input: { conversation_id: string; path?: string }): ConversationExportResult {
+    const tree = this.getConversationTree(input.conversation_id);
+    const ids: string[] = [];
+    const visit = (node: ConversationTreeNode) => {
+      ids.push(node.conversation_id);
+      node.children.forEach(visit);
+    };
+    visit(tree.root);
+    const placeholders = ids.map(() => '?').join(',');
+    const conversations = this.all(`SELECT * FROM conversations WHERE id IN (${placeholders}) ORDER BY datetime(created_at), rowid`, ...ids);
+    const messages = this.all(`SELECT * FROM messages WHERE conversation_id IN (${placeholders}) ORDER BY datetime(created_at), rowid`, ...ids);
+    const branches = this.all(`SELECT * FROM conversation_branches WHERE parent_conversation_id IN (${placeholders}) ORDER BY datetime(created_at), rowid`, ...ids);
+    const compactions = this.all(`SELECT * FROM conversation_compactions WHERE conversation_id IN (${placeholders}) ORDER BY datetime(created_at), rowid`, ...ids);
+    const requestedPath = input.path?.trim();
+    const exportDir = join(this.options.backupDir, 'conversation-exports');
+    mkdirSync(exportDir, { recursive: true });
+    const path = requestedPath && isAbsolute(requestedPath)
+      ? requestedPath
+      : join(exportDir, `${tree.root_conversation_id}-${Date.now()}.joi-conversation.json`);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      format: 'joi.conversation-tree.v1',
+      exported_at: nowIso(),
+      active_conversation_id: tree.active_conversation_id,
+      root_conversation_id: tree.root_conversation_id,
+      conversations,
+      messages,
+      branches,
+      compactions,
+    }, null, 2), 'utf8');
+    return { path, conversation_id: tree.root_conversation_id, branch_count: branches.length, message_count: messages.length };
+  }
+
+  importConversation(input: { path: string }): ConversationImportResult {
+    const path = input.path?.trim();
+    if (!path || !isAbsolute(path)) throw new Error('An absolute conversation export path is required');
+    const document = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    if (document.format !== 'joi.conversation-tree.v1') throw new Error('Unsupported Joi conversation export format');
+    const conversations = Array.isArray(document.conversations) ? document.conversations.filter(isSQLiteRow) : [];
+    const messages = Array.isArray(document.messages) ? document.messages.filter(isSQLiteRow) : [];
+    const branches = Array.isArray(document.branches) ? document.branches.filter(isSQLiteRow) : [];
+    const compactions = Array.isArray(document.compactions) ? document.compactions.filter(isSQLiteRow) : [];
+    if (conversations.length === 0) throw new Error('Conversation export contains no conversations');
+    const conversationIDs = new Map<string, string>();
+    const messageIDs = new Map<string, string>();
+    for (const row of conversations) conversationIDs.set(optionalString(row.id) || '', `conv_${newID()}`);
+    for (const row of messages) messageIDs.set(optionalString(row.id) || '', `msg_${newID()}`);
+    this.transaction(() => {
+      for (const row of conversations) {
+        const oldID = optionalString(row.id) || '';
+        const newConversationID = conversationIDs.get(oldID) || `conv_${newID()}`;
+        this.exec(
+          `INSERT INTO conversations (
+             id, principal_id, channel, user_id, title, active_agent_id, active_project_id, topic,
+             lifecycle_status, group_id, pinned, metadata, created_at, updated_at
+           ) VALUES (?, NULL, ?, ?, ?, ?, NULL, ?, 'active', NULL, 0, ?, datetime('now'), datetime('now'))`,
+          newConversationID,
+          optionalString(row.channel) || 'desktop',
+          optionalString(row.user_id) || 'desktop_user',
+          `${optionalString(row.title) || '导入会话'} · 导入`,
+          optionalString(row.active_agent_id) || null,
+          optionalString(row.topic) || null,
+          json({ ...parseObject(row.metadata), imported_from: oldID, imported_at: nowIso() }),
+        );
+      }
+      for (const row of messages) {
+        const oldID = optionalString(row.id) || '';
+        const oldConversationID = optionalString(row.conversation_id) || '';
+        const newConversationID = conversationIDs.get(oldConversationID);
+        if (!newConversationID) continue;
+        this.exec(
+          `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          messageIDs.get(oldID) || `msg_${newID()}`,
+          newConversationID,
+          optionalString(row.role) || 'message',
+          optionalString(row.content) || '',
+          optionalString(row.attachments) || '[]',
+          json({ ...parseObject(row.metadata), imported_message_id: oldID }),
+          optionalString(row.created_at) || nowIso(),
+        );
+      }
+      for (const row of branches) {
+        const parentID = conversationIDs.get(optionalString(row.parent_conversation_id) || '');
+        const childID = conversationIDs.get(optionalString(row.child_conversation_id) || '');
+        if (!parentID || !childID) continue;
+        this.exec(
+          `INSERT INTO conversation_branches (
+             id, parent_conversation_id, child_conversation_id, from_message_id, source_run_id,
+             copied_message_count, metadata, created_at
+           ) VALUES (?, ?, ?, NULLIF(?, ''), NULL, ?, ?, datetime('now'))`,
+          `branch_${newID()}`,
+          parentID,
+          childID,
+          messageIDs.get(optionalString(row.from_message_id) || '') || '',
+          Number(row.copied_message_count || 0),
+          json({ ...parseObject(row.metadata), imported_branch_id: optionalString(row.id) }),
+        );
+      }
+      for (const row of compactions) {
+        const newConversationID = conversationIDs.get(optionalString(row.conversation_id) || '');
+        const keptMessageID = messageIDs.get(optionalString(row.first_kept_message_id) || '');
+        if (!newConversationID || !keptMessageID) continue;
+        this.exec(
+          `INSERT INTO conversation_compactions (
+             id, conversation_id, source_run_id, summary, first_kept_message_id, covered_message_count,
+             original_message_count, original_char_count, compacted_context_char_count, reason, metadata, created_at
+           ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+          `compact_${newID()}`,
+          newConversationID,
+          optionalString(row.summary) || '',
+          keptMessageID,
+          Number(row.covered_message_count || 0),
+          Number(row.original_message_count || 0),
+          Number(row.original_char_count || 0),
+          Number(row.compacted_context_char_count || 0),
+          'imported',
+          json({ ...parseObject(row.metadata), imported_compaction_id: optionalString(row.id) }),
+        );
+      }
+    });
+    const originalActiveID = optionalString(document.active_conversation_id) || optionalString(document.root_conversation_id) || optionalString(conversations[0]?.id) || '';
+    const activeConversationID = conversationIDs.get(originalActiveID) || [...conversationIDs.values()][0];
+    return {
+      conversation_id: activeConversationID,
+      imported_conversation_ids: [...conversationIDs.values()],
+      message_count: messages.length,
+    };
+  }
+
+  private ensureAutomaticConversationCompaction(conversationID: string): void {
+    const totalCount = Number(this.get(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id=?`, conversationID)?.count || 0);
+    if (totalCount < 48) return;
+    const latest = this.get(
+      `SELECT original_message_count FROM conversation_compactions WHERE conversation_id=? ORDER BY datetime(created_at) DESC, rowid DESC LIMIT 1`,
+      conversationID,
+    );
+    if (totalCount - Number(latest?.original_message_count || 0) < 24) return;
+    const older = this.all(
+      `SELECT role, content FROM messages WHERE conversation_id=? ORDER BY rowid LIMIT ?`,
+      conversationID,
+      Math.max(1, totalCount - 12),
+    );
+    const summaryLines = older.slice(-24).map((row) => `${optionalString(row.role) || 'message'}: ${compactPromptConversationText(optionalString(row.content) || '', 240)}`);
+    const omitted = Math.max(0, older.length - summaryLines.length);
+    const summary = [
+      `Automatic checkpoint covering ${older.length} earlier message(s).`,
+      ...(omitted > 0 ? [`${omitted} oldest message(s) remain in the transcript and are omitted from this compact summary.`] : []),
+      ...summaryLines,
+    ].join('\n');
+    this.compactConversationForTool({
+      conversation_id: conversationID,
+      summary,
+      keep_recent_messages: 12,
+      reason: 'automatic_context_threshold',
+    });
+  }
+
   private buildPromptConversationContext(conversationID?: string): PromptConversationContext {
     const cleanConversationID = conversationID?.trim();
     if (!cleanConversationID) {
       return { prompt: '', included_count: 0, compressed_count: 0, omitted_count: 0, messages: [] };
     }
+    this.ensureAutomaticConversationCompaction(cleanConversationID);
     const totalRow = this.get(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id=?`, cleanConversationID);
     const totalCount = Number(totalRow?.count ?? 0);
     if (!Number.isFinite(totalCount) || totalCount <= 0) {
       return { prompt: '', included_count: 0, compressed_count: 0, omitted_count: 0, messages: [] };
     }
+    const persistentCompaction = this.get(
+      `SELECT * FROM conversation_compactions WHERE conversation_id=? ORDER BY datetime(created_at) DESC, rowid DESC LIMIT 1`,
+      cleanConversationID,
+    );
+    const firstKeptMessageID = optionalString(persistentCompaction?.first_kept_message_id) || '';
     const rows = this.all(
       `SELECT role, content, COALESCE(json_extract(metadata, '$.run_id'), '') AS run_id
        FROM (
          SELECT role, content, metadata, created_at, rowid
          FROM messages
          WHERE conversation_id=?
+           AND (? = '' OR rowid >= COALESCE((SELECT rowid FROM messages WHERE id=? AND conversation_id=?), 0))
          ORDER BY datetime(created_at) DESC, rowid DESC
          LIMIT ?
        )
        ORDER BY datetime(created_at) ASC, rowid ASC`,
+      cleanConversationID,
+      firstKeptMessageID,
+      firstKeptMessageID,
       cleanConversationID,
       promptConversationContextLimit,
     );
@@ -2153,11 +2830,21 @@ export class JoiSQLiteStore {
     if (messages.length === 0) {
       return { prompt: '', included_count: 0, compressed_count: 0, omitted_count: Math.max(0, totalCount), messages: [] };
     }
-    const omittedCount = Math.max(0, totalCount - messages.length);
+    const persistentlyCompressedCount = Math.max(0, Number(persistentCompaction?.covered_message_count ?? 0));
+    const omittedCount = Math.max(0, totalCount - persistentlyCompressedCount - messages.length);
     const compressedCount = Math.max(0, messages.length - promptConversationVerbatimLimit);
     const compressedMessages = messages.slice(0, compressedCount);
     const recentMessages = messages.slice(compressedCount);
     const sections: string[] = [];
+
+    if (persistentCompaction) {
+      sections.push([
+        'Persistent Conversation Checkpoint',
+        `compaction_id: ${optionalString(persistentCompaction.id)}`,
+        `covered_message_count: ${persistentlyCompressedCount}`,
+        compactPromptConversationText(optionalString(persistentCompaction.summary) || '', 12_000),
+      ].join('\n'));
+    }
 
     if (omittedCount > 0 || compressedMessages.length > 0) {
       const lines = [
@@ -2183,7 +2870,7 @@ export class JoiSQLiteStore {
     return {
       prompt: sections.join('\n\n'),
       included_count: messages.length,
-      compressed_count: omittedCount + compressedMessages.length,
+      compressed_count: persistentlyCompressedCount + omittedCount + compressedMessages.length,
       omitted_count: omittedCount,
       messages: recentMessages
         .filter((message) => message.role === 'user' || message.role === 'assistant')
@@ -2200,6 +2887,7 @@ export class JoiSQLiteStore {
     model_base_url?: string;
     model_reasoning_effort?: string;
     model_selection_policy?: 'agent_preferred' | 'settings_preferred';
+    model_route_purpose?: 'default' | 'child' | 'tool' | 'cheap' | 'long_context' | string;
     selected_agent_id?: string;
     prompt_assembly?: ToolCallingPromptAssembly;
   }): StartedToolCallingChat {
@@ -2227,7 +2915,7 @@ export class JoiSQLiteStore {
     };
     const modelEndpoint = params.model_selection_policy === 'settings_preferred'
       ? settingsModelEndpoint
-      : this.modelEndpointForAgent(agentID, settingsModelEndpoint);
+      : this.modelEndpointForAgent(agentID, settingsModelEndpoint, params.model_route_purpose || 'default');
     const provider = modelEndpoint.provider;
     const modelName = modelEndpoint.model_name;
     const modelBaseURL = modelEndpoint.base_url;
@@ -2361,10 +3049,16 @@ export class JoiSQLiteStore {
         prompt.prompt_cache_key,
         prompt.memory_profile_version,
         prompt.tool_schema_version,
-        json({ source: 'electron_ts_tool_calling', memory_result_count: prompt.memory_results?.length || 0, memory_scope: prompt.memory_scope }),
+        json({ source: 'electron_ts_tool_calling', memory_result_count: prompt.memory_results?.length || 0, memory_scope: prompt.memory_scope, selected_skills: prompt.selected_skills }),
       );
       this.insertRunStep(runID, 'input_received', 'Input received', { message }, { conversation_id: conversationID, message_id: userMessageID });
       this.insertRunStep(runID, 'router_selected', 'Router selected agent', { message }, { agent_id: agentID, route: 'electron_ts_tool_calling' });
+      for (const skill of prompt.selected_skills) {
+        this.insertRunStep(runID, 'skill_selected', 'Skill selected', { message, skill_id: skill.id }, skill);
+      }
+      if (prompt.selected_skills.length > 0) {
+        this.insertRunStep(runID, 'skill_plan_generated', 'Skill instructions loaded', { skill_ids: prompt.selected_skills.map((skill) => skill.id) }, { progressive_disclosure: true, selected_skills: prompt.selected_skills });
+      }
       this.insertRunStep(runID, 'prompt_assembled', 'Prompt assembly finished', { run_id: runID, agent_id: agentID }, { prompt_assembly_id: promptAssemblyID, prefix_hash: prompt.prefix_hash, dynamic_tail_hash: prompt.dynamic_tail_hash, prompt_cache_key: prompt.prompt_cache_key, memory_profile_version: prompt.memory_profile_version, tool_schema_version: prompt.tool_schema_version, memory_result_count: prompt.memory_results?.length || 0 });
       this.insertTurnItem(runID, turnID, 1, 'message', 'user', '', '', {}, message, {}, 'completed', { source: 'desktop_user' });
       this.recordRoomRoutingDecision(req, {
@@ -2415,13 +3109,117 @@ export class JoiSQLiteStore {
     };
   }
 
-  private modelEndpointForAgent(agentID: string, fallback: { provider: string; model_name: string; base_url?: string; reasoning_effort?: string }): { provider: string; model_name: string; base_url: string; reasoning_effort?: string } {
+  retargetToolCallingChat(
+    started: StartedToolCallingChat,
+    endpoint: { model_id?: string; provider: string; model_name: string; base_url?: string; reasoning_effort?: string; route_reason?: string },
+    priorError: Error,
+    attempt: number,
+  ): StartedToolCallingChat {
+    const modelID = endpoint.model_id?.trim() || endpoint.model_name.trim();
+    const modelCallID = `mcall_${newID()}`;
+    const errorMessage = priorError.message.slice(0, 2_000);
+    this.transaction(() => {
+      this.exec(
+        `UPDATE model_calls SET status='failed', completed_at=datetime('now'), finish_reason='route_failover',
+           error_code='MODEL_ROUTE_ATTEMPT_FAILED', error_message=?, metadata=json_set(COALESCE(metadata, '{}'), '$.failover_attempt', ?)
+         WHERE id=? AND status IN ('pending', 'running')`,
+        errorMessage,
+        attempt,
+        started.model_call_id,
+      );
+      this.exec(
+        `INSERT INTO models (id, provider, model_name, display_name, base_url, supports_json_mode, supports_tool_calling, enabled, metadata)
+         VALUES (?, ?, ?, ?, ?, 1, 1, 1, ?)
+         ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, model_name=excluded.model_name,
+           base_url=excluded.base_url, supports_tool_calling=1, enabled=1, updated_at=datetime('now')`,
+        modelID,
+        endpoint.provider,
+        endpoint.model_name,
+        endpoint.model_name,
+        endpoint.base_url?.trim() || '',
+        json({ observed_from_model_route: true }),
+      );
+      this.exec(
+        `UPDATE runs SET selected_model_id=?, route_result=json_set(COALESCE(route_result, '{}'), '$.model_failover_attempt', ?, '$.model', ?, '$.provider', ?) WHERE id=?`,
+        modelID,
+        attempt,
+        endpoint.model_name,
+        endpoint.provider,
+        started.run_id,
+      );
+      this.exec(`UPDATE turns SET active_model_call_id=? WHERE id=?`, modelCallID, started.turn_id);
+      this.exec(`UPDATE prompt_assemblies SET model_id=? WHERE id=?`, modelID, started.prompt_assembly_id);
+      this.exec(
+        `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
+                                  prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens,
+                                  cached_input_tokens, latency_ms, status, streaming_enabled, usage_status, raw_response, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'running', 1, 'provider_missing', '{}', ?, datetime('now'))`,
+        modelCallID,
+        started.run_id,
+        started.selected_agent_id,
+        modelID,
+        started.prompt_assembly_id,
+        endpoint.provider,
+        endpoint.model_name,
+        started.prompt_assembly.prompt_cache_key,
+        started.prompt_assembly.prefix_hash,
+        started.prompt_assembly.dynamic_tail_hash,
+        json({
+          source: 'electron_ts_tool_calling',
+          model_route_failover: true,
+          failover_attempt: attempt,
+          route_reason: endpoint.route_reason || 'fallback',
+          previous_error: errorMessage,
+          reasoning_effort: endpoint.reasoning_effort,
+        }),
+      );
+      this.appendRunEventV2({
+        id: `${started.run_id}_evt_model_failover_${attempt}`,
+        run_id: started.run_id,
+        turn_id: started.turn_id,
+        event_type: 'model.route_failover',
+        status: 'running',
+        source: 'model_router',
+        visibility: 'inline_status',
+        payload: {
+          attempt,
+          provider: endpoint.provider,
+          model: endpoint.model_name,
+          route_reason: endpoint.route_reason || 'fallback',
+          previous_error: errorMessage,
+        },
+      });
+    });
+    return {
+      ...started,
+      model_call_id: modelCallID,
+      provider: endpoint.provider,
+      model_name: endpoint.model_name,
+      model_base_url: endpoint.base_url?.trim() || '',
+      model_reasoning_effort: endpoint.reasoning_effort,
+    };
+  }
+
+  private modelEndpointForAgent(
+    agentID: string,
+    fallback: { provider: string; model_name: string; base_url?: string; reasoning_effort?: string },
+    purpose: 'default' | 'child' | 'tool' | 'cheap' | 'long_context' | string = 'default',
+  ): { provider: string; model_name: string; base_url: string; reasoning_effort?: string } {
     const row = this.get(`SELECT model_strategy, metadata FROM personas WHERE id=?`, agentID);
     const personaModelName = configuredPersonaModelStrategy(optionalString(row?.model_strategy));
     const personaReasoningEffort = optionalReasoningEffort(parseObject(row?.metadata).model_reasoning_effort);
     if (personaModelName) {
       const personaEndpoint = this.configuredModelEndpoint(personaModelName);
       if (personaEndpoint) return { ...personaEndpoint, reasoning_effort: personaReasoningEffort };
+    }
+    const routed = this.modelRouteCandidates({ agent_id: agentID, purpose, fallback })[0];
+    if (routed) {
+      return {
+        provider: routed.provider,
+        model_name: routed.model_name,
+        base_url: routed.base_url,
+        reasoning_effort: routed.reasoning_effort,
+      };
     }
     return {
       provider: fallback.provider.trim() || 'openai_compatible',
@@ -2485,9 +3283,10 @@ export class JoiSQLiteStore {
     const row = this.get(
       `SELECT provider, model_name, COALESCE(base_url, '') AS base_url
        FROM models
-       WHERE model_name = ? AND COALESCE(enabled, 1) != 0
+       WHERE (id = ? OR model_name = ?) AND COALESCE(enabled, 1) != 0
        ORDER BY CASE WHEN COALESCE(base_url, '') != '' THEN 0 ELSE 1 END, updated_at DESC
        LIMIT 1`,
+      normalized,
       normalized,
     );
     if (!row) return null;
@@ -2691,20 +3490,24 @@ export class JoiSQLiteStore {
           tool_run_id: toolRunID,
           operation_id: operationID,
         });
+        const generatedMediaOutput = generatedMediaOutputForToolOutput(result.output);
         const generatedAttachment = generatedAttachmentForToolOutput(result.output)[0];
         if (toolStatus === 'succeeded' && generatedAttachment) {
           const artifactID = `art_${newID()}`;
           const artifactMetadata = {
-            generation_mode: 'grok_build_native_image_gen',
-            provider: optionalString(result.output.provider) || 'grok_build',
-            model: optionalString(result.output.model) || 'grok-4.5',
-            native_tool: optionalString(result.output.native_tool) || 'image_gen',
-            source_session_id: optionalString(result.output.source_session_id),
-            source_tool_call_id: optionalString(result.output.source_tool_call_id),
-            prompt_sha256: optionalString(result.output.prompt_sha256),
-            aspect_ratio: optionalString(result.output.aspect_ratio),
-            file_path: optionalString(result.output.file_path),
+            generation_mode: optionalString(generatedMediaOutput.mode) || 'generated_media',
+            provider: optionalString(generatedMediaOutput.provider) || 'local',
+            model: optionalString(generatedMediaOutput.model),
+            native_tool: optionalString(generatedMediaOutput.native_tool),
+            source_session_id: optionalString(generatedMediaOutput.source_session_id),
+            source_tool_call_id: optionalString(generatedMediaOutput.source_tool_call_id),
+            request_id: optionalString(generatedMediaOutput.request_id),
+            prompt_sha256: optionalString(generatedMediaOutput.prompt_sha256),
+            aspect_ratio: optionalString(generatedMediaOutput.aspect_ratio),
+            duration_seconds: Number(generatedMediaOutput.duration_seconds || 0),
+            file_path: optionalString(generatedMediaOutput.file_path),
             file_name: generatedAttachment.name,
+            media_kind: generatedAttachment.kind,
             mime_type: generatedAttachment.mime_type,
             size: generatedAttachment.size,
             preview_url: generatedAttachment.preview_url,
@@ -2712,10 +3515,11 @@ export class JoiSQLiteStore {
           this.exec(
             `INSERT INTO artifacts (id, type, title, content, content_format, source_product_task_id, source_run_id,
                                     source_conversation_id, source_message_id, linked_memory_ids, metadata)
-             VALUES (?, 'image', ?, ?, ?, NULLIF(?, ''), ?, ?, ?, '[]', ?)`,
+             VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, '[]', ?)`,
             artifactID,
+            generatedAttachment.kind,
             generatedAttachment.name,
-            optionalString(result.output.file_path) || '',
+            optionalString(generatedMediaOutput.file_path) || '',
             generatedAttachment.mime_type,
             started.product_task_id || '',
             started.run_id,
@@ -2723,7 +3527,7 @@ export class JoiSQLiteStore {
             started.assistant_message_id,
             json(artifactMetadata),
           );
-          this.insertRunStep(started.run_id, 'artifact_created', 'Generated image persisted', { call_id: result.call_id, capability }, { artifact_id: artifactID, ...artifactMetadata });
+          this.insertRunStep(started.run_id, 'artifact_created', 'Generated media persisted', { call_id: result.call_id, capability }, { artifact_id: artifactID, ...artifactMetadata });
           this.insertRunEvent(started.run_id, started.turn_id, this.nextRunEventSeq(started.run_id), 'artifact.created', {
             item_type: 'artifact',
             item_id: artifactID,
@@ -3111,7 +3915,7 @@ export class JoiSQLiteStore {
         agentID,
         prompt.memory_profile_version,
         json(prompt.memory_results || []),
-        json({ source: 'electron_ts_tool_calling', memory_result_count: prompt.memory_results?.length || 0, memory_scope: prompt.memory_scope }),
+        json({ source: 'electron_ts_tool_calling', memory_result_count: prompt.memory_results?.length || 0, memory_scope: prompt.memory_scope, selected_skills: prompt.selected_skills }),
       );
       this.appendMemoryRecalledEvents(runID, turnID, memoryPackID, prompt.memory_results || [], prompt.memory_scope);
       this.recordMemoryRetrievalUsage(runID, agentID, prompt.memory_results || [], prompt.memory_scope);
@@ -3137,6 +3941,8 @@ export class JoiSQLiteStore {
       const steps: Array<[string, string, Record<string, unknown>, Record<string, unknown>]> = [
         ['input_received', 'Input received', { message }, { conversation_id: conversationID, message_id: userMessageID }],
         ['router_selected', 'Router selected agent', { message }, { agent_id: agentID, route: 'electron_ts_tool_calling' }],
+        ...prompt.selected_skills.map((skill) => ['skill_selected', 'Skill selected', { message, skill_id: skill.id }, skill] as [string, string, Record<string, unknown>, Record<string, unknown>]),
+        ...(prompt.selected_skills.length > 0 ? [['skill_plan_generated', 'Skill instructions loaded', { skill_ids: prompt.selected_skills.map((skill) => skill.id) }, { progressive_disclosure: true, selected_skills: prompt.selected_skills }] as [string, string, Record<string, unknown>, Record<string, unknown>]] : []),
         ['prompt_assembled', 'Prompt assembly finished', { run_id: runID, agent_id: agentID }, { prompt_assembly_id: promptAssemblyID, prefix_hash: prefixHash, dynamic_tail_hash: dynamicTailHash, prompt_cache_key: promptCacheKey, memory_profile_version: prompt.memory_profile_version, tool_schema_version: prompt.tool_schema_version, memory_result_count: prompt.memory_results?.length || 0 }],
       ];
       for (const [stepType, stepTitle, input, output] of steps) {
@@ -3409,6 +4215,21 @@ export class JoiSQLiteStore {
     if (filter.group_id) {
       where.push('c.group_id = ?');
       params.push(filter.group_id);
+    }
+    const query = filter.query?.trim();
+    if (query) {
+      const like = `%${escapeLike(query)}%`;
+      where.push(`(
+        c.id LIKE ? ESCAPE '\\'
+        OR c.title LIKE ? ESCAPE '\\'
+        OR COALESCE(c.topic, '') LIKE ? ESCAPE '\\'
+        OR EXISTS (
+          SELECT 1 FROM messages search_messages
+          WHERE search_messages.conversation_id=c.id
+            AND search_messages.content LIKE ? ESCAPE '\\'
+        )
+      )`);
+      params.push(like, like, like, like);
     }
     const rows = this.all(
       `SELECT
@@ -4752,6 +5573,405 @@ export class JoiSQLiteStore {
     };
   }
 
+  listAgentModelPolicies(): { policies: AgentModelPolicy[] } {
+    const rows = this.all(
+      `SELECT a.id AS agent_id,
+              COALESCE(p.default_model_id, a.default_model_id, '') AS default_model_id,
+              COALESCE(p.fallback_model_ids,
+                CASE WHEN COALESCE(a.fallback_model_id, '')='' THEN '[]' ELSE json_array(a.fallback_model_id) END,
+                '[]') AS fallback_model_ids,
+              COALESCE(p.cheap_model_id, a.cheap_model_id, '') AS cheap_model_id,
+              COALESCE(p.child_model_id, '') AS child_model_id,
+              COALESCE(p.tool_model_id, '') AS tool_model_id,
+              COALESCE(p.long_context_model_id, '') AS long_context_model_id,
+              COALESCE(p.reasoning_effort, '') AS reasoning_effort,
+              COALESCE(p.max_failovers, 2) AS max_failovers,
+              COALESCE(p.enabled, 1) AS enabled,
+              COALESCE(p.metadata, '{}') AS metadata,
+              COALESCE(p.updated_at, a.updated_at) AS updated_at
+       FROM agents a
+       LEFT JOIN agent_model_policies p ON p.agent_id=a.id
+       WHERE a.enabled=1
+       ORDER BY CASE WHEN a.id='general_agent' THEN 0 ELSE 1 END, a.id`,
+    );
+    return { policies: rows.map(rowToAgentModelPolicy) };
+  }
+
+  getAssistantWorkspace(): AssistantWorkspaceSnapshot {
+    for (const [id, provider, name] of [
+      ['assistant_channel_telegram', 'telegram', 'Telegram'],
+      ['assistant_channel_imessage', 'imessage', 'iMessage'],
+      ['assistant_channel_discord', 'discord', 'Discord'],
+      ['assistant_channel_feishu', 'feishu', '飞书'],
+      ['assistant_channel_calendar', 'calendar', 'macOS 日历'],
+      ['assistant_channel_email', 'email', '邮件'],
+    ] as const) {
+      this.exec(
+        `INSERT INTO assistant_channels (id, provider, name, status, enabled, configured, metadata)
+         VALUES (?, ?, ?, 'not_configured', 0, 0, '{}')
+         ON CONFLICT(id) DO NOTHING`,
+        id,
+        provider,
+        name,
+      );
+    }
+    const settings = this.getSettings();
+    this.exec(
+      `UPDATE assistant_channels SET enabled=?, configured=?, status=?, updated_at=datetime('now') WHERE provider='telegram'`,
+      settings.telegram_enabled ? 1 : 0,
+      settings.telegram_enabled ? 1 : 0,
+      settings.telegram_enabled ? 'ready' : 'not_configured',
+    );
+    this.exec(
+      `UPDATE assistant_channels SET enabled=?, configured=?, status=?, updated_at=datetime('now') WHERE provider='imessage'`,
+      settings.imessage_enabled ? 1 : 0,
+      settings.imessage_enabled ? 1 : 0,
+      settings.imessage_enabled ? 'ready' : 'not_configured',
+    );
+    const desktop = this.desktopSettings();
+    const captureActive = desktop['assistant.capture.active'] === 'true';
+    const sessionID = desktop['assistant.capture.session_id'] || '';
+    const intervalSeconds = Math.max(15, Number(desktop['assistant.capture.interval_seconds'] || 60));
+    const activitySessions = this.all(
+      `SELECT * FROM assistant_activity_sessions ORDER BY datetime(started_at) DESC LIMIT 30`,
+    ).map((row) => ({
+      id: optionalString(row.id) || '',
+      status: optionalString(row.status) || 'active',
+      title: optionalString(row.title) || '工作记录',
+      started_at: optionalString(row.started_at),
+      ended_at: optionalString(row.ended_at),
+      event_count: Number(row.event_count || 0),
+      summary: optionalString(row.summary),
+      metadata: parseObject(row.metadata),
+    }));
+    const recentActivity = this.all(
+      `SELECT * FROM assistant_activity_events ORDER BY datetime(created_at) DESC LIMIT 100`,
+    ).map((row) => ({
+      id: optionalString(row.id) || '',
+      session_id: optionalString(row.session_id) || '',
+      event_type: optionalString(row.event_type) || 'snapshot',
+      app_name: optionalString(row.app_name),
+      window_title: optionalString(row.window_title),
+      text: optionalString(row.text),
+      screenshot_path: optionalString(row.screenshot_path),
+      created_at: optionalString(row.created_at),
+      metadata: parseObject(row.metadata),
+    }));
+    const calendar = this.all(
+      `SELECT * FROM assistant_calendar_items ORDER BY datetime(start_at), rowid LIMIT 200`,
+    ).map((row) => ({
+      id: optionalString(row.id) || '',
+      title: optionalString(row.title) || '',
+      start_at: optionalString(row.start_at) || '',
+      end_at: optionalString(row.end_at),
+      status: optionalString(row.status) || 'draft',
+      source: optionalString(row.source) || 'joi',
+      notes: optionalString(row.notes),
+      external_id: optionalString(row.external_id),
+      metadata: parseObject(row.metadata),
+    }));
+    const planRows = this.all(`SELECT * FROM assistant_plans ORDER BY datetime(updated_at) DESC LIMIT 100`);
+    const plans = planRows.map((row) => {
+      const planID = optionalString(row.id) || '';
+      const nodes = this.all(`SELECT * FROM assistant_plan_nodes WHERE plan_id=? ORDER BY sort_order, datetime(created_at), rowid`, planID).map((node) => ({
+        id: optionalString(node.id) || '',
+        plan_id: planID,
+        title: optionalString(node.title) || '',
+        status: optionalString(node.status) || 'pending',
+        parent_id: optionalString(node.parent_id),
+        depends_on: parseStringArray(node.depends_on),
+        evidence: parseArray(node.evidence).filter(isSQLiteRow),
+        sort_order: Number(node.sort_order || 0),
+        metadata: parseObject(node.metadata),
+      }));
+      return {
+        id: planID,
+        title: optionalString(row.title) || '',
+        objective: optionalString(row.objective) || '',
+        status: optionalString(row.status) || 'active',
+        conversation_id: optionalString(row.conversation_id),
+        nodes,
+        review_summary: optionalString(row.review_summary),
+        created_at: optionalString(row.created_at),
+        updated_at: optionalString(row.updated_at),
+        metadata: parseObject(row.metadata),
+      };
+    });
+    const channels = this.all(`SELECT * FROM assistant_channels ORDER BY provider`).map((row) => ({
+      id: optionalString(row.id) || '',
+      provider: optionalString(row.provider) || '',
+      name: optionalString(row.name) || '',
+      status: optionalString(row.status) || 'not_configured',
+      enabled: Boolean(Number(row.enabled || 0)),
+      configured: Boolean(Number(row.configured || 0)),
+      last_sync_at: optionalString(row.last_sync_at),
+      metadata: parseObject(row.metadata),
+    }));
+    return {
+      capture: { active: captureActive, session_id: sessionID || undefined, interval_seconds: intervalSeconds },
+      activity_sessions: activitySessions,
+      recent_activity: recentActivity,
+      calendar,
+      plans,
+      channels,
+    };
+  }
+
+  executeAssistantAction(input: AssistantActionRequest): AssistantActionResult {
+    const action = input.action?.trim();
+    if (!action) throw new Error('assistant action is required');
+    let item: unknown;
+    if (action === 'start_activity') {
+      const existing = this.desktopSettings()['assistant.capture.session_id'] || '';
+      const existingRow = existing ? this.get(`SELECT * FROM assistant_activity_sessions WHERE id=? AND status='active'`, existing) : undefined;
+      const id = existingRow ? existing : `activity_${newID()}`;
+      if (!existingRow) {
+        this.exec(
+          `INSERT INTO assistant_activity_sessions (id, status, title, metadata, started_at)
+           VALUES (?, 'active', ?, ?, datetime('now'))`,
+          id,
+          input.title?.trim() || '工作记录',
+          json(input.metadata || {}),
+        );
+      }
+      this.setDesktopSettings({
+        'assistant.capture.active': 'true',
+        'assistant.capture.session_id': id,
+        'assistant.capture.interval_seconds': String(Math.max(15, Math.min(3600, Math.round(input.interval_seconds || 60)))),
+      });
+      item = { id };
+    } else if (action === 'stop_activity') {
+      const id = input.session_id?.trim() || this.desktopSettings()['assistant.capture.session_id'] || '';
+      if (!id) throw new Error('activity session id is required');
+      const events = this.all(`SELECT app_name, window_title, text FROM assistant_activity_events WHERE session_id=? ORDER BY datetime(created_at)`, id);
+      const summary = input.text?.trim() || summarizeActivityEvents(events);
+      this.exec(
+        `UPDATE assistant_activity_sessions SET status='completed', summary=?, ended_at=datetime('now') WHERE id=?`,
+        summary,
+        id,
+      );
+      this.setDesktopSettings({ 'assistant.capture.active': 'false', 'assistant.capture.session_id': '' });
+      item = { id, summary };
+    } else if (action === 'record_activity') {
+      const sessionID = input.session_id?.trim() || this.desktopSettings()['assistant.capture.session_id'] || '';
+      if (!sessionID || !this.get(`SELECT id FROM assistant_activity_sessions WHERE id=?`, sessionID)) throw new Error('active activity session not found');
+      const metadata = input.metadata || {};
+      const id = `activity_event_${newID()}`;
+      this.transaction(() => {
+        this.exec(
+          `INSERT INTO assistant_activity_events (
+             id, session_id, event_type, app_name, window_title, text, screenshot_path, metadata, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+          id,
+          sessionID,
+          optionalString(metadata.event_type) || 'snapshot',
+          optionalString(metadata.app_name) || '',
+          optionalString(metadata.window_title) || '',
+          input.text?.trim() || optionalString(metadata.text) || '',
+          input.path?.trim() || optionalString(metadata.screenshot_path) || '',
+          json(metadata),
+        );
+        this.exec(`UPDATE assistant_activity_sessions SET event_count=event_count+1 WHERE id=?`, sessionID);
+      });
+      item = { id, session_id: sessionID };
+    } else if (action === 'create_calendar_item') {
+      if (!input.title?.trim() || !input.start_at?.trim()) throw new Error('calendar title and start_at are required');
+      const id = input.id?.trim() || `calendar_${newID()}`;
+      this.exec(
+        `INSERT INTO assistant_calendar_items (id, title, start_at, end_at, status, source, notes, metadata)
+         VALUES (?, ?, ?, NULLIF(?, ''), 'draft', 'joi', ?, ?)
+         ON CONFLICT(id) DO UPDATE SET title=excluded.title, start_at=excluded.start_at, end_at=excluded.end_at,
+           notes=excluded.notes, metadata=excluded.metadata, updated_at=datetime('now')`,
+        id,
+        input.title.trim(),
+        input.start_at.trim(),
+        input.end_at?.trim() || '',
+        input.text?.trim() || '',
+        json(input.metadata || {}),
+      );
+      item = { id };
+    } else if (action === 'mark_calendar_published') {
+      if (!input.id?.trim()) throw new Error('calendar item id is required');
+      this.exec(
+        `UPDATE assistant_calendar_items SET status='published', source=COALESCE(NULLIF(?, ''), source),
+         external_id=COALESCE(NULLIF(?, ''), external_id), updated_at=datetime('now') WHERE id=?`,
+        input.provider?.trim() || '',
+        optionalString(input.metadata?.external_id) || '',
+        input.id.trim(),
+      );
+      item = { id: input.id.trim() };
+    } else if (action === 'create_plan') {
+      if (!input.title?.trim()) throw new Error('plan title is required');
+      const id = input.id?.trim() || `plan_${newID()}`;
+      this.exec(
+        `INSERT INTO assistant_plans (id, title, objective, conversation_id, metadata)
+         VALUES (?, ?, ?, NULLIF(?, ''), ?)
+         ON CONFLICT(id) DO UPDATE SET title=excluded.title, objective=excluded.objective,
+           conversation_id=excluded.conversation_id, metadata=excluded.metadata, updated_at=datetime('now')`,
+        id,
+        input.title.trim(),
+        input.objective?.trim() || '',
+        input.conversation_id?.trim() || '',
+        json(input.metadata || {}),
+      );
+      item = { id };
+    } else if (action === 'add_plan_node') {
+      const planID = optionalString(input.metadata?.plan_id) || input.id?.trim() || '';
+      if (!planID || !this.get(`SELECT id FROM assistant_plans WHERE id=?`, planID)) throw new Error('plan not found');
+      if (!input.title?.trim()) throw new Error('plan node title is required');
+      const id = `plan_node_${newID()}`;
+      this.exec(
+        `INSERT INTO assistant_plan_nodes (id, plan_id, title, parent_id, depends_on, sort_order, metadata)
+         VALUES (?, ?, ?, NULLIF(?, ''), ?, ?, ?)`,
+        id,
+        planID,
+        input.title.trim(),
+        optionalString(input.metadata?.parent_id) || '',
+        json(parseStringArray(input.metadata?.depends_on)),
+        Number(input.metadata?.sort_order || 0),
+        json(input.metadata || {}),
+      );
+      item = { id, plan_id: planID };
+    } else if (action === 'update_plan_node') {
+      if (!input.id?.trim()) throw new Error('plan node id is required');
+      const row = this.get(`SELECT * FROM assistant_plan_nodes WHERE id=?`, input.id.trim());
+      if (!row) throw new Error('plan node not found');
+      const metadata = input.metadata || {};
+      this.exec(
+        `UPDATE assistant_plan_nodes SET title=?, status=?, depends_on=?, evidence=?, metadata=?, updated_at=datetime('now') WHERE id=?`,
+        input.title?.trim() || optionalString(row.title) || '',
+        optionalString(metadata.status) || optionalString(row.status) || 'pending',
+        json(metadata.depends_on === undefined ? parseStringArray(row.depends_on) : parseStringArray(metadata.depends_on)),
+        json(metadata.evidence === undefined ? parseArray(row.evidence) : (Array.isArray(metadata.evidence) ? metadata.evidence : [])),
+        json({ ...parseObject(row.metadata), ...metadata }),
+        input.id.trim(),
+      );
+      item = { id: input.id.trim() };
+    } else if (action === 'review_plan') {
+      if (!input.id?.trim()) throw new Error('plan id is required');
+      const plan = this.getAssistantWorkspace().plans.find((entry) => entry.id === input.id);
+      if (!plan) throw new Error('plan not found');
+      const completed = plan.nodes.filter((node) => node.status === 'completed').length;
+      const blocked = plan.nodes.filter((node) => node.status === 'blocked').length;
+      const review = input.text?.trim() || `${completed}/${plan.nodes.length} 个步骤已完成${blocked ? `，${blocked} 个受阻` : ''}。`;
+      this.exec(`UPDATE assistant_plans SET review_summary=?, updated_at=datetime('now') WHERE id=?`, review, plan.id);
+      item = { id: plan.id, review_summary: review };
+    } else if (action === 'configure_channel') {
+      const provider = input.provider?.trim();
+      if (!provider) throw new Error('channel provider is required');
+      const id = input.id?.trim() || `assistant_channel_${provider}`;
+      const configured = Boolean(input.metadata?.configured ?? input.enabled);
+      this.exec(
+        `INSERT INTO assistant_channels (id, provider, name, status, enabled, configured, metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET name=excluded.name, status=excluded.status, enabled=excluded.enabled,
+           configured=excluded.configured, metadata=excluded.metadata, updated_at=datetime('now')`,
+        id,
+        provider,
+        input.title?.trim() || provider,
+        configured ? 'ready' : 'not_configured',
+        input.enabled ? 1 : 0,
+        configured ? 1 : 0,
+        json(input.metadata || {}),
+      );
+      item = { id, provider };
+    } else {
+      throw new Error(`Unsupported assistant action: ${action}`);
+    }
+    return { ok: true, action, item, snapshot: this.getAssistantWorkspace() };
+  }
+
+  saveAgentModelPolicy(input: AgentModelPolicyRequest): AgentModelPolicy {
+    const agentID = input.agent_id?.trim();
+    if (!agentID || !this.get(`SELECT id FROM agents WHERE id=?`, agentID)) throw new Error(`Agent not found: ${agentID || '(empty)'}`);
+    const modelIDs = [
+      input.default_model_id,
+      input.cheap_model_id,
+      input.child_model_id,
+      input.tool_model_id,
+      input.long_context_model_id,
+      ...(input.fallback_model_ids || []),
+    ].map((item) => item?.trim()).filter((item): item is string => Boolean(item));
+    for (const modelID of new Set(modelIDs)) {
+      if (!this.get(`SELECT id FROM models WHERE id=? OR model_name=?`, modelID, modelID)) throw new Error(`Model not found: ${modelID}`);
+    }
+    const defaultID = input.default_model_id?.trim() || null;
+    const fallbackIDs = [...new Set((input.fallback_model_ids || []).map((item) => item.trim()).filter(Boolean))];
+    const maxFailovers = Math.max(0, Math.min(8, Math.round(input.max_failovers ?? 2)));
+    this.transaction(() => {
+      this.exec(
+        `INSERT INTO agent_model_policies (
+           agent_id, default_model_id, fallback_model_ids, cheap_model_id, child_model_id,
+           tool_model_id, long_context_model_id, reasoning_effort, max_failovers, enabled, metadata, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(agent_id) DO UPDATE SET
+           default_model_id=excluded.default_model_id,
+           fallback_model_ids=excluded.fallback_model_ids,
+           cheap_model_id=excluded.cheap_model_id,
+           child_model_id=excluded.child_model_id,
+           tool_model_id=excluded.tool_model_id,
+           long_context_model_id=excluded.long_context_model_id,
+           reasoning_effort=excluded.reasoning_effort,
+           max_failovers=excluded.max_failovers,
+           enabled=excluded.enabled,
+           metadata=excluded.metadata,
+           updated_at=datetime('now')`,
+        agentID,
+        defaultID,
+        json(fallbackIDs),
+        input.cheap_model_id?.trim() || null,
+        input.child_model_id?.trim() || null,
+        input.tool_model_id?.trim() || null,
+        input.long_context_model_id?.trim() || null,
+        input.reasoning_effort?.trim() || '',
+        maxFailovers,
+        input.enabled === false ? 0 : 1,
+        json(input.metadata || {}),
+      );
+      this.exec(
+        `UPDATE agents SET default_model_id=?, fallback_model_id=?, cheap_model_id=?, updated_at=datetime('now') WHERE id=?`,
+        defaultID,
+        fallbackIDs[0] || null,
+        input.cheap_model_id?.trim() || null,
+        agentID,
+      );
+    });
+    return this.listAgentModelPolicies().policies.find((policy) => policy.agent_id === agentID) || rowToAgentModelPolicy({ agent_id: agentID });
+  }
+
+  modelRouteCandidates(input: {
+    agent_id: string;
+    purpose?: 'default' | 'child' | 'tool' | 'cheap' | 'long_context' | string;
+    fallback: { provider: string; model_name: string; base_url?: string; reasoning_effort?: string };
+  }): Array<{ model_id: string; provider: string; model_name: string; base_url: string; reasoning_effort?: string; route_reason: string }> {
+    const policyRow = this.get(`SELECT * FROM agent_model_policies WHERE agent_id=? AND enabled=1`, input.agent_id);
+    const policy = policyRow ? rowToAgentModelPolicy(policyRow) : undefined;
+    const preferred = input.purpose === 'child' ? policy?.child_model_id
+      : input.purpose === 'tool' ? policy?.tool_model_id
+        : input.purpose === 'cheap' ? policy?.cheap_model_id
+          : input.purpose === 'long_context' ? policy?.long_context_model_id
+            : policy?.default_model_id;
+    const identifiers = [preferred, policy?.default_model_id, ...(policy?.fallback_model_ids || [])]
+      .map((item) => item?.trim()).filter((item): item is string => Boolean(item));
+    const candidates: Array<{ model_id: string; provider: string; model_name: string; base_url: string; reasoning_effort?: string; route_reason: string }> = [];
+    for (const identifier of [...new Set(identifiers)].slice(0, Math.max(1, (policy?.max_failovers ?? 2) + 1))) {
+      const endpoint = this.configuredModelEndpoint(identifier);
+      if (!endpoint) continue;
+      candidates.push({ model_id: identifier, ...endpoint, reasoning_effort: policy?.reasoning_effort || input.fallback.reasoning_effort, route_reason: identifier === preferred ? `policy_${input.purpose || 'default'}` : 'policy_fallback' });
+    }
+    if (!candidates.some((item) => item.provider === input.fallback.provider && item.model_name === input.fallback.model_name)) {
+      candidates.push({
+        model_id: input.fallback.model_name,
+        provider: input.fallback.provider,
+        model_name: input.fallback.model_name,
+        base_url: input.fallback.base_url?.trim() || '',
+        reasoning_effort: input.fallback.reasoning_effort,
+        route_reason: 'request_fallback',
+      });
+    }
+    return candidates;
+  }
+
   replaceFetchedModels(provider: string, baseURL: string, models: AvailableModel[]): void {
     const cleanProvider = provider.trim();
     const cleanBaseURL = baseURL.trim();
@@ -4907,7 +6127,7 @@ export class JoiSQLiteStore {
 
   listMCPServers(): { servers: MCPServerRecord[] } {
     const servers = this.all(
-      `SELECT id, name, transport, command, args, enabled, status, trust, last_sync_at, last_sync_error, metadata
+      `SELECT id, name, transport, command, args, url, env, headers, enabled, status, trust, last_sync_at, last_sync_error, metadata
        FROM mcp_servers
        ORDER BY id ASC`,
     ).map(rowToMCPServer);
@@ -4952,17 +6172,22 @@ export class JoiSQLiteStore {
     const name = req.name.trim();
     if (!id || !name) throw new Error('MCP server id and name are required');
     const transport = (req.transport || 'stdio').trim().toLowerCase();
-    if (transport !== 'stdio') throw new Error('Only stdio MCP servers are supported in Desktop');
+    if (!['stdio', 'streamable_http', 'sse'].includes(transport)) throw new Error(`Unsupported MCP transport: ${transport}`);
     const command = (req.command || '').trim();
-    if (req.enabled !== false && !command) throw new Error('Enabled stdio MCP server requires a command');
+    const url = (req.url || '').trim();
+    if (req.enabled !== false && transport === 'stdio' && !command) throw new Error('Enabled stdio MCP server requires a command');
+    if (req.enabled !== false && transport !== 'stdio' && !url) throw new Error(`Enabled ${transport} MCP server requires a URL`);
     this.exec(
-      `INSERT INTO mcp_servers (id, name, transport, command, args, enabled, status, trust, last_sync_error, metadata)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?)
+      `INSERT INTO mcp_servers (id, name, transport, command, args, url, env, headers, enabled, status, trust, last_sync_error, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)
        ON CONFLICT(id) DO UPDATE SET
          name=excluded.name,
          transport=excluded.transport,
          command=excluded.command,
          args=excluded.args,
+         url=excluded.url,
+         env=excluded.env,
+         headers=excluded.headers,
          enabled=excluded.enabled,
          status=CASE WHEN excluded.enabled=1 THEN mcp_servers.status ELSE 'inactive' END,
          trust=excluded.trust,
@@ -4973,6 +6198,9 @@ export class JoiSQLiteStore {
       transport,
       command,
       json(req.args || []),
+      url,
+      json(req.env || {}),
+      json(req.headers || {}),
       req.enabled === false ? 0 : 1,
       req.enabled === false ? 'inactive' : 'configured',
       req.trust?.trim() || 'untrusted_until_wrapped',
@@ -4994,7 +6222,8 @@ export class JoiSQLiteStore {
     if (!id) throw new Error('MCP server id is required');
     const existing = this.listMCPServers().servers.find((item) => item.id === id);
     if (!existing) throw new Error(`MCP server not found: ${id}`);
-    if (req.enabled !== false && !existing.command?.trim()) throw new Error('MCP server command is required before enabling');
+    if (req.enabled !== false && existing.transport === 'stdio' && !existing.command?.trim()) throw new Error('MCP server command is required before enabling');
+    if (req.enabled !== false && existing.transport !== 'stdio' && !existing.url?.trim()) throw new Error('MCP server URL is required before enabling');
     this.exec(
       `UPDATE mcp_servers SET enabled=?, status=?, updated_at=datetime('now') WHERE id=?`,
       req.enabled === false ? 0 : 1,
@@ -5011,17 +6240,24 @@ export class JoiSQLiteStore {
   }): { server: MCPServerRecord } {
     const id = serverID.trim();
     if (!id) throw new Error('MCP server id is required');
+    const existingWrapped = new Map(this.all(
+      `SELECT name, wrapped_capability_id, enabled FROM mcp_inventory_items WHERE server_id=? AND kind='tool'`,
+      id,
+    ).map((row) => [optionalString(row.name) || '', { capability_id: optionalString(row.wrapped_capability_id), enabled: Number(row.enabled ?? 1) }]));
     this.transaction(() => {
       this.exec(`DELETE FROM mcp_inventory_items WHERE server_id=?`, id);
       for (const tool of inventory.tools || []) {
+        const wrapped = existingWrapped.get(tool.name);
         this.exec(
-          `INSERT INTO mcp_inventory_items (id, server_id, kind, name, description, schema, enabled, last_seen_at)
-           VALUES (?, ?, 'tool', ?, ?, ?, 1, datetime('now'))`,
+          `INSERT INTO mcp_inventory_items (id, server_id, kind, name, description, schema, wrapped_capability_id, enabled, last_seen_at)
+           VALUES (?, ?, 'tool', ?, ?, ?, NULLIF(?, ''), ?, datetime('now'))`,
           `mcpi_${stableShortID(`${id}:tool:${tool.name}`)}`,
           id,
           tool.name,
           tool.description || '',
           json(tool.inputSchema || {}),
+          wrapped?.capability_id || '',
+          wrapped?.enabled ?? 1,
         );
       }
       for (const resource of inventory.resources || []) {
@@ -5140,18 +6376,102 @@ export class JoiSQLiteStore {
     );
     return {
       skills: rows.map((row) => ({
-        id: String(row.id),
-        version: optionalString(row.version) || 'v1',
-        name: String(row.name),
-        description: optionalString(row.description) || '',
-        trigger_phrases: parseArray(row.trigger_phrases).map(String),
-        required_capabilities: parseArray(row.required_capabilities).map(String),
-        forbidden_capabilities: parseArray(row.forbidden_capabilities).map(String),
-        output_contract: optionalString(row.output_contract) || '',
-        enabled: Boolean(Number(row.enabled ?? 1)),
-        metadata: parseObject(row.metadata),
+        ...skillRecordFromRow(row),
       })),
     };
+  }
+
+  syncDiscoveredSkills(discovered: DiscoveredSkill[]): { skills: SkillRecord[]; discovered_count: number; removed_count: number } {
+    const existingRows = this.all(
+      `SELECT id, enabled, metadata FROM skill_definitions
+       WHERE json_extract(metadata, '$.source')='filesystem_skill'`,
+    );
+    const existingEnabled = new Map(existingRows.map((row) => [String(row.id), Boolean(Number(row.enabled ?? 1))]));
+    const incomingIDs = new Set(discovered.map((skill) => skill.id));
+    const staleIDs = existingRows.map((row) => String(row.id)).filter((id) => !incomingIDs.has(id));
+
+    this.transaction(() => {
+      for (const skill of discovered) {
+        const enabled = existingEnabled.has(skill.id)
+          ? existingEnabled.get(skill.id) !== false
+          : skill.validation_errors.length === 0;
+        this.exec(
+          `INSERT INTO skill_definitions (id, version, name, description, trigger_phrases, required_capabilities,
+                                          forbidden_capabilities, output_contract, enabled, metadata)
+           VALUES (?, ?, ?, ?, ?, ?, '[]', '', ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             version=excluded.version,
+             name=excluded.name,
+             description=excluded.description,
+             trigger_phrases=excluded.trigger_phrases,
+             required_capabilities=excluded.required_capabilities,
+             forbidden_capabilities=excluded.forbidden_capabilities,
+             output_contract=excluded.output_contract,
+             enabled=excluded.enabled,
+             metadata=excluded.metadata,
+             updated_at=datetime('now')`,
+          skill.id,
+          skill.version,
+          skill.name,
+          skill.description,
+          json(skill.interface.default_prompt ? [skill.interface.default_prompt] : []),
+          json(skill.required_tools),
+          enabled ? 1 : 0,
+          json({
+            source: 'filesystem_skill',
+            path: skill.path,
+            directory: skill.directory,
+            scope: skill.scope,
+            source_root: skill.source_root,
+            invocation_name: `$${skill.name}`,
+            allow_implicit_invocation: skill.allow_implicit_invocation,
+            interface: skill.interface,
+            resources: skill.resources,
+            sha256: skill.sha256,
+            mtime_ms: skill.mtime_ms,
+            validation_errors: skill.validation_errors,
+            progressive_disclosure: true,
+          }),
+        );
+      }
+      for (const id of staleIDs) this.exec(`DELETE FROM skill_definitions WHERE id=?`, id);
+    });
+
+    return { ...this.listSkills(), discovered_count: discovered.length, removed_count: staleIDs.length };
+  }
+
+  getSkill(idInput: string): { skill: SkillRecord; instructions: string; frontmatter: Record<string, unknown>; openai: Record<string, unknown> } {
+    const id = idInput.trim();
+    if (!id) throw new Error('skill id is required');
+    const row = this.get(
+      `SELECT id, version, name, description, trigger_phrases, required_capabilities, forbidden_capabilities, output_contract, enabled, metadata
+       FROM skill_definitions WHERE id=?`,
+      id,
+    );
+    if (!row) throw new Error(`skill not found: ${id}`);
+    const skill = skillRecordFromRow(row);
+    const path = optionalString(skill.metadata?.path);
+    if (!path) {
+      return { skill, instructions: '', frontmatter: {}, openai: {} };
+    }
+    const detail = readCodexSkill(path);
+    return { skill, instructions: detail.instructions, frontmatter: detail.frontmatter, openai: detail.openai };
+  }
+
+  private skillSelectionCandidates(): SkillSelectionCandidate[] {
+    return this.listSkills().skills.map((skill) => {
+      const metadata = skill.metadata || {};
+      return {
+        id: skill.id,
+        name: skill.name,
+        description: skill.description,
+        path: optionalString(metadata.path) || '',
+        scope: skillScopeValue(metadata.scope),
+        enabled: skill.enabled,
+        allow_implicit_invocation: metadata.allow_implicit_invocation !== false,
+        trigger_phrases: skill.trigger_phrases,
+      };
+    }).filter((skill) => Boolean(skill.path));
   }
 
   setSkillEnabled(req: { id?: string; enabled?: boolean }): void {
@@ -5473,6 +6793,99 @@ export class JoiSQLiteStore {
       limit,
     );
     return { memories: rows.map(rowToMemory), metrics: this.memoryQualityMetrics() };
+  }
+
+  recallMemoriesForTool(req: ChatRequest, query = '', limit = 8): { memories: MemorySearchResult[]; scope: MemoryRetrievalScope } {
+    const scope = this.resolveMemoryRetrievalScope(req);
+    return {
+      memories: this.searchPromptMemories(query.trim(), clampLimit(limit, 8), scope),
+      scope,
+    };
+  }
+
+  createMemoryCandidateForTool(req: ChatRequest, input: {
+    content?: string;
+    summary?: string;
+    type?: string;
+    scope?: string;
+    source?: string;
+  }): {
+    candidate: {
+      id: string;
+      type: string;
+      content: string;
+      summary: string;
+      scope_type: string;
+      scope_id: string;
+      status: string;
+    };
+    deduped: boolean;
+  } {
+    const content = input.content?.trim() || '';
+    if (!content) throw new Error('memory candidate content is required');
+    if (content.length > 20_000) throw new Error('memory candidate content exceeds 20000 characters');
+    const summary = (input.summary?.trim() || titleFromMessage(content)).slice(0, 500);
+    const type = normalizeToolMemoryType(input.type);
+    const scope = this.resolveMemoryRetrievalScope(req);
+    const requestedScope = (input.scope || 'current_context').trim().toLowerCase();
+    const resolvedScope = resolveToolMemoryCandidateScope(requestedScope, scope);
+    const existing = this.get(
+      `SELECT id, type, content, COALESCE(summary, '') AS summary, scope_type, COALESCE(scope_id, '') AS scope_id, status
+       FROM memories
+       WHERE lower(trim(content))=lower(trim(?))
+         AND status <> 'deleted'
+         AND scope_type=?
+         AND COALESCE(scope_id, '')=?
+       ORDER BY datetime(updated_at) DESC
+       LIMIT 1`,
+      content,
+      resolvedScope.scope_type,
+      resolvedScope.scope_id,
+    );
+    if (existing) {
+      return {
+        candidate: {
+          id: String(existing.id),
+          type: optionalString(existing.type) || type,
+          content: optionalString(existing.content) || content,
+          summary: optionalString(existing.summary) || summary,
+          scope_type: optionalString(existing.scope_type) || resolvedScope.scope_type,
+          scope_id: optionalString(existing.scope_id) || '',
+          status: optionalString(existing.status) || 'pending',
+        },
+        deduped: true,
+      };
+    }
+    const memoryID = `mem_${newID()}`;
+    this.exec(
+      `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence,
+                            status, source_event_ids, entities, metadata)
+       VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), 'internal', 0.7, 'pending', '[]', '[]', ?)`,
+      memoryID,
+      type,
+      content,
+      summary,
+      resolvedScope.scope_type,
+      resolvedScope.scope_id,
+      json({
+        source: input.source?.trim() || 'model_tool_candidate',
+        created_by: 'memory_write_candidate',
+        needs_user_review: true,
+        requested_scope: requestedScope,
+      }),
+    );
+    return {
+      candidate: {
+        id: memoryID,
+        type,
+        content,
+        summary,
+        scope_type: resolvedScope.scope_type,
+        scope_id: resolvedScope.scope_id,
+        status: 'pending',
+      },
+      deduped: false,
+    };
   }
 
   private memoryQualityMetrics(): MemoryQualityMetrics {
@@ -6778,6 +8191,139 @@ export class JoiSQLiteStore {
       }
     });
     return this.getRunTrace(runID);
+  }
+
+  enqueueRunMessage(input: {
+    run_id: string;
+    conversation_id?: string;
+    kind: 'steering' | 'follow_up';
+    content: string;
+    attachments?: unknown[];
+  }): RunQueuedMessage {
+    const runID = input.run_id?.trim();
+    const content = input.content?.trim();
+    if (!runID) throw new Error('run_id is required');
+    if (!content) throw new Error('queued message content is required');
+    if (!['steering', 'follow_up'].includes(input.kind)) throw new Error(`Unsupported queued message kind: ${input.kind}`);
+    const run = this.get(`SELECT id, conversation_id, status, terminal_status FROM runs WHERE id=?`, runID);
+    if (!run) throw new Error(`Run not found: ${runID}`);
+    const status = optionalString(run.terminal_status) || optionalString(run.status) || '';
+    if (['completed', 'succeeded', 'failed', 'cancelled', 'redirected'].includes(status)) {
+      throw new Error(`Run ${runID} is already terminal (${status})`);
+    }
+    const conversationID = input.conversation_id?.trim() || optionalString(run.conversation_id) || '';
+    if (!conversationID) throw new Error('conversation_id is required');
+    const id = `rqm_${newID()}`;
+    this.exec(
+      `INSERT INTO run_message_queue (
+         id, run_id, conversation_id, kind, content, attachments, status, metadata, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, datetime('now'))`,
+      id,
+      runID,
+      conversationID,
+      input.kind,
+      content,
+      json(input.attachments || []),
+      json({ source: 'desktop_composer' }),
+    );
+    this.appendRunEventV2({
+      id: `${runID}_evt_queue_${id}`,
+      run_id: runID,
+      event_type: `run.message_${input.kind}_queued`,
+      status: 'pending',
+      source: 'desktop',
+      visibility: 'inline_status',
+      payload: { queue_message_id: id, kind: input.kind, content_preview: content.slice(0, 160) },
+    });
+    return rowToRunQueuedMessage(this.get(`SELECT * FROM run_message_queue WHERE id=?`, id) || {});
+  }
+
+  listRunMessages(input: { run_id: string; status?: string }): { messages: RunQueuedMessage[] } {
+    const runID = input.run_id?.trim();
+    if (!runID) throw new Error('run_id is required');
+    const status = input.status?.trim() || '';
+    const rows = status
+      ? this.all(`SELECT * FROM run_message_queue WHERE run_id=? AND status=? ORDER BY datetime(created_at), rowid`, runID, status)
+      : this.all(`SELECT * FROM run_message_queue WHERE run_id=? ORDER BY datetime(created_at), rowid`, runID);
+    return { messages: rows.map(rowToRunQueuedMessage) };
+  }
+
+  claimRunMessages(input: {
+    run_id: string;
+    kind: 'steering' | 'follow_up';
+    delivered_run_id?: string;
+    limit?: number;
+  }): RunQueuedMessage[] {
+    const runID = input.run_id.trim();
+    const deliveredRunID = input.delivered_run_id?.trim() || runID;
+    const limit = Math.max(1, Math.min(20, Math.round(input.limit || 8)));
+    const rows = this.all(
+      `SELECT * FROM run_message_queue
+       WHERE run_id=? AND kind=? AND status='pending'
+       ORDER BY datetime(created_at), rowid
+       LIMIT ?`,
+      runID,
+      input.kind,
+      limit,
+    );
+    if (rows.length === 0) return [];
+    this.transaction(() => {
+      for (const row of rows) {
+        const id = optionalString(row.id) || '';
+        const content = optionalString(row.content) || '';
+        this.exec(
+          `UPDATE run_message_queue
+           SET status='delivered', delivered_run_id=?, delivered_at=datetime('now')
+           WHERE id=? AND status='pending'`,
+          deliveredRunID,
+          id,
+        );
+        this.exec(
+          `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
+           VALUES (?, ?, 'user', ?, ?, ?, datetime('now'))`,
+          `msg_${newID()}`,
+          optionalString(row.conversation_id) || '',
+          content,
+          optionalString(row.attachments) || '[]',
+          json({ run_id: deliveredRunID, queue_message_id: id, queued_kind: input.kind }),
+        );
+        this.appendRunEventV2({
+          id: `${deliveredRunID}_evt_queue_delivered_${id}`,
+          run_id: deliveredRunID,
+          event_type: `run.message_${input.kind}_delivered`,
+          status: 'completed',
+          source: 'runtime',
+          visibility: 'inline_status',
+          payload: { queue_message_id: id, kind: input.kind },
+        });
+      }
+    });
+    return this.all(
+      `SELECT * FROM run_message_queue WHERE id IN (${rows.map(() => '?').join(',')}) ORDER BY datetime(created_at), rowid`,
+      ...rows.map((row) => optionalString(row.id) || ''),
+    ).map(rowToRunQueuedMessage);
+  }
+
+  cancelRunMessage(input: { id: string; run_id?: string }): RunQueuedMessage {
+    const id = input.id?.trim();
+    if (!id) throw new Error('queued message id is required');
+    const row = this.get(`SELECT * FROM run_message_queue WHERE id=?`, id);
+    if (!row) throw new Error(`Queued message not found: ${id}`);
+    if (input.run_id?.trim() && optionalString(row.run_id) !== input.run_id.trim()) throw new Error('queued message does not belong to the requested run');
+    if (optionalString(row.status) === 'pending') {
+      this.exec(`UPDATE run_message_queue SET status='cancelled' WHERE id=? AND status='pending'`, id);
+      const runID = optionalString(row.run_id) || '';
+      this.appendRunEventV2({
+        id: `${runID}_evt_queue_cancelled_${id}`,
+        run_id: runID,
+        event_type: 'run.message_queue_cancelled',
+        status: 'cancelled',
+        source: 'desktop',
+        visibility: 'inline_status',
+        payload: { queue_message_id: id },
+      });
+    }
+    return rowToRunQueuedMessage(this.get(`SELECT * FROM run_message_queue WHERE id=?`, id) || {});
   }
 
   listRecoverableRuns(req: { limit?: number } = {}): { runs: RecoverableRunRecord[] } {
@@ -8402,6 +9948,7 @@ export class JoiSQLiteStore {
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
       this.db.exec(this.options.schemaSql);
       this.ensureConversationClosureSchema();
+      this.ensureAdvancedAgentSchema();
       this.seedDefaults();
       this.classifyRecoverableRunsOnStartup();
     } catch (error) {
@@ -9745,7 +11292,7 @@ export class JoiSQLiteStore {
       json({ desktop_default: true, electron_native: true }),
     );
     for (const agent of [
-      ['general_agent', 'General Agent', 'General purpose desktop agent.', ['memory_search', 'workspace_search', 'file_read', 'file_analyze', 'image_generate', 'apply_patch', 'shell_command', 'test_command', 'computer_observe', 'browser_observe', 'browser_navigate', 'browser_click', 'browser_type', 'desktop_app_list', 'desktop_app_inspect'], []],
+      ['general_agent', 'General Agent', 'General purpose desktop agent.', ['memory_search', 'memory_write_candidate', 'session_search', 'session_summary', 'session_branch', 'session_compact', 'delegate_task', 'project_list', 'skills_list', 'skill_view', 'tool_search', 'task_list', 'task_view', 'task_update', 'workspace_search', 'file_read', 'file_analyze', 'image_generate', 'video_generate', 'text_to_speech', 'speech_transcribe', 'lsp_definition', 'lsp_references', 'lsp_diagnostics', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop', 'apply_patch', 'shell_command', 'test_command', 'shell_start', 'shell_write', 'shell_output', 'shell_kill', 'computer_observe', 'find_roots', 'observe_ui', 'search_ui', 'expand_ui', 'inspect_ui', 'read_text', 'wait_for', 'act_ui', 'browser_observe', 'browser_navigate', 'browser_click', 'browser_type', 'desktop_app_list', 'desktop_app_inspect', 'request_user_input', 'automation_update'], []],
       ['memory_agent', 'Memory Agent', 'Memory and preference assistant.', ['memory_search'], ['记忆', '记住', '偏好', 'memory']],
       ['devops_agent', 'DevOps Agent', 'Read-only diagnostics assistant.', ['system_health_check', 'server_diagnose'], ['joi 自检', 'health', 'server', 'docker', 'nginx', 'cloudflared', '服务状态', '部署']],
       ['research_agent', 'Research Agent', 'Read-only web research assistant.', ['web_research'], ['@research', 'https://', 'http://', '网页搜索', '上网搜索', '搜一下', '最新消息', '新闻', '天气', '泄露信息']],
@@ -9764,6 +11311,20 @@ export class JoiSQLiteStore {
     }
     for (const capability of [
       ['memory_search', 'Memory Search', 'Search local memory context.', 'read_only'],
+      ['memory_recall', 'Memory Recall', 'Recall confirmed memory within the current room, project, and user scope.', 'read_only'],
+      ['memory_write_candidate', 'Memory Write Candidate', 'Create a pending memory candidate for user review.', 'workspace_write'],
+      ['session_search', 'Session Search', 'Search local Joi conversations and transcript history.', 'read_only'],
+      ['session_summary', 'Session Summary', 'Load bounded context from one Joi conversation.', 'read_only'],
+      ['session_branch', 'Session Branch', 'Fork a local conversation while preserving source provenance.', 'workspace_write'],
+      ['session_compact', 'Session Compact', 'Persist a conversation checkpoint while retaining the original transcript.', 'workspace_write'],
+      ['delegate_task', 'Delegate Task', 'Create a bounded child-agent run with independent provenance.', 'workspace_write'],
+      ['project_list', 'Project List', 'List local Joi projects and active personas.', 'read_only'],
+      ['skills_list', 'Skills List', 'List enabled local Codex-compatible skills.', 'read_only'],
+      ['skill_view', 'Skill View', 'Read one local skill definition and instructions.', 'read_only'],
+      ['tool_search', 'Tool Search', 'Search Joi native capabilities, MCP tools, and skills.', 'read_only'],
+      ['task_list', 'Task List', 'List persisted Joi product tasks.', 'read_only'],
+      ['task_view', 'Task View', 'Read one Joi product task with steps and deliverables.', 'read_only'],
+      ['task_update', 'Task Update', 'Close or reopen one Joi product task after confirmation.', 'workspace_write'],
       ['web_research', 'Web Research', 'Fetch and summarize an allowlisted web page.', 'read_only'],
       ['server_diagnose', 'Server Diagnose', 'Inspect service health through read-only diagnostics.', 'read_only'],
       ['system_health_check', 'System Health Check', 'Inspect Joi local runtime health.', 'read_only'],
@@ -9771,16 +11332,45 @@ export class JoiSQLiteStore {
       ['file_read', 'File Read', 'Read a bounded authorized workspace file line range.', 'read_only'],
       ['file_analyze', 'File Analyze', 'Analyze an authorized workspace file.', 'read_only'],
       ['image_generate', 'Image Generate', 'Generate and persist an image with Grok Build native image_gen.', 'read_only'],
+      ['image_analyze', 'Image Analyze', 'Analyze a local image with macOS Vision OCR.', 'read_only'],
+      ['video_generate', 'Video Generate', 'Generate and persist an MP4 video with xAI.', 'read_only'],
+      ['video_analyze', 'Video Analyze', 'Analyze a local video with FFmpeg keyframes and macOS Vision OCR.', 'read_only'],
+      ['text_to_speech', 'Text To Speech', 'Generate playable speech with the native macOS speech engine.', 'read_only'],
+      ['speech_transcribe', 'Speech Transcribe', 'Transcribe local audio with Whisper.', 'read_only'],
+      ['assistant_workspace', 'Assistant Workspace', 'Read the personal-assistant activity, calendar, plan, and channel workspace.', 'read_only'],
+      ['assistant_action', 'Assistant Action', 'Operate the local personal-assistant loop with full permission.', 'browser_interaction'],
+      ['lsp_definition', 'LSP Definition', 'Resolve a source definition with a native language server.', 'read_only'],
+      ['lsp_references', 'LSP References', 'Resolve source references with a native language server.', 'read_only'],
+      ['lsp_diagnostics', 'LSP Diagnostics', 'Read source diagnostics from a native language server.', 'read_only'],
+      ['debugger_attach', 'Debugger Attach', 'Start a native LLDB session.', 'browser_interaction'],
+      ['debugger_breakpoint', 'Debugger Breakpoint', 'Set a breakpoint in a native LLDB session.', 'browser_interaction'],
+      ['debugger_step', 'Debugger Step', 'Run or step a native LLDB session.', 'browser_interaction'],
+      ['debugger_evaluate', 'Debugger Evaluate', 'Evaluate an expression in a native LLDB session.', 'browser_interaction'],
+      ['debugger_stop', 'Debugger Stop', 'Dispose a native LLDB session.', 'browser_interaction'],
       ['apply_patch', 'Apply Patch', 'Apply a bounded patch inside authorized workspace roots.', 'workspace_write'],
       ['shell_command', 'Shell Command', 'Run a tightly allowlisted read-only workspace command.', 'read_only'],
       ['test_command', 'Test Command', 'Run an allowlisted test/build command.', 'read_only'],
+      ['shell_start', 'Shell Start', 'Start a persistent local shell session with full access.', 'browser_interaction'],
+      ['shell_write', 'Shell Write', 'Write a validated command to a persistent shell session.', 'browser_interaction'],
+      ['shell_output', 'Shell Output', 'Read bounded output from a persistent shell session.', 'read_only'],
+      ['shell_kill', 'Shell Kill', 'Terminate a persistent local shell session.', 'browser_interaction'],
       ['computer_observe', 'Computer Observe', 'Observe bounded frontmost-window metadata and visible text.', 'read_only'],
+      ['find_roots', 'Find UI Roots', 'Find controllable application windows through Pi computer-use.', 'read_only'],
+      ['observe_ui', 'Observe UI', 'Capture an immutable Pi computer-use UI state and semantic outline.', 'read_only'],
+      ['search_ui', 'Search UI', 'Search an observed Pi computer-use UI state.', 'read_only'],
+      ['expand_ui', 'Expand UI', 'Expand one UI ref from an observed Pi state.', 'read_only'],
+      ['inspect_ui', 'Inspect UI', 'Inspect one UI ref from an observed Pi state.', 'read_only'],
+      ['read_text', 'Read UI Text', 'Read bounded text from an observed Pi UI state.', 'read_only'],
+      ['wait_for', 'Wait For UI', 'Wait for a semantic UI condition and return a successor state.', 'read_only'],
+      ['act_ui', 'Act on UI', 'Execute a confirmed Pi UI action transaction with postcondition verification.', 'browser_interaction'],
       ['browser_observe', 'Browser Observe', 'Observe bounded frontmost-browser metadata and visible text.', 'read_only'],
       ['browser_navigate', 'Browser Navigate', 'Navigate an allowlisted browser URL without Playwright.', 'read_only'],
       ['browser_click', 'Browser Click', 'Click an element in the frontmost browser with explicit high permission.', 'browser_interaction'],
       ['browser_type', 'Browser Type', 'Type into an element in the frontmost browser with explicit high permission.', 'browser_interaction'],
       ['desktop_app_list', 'Desktop App List', 'List installed macOS application bundle metadata.', 'read_only'],
       ['desktop_app_inspect', 'Desktop App Inspect', 'Inspect one macOS application bundle metadata record.', 'read_only'],
+      ['request_user_input', 'Request User Input', 'Ask a bounded scheduling clarification before creating an automation proposal.', 'read_only'],
+      ['automation_update', 'Automation Update', 'Create a paused scheduled-task proposal for user review.', 'read_only'],
     ]) {
       this.exec(
         `INSERT INTO capabilities (id, name, description, risk_level, enabled, metadata)
@@ -9805,24 +11395,102 @@ export class JoiSQLiteStore {
          version=excluded.version,
          metadata=excluded.metadata,
          updated_at=datetime('now')`,
-      json(['memory_search', 'workspace_search', 'file_read', 'file_analyze', 'apply_patch', 'shell_command', 'test_command', 'computer_observe', 'browser_observe', 'browser_navigate', 'browser_click', 'browser_type', 'desktop_app_list', 'desktop_app_inspect']),
+      json(['memory_search', 'memory_write_candidate', 'session_search', 'session_summary', 'session_branch', 'session_compact', 'delegate_task', 'project_list', 'skills_list', 'skill_view', 'tool_search', 'task_list', 'task_view', 'task_update', 'workspace_search', 'file_read', 'file_analyze', 'image_generate', 'video_generate', 'text_to_speech', 'speech_transcribe', 'lsp_definition', 'lsp_references', 'lsp_diagnostics', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop', 'apply_patch', 'shell_command', 'test_command', 'shell_start', 'shell_write', 'shell_output', 'shell_kill', 'computer_observe', 'find_roots', 'observe_ui', 'search_ui', 'expand_ui', 'inspect_ui', 'read_text', 'wait_for', 'act_ui', 'browser_observe', 'browser_navigate', 'browser_click', 'browser_type', 'desktop_app_list', 'desktop_app_inspect', 'request_user_input', 'automation_update']),
       this.options.version,
       json({ runtime: 'electron_ts_store', desktop_default: true }),
     );
+    const workbenchCapabilities = [
+      ['browser_back', 'Browser Back', 'Navigate the managed browser back.', 'read_only'],
+      ['browser_forward', 'Browser Forward', 'Navigate the managed browser forward.', 'read_only'],
+      ['browser_reload', 'Browser Reload', 'Reload the managed browser.', 'read_only'],
+      ['browser_scroll', 'Browser Scroll', 'Scroll the managed browser.', 'read_only'],
+      ['browser_press', 'Browser Press', 'Press a key in the managed browser.', 'browser_interaction'],
+      ['browser_console', 'Browser Console', 'Read managed browser console events.', 'read_only'],
+      ['browser_network', 'Browser Network', 'Read managed browser network events.', 'read_only'],
+      ['browser_dialog', 'Browser Dialog', 'Handle a managed browser dialog.', 'browser_interaction'],
+      ['browser_get_images', 'Browser Images', 'Read image metadata from the managed browser.', 'read_only'],
+      ['browser_screenshot', 'Browser Screenshot', 'Capture the managed browser page.', 'read_only'],
+      ['browser_vision', 'Browser Vision', 'Capture and analyze the managed browser page with macOS Vision.', 'read_only'],
+      ['browser_tabs', 'Browser Tabs', 'Manage browser tabs.', 'read_only'],
+      ['browser_upload', 'Browser Upload', 'Attach local files in the managed browser.', 'browser_interaction'],
+      ['browser_evaluate', 'Browser Evaluate', 'Evaluate bounded page JavaScript.', 'browser_interaction'],
+      ['browser_cdp', 'Browser CDP', 'Call an enabled Chrome DevTools Protocol domain.', 'browser_interaction'],
+      ['mcp_tool_call', 'MCP Tool Call', 'Invoke an enabled and wrapped MCP tool.', 'workspace_write'],
+      ['extension_register_tool', 'Extension Register Tool', 'Wrap an installed extension MCP tool.', 'workspace_write'],
+      ['execute_code', 'Execute Code', 'Run code in an ephemeral local kernel.', 'workspace_write'],
+      ['sandbox_run', 'Sandbox Run', 'Run a command in a workspace-scoped macOS sandbox.', 'workspace_write'],
+      ['lsp_hover', 'LSP Hover', 'Read language-server hover information.', 'read_only'],
+      ['lsp_symbols', 'LSP Symbols', 'Read language-server document symbols.', 'read_only'],
+      ['lsp_code_actions', 'LSP Code Actions', 'Read language-server quick fixes and refactors.', 'read_only'],
+      ['lsp_rename', 'LSP Rename', 'Apply language-server rename edits.', 'workspace_write'],
+      ['lsp_format', 'LSP Format', 'Apply language-server formatting edits.', 'workspace_write'],
+      ['debugger_threads', 'Debugger Threads', 'Read LLDB thread state.', 'browser_interaction'],
+      ['debugger_stack', 'Debugger Stack', 'Read LLDB stack traces.', 'browser_interaction'],
+      ['debugger_locals', 'Debugger Locals', 'Read LLDB local variables.', 'browser_interaction'],
+      ['debugger_watchpoint', 'Debugger Watchpoint', 'Set an LLDB watchpoint.', 'browser_interaction'],
+      ['debugger_memory', 'Debugger Memory', 'Read a bounded LLDB memory range.', 'browser_interaction'],
+      ['image_analyze', 'Image Analyze', 'Analyze a local image with macOS Vision OCR.', 'read_only'],
+      ['video_analyze', 'Video Analyze', 'Analyze a local video with FFmpeg keyframes and macOS Vision OCR.', 'read_only'],
+      ['assistant_workspace', 'Assistant Workspace', 'Read the personal-assistant workspace.', 'read_only'],
+      ['assistant_action', 'Assistant Action', 'Operate activity capture, calendar, plans, and channels.', 'browser_interaction'],
+    ] as const;
+    for (const capability of workbenchCapabilities) {
+      this.exec(
+        `INSERT INTO capabilities (id, name, description, risk_level, enabled, metadata)
+         VALUES (?, ?, ?, ?, 1, ?)
+         ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description,
+           risk_level=excluded.risk_level, enabled=1, metadata=excluded.metadata, updated_at=datetime('now')`,
+        capability[0],
+        capability[1],
+        capability[2],
+        capability[3],
+        json({ desktop_default: true, electron_native: true, workbench_runtime: true }),
+      );
+    }
+    for (const target of [['agents', 'general_agent'], ['nodes', 'main-node']] as const) {
+      const row = this.get(`SELECT capabilities FROM ${target[0]} WHERE id=?`, target[1]);
+      const capabilities = [...new Set([...parseStringArray(row?.capabilities), ...workbenchCapabilities.map((item) => item[0])])];
+      this.exec(`UPDATE ${target[0]} SET capabilities=?, updated_at=datetime('now') WHERE id=?`, json(capabilities), target[1]);
+    }
     for (const workflow of [
       ['workflow_memory_search_v1', 'memory_search', 'memory_search_v1', [{ tool: 'memory_search', risk_level: 'read_only' }]],
+      ['workflow_memory_recall_v1', 'memory_recall', 'memory_recall_v1', [{ tool: 'memory_recall', risk_level: 'read_only' }]],
+      ['workflow_memory_write_candidate_v1', 'memory_write_candidate', 'memory_write_candidate_v1', [{ tool: 'memory_write_candidate', risk_level: 'workspace_write' }]],
+      ['workflow_session_search_v1', 'session_search', 'session_search_v1', [{ tool: 'session_search', risk_level: 'read_only' }]],
+      ['workflow_session_summary_v1', 'session_summary', 'session_summary_v1', [{ tool: 'session_summary', risk_level: 'read_only' }]],
+      ['workflow_project_list_v1', 'project_list', 'project_list_v1', [{ tool: 'project_list', risk_level: 'read_only' }]],
+      ['workflow_skills_list_v1', 'skills_list', 'skills_list_v1', [{ tool: 'skills_list', risk_level: 'read_only' }]],
+      ['workflow_skill_view_v1', 'skill_view', 'skill_view_v1', [{ tool: 'skill_view', risk_level: 'read_only' }]],
+      ['workflow_tool_search_v1', 'tool_search', 'tool_search_v1', [{ tool: 'tool_search', risk_level: 'read_only' }]],
+      ['workflow_task_list_v1', 'task_list', 'task_list_v1', [{ tool: 'task_list', risk_level: 'read_only' }]],
+      ['workflow_task_view_v1', 'task_view', 'task_view_v1', [{ tool: 'task_view', risk_level: 'read_only' }]],
+      ['workflow_task_update_v1', 'task_update', 'task_update_v1', [{ tool: 'task_update', risk_level: 'workspace_write' }]],
       ['workflow_workspace_search_v1', 'workspace_search', 'workspace_search_v1', [{ tool: 'workspace_walk_search', risk_level: 'read_only' }]],
       ['workflow_file_read_v1', 'file_read', 'file_read_v1', [{ tool: 'file_read_authorized', risk_level: 'read_only' }]],
       ['workflow_apply_patch_v1', 'apply_patch', 'apply_patch_v1', [{ tool: 'apply_patch', risk_level: 'workspace_write' }]],
       ['workflow_shell_command_v1', 'shell_command', 'shell_command_v1', [{ tool: 'shell_command', risk_level: 'read_only' }]],
       ['workflow_test_command_v1', 'test_command', 'test_command_v1', [{ tool: 'test_command', risk_level: 'read_only' }]],
+      ['workflow_shell_start_v1', 'shell_start', 'shell_start_v1', [{ tool: 'shell_start', risk_level: 'browser_interaction' }]],
+      ['workflow_shell_write_v1', 'shell_write', 'shell_write_v1', [{ tool: 'shell_write', risk_level: 'browser_interaction' }]],
+      ['workflow_shell_output_v1', 'shell_output', 'shell_output_v1', [{ tool: 'shell_output', risk_level: 'read_only' }]],
+      ['workflow_shell_kill_v1', 'shell_kill', 'shell_kill_v1', [{ tool: 'shell_kill', risk_level: 'browser_interaction' }]],
       ['workflow_computer_observe_v1', 'computer_observe', 'computer_observe_v1', [{ tool: 'computer_observe', risk_level: 'read_only' }]],
+      ['workflow_find_roots_v1', 'find_roots', 'find_roots_v1', [{ tool: 'find_roots', risk_level: 'read_only' }]],
+      ['workflow_observe_ui_v1', 'observe_ui', 'observe_ui_v1', [{ tool: 'observe_ui', risk_level: 'read_only' }]],
+      ['workflow_search_ui_v1', 'search_ui', 'search_ui_v1', [{ tool: 'search_ui', risk_level: 'read_only' }]],
+      ['workflow_expand_ui_v1', 'expand_ui', 'expand_ui_v1', [{ tool: 'expand_ui', risk_level: 'read_only' }]],
+      ['workflow_inspect_ui_v1', 'inspect_ui', 'inspect_ui_v1', [{ tool: 'inspect_ui', risk_level: 'read_only' }]],
+      ['workflow_read_text_v1', 'read_text', 'read_text_v1', [{ tool: 'read_text', risk_level: 'read_only' }]],
+      ['workflow_wait_for_v1', 'wait_for', 'wait_for_v1', [{ tool: 'wait_for', risk_level: 'read_only' }]],
+      ['workflow_act_ui_v1', 'act_ui', 'act_ui_v1', [{ tool: 'act_ui', risk_level: 'browser_interaction' }]],
       ['workflow_browser_observe_v1', 'browser_observe', 'browser_observe_v1', [{ tool: 'browser_observe', risk_level: 'read_only' }]],
       ['workflow_browser_navigate_v1', 'browser_navigate', 'browser_navigate_v1', [{ tool: 'browser_navigate', risk_level: 'read_only' }]],
       ['workflow_browser_click_v1', 'browser_click', 'browser_click_v1', [{ tool: 'browser_click', risk_level: 'browser_interaction' }]],
       ['workflow_browser_type_v1', 'browser_type', 'browser_type_v1', [{ tool: 'browser_type', risk_level: 'browser_interaction' }]],
       ['workflow_desktop_app_list_v1', 'desktop_app_list', 'desktop_app_list_v1', [{ tool: 'desktop_list_app_bundles', risk_level: 'read_only' }]],
       ['workflow_desktop_app_inspect_v1', 'desktop_app_inspect', 'desktop_app_inspect_v1', [{ tool: 'desktop_inspect_app_bundle', risk_level: 'read_only' }]],
+      ['workflow_request_user_input_v1', 'request_user_input', 'request_user_input_v1', [{ tool: 'request_user_input', risk_level: 'read_only' }]],
+      ['workflow_automation_update_v1', 'automation_update', 'automation_update_v1', [{ tool: 'automation_update', risk_level: 'read_only' }]],
     ] as const) {
       this.exec(
         `INSERT INTO tool_workflows (id, capability_id, name, version, risk_level, steps, enabled, metadata)
@@ -9891,8 +11559,8 @@ export class JoiSQLiteStore {
       {
         id: 'joi.core.browser',
         name: 'Joi Browser Core',
-        description: 'Controlled browser observation and interaction capabilities.',
-        capability_ids: ['web_research', 'browser_observe', 'browser_navigate', 'browser_click', 'browser_type'],
+        description: 'Controlled browser and Pi stateful computer-use capabilities.',
+        capability_ids: ['web_research', 'find_roots', 'observe_ui', 'search_ui', 'expand_ui', 'inspect_ui', 'read_text', 'wait_for', 'act_ui', 'browser_observe', 'browser_navigate', 'browser_click', 'browser_type'],
         skill_ids: [],
       },
     ]) {
@@ -11078,6 +12746,148 @@ export class JoiSQLiteStore {
       CREATE INDEX IF NOT EXISTS idx_conversation_entry_links_conversation ON conversation_entry_links(conversation_id, channel);
       CREATE INDEX IF NOT EXISTS idx_task_entry_links_task ON task_entry_links(product_task_id, principal_id);
       CREATE INDEX IF NOT EXISTS idx_notification_deliveries_target ON notification_deliveries(conversation_id, product_task_id, status);
+    `);
+  }
+
+  private ensureAdvancedAgentSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS conversation_branches (
+        id TEXT PRIMARY KEY,
+        parent_conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        child_conversation_id TEXT NOT NULL UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+        from_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        source_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        copied_message_count INTEGER NOT NULL DEFAULT 0,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS conversation_compactions (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        source_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        summary TEXT NOT NULL,
+        first_kept_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        covered_message_count INTEGER NOT NULL DEFAULT 0,
+        original_message_count INTEGER NOT NULL DEFAULT 0,
+        original_char_count INTEGER NOT NULL DEFAULT 0,
+        compacted_context_char_count INTEGER NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_conversation_branches_parent
+        ON conversation_branches(parent_conversation_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_conversation_compactions_conversation
+        ON conversation_compactions(conversation_id, created_at DESC);
+    `);
+  }
+
+  private ensureAgentWorkbenchSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS run_message_queue (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK(kind IN ('steering', 'follow_up')),
+        content TEXT NOT NULL,
+        attachments TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'pending',
+        delivered_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        delivered_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_run_message_queue_pending
+        ON run_message_queue(run_id, kind, status, created_at);
+
+      CREATE TABLE IF NOT EXISTS agent_model_policies (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+        default_model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+        fallback_model_ids TEXT NOT NULL DEFAULT '[]',
+        cheap_model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+        child_model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+        tool_model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+        long_context_model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+        reasoning_effort TEXT NOT NULL DEFAULT '',
+        max_failovers INTEGER NOT NULL DEFAULT 2,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS assistant_activity_sessions (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'active',
+        title TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        event_count INTEGER NOT NULL DEFAULT 0,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        ended_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS assistant_activity_events (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES assistant_activity_sessions(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL,
+        app_name TEXT NOT NULL DEFAULT '',
+        window_title TEXT NOT NULL DEFAULT '',
+        text TEXT NOT NULL DEFAULT '',
+        screenshot_path TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_assistant_activity_events_session
+        ON assistant_activity_events(session_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS assistant_calendar_items (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        start_at TEXT NOT NULL,
+        end_at TEXT,
+        status TEXT NOT NULL DEFAULT 'draft',
+        source TEXT NOT NULL DEFAULT 'joi',
+        notes TEXT NOT NULL DEFAULT '',
+        external_id TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS assistant_plans (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        objective TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        review_summary TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS assistant_plan_nodes (
+        id TEXT PRIMARY KEY,
+        plan_id TEXT NOT NULL REFERENCES assistant_plans(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        parent_id TEXT REFERENCES assistant_plan_nodes(id) ON DELETE SET NULL,
+        depends_on TEXT NOT NULL DEFAULT '[]',
+        evidence TEXT NOT NULL DEFAULT '[]',
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS assistant_channels (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'not_configured',
+        enabled INTEGER NOT NULL DEFAULT 0,
+        configured INTEGER NOT NULL DEFAULT 0,
+        last_sync_at TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
     `);
   }
 
@@ -12823,14 +14633,23 @@ export class JoiSQLiteStore {
 }
 
 function rowToAutomationDefinition(row: SQLiteRow): AutomationDefinition {
+  const metadata = parseObject(row.metadata);
+  const automationCwds = Array.isArray(metadata.cwds) ? metadata.cwds : parseArray(metadata.cwds);
+  const executionKind = normalizeAutomationExecutionKind(
+    metadata.execution_kind || (String(row.kind) === 'webhook' ? 'webhook' : 'cron'),
+  );
+  const triggerConfig = parseObject(row.trigger_config);
+  const enabled = Boolean(Number(row.enabled ?? 1));
   return {
     id: String(row.id),
     kind: normalizeAutomationKind(row.kind),
+    execution_kind: executionKind,
+    status: enabled ? 'ACTIVE' : 'PAUSED',
     slug: String(row.slug),
     name: String(row.name),
     description: optionalString(row.description),
-    enabled: Boolean(Number(row.enabled ?? 1)),
-    trigger_config: parseObject(row.trigger_config),
+    enabled,
+    trigger_config: triggerConfig,
     prompt_template: optionalString(row.prompt_template) || '',
     input_mode: normalizeAutomationInputMode(row.input_mode),
     permission_profile: normalizeAutomationPermissionProfile(row.permission_profile),
@@ -12842,9 +14661,19 @@ function rowToAutomationDefinition(row: SQLiteRow): AutomationDefinition {
     retry_policy: parseObject(row.retry_policy),
     max_concurrency: Math.max(1, Number(row.max_concurrency ?? 1)),
     notification_policy: parseObject(row.notification_policy),
+    rrule: optionalString(metadata.rrule) || optionalString(triggerConfig.rrule),
+    model: optionalString(metadata.model),
+    model_provider: optionalString(metadata.model_provider),
+    model_base_url: optionalString(metadata.model_base_url),
+    reasoning_effort: optionalString(metadata.reasoning_effort),
+    execution_environment: optionalString(metadata.execution_environment) || 'local',
+    target: isRecord(metadata.target) ? metadata.target : parseObject(metadata.target),
+    cwds: automationCwds.map(String).filter(Boolean),
+    target_thread_id: optionalString(metadata.target_thread_id) || (executionKind === 'heartbeat' ? optionalString(row.conversation_id) : undefined),
+    is_draft: Boolean(metadata.is_draft),
     next_fire_at: optionalString(row.next_fire_at),
     last_fire_at: optionalString(row.last_fire_at),
-    metadata: parseObject(row.metadata),
+    metadata,
     created_at: optionalString(row.created_at),
     updated_at: optionalString(row.updated_at),
   };
@@ -12873,6 +14702,7 @@ function rowToAutomationTrigger(row: SQLiteRow): AutomationTriggerRecord {
 }
 
 function rowToAutomationRun(row: SQLiteRow): AutomationRunRecord {
+  const metadata = parseObject(row.metadata);
   return {
     id: String(row.id),
     automation_id: String(row.automation_id),
@@ -12886,7 +14716,12 @@ function rowToAutomationRun(row: SQLiteRow): AutomationRunRecord {
     output_summary: optionalString(row.output_summary),
     error_code: optionalString(row.error_code),
     error_message: optionalString(row.error_message),
-    metadata: parseObject(row.metadata),
+    conversation_id: optionalString(metadata.conversation_id),
+    source_cwd: optionalString(metadata.source_cwd),
+    automation_name: optionalString(metadata.automation_name),
+    read_at: optionalString(metadata.read_at),
+    archived_at: optionalString(metadata.archived_at),
+    metadata,
     created_at: optionalString(row.created_at),
     updated_at: optionalString(row.updated_at),
   };
@@ -13221,6 +15056,7 @@ function rowToLogEntry(row: SQLiteRow): LogEntry {
   const sourceTable = optionalString(row.source_table) || 'app_logs';
   const eventType = optionalString(row.event_type);
   const action = optionalString(row.action);
+  const error = sanitizeLogPayload(parseObject(row.error));
   return {
     id: String(row.id),
     source_table: sourceTable,
@@ -13239,7 +15075,7 @@ function rowToLogEntry(row: SQLiteRow): LogEntry {
     action,
     status: optionalString(row.status),
     payload: sanitizeLogPayload(parseObject(row.payload)),
-    error: sanitizeLogPayload(parseObject(row.error)),
+    error: Object.keys(error).length > 0 ? error : undefined,
     duration_ms: optionalNumber(row.duration_ms),
     hidden_by_default: sourceTable === 'worker_gateway_audit_logs' && ['heartbeat', 'claim'].includes(action || '')
       || sourceTable === 'run_events' && ['assistant.delta', 'model.delta', 'message.delta'].includes(eventType || ''),
@@ -13445,6 +15281,9 @@ function rowToMCPServer(row: SQLiteRow): MCPServerRecord {
     transport: optionalString(row.transport) || 'stdio',
     command: optionalString(row.command),
     args: parseArray(row.args).map(String),
+    url: optionalString(row.url),
+    env: stringRecord(row.env),
+    headers: stringRecord(row.headers),
     enabled: Boolean(Number(row.enabled ?? 0)),
     status: optionalString(row.status) || 'inactive',
     trust: optionalString(row.trust) || 'untrusted_until_wrapped',
@@ -14180,7 +16019,7 @@ function responseFromCapabilityOutput(capability: string, output: Record<string,
   if (capability === 'apply_patch') {
     return `${String(output.summary || 'Workspace patch applied.')}`;
   }
-  if (capability === 'computer_observe' || capability === 'browser_observe') {
+  if (capability === 'computer_observe' || capability === 'browser_observe' || ['find_roots', 'observe_ui', 'search_ui', 'expand_ui', 'inspect_ui', 'read_text', 'wait_for', 'act_ui'].includes(capability)) {
     return `${String(output.summary || 'Observe completed.')}`;
   }
   if (capability === 'browser_navigate') {
@@ -14349,6 +16188,46 @@ function workflowNameForGateway(capabilityID: string): string {
     case 'computer_observe':
     case 'computer_observe_v1':
       return 'computer_observe_v1';
+    case 'find_roots':
+    case 'observe_ui':
+    case 'search_ui':
+    case 'expand_ui':
+    case 'inspect_ui':
+    case 'read_text':
+    case 'wait_for':
+    case 'act_ui':
+      return `${capabilityID}_v1`;
+    case 'memory_recall':
+    case 'memory_write_candidate':
+    case 'session_search':
+    case 'session_summary':
+    case 'session_branch':
+    case 'session_compact':
+    case 'delegate_task':
+    case 'project_list':
+    case 'skills_list':
+    case 'skill_view':
+    case 'tool_search':
+    case 'task_list':
+    case 'task_view':
+    case 'task_update':
+    case 'shell_start':
+    case 'shell_write':
+    case 'shell_output':
+    case 'shell_kill':
+    case 'image_generate':
+    case 'video_generate':
+    case 'text_to_speech':
+    case 'speech_transcribe':
+    case 'lsp_definition':
+    case 'lsp_references':
+    case 'lsp_diagnostics':
+    case 'debugger_attach':
+    case 'debugger_breakpoint':
+    case 'debugger_step':
+    case 'debugger_evaluate':
+    case 'debugger_stop':
+      return `${capabilityID}_v1`;
     case 'browser_observe':
     case 'browser_observe_v1':
       return 'browser_observe_v1';
@@ -14373,8 +16252,8 @@ function workflowNameForGateway(capabilityID: string): string {
 }
 
 function workflowRiskLevel(capabilityID: string): string {
-  if (capabilityID === 'apply_patch') return 'workspace_write';
-  if (capabilityID === 'browser_click' || capabilityID === 'browser_type') return 'browser_interaction';
+  if (['apply_patch', 'memory_write_candidate', 'task_update', 'session_branch', 'session_compact', 'delegate_task'].includes(capabilityID)) return 'workspace_write';
+  if (['browser_click', 'browser_type', 'act_ui', 'computer_use', 'shell_start', 'shell_write', 'shell_kill', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop'].includes(capabilityID)) return 'browser_interaction';
   return 'read_only';
 }
 
@@ -14529,12 +16408,17 @@ function riskLevelForPermission(permissionProfile: string | undefined): string {
 }
 
 function capabilityScopeForPermission(permissionProfile: string | undefined): string[] {
-  const scope = ['workspace_search', 'file_read', 'file_analyze', 'web_research', 'computer_observe', 'browser_observe', 'system_health_check'];
+  const scope = [
+    'memory_recall', 'session_search', 'session_summary', 'project_list', 'skills_list', 'skill_view', 'tool_search',
+    'task_list', 'task_view', 'workspace_search', 'file_read', 'file_analyze', 'web_research', 'shell_command',
+    'test_command', 'shell_output', 'computer_observe', 'find_roots', 'observe_ui', 'search_ui', 'expand_ui',
+    'inspect_ui', 'read_text', 'wait_for', 'browser_observe', 'system_health_check', 'request_user_input', 'automation_update',
+  ];
   if (permissionProfile === 'workspace_write' || permissionProfile === 'danger_full_access') {
-    scope.push('apply_patch', 'test_command');
+    scope.push('apply_patch', 'memory_write_candidate', 'task_update');
   }
   if (permissionProfile === 'danger_full_access') {
-    scope.push('browser_click', 'browser_type');
+    scope.push('browser_click', 'browser_type', 'act_ui', 'shell_start', 'shell_write', 'shell_kill');
   }
   return scope;
 }
@@ -14557,6 +16441,12 @@ function failedTaskVerification(summary: string): TaskVerification {
 }
 
 function verifyTaskCompletion(response: string, artifact: ArtifactSummary | undefined, toolResults: PersistedToolResult[]): TaskVerification {
+  const failedToolResults = toolResults.filter(toolResultFailed);
+  const responseDisclosesLimitations = responseDisclosesToolLimitations(response);
+  const disclosedToolFailures = failedToolResults.filter((result) => (
+    readOnlyWebToolFailureMayDegrade(result) && responseDisclosesLimitations
+  ));
+  const unacknowledgedToolFailures = failedToolResults.filter((result) => !disclosedToolFailures.includes(result));
   const checks: TaskVerification['checks'] = [
     {
       name: 'artifact_or_state_evidence',
@@ -14570,17 +16460,43 @@ function verifyTaskCompletion(response: string, artifact: ArtifactSummary | unde
     },
     {
       name: 'tool_failures_not_hidden',
-      status: toolResults.some((result) => String(result.output?.status || '').includes('failed')) ? 'failed' : 'passed',
-      evidence: { tool_result_count: toolResults.length },
+      status: unacknowledgedToolFailures.length > 0 ? 'failed' : 'passed',
+      evidence: {
+        tool_result_count: toolResults.length,
+        failed_tool_count: failedToolResults.length,
+        disclosed_failure_count: disclosedToolFailures.length,
+        unacknowledged_failure_count: unacknowledgedToolFailures.length,
+        failed_tools: failedToolResults.map((result) => result.name).slice(0, 20),
+        unacknowledged_tools: unacknowledgedToolFailures.map((result) => result.name).slice(0, 20),
+      },
     },
   ];
   const passed = checks.every((check) => check.status === 'passed');
   return {
     status: passed ? 'passed' : 'failed',
-    summary: passed ? 'Result verified with artifact/state evidence.' : 'Verification failed; task is blocked rather than completed.',
+    summary: passed
+      ? disclosedToolFailures.length > 0
+        ? 'Result verified with disclosed read-only source limitations.'
+        : 'Result verified with artifact/state evidence.'
+      : 'Verification failed; task is blocked rather than completed.',
     checks,
     verified_at: nowIso(),
   };
+}
+
+function toolResultFailed(result: PersistedToolResult): boolean {
+  const status = (optionalString(result.output?.status) || '').toLowerCase();
+  return ['failed', 'error', 'fatal', 'blocked', 'policy_blocked', 'denied'].includes(status)
+    || status.endsWith('_failed');
+}
+
+function readOnlyWebToolFailureMayDegrade(result: PersistedToolResult): boolean {
+  const name = result.name.trim().toLowerCase();
+  return /(?:^|[._-])(web_extract|web_search|web_research|fetch_url)(?:$|[._-])/.test(name);
+}
+
+function responseDisclosesToolLimitations(response: string): boolean {
+  return /无法|未能|不能|失败|不可用|未完成|未核验|未验证|受限|被阻止|拒绝|\b(?:failed|failure|blocked|denied|unavailable|unable|could not|cannot|not verified|not available)\b/i.test(response);
 }
 
 function taskContractFromMetadata(metadata: Record<string, unknown>): TaskContract | undefined {
@@ -14701,14 +16617,66 @@ function titleForTaskCapability(capability: string): string {
       return '检索网页';
     case 'image_generate':
       return '生成图片';
+    case 'video_generate':
+      return '生成视频';
+    case 'text_to_speech':
+      return '生成语音';
+    case 'speech_transcribe':
+      return '转写语音';
+    case 'delegate_task':
+      return '创建子 Agent';
+    case 'session_branch':
+      return '创建会话分支';
+    case 'session_compact':
+      return '压缩会话上下文';
+    case 'lsp_definition':
+    case 'lsp_references':
+    case 'lsp_diagnostics':
+      return '查询代码索引';
+    case 'debugger_attach':
+    case 'debugger_breakpoint':
+    case 'debugger_step':
+    case 'debugger_evaluate':
+    case 'debugger_stop':
+      return '调试程序';
     case 'apply_patch':
       return '应用代码变更';
     case 'test_command':
       return '运行测试';
+    case 'shell_command':
+    case 'shell_start':
+    case 'shell_write':
+    case 'shell_output':
+    case 'shell_kill':
+      return '操作终端';
+    case 'memory_recall':
+    case 'memory_write_candidate':
+      return '访问记忆';
+    case 'session_search':
+    case 'session_summary':
+      return '查找历史会话';
+    case 'skills_list':
+    case 'skill_view':
+      return '读取技能';
+    case 'tool_search':
+      return '查找工具';
+    case 'task_list':
+    case 'task_view':
+    case 'task_update':
+      return '管理任务';
     case 'browser_click':
     case 'browser_type':
     case 'browser_navigate':
       return '操作浏览器';
+    case 'act_ui':
+    case 'find_roots':
+    case 'observe_ui':
+    case 'search_ui':
+    case 'expand_ui':
+    case 'inspect_ui':
+    case 'read_text':
+    case 'wait_for':
+      return '操作桌面界面';
     case 'computer_observe':
     case 'browser_observe':
       return '观察桌面状态';
@@ -14727,30 +16695,68 @@ function summaryForToolOutput(output: Record<string, unknown>, fallback: string)
 type GeneratedMessageAttachment = {
   id: string;
   name: string;
-  kind: 'image';
+  kind: 'image' | 'video' | 'audio';
   mime_type: string;
   size: number;
   preview_url: string;
 };
 
 function generatedAttachmentForToolOutput(output: Record<string, unknown>): GeneratedMessageAttachment[] {
-  const status = (optionalString(output.status) || '').toLowerCase();
-  if (status !== 'completed' || output.capability !== 'image_generate') return [];
-  const raw = output.attachment && typeof output.attachment === 'object' && !Array.isArray(output.attachment)
-    ? output.attachment as Record<string, unknown>
+  const mediaOutput = generatedMediaOutputForToolOutput(output);
+  const status = (optionalString(mediaOutput.status) || '').toLowerCase();
+  if (status !== 'completed' || !['image_generate', 'video_generate', 'text_to_speech'].includes(optionalString(mediaOutput.capability) || '')) return [];
+  const raw = mediaOutput.attachment && typeof mediaOutput.attachment === 'object' && !Array.isArray(mediaOutput.attachment)
+    ? mediaOutput.attachment as Record<string, unknown>
     : {};
   const mimeType = optionalString(raw.mime_type) || optionalString(raw.mimeType) || '';
   const previewURL = optionalString(raw.preview_url) || optionalString(raw.previewUrl) || '';
   const size = Number(raw.size || 0);
-  if (!mimeType.startsWith('image/') || !previewURL.startsWith('file:') || !Number.isFinite(size) || size <= 0) return [];
+  const rawKind = optionalString(raw.kind);
+  const kind: GeneratedMessageAttachment['kind'] = rawKind === 'video' || rawKind === 'audio' ? rawKind : 'image';
+  if (!mimeType.startsWith(`${kind}/`) || !previewURL.startsWith('file:') || !Number.isFinite(size) || size <= 0) return [];
   return [{
     id: optionalString(raw.id) || `attachment_${newID()}`,
-    name: optionalString(raw.name) || optionalString(raw.filename) || 'Grok Build image',
-    kind: 'image',
+    name: optionalString(raw.name) || optionalString(raw.filename) || `Joi ${kind}`,
+    kind,
     mime_type: mimeType,
     size,
     preview_url: previewURL,
   }];
+}
+
+function generatedMediaOutputForToolOutput(output: Record<string, unknown>): Record<string, unknown> {
+  const rawOutput = toolOutputRecord(output.raw_output);
+  const rawResult = toolOutputRecord(rawOutput.result);
+  const candidates = [
+    output,
+    toolOutputRecord(output.structuredContent),
+    rawOutput,
+    rawResult,
+    toolOutputRecord(rawResult.structuredContent),
+  ];
+  const structured = candidates.find((candidate) => (
+    ['image_generate', 'video_generate', 'text_to_speech'].includes(optionalString(candidate.capability) || '')
+    && (optionalString(candidate.status) || '').toLowerCase() === 'completed'
+  ));
+  if (structured) return structured;
+  const content = Array.isArray(rawResult.content) ? rawResult.content : [];
+  for (const item of content) {
+    const parsedItem = toolOutputRecord(item);
+    const parsedText = toolOutputRecord(parsedItem.text);
+    if (['image_generate', 'video_generate', 'text_to_speech'].includes(optionalString(parsedText.capability) || '')) {
+      return parsedText;
+    }
+  }
+  return output;
+}
+
+function toolOutputRecord(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
+  return parseObject(value);
+}
+
+function normalizeAgentLookupToken(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 function toolRunStatusForOutput(output: Record<string, unknown>): string {
@@ -14867,9 +16873,9 @@ function cacheHitRatioForUsage(inputTokens: number, cachedInputTokens: number): 
 }
 
 function sideEffectLevelForCapability(capability: string): string {
-  if (capability === 'apply_patch') return 'write_local';
-  if (capability === 'browser_click' || capability === 'browser_type') return 'external_action';
-  if (capability === 'shell_command' || capability === 'test_command') return 'write_local';
+  if (['apply_patch', 'memory_write_candidate', 'task_update', 'session_branch', 'session_compact', 'delegate_task', 'text_to_speech', 'video_generate'].includes(capability)) return 'write_local';
+  if (['browser_click', 'browser_type', 'act_ui', 'computer_use'].includes(capability)) return 'external_action';
+  if (['shell_command', 'test_command', 'shell_start', 'shell_write', 'shell_kill', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop'].includes(capability)) return 'write_local';
   return 'read';
 }
 
@@ -14908,28 +16914,105 @@ function affectedPathsForTool(capability: string, args: Record<string, unknown>)
 
 function externalTargetForTool(capability: string, args: Record<string, unknown>): string {
   if (capability.startsWith('browser_')) return optionalString(args.url) || optionalString(args.target) || 'frontmost_browser';
+  if (capability === 'act_ui' || capability === 'computer_use') return optionalString(args.app) || optionalString(args.root) || optionalString(args.stateId) || 'observed_ui_root';
+  if (capability.startsWith('shell_')) return optionalString(args.session_id) || optionalString(args.cwd) || 'local_terminal';
   return '';
 }
 
 function reversibleForTool(capability: string): boolean {
-  return capability === 'apply_patch';
+  return capability === 'apply_patch' || capability === 'memory_write_candidate' || capability === 'task_update';
 }
 
 function parseStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  const items = value.map((item) => String(item).trim()).filter(Boolean);
+  const source = Array.isArray(value) ? value : parseArray(value);
+  const items = source.map((item) => String(item).trim()).filter(Boolean);
   return items;
 }
 
+function normalizeToolMemoryType(value: unknown): string {
+  const normalized = optionalString(value)?.trim().toLowerCase() || 'note';
+  return new Set(['note', 'preference', 'current_state', 'user_state', 'relationship_state', 'fact']).has(normalized)
+    ? normalized
+    : 'note';
+}
+
+function resolveToolMemoryCandidateScope(
+  requestedScope: string,
+  scope: MemoryRetrievalScope,
+): { scope_type: 'global' | 'user' | 'room' | 'project'; scope_id: string } {
+  if (requestedScope === 'global') return { scope_type: 'global', scope_id: '' };
+  if (requestedScope === 'user') {
+    const userID = scope.user_ids[0];
+    if (!userID) throw new Error('No current user scope is available for this memory candidate');
+    return { scope_type: 'user', scope_id: userID };
+  }
+  if (requestedScope === 'room') {
+    if (!scope.room_id) throw new Error('No current room scope is available for this memory candidate');
+    return { scope_type: 'room', scope_id: scope.room_id };
+  }
+  if (requestedScope === 'project' || requestedScope === 'current_project') {
+    const projectID = scope.project_ids[0];
+    if (!projectID) throw new Error('No current project scope is available for this memory candidate');
+    return { scope_type: 'project', scope_id: projectID };
+  }
+  if (!['current_context', 'auto'].includes(requestedScope)) {
+    throw new Error(`Unsupported memory candidate scope: ${requestedScope}`);
+  }
+  if (scope.project_ids[0]) return { scope_type: 'project', scope_id: scope.project_ids[0] };
+  if (scope.room_id) return { scope_type: 'room', scope_id: scope.room_id };
+  if (scope.user_ids[0]) return { scope_type: 'user', scope_id: scope.user_ids[0] };
+  return { scope_type: 'global', scope_id: '' };
+}
+
 const defaultPersonaAgentCapabilities = [
+  'memory_recall',
+  'memory_write_candidate',
+  'session_search',
+  'session_summary',
+  'session_branch',
+  'session_compact',
+  'delegate_task',
+  'project_list',
+  'skills_list',
+  'skill_view',
+  'tool_search',
+  'task_list',
+  'task_view',
+  'task_update',
   'workspace_search',
   'file_read',
   'file_analyze',
   'image_generate',
+  'image_analyze',
+  'video_generate',
+  'video_analyze',
+  'text_to_speech',
+  'speech_transcribe',
+  'assistant_workspace',
+  'assistant_action',
+  'lsp_definition',
+  'lsp_references',
+  'lsp_diagnostics',
+  'debugger_attach',
+  'debugger_breakpoint',
+  'debugger_step',
+  'debugger_evaluate',
+  'debugger_stop',
   'web_research',
   'shell_command',
   'test_command',
+  'shell_start',
+  'shell_write',
+  'shell_output',
+  'shell_kill',
   'computer_observe',
+  'find_roots',
+  'observe_ui',
+  'search_ui',
+  'expand_ui',
+  'inspect_ui',
+  'read_text',
+  'wait_for',
   'browser_observe',
   'browser_navigate',
   'desktop_app_list',
@@ -14939,6 +17022,9 @@ const defaultPersonaAgentCapabilities = [
   'apply_patch',
   'browser_click',
   'browser_type',
+  'act_ui',
+  'request_user_input',
+  'automation_update',
 ];
 
 const personaUiOnlyCapabilities = new Set([
@@ -14978,6 +17064,8 @@ function canonicalCapabilityName(capabilityID: string): string {
       return 'desktop_app_inspect';
     case 'computer_observe_v1':
       return 'computer_observe';
+    case 'computer_use':
+      return 'act_ui';
     case 'browser_read_v1':
       return 'browser_read';
     case 'browser_observe_v1':
@@ -15009,6 +17097,10 @@ function canonicalCapabilityName(capabilityID: string): string {
       return 'test_command';
     case 'image_gen':
       return 'image_generate';
+    case 'subagent_delegate':
+      return 'delegate_task';
+    case 'compaction_run':
+      return 'session_compact';
     case 'web_research_v1':
     case 'web_research_v2':
     case 'web_search':
@@ -15212,6 +17304,13 @@ function clampLimit(value: number | undefined, fallback: number): number {
 
 function normalizeAutomationKind(value: unknown): AutomationKind {
   return value === 'webhook' ? 'webhook' : 'schedule';
+}
+
+function normalizeAutomationExecutionKind(value: unknown): AutomationExecutionKind {
+  const normalized = (optionalString(value) || '').toLowerCase();
+  if (normalized === 'heartbeat') return 'heartbeat';
+  if (normalized === 'webhook') return 'webhook';
+  return 'cron';
 }
 
 function normalizeAutomationInputMode(value: unknown): InputMode {
@@ -15555,8 +17654,8 @@ function logRiskForRunEvent(eventType: string, payload: Record<string, unknown>)
   const explicit = optionalString(payload.risk_level) || optionalString(payload.risk);
   if (explicit) return explicit;
   const capability = optionalString(payload.capability) || optionalString(payload.tool_name) || eventType;
-  if (capability === 'apply_patch') return 'workspace_write';
-  if (capability === 'browser_click' || capability === 'browser_type') return 'browser_interaction';
+  if (['apply_patch', 'memory_write_candidate', 'task_update'].includes(capability)) return 'workspace_write';
+  if (['browser_click', 'browser_type', 'act_ui', 'computer_use', 'shell_start', 'shell_write', 'shell_kill'].includes(capability)) return 'browser_interaction';
   if (eventType.startsWith('approval.')) return 'state_change';
   if (eventType.startsWith('memory.')) return 'write_candidate';
   return 'read_only';
@@ -15688,6 +17787,12 @@ function hashText(value: string): string {
 }
 
 function parseObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Uint8Array)) {
+    const keys = Object.keys(value as Record<string, unknown>);
+    if (!keys.length || !keys.every((key) => /^\d+$/.test(key))) {
+      return value as Record<string, unknown>;
+    }
+  }
   const text = jsonText(value);
   if (!text) return {};
   try {
@@ -15696,6 +17801,27 @@ function parseObject(value: unknown): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function skillRecordFromRow(row: SQLiteRow): SkillRecord {
+  return {
+    id: String(row.id),
+    version: optionalString(row.version) || 'v1',
+    name: String(row.name),
+    description: optionalString(row.description) || '',
+    trigger_phrases: parseArray(row.trigger_phrases).map(String),
+    required_capabilities: parseArray(row.required_capabilities).map(String),
+    forbidden_capabilities: parseArray(row.forbidden_capabilities).map(String),
+    output_contract: optionalString(row.output_contract) || '',
+    enabled: Boolean(Number(row.enabled ?? 1)),
+    metadata: parseObject(row.metadata),
+  };
+}
+
+function skillScopeValue(value: unknown): SkillScope {
+  const scope = optionalString(value);
+  if (scope === 'repo' || scope === 'user' || scope === 'compat' || scope === 'admin' || scope === 'system' || scope === 'extra') return scope;
+  return 'extra';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -15753,6 +17879,81 @@ function parseArray(value: unknown): unknown[] {
   }
 }
 
+function rowToRunQueuedMessage(row: SQLiteRow): RunQueuedMessage {
+  return {
+    id: optionalString(row.id) || '',
+    run_id: optionalString(row.run_id) || '',
+    conversation_id: optionalString(row.conversation_id) || '',
+    kind: (optionalString(row.kind) || 'follow_up') as RunQueuedMessage['kind'],
+    content: optionalString(row.content) || '',
+    attachments: parseArray(row.attachments),
+    status: optionalString(row.status) || 'pending',
+    delivered_run_id: optionalString(row.delivered_run_id),
+    created_at: optionalString(row.created_at),
+    delivered_at: optionalString(row.delivered_at),
+    metadata: parseObject(row.metadata),
+  };
+}
+
+function rowToConversationCompaction(row: SQLiteRow): ConversationCompactionRecord {
+  return {
+    id: optionalString(row.id) || '',
+    conversation_id: optionalString(row.conversation_id) || '',
+    source_run_id: optionalString(row.source_run_id),
+    summary: optionalString(row.summary) || '',
+    first_kept_message_id: optionalString(row.first_kept_message_id),
+    covered_message_count: Number(row.covered_message_count || 0),
+    original_message_count: Number(row.original_message_count || 0),
+    original_char_count: Number(row.original_char_count || 0),
+    compacted_context_char_count: Number(row.compacted_context_char_count || 0),
+    reason: optionalString(row.reason) || '',
+    created_at: optionalString(row.created_at),
+    metadata: parseObject(row.metadata),
+  };
+}
+
+function rowToAgentModelPolicy(row: SQLiteRow): AgentModelPolicy {
+  return {
+    agent_id: optionalString(row.agent_id) || '',
+    default_model_id: optionalString(row.default_model_id),
+    fallback_model_ids: parseStringArray(row.fallback_model_ids),
+    cheap_model_id: optionalString(row.cheap_model_id),
+    child_model_id: optionalString(row.child_model_id),
+    tool_model_id: optionalString(row.tool_model_id),
+    long_context_model_id: optionalString(row.long_context_model_id),
+    reasoning_effort: optionalString(row.reasoning_effort),
+    max_failovers: Number(row.max_failovers ?? 2),
+    enabled: Boolean(Number(row.enabled ?? 1)),
+    metadata: parseObject(row.metadata),
+    updated_at: optionalString(row.updated_at),
+  };
+}
+
+function isSQLiteRow(value: unknown): value is SQLiteRow {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function stringRecord(value: unknown): Record<string, string> {
+  const parsed = parseObject(value);
+  return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
+}
+
+function summarizeActivityEvents(rows: SQLiteRow[]): string {
+  if (rows.length === 0) return '本次记录没有采集到可用活动。';
+  const apps = new Map<string, number>();
+  for (const row of rows) {
+    const app = optionalString(row.app_name) || '未知应用';
+    apps.set(app, (apps.get(app) || 0) + 1);
+  }
+  const topApps = [...apps.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const recent = rows.slice(-5).map((row) => optionalString(row.window_title) || optionalString(row.text)).filter(Boolean);
+  return [
+    `记录 ${rows.length} 个活动快照。`,
+    `主要应用：${topApps.map(([app, count]) => `${app} ${count} 次`).join('、')}。`,
+    ...(recent.length ? [`最近上下文：${recent.join('；')}`] : []),
+  ].join('\n');
+}
+
 function mergeStringIDs(current: unknown[], additions: string[]): string[] {
   const merged = new Set<string>();
   for (const value of current) {
@@ -15807,6 +18008,10 @@ function compactPromptConversationText(value: string, limit: number): string {
   const compact = redactSensitiveText(value).replace(/\s+/g, ' ').trim();
   if (compact.length <= limit) return compact;
   return `${compact.slice(0, Math.max(0, limit - 3))}...`;
+}
+
+function isSkillFollowupMessage(message: string): boolean {
+  return /(?:这个|刚才|同一个|继续)(?:\s*的)?\s*(?:skill|技能)|(?:this|that|same|previous)\s+skill|use\s+it\s+again/i.test(message);
 }
 
 function optionalString(value: unknown): string | undefined {

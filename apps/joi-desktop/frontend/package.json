@@ -10,8 +10,9 @@
     "test:execution-actions": "node scripts/test-execution-actions.mjs",
     "test:chat-projection": "node scripts/test-chat-projection.mjs",
     "test:single-agent-workspace": "node scripts/test-single-agent-workspace.mjs",
+    "test:run-record-truth": "node scripts/test-run-record-truth.mjs",
     "test:task-mini-list": "node scripts/test-task-mini-list.mjs",
-    "test:automation-ui-state": "node scripts/test-automation-ui-state.mjs",
+    "test:automation-ui-state": "node scripts/test-automation-ui-state.mjs && node scripts/test-automation-parity.mjs",
     "test:settings-completion": "node --experimental-strip-types scripts/test-settings-completion.mjs && node --experimental-strip-types scripts/test-acp-plugin-models.mjs"
   },
   "dependencies": {

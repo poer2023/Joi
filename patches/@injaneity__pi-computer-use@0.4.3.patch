@@ -1,0 +1,32 @@
+diff --git a/src/bridge.ts b/src/bridge.ts
+index 6d5c9fe03f075162e075bcef1fb3808b8dd9c6c9..0727e14392c7062304e73681f9a4f71c7a556e34 100644
+--- a/src/bridge.ts
++++ b/src/bridge.ts
+@@ -1693,7 +1693,11 @@ async function performWaitFor(params: WaitForParams, signal?: AbortSignal): Prom
+ 		timeoutMs,
+ 	}, { signal, timeoutMs: timeoutMs + 2_000 });
+ 	if (!state.resourceKey || state.epoch === undefined) throw new Error("The observation has no live resource identity. Observe again.");
+-	const refreshed = (await resourceScheduler.readAt(state.resourceKey, state.epoch, async () => await captureCurrentTarget(signal, "auto"))).value;
++	const refreshed = (await resourceScheduler.readAt(
++		state.resourceKey,
++		state.epoch,
++		async () => await captureCurrentTarget(signal, "auto", AUTO_IMAGE_MAX_DIMENSION, undefined, state.currentImageMode !== "never"),
++	)).value;
+ 	const transition = changesBetween(baseView.outline, refreshed.outline);
+ 	const useDiff = !transition.useFullView;
+ 	const matches = searchOutline(refreshed.outline, text, role, undefined, 1);
+@@ -2001,7 +2005,13 @@ async function performDesktopTransaction(params: ActParams, actions: UiAction[],
+ 		} else {
+ 			await sleep(settleMsForExecution(execution), signal);
+ 		}
+-		const capture = await captureCurrentTarget(signal, "auto", AUTO_IMAGE_MAX_DIMENSION, target);
++		const capture = await captureCurrentTarget(
++			signal,
++			"auto",
++			AUTO_IMAGE_MAX_DIMENSION,
++			target,
++			state.currentImageMode !== "never",
++		);
+ 		execution.outcome = outcomeAfterObservedValues(execution.outcome ?? "unknown", executedActions, (ref) => nodeByRef(capture.outline, ref)?.value);
+ 		for (const action of executedActions) {
+ 			state.currentNote = noteAfterAct(state.currentNote ?? noteBefore, action.ref, capture.outline, { window: noteWindowForTarget(capture.target, capture.look), rootDelta: execution.rootDelta });

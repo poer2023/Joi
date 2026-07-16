@@ -5,14 +5,15 @@ import { createConnection } from 'node:net';
 const bridgeConfig = loadBridgeConfig();
 const socketPath = String(process.env.JOI_ACP_WEB_SOCKET || bridgeConfig.socket_path || '').trim();
 const bridgeToken = String(process.env.JOI_ACP_WEB_TOKEN || bridgeConfig.token || '').trim();
+const serverName = String(bridgeConfig.server_name || 'joi_web').trim() || 'joi_web';
 if (!socketPath || !bridgeToken) {
-  process.stderr.write('Joi ACP web MCP bridge configuration is unavailable or invalid.\n');
+  process.stderr.write('Joi ACP MCP bridge configuration is unavailable or invalid.\n');
   process.exit(1);
 }
 let inputBuffer = '';
 let queue = Promise.resolve();
 
-const tools = [
+const fallbackWebTools = [
   {
     name: 'web_search',
     description: 'Search the public web through Joi\'s policy-controlled read-only backend. Use this for websites, current information, news, and public X/Twitter links without requiring an interactive Browser session. Search snippets are unverified until a page is extracted.',
@@ -39,6 +40,9 @@ const tools = [
     },
   },
 ];
+const tools = Array.isArray(bridgeConfig.tools) && bridgeConfig.tools.length > 0
+  ? bridgeConfig.tools
+  : fallbackWebTools;
 
 function loadBridgeConfig() {
   const flagIndex = process.argv.indexOf('--bridge-config');
@@ -46,17 +50,39 @@ function loadBridgeConfig() {
   try {
     const path = String(process.argv[flagIndex + 1]);
     const info = lstatSync(path);
-    if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || info.size > 16 * 1024) return {};
+    if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || info.size > 128 * 1024) return {};
     if (typeof process.getuid === 'function' && info.uid !== process.getuid()) return {};
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
     return {
       socket_path: typeof parsed.socket_path === 'string' ? parsed.socket_path : '',
       token: typeof parsed.token === 'string' ? parsed.token : '',
+      server_name: typeof parsed.server_name === 'string' ? parsed.server_name : '',
+      tools: validTools(parsed.tools),
     };
   } catch {
     return {};
   }
+}
+
+function validTools(value) {
+  if (!Array.isArray(value) || value.length > 64) return [];
+  const tools = [];
+  const names = new Set();
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const name = typeof item.name === 'string' ? item.name.trim() : '';
+    const inputSchema = item.inputSchema;
+    if (!/^[A-Za-z0-9_.-]{1,96}$/.test(name) || names.has(name)) return [];
+    if (!inputSchema || typeof inputSchema !== 'object' || Array.isArray(inputSchema)) return [];
+    names.add(name);
+    tools.push({
+      name,
+      description: typeof item.description === 'string' ? item.description.slice(0, 2_000) : '',
+      inputSchema,
+    });
+  }
+  return tools;
 }
 
 process.stdin.setEncoding('utf8');
@@ -90,7 +116,7 @@ async function handleLine(line) {
     sendResult(id, {
       protocolVersion: requestedVersion || '2025-03-26',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'joi-web', version: '0.1.0' },
+      serverInfo: { name: serverName.replaceAll('_', '-'), version: '0.2.0' },
     });
     return;
   }
@@ -120,7 +146,7 @@ async function handleLine(line) {
 async function callTool(id, params) {
   const name = String(params?.name || '').trim();
   if (!tools.some((tool) => tool.name === name)) {
-    sendError(id, -32602, `Unsupported Joi web tool: ${name || '(empty)'}`);
+    sendError(id, -32602, `Unsupported Joi capability tool: ${name || '(empty)'}`);
     return;
   }
   const args = params?.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments)
@@ -137,18 +163,29 @@ async function callTool(id, params) {
   try {
     const envelope = await invokeJoiBridge({
       action: 'acp_web',
-      request_id: `acp_web_${randomUUID().replaceAll('-', '')}`,
+      request_id: `acp_bridge_${randomUUID().replaceAll('-', '')}`,
       token: bridgeToken,
       capability: name,
-      payload: args,
-    });
+      payload: {
+        ...args,
+        __joi_parent_run_id: String(process.env.JOI_PARENT_RUN_ID || ''),
+        __joi_parent_conversation_id: String(process.env.JOI_PARENT_CONVERSATION_ID || ''),
+        __joi_delegation_depth: Number(process.env.JOI_DELEGATION_DEPTH || 0),
+      },
+    }, ['video_generate', 'speech_transcribe'].includes(name)
+      ? 660_000
+      : name === 'delegate_task'
+        ? 360_000
+        : name === 'text_to_speech'
+          ? 240_000
+          : 30_000);
     if (!envelope?.ok) {
       const error = envelope?.error || {};
       sendResult(id, toolResult({
         status: 'failed',
         capability: name,
-        code: String(error.code || 'ACP_WEB_FAILED'),
-        summary: String(error.message || 'Joi ACP web bridge failed'),
+        code: String(error.code || 'ACP_BRIDGE_FAILED'),
+        summary: String(error.message || 'Joi ACP capability bridge failed'),
       }, true));
       return;
     }
@@ -165,16 +202,16 @@ async function callTool(id, params) {
   }
 }
 
-function invokeJoiBridge(request) {
-  if (!socketPath) return Promise.reject(new Error('JOI_ACP_WEB_SOCKET is not configured'));
-  if (!bridgeToken) return Promise.reject(new Error('JOI_ACP_WEB_TOKEN is not configured'));
+function invokeJoiBridge(request, timeoutMs = 30_000) {
+  if (!socketPath) return Promise.reject(new Error('Joi ACP bridge socket is not configured'));
+  if (!bridgeToken) return Promise.reject(new Error('Joi ACP bridge token is not configured'));
   return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
     let response = '';
     const timer = setTimeout(() => {
       socket.destroy();
-      reject(new Error('Joi ACP web bridge timed out'));
-    }, 30_000);
+      reject(new Error('Joi ACP capability bridge timed out'));
+    }, timeoutMs);
     timer.unref?.();
     socket.setEncoding('utf8');
     socket.on('connect', () => socket.end(`${JSON.stringify(request)}\n`));
@@ -182,7 +219,7 @@ function invokeJoiBridge(request) {
       response += String(chunk);
       if (Buffer.byteLength(response, 'utf8') > 2 * 1024 * 1024) {
         socket.destroy();
-        reject(new Error('Joi ACP web bridge response exceeds 2 MiB'));
+        reject(new Error('Joi ACP capability bridge response exceeds 2 MiB'));
       }
     });
     socket.on('error', (error) => {

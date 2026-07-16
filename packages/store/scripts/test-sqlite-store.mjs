@@ -19,6 +19,9 @@ try {
   });
 
   const initialWorkspaceSettings = store.getWorkspaceSettings();
+  assert.equal(store.resolveAgentIDForTool('Research Agent'), 'research_agent');
+  assert.equal(store.resolveAgentIDForTool('research'), 'research_agent');
+  assert.equal(store.resolveAgentIDForTool(''), 'research_agent');
   store.saveWorkspaceSettings({ ...initialWorkspaceSettings, allowed_roots: [...initialWorkspaceSettings.allowed_roots, tempDir] });
   const enhancedDiagnosticsPath = store.exportDiagnostics().path;
   const enhancedDiagnosticsManifest = JSON.parse(execFileSync('unzip', ['-p', enhancedDiagnosticsPath, 'manifest.json'], { encoding: 'utf8' }));
@@ -82,10 +85,63 @@ try {
   assert.equal(conversations[0].title, 'store test ping');
   assert.equal(conversations[0].latest_run_id, response.run_id);
   assert.equal(conversations[0].message_count, 2);
+  assert.equal(store.listConversations({ view: 'all', query: 'store test ping', limit: 10 }).conversations[0].id, response.conversation_id);
+  assert.equal(store.listConversations({ view: 'all', query: 'no-such-session-token', limit: 10 }).conversations.length, 0);
 
   const detail = store.getConversation(response.conversation_id);
   assert.deepEqual(detail.messages.map((message) => message.role), ['user', 'assistant']);
   assert.equal(detail.messages[1].content, response.response);
+
+  for (let index = 1; index <= 4; index += 1) {
+    store.recordToolCallingChat({
+      conversation_id: response.conversation_id,
+      message: `branch and compaction history ${index}`,
+      model_name: 'deepseek-v4-flash',
+      runtime_mode: 'tool_calling',
+      permission_profile: 'danger_full_access',
+    }, {
+      provider: 'openai_compatible',
+      model_name: 'deepseek-v4-flash',
+      selected_agent_id: 'general_agent',
+      final_message: `history response ${index}`,
+      tool_results: [],
+      usage: {},
+      usage_status: 'provider_missing',
+      finish_reason: 'stop',
+      model_responses: [],
+    });
+  }
+  const sourceBeforeBranch = store.getConversation(response.conversation_id);
+  const branch = store.branchConversationForTool({
+    source_conversation_id: response.conversation_id,
+    from_message_id: sourceBeforeBranch.messages[3].id,
+    title: 'Persistent branch fixture',
+    source_run_id: response.run_id,
+  });
+  assert.equal(branch.copied_message_count, 4);
+  assert.equal(branch.source_unchanged, true);
+  assert.equal(store.getConversation(branch.child_conversation_id).messages.length, 4);
+  assert.equal(store.getConversation(response.conversation_id).messages.length, sourceBeforeBranch.messages.length);
+  assert.equal(store.getConversation(branch.child_conversation_id).conversation.metadata?.branch?.parent_conversation_id, response.conversation_id);
+
+  const compaction = store.compactConversationForTool({
+    conversation_id: response.conversation_id,
+    summary: 'Persistent checkpoint: the fixture established branch and compaction provenance.',
+    keep_recent_messages: 2,
+    reason: 'contract_test',
+    source_run_id: response.run_id,
+  });
+  assert.equal(compaction.transcript_preserved, true);
+  assert.equal(compaction.covered_message_count, sourceBeforeBranch.messages.length - 2);
+  assert.equal(store.getConversation(response.conversation_id).messages.length, sourceBeforeBranch.messages.length);
+  const compactedPrompt = store.assembleToolCallingPrompt({
+    conversation_id: response.conversation_id,
+    message: 'continue after checkpoint',
+    runtime_mode: 'tool_calling',
+  }, 'general_agent', 'deepseek-v4-flash');
+  assert.match(compactedPrompt.dynamic_tail, /Persistent Conversation Checkpoint/);
+  assert.match(compactedPrompt.dynamic_tail, /Persistent checkpoint: the fixture established branch/);
+  assert.equal(compactedPrompt.conversation_messages.length, 2);
 
   const trace = store.getRunTrace(response.run_id);
   assert.equal(trace.status, 'completed');
@@ -262,6 +318,77 @@ try {
   const imageTrace = store.getRunTrace(imageResponse.run_id);
   assert.ok(imageTrace.events.some((event) => event.event_type === 'artifact.created' && event.payload?.native_tool === 'image_gen'));
 
+  for (const media of [
+    {
+      capability: 'video_generate', kind: 'video', mime: 'video/mp4', name: 'joi-generated-video.mp4',
+      path: '/tmp/joi-generated-video.mp4', size: 60_165, mode: 'xai_async_video_v1', provider: 'xai', model: 'grok-imagine-video',
+    },
+    {
+      capability: 'text_to_speech', kind: 'audio', mime: 'audio/wav', name: 'joi-generated-speech.wav',
+      path: '/tmp/joi-generated-speech.wav', size: 42_000, mode: 'macos_say_ffmpeg_v1', provider: 'local_macos', model: '',
+    },
+  ]) {
+    const started = store.beginToolCallingChat({
+      message: `test ${media.capability}`,
+      runtime_mode: 'tool_calling',
+      model_name: 'fixture-model',
+    }, { provider: 'openai_compatible', model_name: 'fixture-model', selected_agent_id: 'general_agent' });
+    const responseWithMedia = store.finishToolCallingChat(started, {
+      status: 'completed', provider: 'openai_compatible', model_name: 'fixture-model', selected_agent_id: 'general_agent',
+      final_message: `${media.capability} completed`,
+      tool_results: [{
+        call_id: `call_${media.capability}`,
+        name: media.capability,
+        arguments: {},
+        output: {
+          status: 'completed', capability: media.capability, mode: media.mode, provider: media.provider, model: media.model,
+          duration_seconds: 1.04, file_path: media.path, summary: `${media.capability} completed`,
+          attachment: {
+            id: `attachment_${media.kind}_fixture`, name: media.name, kind: media.kind,
+            mime_type: media.mime, size: media.size, preview_url: `file://${media.path}`,
+          },
+        },
+      }],
+      usage: {}, usage_status: 'provider_missing', finish_reason: 'stop', model_responses: [],
+    });
+    const messageAttachment = store.getConversation(responseWithMedia.conversation_id).messages.at(-1)?.attachments?.[0];
+    assert.equal(messageAttachment?.kind, media.kind);
+    assert.equal(messageAttachment?.mime_type, media.mime);
+    const artifact = store.listArtifacts({ type: media.kind, limit: 10 }).artifacts.find((item) => item.source_run_id === responseWithMedia.run_id);
+    assert.equal(artifact?.type, media.kind);
+    assert.equal(artifact?.metadata?.generation_mode, media.mode);
+  }
+
+  const acpMediaStarted = store.beginToolCallingChat({
+    message: 'test ACP wrapped speech attachment', runtime_mode: 'tool_calling', model_name: 'fixture-model',
+  }, { provider: 'acp_codex_cli', model_name: 'fixture-model', selected_agent_id: 'general_agent' });
+  const acpMediaPayload = {
+    status: 'completed', capability: 'text_to_speech', mode: 'macos_say_ffmpeg_v1', provider: 'local_macos',
+    duration_seconds: 4.5, file_path: '/tmp/joi-acp-speech.wav',
+    attachment: {
+      id: 'attachment_acp_audio_fixture', name: 'joi-acp-speech.wav', kind: 'audio',
+      mime_type: 'audio/wav', size: 84_000, preview_url: 'file:///tmp/joi-acp-speech.wav',
+    },
+  };
+  const acpMediaResponse = store.finishToolCallingChat(acpMediaStarted, {
+    status: 'completed', provider: 'acp_codex_cli', model_name: 'fixture-model', selected_agent_id: 'general_agent',
+    final_message: 'ACP speech completed',
+    tool_results: [{
+      call_id: 'call_acp_text_to_speech', name: 'mcp.joi_capabilities.text_to_speech', arguments: {},
+      output: {
+        status: 'succeeded', protocol: 'acp', kind: 'other',
+        raw_output: { result: { content: [{ type: 'text', text: JSON.stringify(acpMediaPayload) }], structuredContent: acpMediaPayload }, error: null },
+      },
+    }],
+    usage: {}, usage_status: 'provider_missing', finish_reason: 'stop', model_responses: [],
+  });
+  const acpMediaAttachment = store.getConversation(acpMediaResponse.conversation_id).messages.at(-1)?.attachments?.[0];
+  assert.equal(acpMediaAttachment?.kind, 'audio');
+  assert.equal(acpMediaAttachment?.preview_url, 'file:///tmp/joi-acp-speech.wav');
+  const acpMediaArtifact = store.listArtifacts({ type: 'audio', limit: 20 }).artifacts.find((item) => item.source_run_id === acpMediaResponse.run_id);
+  assert.equal(acpMediaArtifact?.metadata?.generation_mode, 'macos_say_ffmpeg_v1');
+  assert.equal(acpMediaArtifact?.metadata?.file_path, '/tmp/joi-acp-speech.wav');
+
   const chatOnlyResponse = await store.sendDeterministicChat({
     message: '今天只做一个纯聊天检查：用一句话回复我，不要创建任务。',
     input_mode: 'auto',
@@ -319,20 +446,49 @@ try {
 
   const capabilities = store.listCapabilities().capabilities.map((capability) => capability.id);
   assert.ok(capabilities.includes('memory_search'));
+  assert.ok(capabilities.includes('memory_recall'));
+  assert.ok(capabilities.includes('session_search'));
+  assert.ok(capabilities.includes('tool_search'));
+  assert.ok(capabilities.includes('shell_start'));
+  assert.ok(capabilities.includes('task_update'));
   assert.ok(capabilities.includes('apply_patch'));
+  assert.ok(capabilities.includes('request_user_input'));
+  assert.ok(capabilities.includes('automation_update'));
 
   const workflows = store.listToolWorkflows().workflows.map((workflow) => workflow.name);
   assert.ok(workflows.includes('memory_search_v1'));
+  assert.ok(workflows.includes('memory_recall_v1'));
+  assert.ok(workflows.includes('session_search_v1'));
+  assert.ok(workflows.includes('shell_start_v1'));
 
   const automation = store.saveAutomation({
     kind: 'schedule',
+    execution_kind: 'cron',
     name: 'Store automation interval',
     trigger_config: { type: 'interval', every_minutes: 15 },
     prompt_template: 'Run store automation for {{payload.subject}}',
+    rrule: 'FREQ=MINUTELY;INTERVAL=15',
+    model: 'deepseek-v4-flash',
+    model_provider: 'openai_compatible',
+    model_base_url: 'https://api.deepseek.com/v1',
+    reasoning_effort: 'medium',
+    cwds: ['/tmp/joi-automation'],
+    execution_environment: 'local',
+    target: { kind: 'new_task' },
   });
   assert.equal(automation.kind, 'schedule');
+  assert.equal(automation.execution_kind, 'cron');
+  assert.equal(automation.status, 'ACTIVE');
   assert.equal(automation.enabled, true);
   assert.equal(automation.permission_profile, 'read_only');
+  assert.equal(automation.rrule, 'FREQ=MINUTELY;INTERVAL=15');
+  assert.equal(automation.model, 'deepseek-v4-flash');
+  assert.equal(automation.model_provider, 'openai_compatible');
+  assert.equal(automation.model_base_url, 'https://api.deepseek.com/v1');
+  assert.equal(automation.reasoning_effort, 'medium');
+  assert.deepEqual(automation.cwds, ['/tmp/joi-automation']);
+  assert.equal(automation.execution_environment, 'local');
+  assert.deepEqual(automation.target, { kind: 'new_task' });
   assert.equal(store.listAutomations({ kind: 'schedule' }).automations.some((item) => item.id === automation.id), true);
   const triggerInsert = store.enqueueAutomationTrigger({
     automation_id: automation.id,
@@ -366,18 +522,76 @@ try {
     trigger_id: claimed.trigger.id,
     run_id: automationResponse.run_id,
     product_task_id: automationResponse.product_task?.id,
+    conversation_id: automationResponse.conversation_id,
+    source_cwd: automation.cwds[0],
+    automation_name: automation.name,
   });
   store.recordAutomationRunCompleted({
     automation_run_id: automationRun.id,
     run_id: automationResponse.run_id,
     output_summary: 'store automation completed',
   });
-  assert.equal(store.listAutomationRuns({ automation_id: automation.id }).runs[0].status, 'succeeded');
+  const completedAutomationRun = store.listAutomationRuns({ automation_id: automation.id }).runs[0];
+  assert.equal(completedAutomationRun.status, 'succeeded');
+  assert.equal(completedAutomationRun.conversation_id, automationResponse.conversation_id);
+  assert.equal(completedAutomationRun.source_cwd, '/tmp/joi-automation');
+  assert.equal(completedAutomationRun.automation_name, automation.name);
+  assert.equal(completedAutomationRun.read_at, undefined);
+  assert.equal(completedAutomationRun.archived_at, undefined);
+  assert.ok(store.setAutomationRunRead({ id: completedAutomationRun.id, read: true }).read_at);
+  assert.equal(store.setAutomationRunRead({ id: completedAutomationRun.id, read: false }).read_at, undefined);
+  assert.equal(store.markAllAutomationRunsRead({ automation_id: automation.id }).updated, 1);
+  assert.ok(store.listAutomationRuns({ automation_id: automation.id }).runs[0].read_at);
+  assert.ok(store.setAutomationRunArchived({ id: completedAutomationRun.id, archived: true }).archived_at);
+  assert.equal(store.setAutomationRunArchived({ id: completedAutomationRun.id, archived: false }).archived_at, undefined);
+  assert.deepEqual(store.archiveAllAutomationRuns({ automation_id: automation.id }), { succeeded_count: 1, failed_count: 0 });
+  assert.ok(store.listAutomationRuns({ automation_id: automation.id }).runs[0].archived_at);
   assert.equal(store.listAutomationTriggers({ automation_id: automation.id }).triggers[0].status, 'succeeded');
   const automationCompletedEvent = store.getRunTrace(automationResponse.run_id).events.find((event) => event.event_type === 'automation.run_completed');
   assert.equal(automationCompletedEvent?.status, 'completed');
   assert.equal(automationCompletedEvent?.terminal, true);
   assert.equal(automationCompletedEvent?.visibility, 'trace_only');
+
+  const concurrencyTriggerOne = store.enqueueAutomationTrigger({
+    automation_id: automation.id,
+    trigger_type: 'schedule',
+    dedup_key: 'schedule:store:concurrency:1',
+    payload: { concurrency: 1 },
+    fire_at: new Date(Date.now() - 1000).toISOString(),
+  }).trigger;
+  const concurrencyTriggerTwo = store.enqueueAutomationTrigger({
+    automation_id: automation.id,
+    trigger_type: 'schedule',
+    dedup_key: 'schedule:store:concurrency:2',
+    payload: { concurrency: 2 },
+    fire_at: new Date(Date.now() - 1000).toISOString(),
+  }).trigger;
+  const firstConcurrencyClaim = store.claimDueAutomationTrigger(new Date().toISOString());
+  assert.equal(firstConcurrencyClaim?.trigger.id, concurrencyTriggerOne.id);
+  assert.equal(store.claimDueAutomationTrigger(new Date().toISOString()), undefined);
+  store.recordAutomationTriggerFailed({
+    trigger_id: concurrencyTriggerOne.id,
+    error_code: 'TEST_COMPLETE',
+    error_message: 'release concurrency slot',
+  });
+  const secondConcurrencyClaim = store.claimDueAutomationTrigger(new Date().toISOString());
+  assert.equal(secondConcurrencyClaim?.trigger.id, concurrencyTriggerTwo.id);
+  store.recordAutomationTriggerFailed({
+    trigger_id: concurrencyTriggerTwo.id,
+    error_code: 'TEST_COMPLETE',
+    error_message: 'release concurrency slot',
+  });
+
+  store.setAutomationEnabled({ id: automation.id, enabled: false });
+  const pausedManualTrigger = store.triggerAutomationNow({ id: automation.id, payload: { paused_manual: true } }).trigger;
+  const pausedManualClaim = store.claimDueAutomationTrigger(new Date().toISOString());
+  assert.equal(pausedManualClaim?.trigger.id, pausedManualTrigger.id);
+  store.recordAutomationTriggerFailed({
+    trigger_id: pausedManualTrigger.id,
+    error_code: 'TEST_COMPLETE',
+    error_message: 'paused manual run was claimable',
+  });
+  store.setAutomationEnabled({ id: automation.id, enabled: true });
 
   const retryAutomation = store.saveAutomation({
     kind: 'webhook',
@@ -610,6 +824,35 @@ try {
   assert.ok(projectScopedPrompt.memory_results.some((result) => result.memory.id === 'mem_scope_project_a'));
   assert.ok(!projectScopedPrompt.memory_results.some((result) => result.memory.id === 'mem_scope_project_b'));
   assert.deepEqual(projectScopedPrompt.memory_scope.project_ids, ['prj_memory_scope_a']);
+  const toolScopedRecall = store.recallMemoriesForTool({
+    conversation_id: 'conv_memory_scope',
+    room_id: 'room_memory_scope',
+    user_id: 'desktop_user',
+    message: 'Scope cipher',
+    runtime_mode: 'tool_calling',
+  }, 'Scope cipher', 8);
+  assert.ok(toolScopedRecall.memories.some((result) => result.memory.id === 'mem_scope_project_a'));
+  assert.ok(!toolScopedRecall.memories.some((result) => result.memory.id === 'mem_scope_project_b'));
+  assert.deepEqual(toolScopedRecall.scope.project_ids, ['prj_memory_scope_a']);
+  const toolCandidateRequest = {
+    conversation_id: 'conv_memory_scope',
+    room_id: 'room_memory_scope',
+    user_id: 'desktop_user',
+    message: 'Remember a scoped tool candidate',
+    runtime_mode: 'tool_calling',
+  };
+  const toolCandidate = store.createMemoryCandidateForTool(toolCandidateRequest, {
+    content: 'Tool candidate stays inside project alpha.',
+    summary: 'Scoped tool candidate',
+    scope: 'current_project',
+  });
+  assert.equal(toolCandidate.candidate.scope_type, 'project');
+  assert.equal(toolCandidate.candidate.scope_id, 'prj_memory_scope_a');
+  assert.equal(toolCandidate.candidate.status, 'pending');
+  assert.equal(store.createMemoryCandidateForTool(toolCandidateRequest, {
+    content: 'Tool candidate stays inside project alpha.',
+    scope: 'current_project',
+  }).deduped, true);
   const crossProjectPrompt = store.assembleToolCallingPrompt({
     conversation_id: 'conv_memory_scope',
     room_id: 'room_memory_scope',
@@ -1010,6 +1253,74 @@ try {
   assert.equal(seriousTaskModeEvent?.payload?.contract_mode, 'execution');
   assert.ok(seriousTaskTrace.steps.some((step) => step.step_type === 'artifact_created'));
   assert.ok(seriousTaskTrace.steps.some((step) => step.step_type === 'task_verification_finished'));
+
+  const disclosedWebFailureChat = store.recordToolCallingChat({
+    message: '生成一份只保留已核验来源的免费游戏报告',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'Epic 免费游戏页返回 403，无法完成正文核验，因此本期不列具体游戏。',
+    tool_results: [{
+      call_id: 'call_disclosed_web_failure',
+      name: 'mcp.joi_web.web_extract',
+      arguments: { url: 'https://store.epicgames.com/en-US/free-games' },
+      output: {
+        status: 'failed',
+        fetch_status: 'http_error',
+        status_code: 403,
+        failure_class: 'origin_access_restricted',
+        summary: 'Source could not be verified: HTTP 403.',
+      },
+    }],
+    usage: { input_tokens: 4, output_tokens: 4 },
+    model_responses: [{ id: 'chatcmpl_disclosed_web_failure' }],
+  });
+  assert.equal(disclosedWebFailureChat.product_task.status, 'completed');
+  assert.equal(disclosedWebFailureChat.product_task.verification.status, 'passed');
+  assert.match(disclosedWebFailureChat.product_task.verification.summary, /disclosed read-only source limitations/);
+  const disclosedFailureCheck = disclosedWebFailureChat.product_task.verification.checks.find((check) => check.name === 'tool_failures_not_hidden');
+  assert.equal(disclosedFailureCheck.status, 'passed');
+  assert.equal(disclosedFailureCheck.evidence.failed_tool_count, 1);
+  assert.equal(disclosedFailureCheck.evidence.disclosed_failure_count, 1);
+  const disclosedWebFailureTrace = store.getRunTrace(disclosedWebFailureChat.run_id);
+  assert.ok(disclosedWebFailureTrace.events.some((event) => event.event_type === 'tool.failed'));
+  assert.ok(disclosedWebFailureTrace.events.some((event) => event.event_type === 'task.completed'));
+  assert.ok(!disclosedWebFailureTrace.events.some((event) => event.event_type === 'task.blocked'));
+
+  const hiddenWebFailureChat = store.recordToolCallingChat({
+    message: '生成一份确认所有来源都成功的免费游戏报告',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'Epic 免费游戏页已经完整核验，一切正常。',
+    tool_results: [{
+      call_id: 'call_hidden_web_failure',
+      name: 'mcp.joi_web.web_extract',
+      arguments: { url: 'https://store.epicgames.com/en-US/free-games' },
+      output: {
+        status: 'failed',
+        fetch_status: 'http_error',
+        status_code: 403,
+        failure_class: 'origin_access_restricted',
+      },
+    }],
+    usage: { input_tokens: 4, output_tokens: 4 },
+    model_responses: [{ id: 'chatcmpl_hidden_web_failure' }],
+  });
+  assert.equal(hiddenWebFailureChat.product_task.status, 'blocked');
+  assert.equal(hiddenWebFailureChat.product_task.verification.status, 'failed');
+  const hiddenWebFailureTrace = store.getRunTrace(hiddenWebFailureChat.run_id);
+  assert.ok(hiddenWebFailureTrace.events.some((event) => event.event_type === 'task.blocked'));
 
   const telegramTaskChat = store.recordToolCallingChat({
     conversation_id: 'conv_tg_handoff_test',
@@ -1672,6 +1983,17 @@ try {
     usage: { input_tokens: 9, output_tokens: 4, cached_input_tokens: 2 },
     usage_status: 'recorded',
   });
+  streamCallbacks.onEvent({
+    type: 'work_summary.updated',
+    step: 0,
+    status: 'completed',
+    detail: {
+      phase: 'prepared',
+      summary: '已准备 3 项 Joi 能力',
+      user_visible: true,
+      capability_count: 3,
+    },
+  });
   streamCallbacks.onAssistantDelta({ step: 1, text: `${committedStreamAnswer}\n\n`, index: 0 });
   streamCallbacks.onAssistantCompleted({ step: 1, text: `${committedStreamAnswer}\n\n`, finish_reason: 'stop', usage_status: 'recorded' });
   streamCallbacks.onModelCompleted({ step: 1, finish_reason: 'stop', usage_status: 'recorded' });
@@ -1690,6 +2012,7 @@ try {
   assert.equal(streamFinished.response, committedStreamAnswer);
   assert.ok(emittedEventTypes.includes('assistant.delta'));
   assert.ok(emittedEventTypes.includes('tool.completed'));
+  assert.ok(emittedEventTypes.includes('work_summary.updated'));
   assert.ok(emittedEvents.every((event) => event.run_id === streamStarted.run_id && event.seq > 0));
   const streamTrace = store.getRunTrace(streamStarted.run_id);
   const streamEventTypes = streamTrace.events.map((event) => event.event_type);
@@ -1710,6 +2033,11 @@ try {
   assert.equal(streamTrace.events.filter((event) => event.event_type === 'tool.started' && event.item_id === streamToolCall.id).length, 1);
   assert.equal(streamTrace.events.filter((event) => event.event_type === 'tool.completed' && event.item_id === streamToolCall.id).length, 1);
   assert.equal(streamTrace.events.filter((event) => event.event_type === 'usage.recorded' && event.item_id === streamStarted.model_call_id).length, 1);
+  const preparedStage = streamTrace.events.find((event) => event.event_type === 'work_summary.updated');
+  assert.equal(preparedStage?.visibility, 'transcript');
+  assert.equal(preparedStage?.item_type, 'work_summary');
+  assert.equal(preparedStage?.phase, 'prepared');
+  assert.equal(preparedStage?.payload?.user_visible, true);
   assert.equal(streamTrace.model_calls[0].input_tokens, 9);
   assert.equal(streamTrace.model_calls[0].cached_input_tokens, 2);
   const streamModelCallRow = store['get'](
@@ -2087,6 +2415,7 @@ try {
   assert.equal(appLog.payload.nested.password, '[REDACTED]');
   assert.equal(String(appLog.payload.note).includes('log-token-value'), false);
   assert.equal(String(appLog.payload.long_note).includes(longLogBody), true);
+  assert.equal(appLog.error, undefined);
   assert.match(appLog.created_at, /^\d{4}-\d{2}-\d{2}/);
   const defaultTimestampEvent = store.appendRunEventV2({
     run_id: response.run_id,
@@ -2110,6 +2439,39 @@ try {
   assert.equal(JSON.stringify(secretShapeLog.payload).includes('plain-local-secret-12345'), false);
   const logDetail = store.getLogEntry(appLog.id);
   assert.equal(logDetail?.feature_key, 'store.test.app_log');
+  assert.equal(logDetail?.error, undefined);
+  const ipcStartedLog = store.recordAppLog({
+    level: 'debug',
+    risk_level: 'read_only',
+    category: 'ipc',
+    feature_key: 'ipc.GetSystemHealth.started',
+    source: 'electron_ipc',
+    message: 'IPC GetSystemHealth started',
+  });
+  const ipcSucceededLog = store.recordAppLog({
+    level: 'debug',
+    risk_level: 'read_only',
+    category: 'ipc',
+    feature_key: 'ipc.GetSystemHealth.succeeded',
+    source: 'electron_ipc',
+    message: 'IPC GetSystemHealth succeeded',
+  });
+  const ipcFailedLog = store.recordAppLog({
+    level: 'error',
+    risk_level: 'read_only',
+    category: 'ipc',
+    feature_key: 'ipc.GetSystemHealth.failed',
+    source: 'electron_ipc',
+    message: 'IPC GetSystemHealth failed',
+    error: new Error('fixture IPC failure'),
+  });
+  const defaultIPCLogs = store.listLogs({ sources: ['electron_ipc'], limit: 100 }).logs;
+  assert.ok(!defaultIPCLogs.some((log) => log.id === ipcStartedLog.id));
+  assert.ok(!defaultIPCLogs.some((log) => log.id === ipcSucceededLog.id));
+  assert.ok(defaultIPCLogs.some((log) => log.id === ipcFailedLog.id && log.error?.message === 'fixture IPC failure'));
+  const explicitDebugIPCLogs = store.listLogs({ sources: ['electron_ipc'], levels: ['debug'], limit: 100 }).logs;
+  assert.ok(explicitDebugIPCLogs.some((log) => log.id === ipcStartedLog.id));
+  assert.ok(explicitDebugIPCLogs.some((log) => log.id === ipcSucceededLog.id));
   const unifiedLogs = store.listLogs({ query: 'store.test.app_log', include_trace: true, include_worker_heartbeat: true, limit: 100 }).logs;
   assert.ok(unifiedLogs.some((log) => log.id === appLog.id && log.source_table === 'app_logs'));
   const runLogs = store.listLogs({ run_id: response.run_id, include_trace: true, include_worker_heartbeat: true, limit: 100 }).logs;

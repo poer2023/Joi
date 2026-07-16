@@ -98,6 +98,9 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   transport TEXT NOT NULL DEFAULT 'stdio',
   command TEXT NOT NULL DEFAULT '',
   args TEXT NOT NULL DEFAULT '[]',
+  url TEXT NOT NULL DEFAULT '',
+  env TEXT NOT NULL DEFAULT '{}',
+  headers TEXT NOT NULL DEFAULT '{}',
   env_secret_refs TEXT NOT NULL DEFAULT '{}',
   enabled INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'inactive',
@@ -432,6 +435,143 @@ CREATE TABLE IF NOT EXISTS messages (
   attachments TEXT NOT NULL DEFAULT '[]',
   metadata TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS conversation_branches (
+  id TEXT PRIMARY KEY,
+  parent_conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  child_conversation_id TEXT NOT NULL UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+  from_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  source_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  copied_message_count INTEGER NOT NULL DEFAULT 0,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS conversation_compactions (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  source_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  summary TEXT NOT NULL,
+  first_kept_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  covered_message_count INTEGER NOT NULL DEFAULT 0,
+  original_message_count INTEGER NOT NULL DEFAULT 0,
+  original_char_count INTEGER NOT NULL DEFAULT 0,
+  compacted_context_char_count INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS run_message_queue (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('steering', 'follow_up')),
+  content TEXT NOT NULL,
+  attachments TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'pending',
+  delivered_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  delivered_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_message_queue_pending
+  ON run_message_queue(run_id, kind, status, created_at);
+
+CREATE TABLE IF NOT EXISTS agent_model_policies (
+  agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+  default_model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+  fallback_model_ids TEXT NOT NULL DEFAULT '[]',
+  cheap_model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+  child_model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+  tool_model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+  long_context_model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+  reasoning_effort TEXT NOT NULL DEFAULT '',
+  max_failovers INTEGER NOT NULL DEFAULT 2,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS assistant_activity_sessions (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'active',
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  event_count INTEGER NOT NULL DEFAULT 0,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  started_at TEXT NOT NULL DEFAULT (datetime('now')),
+  ended_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS assistant_activity_events (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES assistant_activity_sessions(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  app_name TEXT NOT NULL DEFAULT '',
+  window_title TEXT NOT NULL DEFAULT '',
+  text TEXT NOT NULL DEFAULT '',
+  screenshot_path TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_assistant_activity_events_session
+  ON assistant_activity_events(session_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS assistant_calendar_items (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  start_at TEXT NOT NULL,
+  end_at TEXT,
+  status TEXT NOT NULL DEFAULT 'draft',
+  source TEXT NOT NULL DEFAULT 'joi',
+  notes TEXT NOT NULL DEFAULT '',
+  external_id TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS assistant_plans (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  objective TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  review_summary TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS assistant_plan_nodes (
+  id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL REFERENCES assistant_plans(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  parent_id TEXT REFERENCES assistant_plan_nodes(id) ON DELETE SET NULL,
+  depends_on TEXT NOT NULL DEFAULT '[]',
+  evidence TEXT NOT NULL DEFAULT '[]',
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS assistant_channels (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'not_configured',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  configured INTEGER NOT NULL DEFAULT 0,
+  last_sync_at TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS runs (

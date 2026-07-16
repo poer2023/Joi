@@ -52,6 +52,17 @@ export function filterSingleAgentConversations(
   ].some((value) => normalized(value).includes(needle)));
 }
 
+export function isMessagingConversationChannel(channel?: string) {
+  return ['telegram', 'imessage'].includes(normalized(channel));
+}
+
+export function splitSingleAgentConversations(conversations: ConversationSummary[]) {
+  return {
+    channels: conversations.filter((conversation) => isMessagingConversationChannel(conversation.channel)),
+    threads: conversations.filter((conversation) => !isMessagingConversationChannel(conversation.channel)),
+  };
+}
+
 export function conversationChannelLabel(channel?: string) {
   switch (normalized(channel)) {
     case 'imessage': return 'iMessage';

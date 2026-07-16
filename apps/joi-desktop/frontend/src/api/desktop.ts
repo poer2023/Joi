@@ -4,10 +4,16 @@ import {
   type JoiPreloadApi,
   type ApprovalDecisionRequest,
   type ApprovalResumeRunRequest,
+  type AgentModelPolicy,
+  type AgentModelPolicyRequest,
+  type AssistantActionRequest,
+  type AssistantActionResult,
+  type AssistantWorkspaceSnapshot,
   type ArtifactDetail,
   type ArtifactSummary,
   type AutomationDefinition,
   type AutomationDefinitionRequest,
+  type AutomationExecutionKind,
   type AutomationRunRecord,
   type AutomationTriggerNowRequest,
   type AutomationTriggerRecord,
@@ -21,18 +27,25 @@ import {
   type CheckpointSummary,
   type ConnectExternalMirrorRoomRequest,
   type CompleteCheckpointRequest,
+  type CompactConversationRequest,
+  type CompactConversationResult,
   type ConfirmationRecord,
   type ConversationActionRequest,
   type ConversationActionResponse,
+  type ConversationBranchResult,
   type ConversationDetail,
+  type ConversationTree,
   type ConversationFilter,
   type ConversationGroup,
   type ConversationGroupRequest,
   type ConversationMessage,
   type ConversationSummary,
+  type CreateConversationBranchRequest,
   type ConnectionTest,
   type CreateProjectPersonaRequest,
   type CreateSharedRoomRequest,
+  type DeveloperWorkbenchRequest,
+  type DeveloperWorkbenchResult,
   type EvaluateRoomPermissionsRequest,
   type ExternalHandoffAudit,
   type GenerateProjectPersonaCandidatesRequest,
@@ -47,6 +60,9 @@ import {
   type MCPServerRecord,
   type MCPServerConfigRequest,
   type MCPWrapToolRequest,
+  type MCPToolCallRequest,
+  type MediaWorkbenchRequest,
+  type MediaWorkbenchResult,
   type MemoryCandidateDecisionRequest,
   type MemoryCandidateFilter,
   type MemoryCorrectionRequest,
@@ -97,6 +113,7 @@ import {
   type RetryExternalConnectorEventRequest,
   type RunClosureReport,
   type RunEvent,
+  type RunQueuedMessage,
   type RunTrace,
   type RunTraceSpan,
   type RunTraceSpanFilter,
@@ -106,6 +123,7 @@ import {
   type SecretStatus,
   type SetRouteLockRequest,
   type SettingsRecord,
+  type SkillDetailRecord,
   type SkillRecord,
   type SystemHealth,
   type TerminalSessionEvent,
@@ -122,14 +140,22 @@ import {
   type UpdateProjectPersonaRequest,
   type WorkerGatewayAuditRecord,
   type WorkspaceSettings,
+  type BrowserWorkbenchRequest,
+  type BrowserWorkbenchResult,
 } from '../../../../../packages/shared-types/src/desktop-api';
 export type {
   ApprovalDecisionRequest,
   ApprovalResumeRunRequest,
+  AgentModelPolicy,
+  AgentModelPolicyRequest,
+  AssistantActionRequest,
+  AssistantActionResult,
+  AssistantWorkspaceSnapshot,
   ArtifactDetail,
   ArtifactSummary,
   AutomationDefinition,
   AutomationDefinitionRequest,
+  AutomationExecutionKind,
   AutomationRunRecord,
   AutomationTriggerNowRequest,
   AutomationTriggerRecord,
@@ -137,24 +163,33 @@ export type {
   AutomationWebhookTestRequest,
   AvailableModel,
   BackupRecord,
+  BrowserWorkbenchRequest,
+  BrowserWorkbenchResult,
   CapabilityRecord,
   ChatRequest,
   ChatResponse,
   CheckpointSummary,
   ConnectExternalMirrorRoomRequest,
   CompleteCheckpointRequest,
+  CompactConversationRequest,
+  CompactConversationResult,
   ConfirmationRecord,
   ConversationActionRequest,
   ConversationActionResponse,
+  ConversationBranchResult,
   ConversationDetail,
   ConversationFilter,
   ConversationGroup,
   ConversationGroupRequest,
   ConversationMessage,
   ConversationSummary,
+  ConversationTree,
+  CreateConversationBranchRequest,
   ConnectionTest,
   CreateProjectPersonaRequest,
   CreateSharedRoomRequest,
+  DeveloperWorkbenchRequest,
+  DeveloperWorkbenchResult,
   EvaluateRoomPermissionsRequest,
   ExternalHandoffAudit,
   GenerateProjectPersonaCandidatesRequest,
@@ -169,6 +204,8 @@ export type {
   MCPServerRecord,
   MCPServerConfigRequest,
   MCPWrapToolRequest,
+  MediaWorkbenchRequest,
+  MediaWorkbenchResult,
   MemoryCandidateDecisionRequest,
   MemoryCandidateFilter,
   MemoryCorrectionRequest,
@@ -217,6 +254,7 @@ export type {
   RetryExternalConnectorEventRequest,
   RunClosureReport,
   RunEvent,
+  RunQueuedMessage,
   RunTrace,
   RunTraceSpan,
   RunTraceSpanFilter,
@@ -226,6 +264,7 @@ export type {
   SecretStatus,
   SetRouteLockRequest,
   SettingsRecord,
+  SkillDetailRecord,
   SkillRecord,
   SystemHealth,
   TerminalSessionEvent,
@@ -1313,6 +1352,34 @@ function electronBindings(api: JoiPreloadApi): DesktopBindings {
 
 const BROWSER_BRIDGE_URL = 'http://127.0.0.1:18083';
 let browserBridgeUnavailable = false;
+let previewAutomationDefinitions: AutomationDefinition[] = [
+  {
+    id: 'automation_preview_schedule',
+    kind: 'schedule',
+    execution_kind: 'cron',
+    status: 'ACTIVE',
+    slug: 'preview-schedule',
+    name: 'Preview interval check',
+    enabled: true,
+    trigger_config: { type: 'interval', every_minutes: 60 },
+    prompt_template: 'Preview {{payload}}',
+    input_mode: 'background_task',
+    permission_profile: 'read_only',
+    preferred_node: 'main-node',
+    allow_worker: false,
+    dedup_policy: {},
+    retry_policy: { max_attempts: 2, backoff_seconds: [60, 300] },
+    max_concurrency: 1,
+    notification_policy: {},
+    rrule: 'FREQ=HOURLY;INTERVAL=1;BYMINUTE=0;BYSECOND=0',
+    cwds: [],
+    metadata: { preview: true },
+    created_at: previewIso(60),
+    updated_at: previewIso(60),
+  },
+];
+let previewAutomationTriggers: AutomationTriggerRecord[] = [];
+let previewAutomationRuns: AutomationRunRecord[] = [];
 
 function shouldUseBrowserBridge(): boolean {
   if (browserBridgeUnavailable) return false;
@@ -1636,37 +1703,27 @@ function bindings(): DesktopBindings {
           summary: 'preview permission audit',
         };
       },
-      async ListAutomations() {
+      async ListAutomations(filter) {
         return {
-          automations: [
-            {
-              id: 'automation_preview_schedule',
-              kind: 'schedule',
-              slug: 'preview-schedule',
-              name: 'Preview interval check',
-              enabled: true,
-              trigger_config: { type: 'interval', every_minutes: 60 },
-              prompt_template: 'Preview {{payload}}',
-              input_mode: 'background_task',
-              permission_profile: 'read_only',
-              preferred_node: 'main-node',
-              allow_worker: false,
-              dedup_policy: {},
-              retry_policy: { max_attempts: 2, backoff_seconds: [60, 300] },
-              max_concurrency: 1,
-              notification_policy: {},
-              metadata: {},
-            },
-          ],
+          automations: previewAutomationDefinitions.filter((automation) => (
+            (!filter?.kind || automation.kind === filter.kind)
+            && (filter?.enabled === undefined || automation.enabled === filter.enabled)
+          )).slice(0, filter?.limit || 200),
         };
       },
       async GetAutomation(id) {
-        return (await this.ListAutomations()).automations.find((item) => item.id === id || item.slug === id) ?? (await this.ListAutomations()).automations[0];
+        const automation = previewAutomationDefinitions.find((item) => item.id === id || item.slug === id);
+        if (!automation) throw new Error(`Automation not found: ${id}`);
+        return automation;
       },
       async SaveAutomation(req) {
-        return {
+        const existing = req.id ? previewAutomationDefinitions.find((item) => item.id === req.id) : undefined;
+        const timestamp = new Date().toISOString();
+        const saved: AutomationDefinition = {
           id: req.id || `automation_preview_${Date.now()}`,
           kind: req.kind,
+          execution_kind: req.execution_kind || (req.kind === 'webhook' ? 'webhook' : 'cron'),
+          status: req.enabled === false ? 'PAUSED' : 'ACTIVE',
           slug: req.slug || 'preview-automation',
           name: req.name,
           enabled: req.enabled ?? true,
@@ -1680,31 +1737,104 @@ function bindings(): DesktopBindings {
           retry_policy: req.retry_policy ?? {},
           max_concurrency: req.max_concurrency ?? 1,
           notification_policy: req.notification_policy ?? {},
+          rrule: req.rrule,
+          model: req.model,
+          reasoning_effort: req.reasoning_effort,
+          execution_environment: req.execution_environment || 'local',
+          target: req.target,
+          cwds: req.cwds ?? [],
+          target_thread_id: req.target_thread_id,
+          is_draft: req.is_draft,
           metadata: req.metadata ?? {},
+          created_at: existing?.created_at || timestamp,
+          updated_at: timestamp,
         };
+        previewAutomationDefinitions = existing
+          ? previewAutomationDefinitions.map((item) => item.id === saved.id ? saved : item)
+          : [...previewAutomationDefinitions, saved];
+        return saved;
       },
-      async DeleteAutomation() {},
+      async DeleteAutomation(id) {
+        previewAutomationDefinitions = previewAutomationDefinitions.filter((item) => item.id !== id);
+      },
       async SetAutomationEnabled(req) {
-        return { ...(await this.GetAutomation(req.id)), enabled: req.enabled };
+        const updated = { ...(await this.GetAutomation(req.id)), enabled: req.enabled, status: req.enabled ? 'ACTIVE' : 'PAUSED', updated_at: new Date().toISOString() } as AutomationDefinition;
+        previewAutomationDefinitions = previewAutomationDefinitions.map((item) => item.id === req.id ? updated : item);
+        return updated;
       },
       async TriggerAutomationNow(req) {
+        const automation = await this.GetAutomation(req.id);
+        const timestamp = new Date().toISOString();
+        const triggerID = `autotrig_preview_${Date.now()}`;
+        const trigger: AutomationTriggerRecord = {
+          id: triggerID,
+          automation_id: req.id,
+          trigger_type: 'manual',
+          dedup_key: `preview:${triggerID}`,
+          payload: req.payload ?? {},
+          status: 'succeeded',
+          attempt_count: 1,
+          fire_at: timestamp,
+          created_at: timestamp,
+          updated_at: timestamp,
+        };
+        previewAutomationTriggers = [trigger, ...previewAutomationTriggers];
+        previewAutomationRuns = [{
+          id: `autorun_preview_${Date.now()}`,
+          automation_id: req.id,
+          trigger_id: triggerID,
+          run_id: `run_preview_automation_${Date.now()}`,
+          conversation_id: automation.execution_kind === 'heartbeat' ? automation.target_thread_id : 'conv_private_hub',
+          source_cwd: automation.cwds[0],
+          automation_name: automation.name,
+          status: 'succeeded',
+          attempt_number: 1,
+          output_summary: 'Preview automation completed',
+          metadata: { preview: true },
+          created_at: timestamp,
+          updated_at: timestamp,
+        }, ...previewAutomationRuns];
         return {
-          trigger: {
-            id: `autotrig_preview_${Date.now()}`,
-            automation_id: req.id,
-            trigger_type: 'manual',
-            dedup_key: 'preview',
-            payload: req.payload ?? {},
-            status: 'pending',
-            attempt_count: 0,
-          },
+          trigger,
         };
       },
-      async ListAutomationTriggers() {
-        return { triggers: [] };
+      async ListAutomationTriggers(filter) {
+        return { triggers: previewAutomationTriggers.filter((trigger) => !filter?.automation_id || trigger.automation_id === filter.automation_id).slice(0, filter?.limit || 200) };
       },
-      async ListAutomationRuns() {
-        return { runs: [] };
+      async ListAutomationRuns(filter) {
+        return { runs: previewAutomationRuns.filter((run) => !filter?.automation_id || run.automation_id === filter.automation_id).slice(0, filter?.limit || 200) };
+      },
+      async SetAutomationRunRead(req) {
+        const existing = previewAutomationRuns.find((run) => run.id === req.id);
+        if (!existing) throw new Error(`Automation run not found: ${req.id}`);
+        const updated = { ...existing, read_at: req.read ? new Date().toISOString() : undefined };
+        previewAutomationRuns = previewAutomationRuns.map((run) => run.id === req.id ? updated : run);
+        return updated;
+      },
+      async MarkAllAutomationRunsRead(req) {
+        let updated = 0;
+        previewAutomationRuns = previewAutomationRuns.map((run) => {
+          if (run.read_at || (req?.automation_id && run.automation_id !== req.automation_id)) return run;
+          updated += 1;
+          return { ...run, read_at: new Date().toISOString() };
+        });
+        return { updated };
+      },
+      async SetAutomationRunArchived(req) {
+        const existing = previewAutomationRuns.find((run) => run.id === req.id);
+        if (!existing) throw new Error(`Automation run not found: ${req.id}`);
+        const updated = { ...existing, archived_at: req.archived ? new Date().toISOString() : undefined };
+        previewAutomationRuns = previewAutomationRuns.map((run) => run.id === req.id ? updated : run);
+        return updated;
+      },
+      async ArchiveAllAutomationRuns(req) {
+        let succeededCount = 0;
+        previewAutomationRuns = previewAutomationRuns.map((run) => {
+          if (run.automation_id !== req.automation_id || run.archived_at || run.status === 'running') return run;
+          succeededCount += 1;
+          return { ...run, archived_at: new Date().toISOString() };
+        });
+        return { succeeded_count: succeededCount, failed_count: 0 };
       },
       async GetAutomationWebhookEndpoint(id) {
         return {
@@ -1768,6 +1898,59 @@ function bindings(): DesktopBindings {
       async GetConversationForMessage(messageID = '') {
         return previewConversationForMessage(messageID);
       },
+      async GetConversationTree(conversationID = 'conv_private_hub') {
+        const detail = previewConversationDetail(conversationID);
+        return {
+          root_conversation_id: conversationID,
+          active_conversation_id: conversationID,
+          node_count: 1,
+          root: {
+            conversation_id: conversationID,
+            title: detail.conversation.title,
+            copied_message_count: 0,
+            message_count: detail.messages.length,
+            child_count: 0,
+            active: true,
+            children: [],
+          },
+        };
+      },
+      async CreateConversationBranch(req) {
+        return {
+          source_conversation_id: req.source_conversation_id,
+          child_conversation_id: `conv_preview_branch_${Date.now()}`,
+          from_message_id: req.from_message_id || '',
+          copied_message_count: previewConversationDetail(req.source_conversation_id).messages.length,
+          source_message_count: previewConversationDetail(req.source_conversation_id).messages.length,
+          source_unchanged: true as const,
+        };
+      },
+      async CompactConversation(req) {
+        const count = previewConversationDetail(req.conversation_id).messages.length;
+        return {
+          compaction_id: `compact_preview_${Date.now()}`,
+          conversation_id: req.conversation_id,
+          summary: req.summary,
+          first_kept_message_id: '',
+          covered_message_count: Math.max(0, count - (req.keep_recent_messages || 6)),
+          original_message_count: count,
+          original_char_count: req.summary.length * 4,
+          compacted_context_char_count: req.summary.length,
+          transcript_preserved: true as const,
+        };
+      },
+      async UpdateConversationBranch(req) {
+        const tree = await this.GetConversationTree(req.conversation_id);
+        tree.root.label = req.label;
+        tree.root.summary = req.summary;
+        return tree;
+      },
+      async ExportConversation(req) {
+        return { path: `/tmp/${req.conversation_id}.joi-conversation.json`, conversation_id: req.conversation_id, branch_count: 0, message_count: previewConversationDetail(req.conversation_id).messages.length };
+      },
+      async ImportConversation() {
+        return { conversation_id: 'conv_preview_imported', imported_conversation_ids: ['conv_preview_imported'], message_count: 2 };
+      },
       async ListCapabilities() {
         return {
           capabilities: [
@@ -1794,8 +1977,20 @@ function bindings(): DesktopBindings {
       async WrapMCPTool(serverID, toolName, req) {
         return { capability: { id: req.capability_id || `mcp_${serverID}_${toolName}`, name: toolName, description: req.description, risk_level: req.risk_level, enabled: true, metadata: { source: 'mcp_wrapped', intent_domain: req.intent_domain } } };
       },
+      async InvokeMCPTool(req) {
+        return { server_id: req.server_id, tool_name: req.tool_name, content: [{ type: 'text', text: 'preview' }], is_error: false, duration_ms: 1 };
+      },
       async ListSkills() {
         return { skills: [{ id: 'desktop_inventory_skill', version: 'v1', name: 'Desktop Inventory', description: 'List local installed applications without reading app content.', trigger_phrases: ['列出本地所有 app'], required_capabilities: ['desktop_app_list'], forbidden_capabilities: ['system_health_check'], output_contract: 'final_answer with bounded app metadata', enabled: true, metadata: { source: 'native_skill_registry' } }] };
+      },
+      async ReloadSkills() {
+        const result = await this.ListSkills();
+        return { ...result, discovered_count: result.skills.length, removed_count: 0 };
+      },
+      async GetSkill(id) {
+        const result = await this.ListSkills();
+        const skill = result.skills.find((item) => item.id === id) || result.skills[0];
+        return { skill, instructions: '# Preview Skill\n\nPreview-only instructions.', frontmatter: { name: skill.name, description: skill.description }, openai: {} };
       },
       async SetSkillEnabled() {},
       async TestGitHubConnection() {
@@ -2096,6 +2291,15 @@ function bindings(): DesktopBindings {
           },
         };
       },
+      async EnqueueRunMessage(req) {
+        return { id: `rqm_preview_${Date.now()}`, run_id: req.run_id, conversation_id: req.conversation_id || 'conv_private_hub', kind: req.kind, content: req.content, attachments: req.attachments || [], status: 'pending', created_at: new Date().toISOString() };
+      },
+      async ListRunMessages() {
+        return { messages: [] };
+      },
+      async CancelRunMessage(req) {
+        return { id: req.id, run_id: req.run_id || 'run_preview', conversation_id: 'conv_private_hub', kind: 'follow_up', content: '', attachments: [], status: 'cancelled' };
+      },
       async ListRecoverableRuns() {
         return { runs: [] };
       },
@@ -2220,6 +2424,44 @@ function bindings(): DesktopBindings {
       },
       async SaveModelConfig() {},
       async SaveModelSettings() {},
+      async ListAgentModelPolicies() {
+        return { policies: [{ agent_id: 'general_agent', default_model_id: 'deepseek-v4-pro', fallback_model_ids: ['deepseek-v4-flash'], max_failovers: 2, enabled: true }] };
+      },
+      async SaveAgentModelPolicy(req) {
+        return req;
+      },
+      async ExecuteBrowserAction(req) {
+        return { session_id: req.session_id || 'browser_preview', action: req.action, active_tab_id: 1, url: req.url || 'about:blank', title: 'Browser Preview', tabs: [{ id: 1, title: 'Browser Preview', url: req.url || 'about:blank', active: true }] };
+      },
+      async ExecuteDeveloperAction(req) {
+        return {
+          action: req.action,
+          output: {
+            status: 'completed',
+            mode: 'preview_developer_workbench',
+            summary: `${req.action} preview completed.`,
+            input: req.input || {},
+          },
+        };
+      },
+      async ExecuteMediaAction(req) {
+        return {
+          action: req.action,
+          output: {
+            status: 'completed',
+            mode: 'preview_media_workbench',
+            summary: `${req.action} preview completed.`,
+            preview_url: req.data_url,
+            file_path: req.path || '/tmp/joi-preview-media.mp4',
+          },
+        };
+      },
+      async GetAssistantWorkspace() {
+        return { capture: { active: false, interval_seconds: 60 }, activity_sessions: [], recent_activity: [], calendar: [], plans: [], channels: [] };
+      },
+      async ExecuteAssistantAction(req) {
+        return { ok: true, action: req.action, item: { id: req.id || `preview_${Date.now()}` }, snapshot: await this.GetAssistantWorkspace() };
+      },
       async SaveOperationalSettings() {},
       async SaveTelegramConfig() {},
       async SendTestTelegramMessage() {
@@ -2349,6 +2591,12 @@ export const desktopApi = {
   listConversations: (filter: ConversationFilter = { view: 'active', limit: 100 }) => bindings().ListConversations(filter),
   getConversation: (conversationID: string) => bindings().GetConversation(conversationID),
   getConversationForMessage: (messageID: string) => bindings().GetConversationForMessage(messageID),
+  getConversationTree: (conversationID: string) => bindings().GetConversationTree(conversationID),
+  createConversationBranch: (req: CreateConversationBranchRequest) => bindings().CreateConversationBranch(req),
+  compactConversation: (req: CompactConversationRequest) => bindings().CompactConversation(req),
+  updateConversationBranch: (req: { conversation_id: string; label?: string; summary?: string }) => bindings().UpdateConversationBranch(req),
+  exportConversation: (req: { conversation_id: string; path?: string }) => bindings().ExportConversation(req),
+  importConversation: (req: { path: string }) => bindings().ImportConversation(req),
   listConversationGroups: () => bindings().ListConversationGroups(),
   saveConversationGroup: (req: ConversationGroupRequest) => bindings().SaveConversationGroup(req),
   deleteConversationGroup: (id: string) => bindings().DeleteConversationGroup(id),
@@ -2365,7 +2613,10 @@ export const desktopApi = {
   setMCPServerEnabled: (req: { id: string; enabled: boolean }) => bindings().SetMCPServerEnabled(req),
   syncMCPServer: (id: string) => bindings().SyncMCPServer(id),
   wrapMCPTool: (serverID: string, toolName: string, req: MCPWrapToolRequest) => bindings().WrapMCPTool(serverID, toolName, req),
+  invokeMCPTool: (req: MCPToolCallRequest) => bindings().InvokeMCPTool(req),
   listSkills: () => bindings().ListSkills(),
+  reloadSkills: () => bindings().ReloadSkills(),
+  getSkill: (id: string) => bindings().GetSkill(id),
   setSkillEnabled: (req: { id: string; enabled: boolean }) => bindings().SetSkillEnabled(req),
   testGitHubConnection: () => bindings().TestGitHubConnection(),
   listPlugins: () => bindings().ListPlugins(),
@@ -2414,6 +2665,9 @@ export const desktopApi = {
   resumeApprovalRun: (req: ApprovalResumeRunRequest) => bindings().ResumeApprovalRun(req),
   interruptRun: (req: InterruptRunRequest) => bindings().InterruptRun(req),
   redirectRun: (req: RedirectRunRequest) => bindings().RedirectRun(req),
+  enqueueRunMessage: (req: { run_id: string; conversation_id?: string; kind: 'steering' | 'follow_up'; content: string; attachments?: unknown[] }) => bindings().EnqueueRunMessage(req),
+  listRunMessages: (req: { run_id: string; status?: string }) => bindings().ListRunMessages(req),
+  cancelRunMessage: (req: { id: string; run_id?: string }) => bindings().CancelRunMessage(req),
   listRecoverableRuns: (req: { limit?: number } = {}) => bindings().ListRecoverableRuns(req),
   listBackups: () => bindings().ListBackups(),
   createBackup: () => bindings().CreateBackup(),
@@ -2428,6 +2682,10 @@ export const desktopApi = {
   triggerAutomationNow: (req: AutomationTriggerNowRequest) => bindings().TriggerAutomationNow(req),
   listAutomationTriggers: (filter: { automation_id?: string; status?: string; limit?: number } = {}) => bindings().ListAutomationTriggers(filter),
   listAutomationRuns: (filter: { automation_id?: string; trigger_id?: string; limit?: number } = {}) => bindings().ListAutomationRuns(filter),
+  setAutomationRunRead: (req: { id: string; read: boolean }) => bindings().SetAutomationRunRead(req),
+  markAllAutomationRunsRead: (req: { automation_id?: string } = {}) => bindings().MarkAllAutomationRunsRead(req),
+  setAutomationRunArchived: (req: { id: string; archived: boolean }) => bindings().SetAutomationRunArchived(req),
+  archiveAllAutomationRuns: (req: { automation_id: string }) => bindings().ArchiveAllAutomationRuns(req),
   getAutomationWebhookEndpoint: (id: string) => bindings().GetAutomationWebhookEndpoint(id),
   rotateAutomationWebhookSecret: (id: string) => bindings().RotateAutomationWebhookSecret(id),
   testAutomationWebhook: (req: AutomationWebhookTestRequest) => bindings().TestAutomationWebhook(req),
@@ -2443,6 +2701,13 @@ export const desktopApi = {
   fetchAvailableModels: (req?: ModelConnectionTestRequest) => bindings().FetchAvailableModels(req),
   saveModelConfig: (req: ModelConfigRequest) => bindings().SaveModelConfig(req),
   saveModelSettings: (req: ModelSettingsRequest) => bindings().SaveModelSettings(req),
+  listAgentModelPolicies: () => bindings().ListAgentModelPolicies(),
+  saveAgentModelPolicy: (req: AgentModelPolicyRequest) => bindings().SaveAgentModelPolicy(req),
+  executeBrowserAction: (req: BrowserWorkbenchRequest) => bindings().ExecuteBrowserAction(req),
+  executeDeveloperAction: (req: DeveloperWorkbenchRequest) => bindings().ExecuteDeveloperAction(req),
+  executeMediaAction: (req: MediaWorkbenchRequest) => bindings().ExecuteMediaAction(req),
+  getAssistantWorkspace: () => bindings().GetAssistantWorkspace(),
+  executeAssistantAction: (req: AssistantActionRequest) => bindings().ExecuteAssistantAction(req),
   saveOperationalSettings: (req: { telegram_enabled: boolean; telegram_allowed_user_ids?: string; imessage_enabled?: boolean; imessage_allowed_users?: string; imessage_require_mention?: boolean; imessage_home_channel?: string; worker_gateway_enabled: boolean; backup_dir?: string; auto_backup_enabled: boolean }) => bindings().SaveOperationalSettings(req),
   saveTelegramConfig: (req: { token?: string; allowed_user_ids?: string; enabled: boolean }) => bindings().SaveTelegramConfig(req),
   sendTestTelegramMessage: (req: { chat_id?: string; message?: string }) => bindings().SendTestTelegramMessage(req),

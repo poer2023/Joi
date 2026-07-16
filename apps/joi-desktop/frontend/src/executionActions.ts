@@ -604,11 +604,19 @@ function statusForSteps(steps: RunStep[]): ExecutionActionStatus {
   if (steps.some((step) => outputStatusForStep(step) === 'policy_blocked')) return 'blocked';
   if (steps.some((step) => outputStatusForStep(step) === 'failed')) return 'failed';
   if (steps.some((step) => step.step_type.includes('blocked') || step.status === 'blocked')) return 'blocked';
-  if (steps.some((step) => step.step_type.includes('failed') || step.status === 'failed' || step.error)) return 'failed';
+  if (steps.some((step) => step.step_type.includes('failed') || step.status === 'failed' || hasStepError(step.error))) return 'failed';
   if (steps.some((step) => step.status === 'running')) return 'running';
   if (steps.some((step) => step.step_type === 'task_dispatched')) return 'queued';
   if (steps.every((step) => step.status === 'succeeded' || step.status === 'success' || step.status === 'completed')) return 'completed';
   return normalizeActionStatus(steps[steps.length - 1]?.status);
+}
+
+function hasStepError(error: unknown) {
+  if (!error) return false;
+  if (typeof error === 'string') return error.trim().length > 0;
+  if (Array.isArray(error)) return error.length > 0;
+  if (typeof error === 'object') return Object.keys(error).length > 0;
+  return true;
 }
 
 function outputStatusForStep(step: RunStep): string {
@@ -659,6 +667,7 @@ function titleForCapability(capability: string, workflow: string) {
   if (key.includes('video_generate')) return '生成视频';
   if (key.includes('video_analyze')) return '分析视频';
   if (key.includes('text_to_speech') || key.includes('tts')) return '生成语音';
+  if (key.includes('speech_transcribe') || key.includes('transcri')) return '转写语音';
   if (key.includes('execute_code') || key.includes('code_execution')) return '执行代码';
   if (key.includes('sandbox_run')) return '执行沙箱';
   if (key.includes('delegate_task') || key.includes('subagent_delegate')) return '派发子任务';
@@ -666,16 +675,22 @@ function titleForCapability(capability: string, workflow: string) {
   if (key.includes('extension_register_tool')) return '注册扩展工具';
   if (key.includes('lsp_')) return '查询代码索引';
   if (key.includes('debugger_')) return '调试程序';
+  if (key.includes('tool_search')) return '查找工具';
   if (key.includes('session_search')) return '搜索会话';
   if (key.includes('session_summary')) return '总结会话';
   if (key.includes('session_branch')) return '创建会话分支';
-  if (key.includes('compaction')) return '压缩上下文';
+  if (key.includes('session_compact') || key.includes('compaction')) return '压缩上下文';
   if (key.includes('queue_followup')) return '加入队列';
   if (key.includes('clarify')) return '请求澄清';
   if (key.includes('todo')) return '更新待办';
   if (key.includes('cronjob')) return '设置定时任务';
   if (key.includes('project_')) return '管理项目';
   if (key.includes('skill_') || key.includes('skills_')) return '管理技能';
+  if (key.includes('task_list')) return '查看任务';
+  if (key.includes('task_view')) return '查看任务详情';
+  if (key.includes('task_update')) return '更新任务';
+  if (key.includes('memory_write_candidate')) return '创建记忆建议';
+  if (key.includes('memory_recall') || key.includes('memory_search')) return '检索记忆';
   if (key.includes('ha_')) return '调用 Home Assistant';
   if (key.includes('apply_patch') || key.includes('patch') || key.includes('workspace_write') || key.includes('write_file')) return '写入文件';
   if (key.includes('desktop_app_list') || key.includes('desktop_list_app')) return '列出本机 App';
@@ -710,6 +725,7 @@ function kindForCapability(capability: string, workflow: string, title: string):
   if (key.includes('image_generate') || key.includes('video_generate') || title === '生成图片' || title === '生成视频') return 'artifact';
   if (key.includes('vision_analyze') || key.includes('video_analyze') || title === '分析图片' || title === '分析视频') return 'observe';
   if (key.includes('text_to_speech') || title === '生成语音') return 'artifact';
+  if (key.includes('speech_transcribe') || title === '转写语音') return 'observe';
   if (key.includes('lsp_')) return key.includes('rename') || key.includes('format') ? 'file' : 'workspace';
   if (key.includes('debugger_') || key.includes('execute_code') || key.includes('code_execution') || key.includes('sandbox_run')) return 'command';
   if (key.includes('delegate_task') || key.includes('subagent_delegate') || key.includes('mcp_tool_call') || key.includes('extension_register_tool')) return 'command';

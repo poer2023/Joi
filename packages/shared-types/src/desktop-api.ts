@@ -11,7 +11,11 @@ export type ChatRequest = {
   route_lock_action?: 'lock' | 'unlock' | 'none';
   preferred_node?: string;
   allow_worker?: boolean;
+  model_provider?: string;
   model_name?: string;
+  model_base_url?: string;
+  reasoning_effort?: string;
+  workspace_root?: string;
   input_mode?: InputMode;
   product_task_id?: string;
   parent_run_id?: string;
@@ -586,6 +590,10 @@ export type LogCleanupResult = LogCleanupPreview & {
 
 export type AutomationKind = 'schedule' | 'webhook';
 
+export type AutomationExecutionKind = 'cron' | 'heartbeat' | 'webhook';
+
+export type AutomationStatus = 'ACTIVE' | 'PAUSED' | 'DELETED';
+
 export type AutomationTriggerStatus = 'pending' | 'claimed' | 'running' | 'retry_scheduled' | 'succeeded' | 'failed' | 'cancelled' | 'deduped' | string;
 
 export type AutomationRunStatus = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'waiting_confirmation' | string;
@@ -593,6 +601,8 @@ export type AutomationRunStatus = 'running' | 'succeeded' | 'failed' | 'cancelle
 export type AutomationDefinition = {
   id: string;
   kind: AutomationKind;
+  execution_kind: AutomationExecutionKind;
+  status: AutomationStatus;
   slug: string;
   name: string;
   description?: string;
@@ -609,6 +619,16 @@ export type AutomationDefinition = {
   retry_policy: Record<string, unknown>;
   max_concurrency: number;
   notification_policy: Record<string, unknown>;
+  rrule?: string;
+  model?: string;
+  model_provider?: string;
+  model_base_url?: string;
+  reasoning_effort?: string;
+  execution_environment?: 'local' | string;
+  target?: Record<string, unknown>;
+  cwds: string[];
+  target_thread_id?: string;
+  is_draft?: boolean;
   next_fire_at?: string;
   last_fire_at?: string;
   metadata: Record<string, unknown>;
@@ -619,6 +639,7 @@ export type AutomationDefinition = {
 export type AutomationDefinitionRequest = {
   id?: string;
   kind: AutomationKind;
+  execution_kind?: AutomationExecutionKind;
   slug?: string;
   name: string;
   description?: string;
@@ -635,6 +656,16 @@ export type AutomationDefinitionRequest = {
   retry_policy?: Record<string, unknown>;
   max_concurrency?: number;
   notification_policy?: Record<string, unknown>;
+  rrule?: string;
+  model?: string;
+  model_provider?: string;
+  model_base_url?: string;
+  reasoning_effort?: string;
+  execution_environment?: 'local' | string;
+  target?: Record<string, unknown>;
+  cwds?: string[];
+  target_thread_id?: string;
+  is_draft?: boolean;
   metadata?: Record<string, unknown>;
 };
 
@@ -671,6 +702,11 @@ export type AutomationRunRecord = {
   output_summary?: string;
   error_code?: string;
   error_message?: string;
+  conversation_id?: string;
+  source_cwd?: string;
+  automation_name?: string;
+  read_at?: string;
+  archived_at?: string;
   metadata: Record<string, unknown>;
   created_at?: string;
   updated_at?: string;
@@ -679,6 +715,16 @@ export type AutomationRunRecord = {
 export type AutomationTriggerNowRequest = {
   id: string;
   payload?: Record<string, unknown>;
+};
+
+export type AutomationRunReadRequest = {
+  id: string;
+  read: boolean;
+};
+
+export type AutomationRunArchiveRequest = {
+  id: string;
+  archived: boolean;
 };
 
 export type AutomationWebhookEndpoint = {
@@ -734,6 +780,36 @@ export type RedirectRunRequest = {
 export type RedirectRunResponse = {
   redirected_run: RunTrace;
   new_run?: ChatResponse;
+};
+
+export type RunQueuedMessageKind = 'steering' | 'follow_up';
+export type RunQueuedMessageStatus = 'pending' | 'delivered' | 'cancelled';
+
+export type RunQueuedMessage = {
+  id: string;
+  run_id: string;
+  conversation_id: string;
+  kind: RunQueuedMessageKind;
+  content: string;
+  attachments: unknown[];
+  status: RunQueuedMessageStatus | string;
+  delivered_run_id?: string;
+  created_at?: string;
+  delivered_at?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type EnqueueRunMessageRequest = {
+  run_id: string;
+  conversation_id?: string;
+  kind: RunQueuedMessageKind;
+  content: string;
+  attachments?: unknown[];
+};
+
+export type CancelRunMessageRequest = {
+  id: string;
+  run_id?: string;
 };
 
 export type ApprovalDecisionRequest = {
@@ -1064,6 +1140,7 @@ export type ConversationSummary = {
 export type ConversationFilter = {
   view?: 'active' | 'archived' | 'trash' | 'all' | 'purged' | string;
   group_id?: string;
+  query?: string;
   limit?: number;
 };
 
@@ -1111,6 +1188,102 @@ export type ConversationDetail = {
   messages: ConversationMessage[];
 };
 
+export type ConversationCompactionRecord = {
+  id: string;
+  conversation_id: string;
+  source_run_id?: string;
+  summary: string;
+  first_kept_message_id?: string;
+  covered_message_count: number;
+  original_message_count: number;
+  original_char_count: number;
+  compacted_context_char_count: number;
+  reason: string;
+  created_at?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type ConversationTreeNode = {
+  conversation_id: string;
+  title: string;
+  label?: string;
+  summary?: string;
+  parent_conversation_id?: string;
+  branch_id?: string;
+  from_message_id?: string;
+  source_run_id?: string;
+  copied_message_count: number;
+  message_count: number;
+  child_count: number;
+  active: boolean;
+  created_at?: string;
+  updated_at?: string;
+  latest_compaction?: ConversationCompactionRecord;
+  children: ConversationTreeNode[];
+};
+
+export type ConversationTree = {
+  root_conversation_id: string;
+  active_conversation_id: string;
+  node_count: number;
+  root: ConversationTreeNode;
+};
+
+export type UpdateConversationBranchRequest = {
+  conversation_id: string;
+  label?: string;
+  summary?: string;
+};
+
+export type CreateConversationBranchRequest = {
+  source_conversation_id: string;
+  from_message_id?: string;
+  title?: string;
+  source_run_id?: string;
+};
+
+export type ConversationBranchResult = {
+  source_conversation_id: string;
+  child_conversation_id: string;
+  from_message_id: string;
+  copied_message_count: number;
+  source_message_count: number;
+  source_unchanged: true;
+};
+
+export type CompactConversationRequest = {
+  conversation_id: string;
+  summary: string;
+  keep_recent_messages?: number;
+  reason?: string;
+  source_run_id?: string;
+};
+
+export type CompactConversationResult = {
+  compaction_id: string;
+  conversation_id: string;
+  summary: string;
+  first_kept_message_id: string;
+  covered_message_count: number;
+  original_message_count: number;
+  original_char_count: number;
+  compacted_context_char_count: number;
+  transcript_preserved: true;
+};
+
+export type ConversationExportResult = {
+  path: string;
+  conversation_id: string;
+  branch_count: number;
+  message_count: number;
+};
+
+export type ConversationImportResult = {
+  conversation_id: string;
+  imported_conversation_ids: string[];
+  message_count: number;
+};
+
 export type CapabilityRecord = {
   id: string;
   name: string;
@@ -1147,6 +1320,9 @@ export type MCPServerRecord = {
   transport: string;
   command?: string;
   args?: string[];
+  url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
   enabled?: boolean;
   status: string;
   trust: string;
@@ -1161,12 +1337,31 @@ export type MCPServerRecord = {
 export type MCPServerConfigRequest = {
   id: string;
   name: string;
-  transport?: 'stdio' | string;
+  transport?: 'stdio' | 'streamable_http' | 'sse' | string;
   command?: string;
   args?: string[];
+  url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
   enabled?: boolean;
   trust?: string;
   metadata?: Record<string, unknown>;
+};
+
+export type MCPToolCallRequest = {
+  server_id: string;
+  tool_name: string;
+  input?: Record<string, unknown>;
+  timeout_ms?: number;
+};
+
+export type MCPToolCallResult = {
+  server_id: string;
+  tool_name: string;
+  content: unknown[];
+  structured_content?: Record<string, unknown>;
+  is_error: boolean;
+  duration_ms: number;
 };
 
 export type MCPWrapToolRequest = {
@@ -1195,6 +1390,13 @@ export type SkillRecord = {
   enabled: boolean;
   metadata?: Record<string, unknown>;
   recent_run?: Record<string, unknown>;
+};
+
+export type SkillDetailRecord = {
+  skill: SkillRecord;
+  instructions: string;
+  frontmatter: Record<string, unknown>;
+  openai: Record<string, unknown>;
 };
 
 export type PluginRecord = {
@@ -1726,6 +1928,223 @@ export type ModelSettingsRequest = ModelRuntimeConfig & {
   display_name?: string;
 };
 
+export type AgentModelPolicy = {
+  agent_id: string;
+  default_model_id?: string;
+  fallback_model_ids: string[];
+  cheap_model_id?: string;
+  child_model_id?: string;
+  tool_model_id?: string;
+  long_context_model_id?: string;
+  reasoning_effort?: string;
+  max_failovers: number;
+  enabled: boolean;
+  metadata?: Record<string, unknown>;
+  updated_at?: string;
+};
+
+export type AgentModelPolicyRequest = AgentModelPolicy;
+
+export type BrowserWorkbenchAction =
+  | 'open'
+  | 'close'
+  | 'list_tabs'
+  | 'new_tab'
+  | 'activate_tab'
+  | 'close_tab'
+  | 'navigate'
+  | 'back'
+  | 'forward'
+  | 'reload'
+  | 'observe'
+  | 'click'
+  | 'type'
+  | 'press'
+  | 'scroll'
+  | 'upload'
+  | 'screenshot'
+  | 'vision'
+  | 'get_images'
+  | 'console'
+  | 'network'
+  | 'dialog'
+  | 'evaluate'
+  | 'cdp';
+
+export type BrowserWorkbenchRequest = {
+  action: BrowserWorkbenchAction | string;
+  session_id?: string;
+  tab_id?: number;
+  url?: string;
+  selector?: string;
+  text?: string;
+  key?: string;
+  delta_x?: number;
+  delta_y?: number;
+  paths?: string[];
+  expression?: string;
+  method?: string;
+  params?: Record<string, unknown>;
+  timeout_ms?: number;
+  visible?: boolean;
+};
+
+export type BrowserWorkbenchResult = {
+  session_id: string;
+  action: string;
+  active_tab_id?: number;
+  url?: string;
+  title?: string;
+  text?: string;
+  screenshot_path?: string;
+  tabs?: Array<{ id: number; title: string; url: string; active: boolean }>;
+  console?: Array<Record<string, unknown>>;
+  network?: Array<Record<string, unknown>>;
+  images?: Array<Record<string, unknown>>;
+  result?: unknown;
+};
+
+export type DeveloperWorkbenchRequest = {
+  action: string;
+  input?: Record<string, unknown>;
+  permission_profile?: PermissionProfile | string;
+};
+
+export type DeveloperWorkbenchResult = {
+  action: string;
+  output: Record<string, unknown>;
+};
+
+export type MediaWorkbenchRequest = {
+  action: 'save_recording' | 'text_to_speech' | 'speech_transcribe' | 'analyze_image' | 'analyze_video' | 'generate_video' | string;
+  path?: string;
+  data_url?: string;
+  mime_type?: string;
+  text?: string;
+  prompt?: string;
+  voice?: string;
+  language?: string;
+  model?: string;
+  format?: string;
+  rate?: number;
+  duration_seconds?: number;
+  aspect_ratio?: string;
+  resolution?: string;
+  transcribe?: boolean;
+};
+
+export type MediaWorkbenchResult = {
+  action: string;
+  output: Record<string, unknown>;
+};
+
+export type AssistantActivitySession = {
+  id: string;
+  status: string;
+  title: string;
+  started_at?: string;
+  ended_at?: string;
+  event_count: number;
+  summary?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type AssistantActivityEvent = {
+  id: string;
+  session_id: string;
+  event_type: string;
+  app_name?: string;
+  window_title?: string;
+  text?: string;
+  screenshot_path?: string;
+  created_at?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type AssistantCalendarItem = {
+  id: string;
+  title: string;
+  start_at: string;
+  end_at?: string;
+  status: string;
+  source: string;
+  notes?: string;
+  external_id?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type AssistantPlanNode = {
+  id: string;
+  plan_id: string;
+  title: string;
+  status: string;
+  parent_id?: string;
+  depends_on: string[];
+  evidence: Array<Record<string, unknown>>;
+  sort_order: number;
+  metadata?: Record<string, unknown>;
+};
+
+export type AssistantPlan = {
+  id: string;
+  title: string;
+  objective: string;
+  status: string;
+  conversation_id?: string;
+  nodes: AssistantPlanNode[];
+  review_summary?: string;
+  created_at?: string;
+  updated_at?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type AssistantChannel = {
+  id: string;
+  provider: string;
+  name: string;
+  status: string;
+  enabled: boolean;
+  configured: boolean;
+  last_sync_at?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type AssistantWorkspaceSnapshot = {
+  capture: { active: boolean; session_id?: string; interval_seconds: number };
+  activity_sessions: AssistantActivitySession[];
+  recent_activity: AssistantActivityEvent[];
+  calendar: AssistantCalendarItem[];
+  plans: AssistantPlan[];
+  channels: AssistantChannel[];
+};
+
+export type AssistantActionRequest = {
+  action: string;
+  id?: string;
+  session_id?: string;
+  conversation_id?: string;
+  title?: string;
+  objective?: string;
+  text?: string;
+  start_at?: string;
+  end_at?: string;
+  interval_seconds?: number;
+  provider?: string;
+  enabled?: boolean;
+  path?: string;
+  data_url?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type AssistantActionResult = {
+  ok: boolean;
+  action: string;
+  item?: unknown;
+  path?: string;
+  text?: string;
+  snapshot?: AssistantWorkspaceSnapshot;
+};
+
 export type OnboardingStatus = {
   required: boolean;
   completed: boolean;
@@ -1892,6 +2311,10 @@ export type DesktopBindings = {
   TriggerAutomationNow(req: AutomationTriggerNowRequest): Promise<{ trigger: AutomationTriggerRecord }>;
   ListAutomationTriggers(filter?: { automation_id?: string; status?: string; limit?: number }): Promise<{ triggers: AutomationTriggerRecord[] }>;
   ListAutomationRuns(filter?: { automation_id?: string; trigger_id?: string; limit?: number }): Promise<{ runs: AutomationRunRecord[] }>;
+  SetAutomationRunRead(req: AutomationRunReadRequest): Promise<AutomationRunRecord>;
+  MarkAllAutomationRunsRead(req?: { automation_id?: string }): Promise<{ updated: number }>;
+  SetAutomationRunArchived(req: AutomationRunArchiveRequest): Promise<AutomationRunRecord>;
+  ArchiveAllAutomationRuns(req: { automation_id: string }): Promise<{ succeeded_count: number; failed_count: number }>;
   GetAutomationWebhookEndpoint(id: string): Promise<AutomationWebhookEndpoint>;
   RotateAutomationWebhookSecret(id: string): Promise<AutomationWebhookEndpoint>;
   TestAutomationWebhook(req: AutomationWebhookTestRequest): Promise<{ trigger: AutomationTriggerRecord }>;
@@ -1900,6 +2323,12 @@ export type DesktopBindings = {
   ListConversations(filter: ConversationFilter): Promise<{ conversations: ConversationSummary[] }>;
   GetConversation(conversationID: string): Promise<ConversationDetail>;
   GetConversationForMessage(messageID: string): Promise<ConversationDetail>;
+  GetConversationTree(conversationID: string): Promise<ConversationTree>;
+  CreateConversationBranch(req: CreateConversationBranchRequest): Promise<ConversationBranchResult>;
+  CompactConversation(req: CompactConversationRequest): Promise<CompactConversationResult>;
+  UpdateConversationBranch(req: UpdateConversationBranchRequest): Promise<ConversationTree>;
+  ExportConversation(req: { conversation_id: string; path?: string }): Promise<ConversationExportResult>;
+  ImportConversation(req: { path: string }): Promise<ConversationImportResult>;
   ListConversationGroups(): Promise<{ groups: ConversationGroup[] }>;
   SaveConversationGroup(req: ConversationGroupRequest): Promise<ConversationGroup>;
   DeleteConversationGroup(id: string): Promise<void>;
@@ -1916,7 +2345,10 @@ export type DesktopBindings = {
   SetMCPServerEnabled(req: { id: string; enabled: boolean }): Promise<{ server: MCPServerRecord }>;
   SyncMCPServer(id: string): Promise<{ server: MCPServerRecord }>;
   WrapMCPTool(serverID: string, toolName: string, req: MCPWrapToolRequest): Promise<{ capability: CapabilityRecord }>;
+  InvokeMCPTool(req: MCPToolCallRequest): Promise<MCPToolCallResult>;
   ListSkills(): Promise<{ skills: SkillRecord[] }>;
+  ReloadSkills(): Promise<{ skills: SkillRecord[]; discovered_count: number; removed_count: number }>;
+  GetSkill(id: string): Promise<SkillDetailRecord>;
   SetSkillEnabled(req: { id: string; enabled: boolean }): Promise<void>;
   TestGitHubConnection(): Promise<GitHubConnectionResult>;
   ListPlugins(): Promise<{ plugins: PluginRecord[] }>;
@@ -1963,6 +2395,9 @@ export type DesktopBindings = {
   ResumeApprovalRun(req: ApprovalResumeRunRequest): Promise<ApprovalResumeRunResponse>;
   InterruptRun(req: InterruptRunRequest): Promise<void>;
   RedirectRun(req: RedirectRunRequest): Promise<RedirectRunResponse>;
+  EnqueueRunMessage(req: EnqueueRunMessageRequest): Promise<RunQueuedMessage>;
+  ListRunMessages(req: { run_id: string; status?: string }): Promise<{ messages: RunQueuedMessage[] }>;
+  CancelRunMessage(req: CancelRunMessageRequest): Promise<RunQueuedMessage>;
   ListRecoverableRuns(req?: { limit?: number }): Promise<{ runs: RecoverableRunRecord[] }>;
   GetRecentRunClosureReport(req?: { limit?: number }): Promise<RunClosureReport>;
   GetExternalHandoffAudit(): Promise<ExternalHandoffAudit>;
@@ -1982,6 +2417,13 @@ export type DesktopBindings = {
   FetchAvailableModels(req?: ModelConnectionTestRequest): Promise<ConnectionTest>;
   SaveModelConfig(req: ModelConfigRequest): Promise<void>;
   SaveModelSettings(req: ModelSettingsRequest): Promise<void>;
+  ListAgentModelPolicies(): Promise<{ policies: AgentModelPolicy[] }>;
+  SaveAgentModelPolicy(req: AgentModelPolicyRequest): Promise<AgentModelPolicy>;
+  ExecuteBrowserAction(req: BrowserWorkbenchRequest): Promise<BrowserWorkbenchResult>;
+  ExecuteDeveloperAction(req: DeveloperWorkbenchRequest): Promise<DeveloperWorkbenchResult>;
+  ExecuteMediaAction(req: MediaWorkbenchRequest): Promise<MediaWorkbenchResult>;
+  GetAssistantWorkspace(): Promise<AssistantWorkspaceSnapshot>;
+  ExecuteAssistantAction(req: AssistantActionRequest): Promise<AssistantActionResult>;
   SaveOperationalSettings(req: { telegram_enabled: boolean; telegram_allowed_user_ids?: string; imessage_enabled?: boolean; imessage_allowed_users?: string; imessage_require_mention?: boolean; imessage_home_channel?: string; worker_gateway_enabled: boolean; backup_dir?: string; auto_backup_enabled: boolean }): Promise<void>;
   SaveTelegramConfig(req: { token?: string; allowed_user_ids?: string; enabled: boolean }): Promise<void>;
   SendTestTelegramMessage(req: { chat_id?: string; message?: string }): Promise<ConnectionTest>;
@@ -2023,12 +2465,15 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'CloseProductTask',
   'CompleteOnboarding',
   'CompleteCheckpoint',
+  'CompactConversation',
   'ConnectExternalMirrorRoom',
   'CorrectMemory',
   'CreateProjectPersona',
   'CreateSharedRoom',
   'CreateBackup',
+  'CreateConversationBranch',
   'ClearLogs',
+  'CancelRunMessage',
   'DecideConfirmation',
   'DecideApproval',
   'DecideMemoryCandidate',
@@ -2041,6 +2486,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'EnableNode',
   'EvaluateRoomPermissions',
   'ExportDiagnostics',
+  'ExportConversation',
   'ExportLogs',
   'ExportPersonaMessengerData',
   'FetchAvailableModels',
@@ -2051,6 +2497,8 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'GetAutomationWebhookEndpoint',
   'GetConversation',
   'GetConversationForMessage',
+  'GetConversationTree',
+  'GetAssistantWorkspace',
   'GetExternalHandoffAudit',
   'GetLogEntry',
   'GetModelUsage',
@@ -2064,7 +2512,11 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'GetSystemHealth',
   'GetWorkspaceSettings',
   'InterruptRun',
+  'ImportConversation',
+  'InvokeMCPTool',
+  'EnqueueRunMessage',
   'ListRecoverableRuns',
+  'ListRunMessages',
   'ListRunTraceSpans',
   'ListPersonaMessenger',
   'ListArtifacts',
@@ -2095,7 +2547,10 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'ListProactiveMessages',
   'ListRelationshipStates',
   'ListSavedModels',
+  'ListAgentModelPolicies',
   'ListSkills',
+  'ReloadSkills',
+  'GetSkill',
   'SetSkillEnabled',
   'TestGitHubConnection',
   'ListPlugins',
@@ -2129,6 +2584,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'SaveConversationGroup',
   'SaveModelConfig',
   'SaveModelSettings',
+  'SaveAgentModelPolicy',
   'SaveIMessageConfig',
   'SaveOperationalSettings',
   'SaveSecret',
@@ -2140,6 +2596,8 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'SetRouteLock',
   'SetToolWorkflowEnabled',
   'SetAutomationEnabled',
+  'SetAutomationRunArchived',
+  'SetAutomationRunRead',
   'SetupPhotonIMessage',
   'SyncMCPServer',
   'TestAutomationWebhook',
@@ -2147,9 +2605,16 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'TestModelConnection',
   'TestWebSearch',
   'TestTelegramConnection',
+  'ExecuteBrowserAction',
+  'ExecuteDeveloperAction',
+  'ExecuteMediaAction',
+  'ExecuteAssistantAction',
   'TrashConversation',
   'TriggerAutomationNow',
+  'MarkAllAutomationRunsRead',
+  'ArchiveAllAutomationRuns',
   'UpdateMemory',
+  'UpdateConversationBranch',
   'UpdateMessengerProject',
   'UpdateProjectPersona',
   'UpdateMessengerRoom',

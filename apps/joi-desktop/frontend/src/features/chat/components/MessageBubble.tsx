@@ -130,7 +130,8 @@ export function MessageAttachmentGrid({
           className={`message-attachment message-attachment-${attachment.kind}${expandImages && attachment.kind === 'image' && attachment.previewUrl ? ' message-attachment-expanded-image' : ''}`}
         >
           {attachment.kind === 'image' && attachment.previewUrl ? <img src={attachment.previewUrl} alt="" /> : null}
-          {attachment.kind === 'video' && attachment.previewUrl ? <video src={attachment.previewUrl} muted playsInline preload="metadata" /> : null}
+          {attachment.kind === 'video' && attachment.previewUrl ? <video src={attachment.previewUrl} controls playsInline preload="metadata" /> : null}
+          {attachment.kind === 'audio' && attachment.previewUrl ? <audio src={attachment.previewUrl} controls preload="metadata" /> : null}
           {attachment.kind === 'file' || !attachment.previewUrl ? (
             <span className="message-attachment-icon" aria-hidden="true"><AttachmentGlyph kind={attachment.kind} /></span>
           ) : null}
@@ -144,7 +145,7 @@ export function MessageAttachmentGrid({
   );
 }
 
-function AttachmentGlyph({ kind }: { kind: 'image' | 'video' | 'file' }) {
+function AttachmentGlyph({ kind }: { kind: 'image' | 'video' | 'audio' | 'file' }) {
   if (kind === 'image') {
     return (
       <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
@@ -159,6 +160,15 @@ function AttachmentGlyph({ kind }: { kind: 'image' | 'video' | 'file' }) {
       <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
         <path d="M5 7h10v10H5z" />
         <path d="m15 10 4-2v8l-4-2" />
+      </svg>
+    );
+  }
+  if (kind === 'audio') {
+    return (
+      <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+        <path d="M9 18V6l9-2v12" />
+        <circle cx="6" cy="18" r="3" />
+        <circle cx="15" cy="16" r="3" />
       </svg>
     );
   }

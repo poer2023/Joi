@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-16T02:04:29+08:00",
+  "status": "passed",
+  "repo": "/Users/hao/project/Joi",
+  "installed_app": {
+    "path": "/Applications/Joi.app",
+    "version": "0.1.1",
+    "bundle_timestamp": "2026-07-16T01:56:16+08:00",
+    "built_at": "2026-07-15T17:55:59Z",
+    "git_commit": "58fc84a96b41964fb4ee596dfd5767996058662d",
+    "canonical_main_guard_bypassed": true,
+    "codesign_deep_strict": "passed",
+    "launch_after_full_exit": "passed",
+    "data_directory_preserved": true,
+    "package_sha256": "45cfe795719a385c8052042d118e85ccd175d11e799f128dab3cea7cb3b9e339",
+    "app_asar_markers": [
+      "resolveAgentIDForTool",
+      "generatedMediaOutputForToolOutput",
+      "conversation_branches",
+      "delegate_task",
+      "text_to_speech",
+      "video_generate",
+      "lsp_definition",
+      "debugger_attach"
+    ]
+  },
+  "reference_comparison": {
+    "codex": [
+      "session fork and compaction",
+      "multi-agent runs with parent-child provenance",
+      "native coding workflow through tools"
+    ],
+    "pi": [
+      "persistent session tree",
+      "fork and compact commands",
+      "extension-provided capabilities"
+    ],
+    "alma": [
+      "automatic compaction",
+      "task delegation",
+      "local Whisper and TTS settings"
+    ],
+    "joi_alignment": [
+      "SQLite-persistent branch and checkpoint records without transcript deletion",
+      "code-orchestrated bounded child runs without a global master model",
+      "local speech generation and transcription with playable attachments",
+      "native clangd/sourcekit-lsp and LLDB backends",
+      "real asynchronous xAI video generation with a downloaded MP4 attachment"
+    ]
+  },
+  "capabilities": {
+    "session_branch": {
+      "status": "passed",
+      "run_id": "run_mrmdgjl2f3f390",
+      "branch_id": "branch_mrmdgu2x8ce539",
+      "source_conversation_id": "conv_mrmdfrgvzb3a97",
+      "child_conversation_id": "conv_mrmdgu2xzgxh7h",
+      "copied_message_count": 3,
+      "source_message_count_after_all_tests": 20,
+      "branch_message_count_after_all_tests": 3,
+      "source_unchanged": true
+    },
+    "session_compact": {
+      "status": "passed",
+      "run_id": "run_mrmdhgpy7hwna4",
+      "compaction_id": "compact_mrmdhqkwum8dik",
+      "conversation_id": "conv_mrmdfrgvzb3a97",
+      "covered_message_count": 3,
+      "original_message_count": 5,
+      "original_char_count": 690,
+      "compacted_context_char_count": 502,
+      "approximate_context_reduction_percent": 27,
+      "transcript_preserved": true,
+      "future_prompt_checkpoint_verified_in_run": "run_mrmdwveexlqsmh"
+    },
+    "child_agent": {
+      "status": "passed",
+      "proactive_parent_run_id": "run_mrmdijxlxvcdp6",
+      "proactive_child_run_id": "run_mrmdj4615ery5r",
+      "proactive_child_conversation_id": "conv_mrmdj461hyvc5f",
+      "friendly_name_parent_run_id": "run_mrmdubb5lh2mcj",
+      "friendly_name_child_run_id": "run_mrmduntjc8q1b3",
+      "friendly_name_child_conversation_id": "conv_mrmduntjqpcopy",
+      "friendly_name_input": "Research Agent",
+      "resolved_agent_id": "research_agent",
+      "friendly_name_attempts": 1,
+      "friendly_name_failures": 0,
+      "recursive_delegation_allowed": false,
+      "child_response": "FRIENDLY_AGENT_OK"
+    },
+    "speech": {
+      "status": "passed",
+      "run_id": "run_mrmdvgkq75ub1o",
+      "tts_tool_status": "succeeded",
+      "transcription_tool_status": "succeeded",
+      "format": "wav",
+      "codec": "pcm_s16le",
+      "sample_rate": 22050,
+      "channels": 1,
+      "duration_seconds": 4.50458,
+      "size": 198730,
+      "transcript": "testing local speech recognition, the verification number is 42.",
+      "artifact_id": "art_mrmdvywpxctnoi",
+      "message_attachment_kind": "audio",
+      "evidence_file": "joi-installed-speech.wav",
+      "evidence_sha256": "3d786d02711c7e34a03deb62f437a4efaa9e72396730b94b4f3c3a375a72b038"
+    },
+    "lsp": {
+      "status": "passed",
+      "run_id": "run_mrmdqvhn7hrynm",
+      "backend": "clangd",
+      "definition_count": 1,
+      "definition_start": {
+        "line": 1,
+        "character": 4
+      },
+      "diagnostic_count": 1,
+      "diagnostic_symbol": "missing_native_symbol"
+    },
+    "debugger": {
+      "status": "passed",
+      "run_id": "run_mrmdrr8sg1voh2",
+      "backend": "lldb",
+      "session_id": "debug_348f05044fde4f50",
+      "breakpoint_symbol": "twice",
+      "process_state_at_breakpoint": "stopped",
+      "evaluated_expression": "value",
+      "evaluated_value": 21,
+      "step_action": "next",
+      "disposed": true
+    },
+    "video": {
+      "status": "passed",
+      "run_id": "run_mrmdwveexlqsmh",
+      "request_id": "ef7dd1b0-c512-939c-a00b-7f9987248a02",
+      "provider": "xai",
+      "model": "grok-imagine-video",
+      "container": "mov,mp4,m4a,3gp,3g2,mj2",
+      "video_codec": "h264",
+      "audio_codec": "aac",
+      "width": 480,
+      "height": 480,
+      "duration_seconds": 1.041667,
+      "size": 81535,
+      "artifact_id": "art_mrmdxne7z0voer",
+      "message_attachment_kind": "video",
+      "evidence_file": "joi-installed-video.mp4",
+      "evidence_sha256": "a94760c0259e8b463945d91926f8e45b942631cc4886dc65227a0b11eaa4d551"
+    }
+  },
+  "ui": {
+    "audio_controls_exposed": true,
+    "video_timeline_exposed": true,
+    "screenshot": "audio-video-player.jpeg",
+    "screenshot_sha256": "732eac6f8b0000df512625f35656bad57a27e1ed586dca5e642cc0ae4bc24291"
+  },
+  "regression": {
+    "runtime": "passed",
+    "store": "passed",
+    "electron_contract": "passed",
+    "frontend_execution_actions": "passed",
+    "frontend_chat_projection": "passed",
+    "frontend_single_agent_workspace": "passed",
+    "frontend_run_record_truth": "passed",
+    "frontend_task_mini_list": "passed",
+    "frontend_automation": "passed",
+    "frontend_settings": "passed",
+    "preload_operations_covered": 150
+  }
+}

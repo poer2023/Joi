@@ -7,23 +7,28 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
+  RefObject,
   ReactNode,
 } from 'react';
 import {
   desktopApi,
   type ArtifactDetail,
   type ArtifactSummary,
+  type AgentModelPolicy,
+  type AssistantWorkspaceSnapshot,
   type AutomationDefinition,
   type AutomationRunRecord,
   type AutomationTriggerRecord,
   type AutomationWebhookEndpoint,
   type AvailableModel,
   type BackupRecord,
+  type BrowserWorkbenchResult,
   type ChatResponse,
   type CapabilityRecord,
   type ConversationDetail,
   type ConversationMessage,
   type ConversationSummary,
+  type ConversationTree,
   type ConfirmationRecord,
   type ExternalHandoffAudit,
   type InputMode,
@@ -49,11 +54,13 @@ import {
   type ProductTaskDetail,
   type ProjectPersona,
   type RunClosureReport,
+  type RunQueuedMessage,
   type RunTrace,
   type RunTraceSpan,
   type RunTraceSpanSummary,
   type SecretStatus,
   type SettingsRecord,
+  type SkillDetailRecord,
   type SkillRecord,
   type SystemHealth,
   type TerminalSessionEvent,
@@ -70,7 +77,7 @@ import { eventsOn, windowSetMinSize } from './api/runtime';
 import { permissionProfileForPrompt } from './permissionProfile';
 import joiAvatar from './assets/joi-avatar-circle.png';
 import { ScrollArea } from './components/ScrollArea';
-import { buildConversationRenderItems, getMessageRunId, sortBySeq } from './features/chat/conversationProjector';
+import { buildConversationRenderItems, deriveRunStatus, getMessageRunId, sortBySeq } from './features/chat/conversationProjector';
 import {
   buildAutomationTelegramNotificationPolicy,
   getAutomationDetailState,
@@ -79,6 +86,8 @@ import {
   getAutomationTelegramReadiness,
   getAutomationTelegramTargetError,
 } from './features/automation/automationUiState';
+import { CodexAutomationConsole } from './features/automation/CodexAutomationConsole';
+import { automationSetupModelRoute } from './features/automation/automationParity';
 import { MessageList } from './features/chat/components/MessageList';
 import { ChatMessageScroller } from './features/chat/components/ChatMessageScroller';
 import { TraceDrawer } from './features/chat/components/TraceDrawer';
@@ -89,10 +98,13 @@ import type { MessageThreadAnnotation, NormalizedRunEvent } from './features/cha
 import {
   conversationChannelLabel,
   filterSingleAgentConversations,
+  isMessagingConversationChannel,
   selectPrimaryJoiRoom,
+  splitSingleAgentConversations,
   visibleSingleAgentConversations,
 } from './features/workspace/singleAgentWorkspace';
 import { executionRoutingForSettings } from './features/settings/settingsRuntime';
+import { isLogFailure } from './features/logs/logPresentation';
 import {
   acpPluginModelConfig,
   mergeACPPluginModels,
@@ -122,7 +134,8 @@ import '@xterm/xterm/css/xterm.css';
 type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
 type SettingsTab = Exclude<Tab, 'chat'>;
 type SettingsCategory = 'models' | 'chatEntrances' | 'automations' | 'observability' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
-type RightInspectorTab = 'overview' | 'runs' | 'threads' | 'assets' | 'memory' | 'member';
+type SelectSettingsObject = (category: SettingsCategory, objectID?: string) => void;
+type RightInspectorTab = 'overview' | 'runs' | 'assets' | 'memory' | 'member';
 type MessengerRoomMember = NonNullable<MessengerRoom['members']>[number];
 type MessengerThread = PersonaMessengerSnapshot['threads'][number];
 type ComposerAttachment = {
@@ -208,14 +221,14 @@ const settingsCategories: Array<{ id: SettingsCategory; label: string; descripti
   { id: 'advanced', label: '支持', description: '诊断、导出与问题修复' },
 ];
 const defaultSettingsObjectByCategory: Record<SettingsCategory, string> = {
-  models: 'deepseek',
+  models: 'routing',
   chatEntrances: 'telegram',
   automations: 'new-schedule',
   observability: 'logs',
   dataMemory: 'memory-inbox',
   capabilities: 'builtin',
   nodesExecution: 'main-node',
-  privacySecurity: 'secrets',
+  privacySecurity: 'privacy-policy',
   advanced: 'diagnostics',
 };
 const DEFAULT_SIDEBAR_WIDTH = 250;
@@ -281,19 +294,18 @@ function pickRunEvents(
   return picked;
 }
 
-function latestActiveRunId(eventsByRunId: Record<string, NormalizedRunEvent[]>): string {
+function latestActiveRunId(
+  eventsByRunId: Record<string, NormalizedRunEvent[]>,
+  conversationID = '',
+): string {
   let latest = '';
   let latestSeq = -1;
   for (const [runId, events] of Object.entries(eventsByRunId)) {
     if (!runId || events.length === 0) continue;
+    if (!runEventsBelongToConversation(events, conversationID)) continue;
     const sorted = sortBySeq(events);
-    const terminal = [...sorted].reverse().find((event) => (
-      event.type === 'run.completed'
-      || event.type === 'run.finalized'
-      || event.type === 'run.failed'
-      || event.type === 'run.interrupted'
-      || event.type === 'turn.aborted'
-    ));
+    const runStatus = deriveRunStatus(sorted);
+    if (runStatus !== 'running' && runStatus !== 'queued' && runStatus !== 'pending' && runStatus !== 'waiting_approval') continue;
     const lastRunning = [...sorted].reverse().find((event) => (
       event.type === 'run.started'
       || event.type === 'turn.started'
@@ -301,13 +313,18 @@ function latestActiveRunId(eventsByRunId: Record<string, NormalizedRunEvent[]>):
       || event.status === 'waiting_approval'
     ));
     if (!lastRunning) continue;
-    if (terminal && terminal.seq >= lastRunning.seq) continue;
     if (lastRunning.seq >= latestSeq) {
       latest = runId;
       latestSeq = lastRunning.seq;
     }
   }
   return latest;
+}
+
+function runEventsBelongToConversation(events: NormalizedRunEvent[], conversationID: string): boolean {
+  if (!conversationID) return true;
+  const explicitConversationIDs = new Set(events.map((event) => event.conversationId).filter(Boolean));
+  return explicitConversationIDs.size === 0 || explicitConversationIDs.has(conversationID);
 }
 
 function normalizeTraceEvents(trace: RunTrace | null): NormalizedRunEvent[] {
@@ -422,6 +439,8 @@ export default function App() {
   const [activeExecutionActions, setActiveExecutionActions] = useState<ExecutionAction[]>([]);
   const [activeExecutionStatus, setActiveExecutionStatus] = useState<ExecutionRunStatus>('pending');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [queuedMessageMode, setQueuedMessageMode] = useState<'steering' | 'follow_up'>('steering');
+  const [pendingRunMessages, setPendingRunMessages] = useState<RunQueuedMessage[]>([]);
   const [inputMode, setInputMode] = useState<InputMode>('auto');
   const [selectedModelName, setSelectedModelName] = useState('');
   const [chat, setChat] = useState<ChatResponse | null>(null);
@@ -593,6 +612,31 @@ export default function App() {
       return undefined;
     }
   }, []);
+
+  useEffect(() => {
+    const runID = isSubmitting
+      ? latestActiveRunId(runEventsByRunId) || chat?.run_id || trace?.id || ''
+      : '';
+    if (!runID) {
+      if (!isSubmitting) setPendingRunMessages([]);
+      return undefined;
+    }
+    let cancelled = false;
+    const refreshQueue = async () => {
+      try {
+        const result = await desktopApi.listRunMessages({ run_id: runID, status: 'pending' });
+        if (!cancelled) setPendingRunMessages(result.messages ?? []);
+      } catch {
+        // The run event stream remains authoritative if queue inspection briefly races startup.
+      }
+    };
+    void refreshQueue();
+    const timer = window.setInterval(() => void refreshQueue(), 900);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [chat?.run_id, isSubmitting, runEventsByRunId, trace?.id]);
 
   useEffect(() => {
     let animationFrame = 0;
@@ -1301,7 +1345,7 @@ export default function App() {
     try {
       const result = await desktopApi.syncMCPServer(serverID);
       setMCPServers((current) => current.map((server) => (server.id === serverID ? result.server : server)));
-      showNotice('MCP inventory 已刷新；执行仍需 wrapped capability 授权。');
+      showNotice('MCP 真实连接已验证，工具、资源与 Prompt 清单已刷新。');
     } catch (err) {
       showError(err instanceof Error ? err.message : String(err));
     }
@@ -1346,21 +1390,18 @@ export default function App() {
     if (isSubmitting && currentActiveRunID) {
       setMessage('');
       clearComposerAttachments();
-      showNotice('已追加到当前任务。');
       try {
-        const redirected = await desktopApi.redirectRun({
+        const queued = await desktopApi.enqueueRunMessage({
           run_id: currentActiveRunID,
-          message: requestMessage,
-          reason: 'steer_in_desktop',
-          requested_mode: inputMode,
-          product_task_id: activeProductTaskID || undefined,
+          conversation_id: currentConversationID || undefined,
+          kind: queuedMessageMode,
+          content: requestMessage,
+          attachments: attachments.map(attachmentForRequest),
         });
-        setTrace(redirected.new_run ? await desktopApi.getRunTrace(redirected.new_run.run_id) : redirected.redirected_run);
-        if (redirected.new_run) {
-          setChat(redirected.new_run);
-          setCurrentConversationID(redirected.new_run.conversation_id);
-        }
-        await refreshAll();
+        setPendingRunMessages((current) => [...current.filter((item) => item.id !== queued.id), queued]);
+        showNotice(queuedMessageMode === 'steering'
+          ? '已入队：会在当前运行的下一个可用转折点立即引导。'
+          : '已入队：当前运行完成后在同一会话继续。');
       } catch (err) {
         setMessage(prompt);
         setComposerAttachments(attachments);
@@ -1368,6 +1409,7 @@ export default function App() {
       }
       return;
     }
+    setChat(null);
     setTrace(null);
     resetStreamingAssistantQueue();
     resetLiveProcessEventQueue();
@@ -1569,6 +1611,41 @@ export default function App() {
     return applyLoadedConversation(detail, requestID);
   }
 
+  async function createAutomationWithJoi(request: string): Promise<void> {
+    setError('');
+    setNotice('');
+    const instruction = [
+      '你正在帮助用户创建 Joi 已安排任务。',
+      '先确认任务目标、时间安排、时区、执行方式和目标上下文；信息不足时必须调用 request_user_input，只问一个最关键的问题并给出 2-3 个互斥选项。',
+      '信息足够后调用 automation_update，mode 必须是 suggested_create。它只会生成暂停草稿，用户会在“已安排”页面审核并启用。',
+      'cron 表示每次运行创建新任务；heartbeat 表示继续一个现有任务，必须提供 target_thread_id。',
+      `用户需求：${request}`,
+    ].join('\n');
+    try {
+      const setupModel = automationSetupModelRoute(settings, savedModels);
+      if (!setupModel?.hostToolRuntime) {
+        throw new Error('使用 Joi 创建已安排任务需要一个已配置、可调用 Joi 工具的 API 模型。请先在“模型”中配置 DeepSeek、OpenAI 或 xAI。');
+      }
+      const response = await desktopApi.sendChat({
+        channel: 'automation_setup',
+        user_id: 'desktop_user',
+        message: instruction,
+        model_provider: setupModel.provider,
+        model_name: setupModel.model,
+        model_base_url: setupModel.baseURL,
+        reasoning_effort: setupModel.reasoningEffort,
+        input_mode: 'chat_assist',
+        runtime_mode: 'tool_calling',
+        permission_profile: 'read_only',
+      });
+      await refreshAll();
+      await loadConversation(response.conversation_id);
+    } catch (error) {
+      showError(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
   async function findConversationDetailForMessage(messageID: string): Promise<ConversationDetail> {
     try {
       return await desktopApi.getConversationForMessage(messageID);
@@ -1745,6 +1822,16 @@ export default function App() {
     if (!runID) return;
     await desktopApi.interruptRun({ run_id: runID, reason: 'cancelled_in_desktop' });
     showNotice(`已请求中断运行：${compactIdentifier(runID)}`);
+  }
+
+  async function cancelQueuedRunMessage(messageID: string, runID: string) {
+    try {
+      const cancelled = await desktopApi.cancelRunMessage({ id: messageID, run_id: runID });
+      setPendingRunMessages((current) => current.filter((item) => item.id !== cancelled.id));
+      showNotice('已取消尚未交给模型的追加消息。');
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function continueProductTask(task: ProductTask) {
@@ -1931,7 +2018,9 @@ export default function App() {
   return (
     <main ref={shellRef} data-theme="light" className={`im-app-shell app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${inSettingsArea ? 'settings-mode' : ''}`} style={shellStyle}>
       {inSettingsArea ? (
-        <SettingsTopControls collapsed={sidebarCollapsed} goBack={() => setActiveTab('chat')} toggleCollapsed={toggleSidebarCollapsed} />
+        <div className="settings-window-titlebar">
+          <SettingsTopControls collapsed={sidebarCollapsed} goBack={() => setActiveTab('chat')} toggleCollapsed={toggleSidebarCollapsed} />
+        </div>
       ) : (
         <SidebarTopControls
           collapsed={sidebarCollapsed}
@@ -1963,7 +2052,7 @@ export default function App() {
           trace={trace}
         />
       )}
-      {!sidebarCollapsed && <div aria-label="调整侧边栏宽度" className="sidebar-resizer" role="separator" onPointerDown={startSidebarResize} />}
+      {!sidebarCollapsed && !inSettingsArea && <div aria-label="调整侧边栏宽度" className="sidebar-resizer" role="separator" onPointerDown={startSidebarResize} />}
 
       <section className="im-workspace app__editor tk-content-panel">
         <NotificationStack
@@ -1997,6 +2086,7 @@ export default function App() {
               autoRightPanelCollapsed={autoRightPanelCollapsed}
               chat={chat}
               conversationMessages={conversationMessages}
+              currentConversationID={currentConversationID}
               cancelRun={cancelRun}
               continueProductTask={continueProductTask}
               decideConfirmation={decideConfirmation}
@@ -2009,10 +2099,13 @@ export default function App() {
               openArtifact={openArtifact}
               openLoops={openLoops}
               openRunTrace={openRunTrace}
+              openConversation={loadConversation}
               loadConversationForMessage={loadConversationForMessage}
               lastPrompt={lastPrompt}
               message={message}
               pendingUserMessage={pendingUserMessage}
+              pendingRunMessages={pendingRunMessages}
+              queuedMessageMode={queuedMessageMode}
               streamingAssistantMessage={streamingAssistantMessage}
               proactiveMessages={proactiveMessages}
               productTasks={productTasks}
@@ -2025,6 +2118,8 @@ export default function App() {
               setActiveTab={setActiveTab}
               addAttachments={addComposerAttachments}
               setMessage={setMessage}
+              setQueuedMessageMode={setQueuedMessageMode}
+              cancelQueuedRunMessage={cancelQueuedRunMessage}
               removeAttachment={removeComposerAttachment}
               startRightPanelResize={startRightPanelResize}
               updateMemory={updateMemory}
@@ -2091,6 +2186,7 @@ export default function App() {
               capabilities={capabilities}
               calls={trace?.model_calls ?? []}
               confirmations={confirmations}
+              conversations={conversations}
               closureReport={closureReport}
               continueProductTaskByID={continueProductTaskByID}
               externalHandoffAudit={externalHandoffAudit}
@@ -2105,6 +2201,8 @@ export default function App() {
               nodes={nodes}
               plugins={plugins}
               refreshAll={refreshAll}
+              openConversation={loadConversation}
+              createAutomationWithJoi={createAutomationWithJoi}
               restoreBackup={restoreBackup}
               restoreConversation={restoreConversation}
               rotateWorkerToken={rotateWorkerToken}
@@ -2406,10 +2504,10 @@ function SettingsSidebar({
 }: {
   activeCategory: SettingsCategory;
   collapsed: boolean;
-  selectSettingsObject: (category: SettingsCategory, objectID?: string) => void;
+  selectSettingsObject: SelectSettingsObject;
 }) {
   if (collapsed) {
-    return <aside aria-hidden="true" className="im-sidebar sidebar-placeholder app__sidebar tk-sidebar" />;
+    return <aside aria-hidden="true" className="im-sidebar settings-sidebar sidebar-placeholder app__sidebar tk-sidebar" />;
   }
 
   return (
@@ -2444,6 +2542,7 @@ function SettingsConsole({
   capabilities,
   calls,
   confirmations,
+  conversations,
   closureReport,
   continueProductTaskByID,
   externalHandoffAudit,
@@ -2458,6 +2557,8 @@ function SettingsConsole({
   nodes,
   plugins,
   refreshAll,
+  openConversation,
+  createAutomationWithJoi,
   restoreBackup,
   restoreConversation,
   rotateWorkerToken,
@@ -2494,6 +2595,7 @@ function SettingsConsole({
   capabilities: CapabilityRecord[];
   calls: ModelCall[];
   confirmations: ConfirmationRecord[];
+  conversations: ConversationSummary[];
   closureReport: RunClosureReport | null;
   continueProductTaskByID: (id: string) => Promise<void>;
   externalHandoffAudit: ExternalHandoffAudit | null;
@@ -2508,12 +2610,14 @@ function SettingsConsole({
   nodes: NodeRecord[];
   plugins: PluginRecord[];
   refreshAll: () => Promise<void>;
+  openConversation: (id: string) => Promise<void>;
+  createAutomationWithJoi: (request: string) => Promise<void>;
   restoreBackup: (path: string) => Promise<void>;
   restoreConversation: (conversationID: string) => Promise<void>;
   rotateWorkerToken: () => Promise<void>;
   savedModels: AvailableModel[];
   secretStatus: SecretStatus | null;
-  selectSettingsObject: (category: SettingsCategory, objectID?: string) => void;
+  selectSettingsObject: SelectSettingsObject;
   setMemoryQuery: (value: string) => void;
   setNodeDisabled: (nodeID: string, disabled: boolean) => Promise<void>;
   setNotice: (value: string) => void;
@@ -2583,6 +2687,12 @@ function SettingsConsole({
   const [browserEnabled, setBrowserEnabled] = useState(workspaceSettings?.browser_enabled ?? true);
   const [browserHostsText, setBrowserHostsText] = useState((workspaceSettings?.browser_allowed_hosts ?? []).join(', '));
   const [browserPrivateHosts, setBrowserPrivateHosts] = useState(workspaceSettings?.web_research_allow_private_hosts ?? false);
+  const [browserWorkbenchURL, setBrowserWorkbenchURL] = useState('https://example.com');
+  const [browserWorkbenchSelector, setBrowserWorkbenchSelector] = useState('body');
+  const [browserWorkbenchText, setBrowserWorkbenchText] = useState('');
+  const [browserWorkbenchSessionID, setBrowserWorkbenchSessionID] = useState('');
+  const [browserWorkbenchResult, setBrowserWorkbenchResult] = useState<BrowserWorkbenchResult | null>(null);
+  const [browserWorkbenchBusy, setBrowserWorkbenchBusy] = useState('');
   const [githubDefaultRepo, setGithubDefaultRepo] = useState(workspaceSettings?.github_default_repo ?? '');
   const [githubApiBaseURL, setGithubApiBaseURL] = useState(workspaceSettings?.github_api_base_url ?? 'https://api.github.com');
   const [githubToken, setGithubToken] = useState('');
@@ -2593,7 +2703,14 @@ function SettingsConsole({
   const [pluginTestStatus, setPluginTestStatus] = useState<Record<string, string>>({});
   const [pluginProviderModels, setPluginProviderModels] = useState<Record<string, ACPPluginModelOption[]>>({});
   const [pluginSelectedModels, setPluginSelectedModels] = useState<Record<string, string>>({});
-  const [mcpDraft, setMCPDraft] = useState({ id: '', name: '', command: '', args: '' });
+  const [skillQuery, setSkillQuery] = useState('');
+  const [skillScope, setSkillScope] = useState('all');
+  const [skillDetail, setSkillDetail] = useState<SkillDetailRecord | null>(null);
+  const [skillBusy, setSkillBusy] = useState(false);
+  const [mcpDraft, setMCPDraft] = useState({ id: '', name: '', transport: 'stdio', command: '', args: '', url: '', env: '', headers: '' });
+  const [mcpToolInputs, setMCPToolInputs] = useState<Record<string, string>>({});
+  const [mcpToolResults, setMCPToolResults] = useState<Record<string, unknown>>({});
+  const [mcpBusy, setMCPBusy] = useState('');
   const [nodeAssignmentPolicy, setNodeAssignmentPolicy] = useState(workspaceSettings?.node_assignment_policy ?? 'main_first');
   const [allowRemoteExecution, setAllowRemoteExecution] = useState(workspaceSettings?.allow_remote_execution ?? false);
   const [privacyLocalOnly, setPrivacyLocalOnly] = useState(workspaceSettings?.privacy_local_only ?? true);
@@ -2968,7 +3085,7 @@ function SettingsConsole({
   async function saveSecret() {
     await desktopApi.saveSecret({ name: secretName, value: secretValue });
     setSecretValue('');
-    setNotice(`${secretName} 已保存到钥匙串`);
+    setNotice(`${secretDisplayName(secretName)}已保存到钥匙串`);
     await refreshAll();
   }
 
@@ -3005,6 +3122,36 @@ function SettingsConsole({
     await desktopApi.setSkillEnabled({ id: skill.id, enabled: !skill.enabled });
     setNotice(`${skill.name} 已${skill.enabled ? '停用' : '启用'}`);
     await refreshAll();
+  }
+
+  async function reloadSkills() {
+    setSkillBusy(true);
+    try {
+      const result = await desktopApi.reloadSkills();
+      await refreshAll();
+      setNotice(`Skill 已刷新 · 发现 ${result.discovered_count} 个${result.removed_count ? ` · 移除 ${result.removed_count} 个失效项` : ''}`);
+    } catch (error) {
+      setNotice(`Skill 刷新失败 · ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setSkillBusy(false);
+    }
+  }
+
+  async function inspectSkill(skill: SkillRecord) {
+    setSkillBusy(true);
+    try {
+      setSkillDetail(await desktopApi.getSkill(skill.id));
+    } catch (error) {
+      setNotice(`Skill 读取失败 · ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setSkillBusy(false);
+    }
+  }
+
+  async function copySkillInvocation(skill: SkillRecord) {
+    const invocation = String(skill.metadata?.invocation_name || `$${skill.name}`);
+    await navigator.clipboard.writeText(invocation);
+    setNotice(`${invocation} 已复制`);
   }
 
   async function installPlugin() {
@@ -3099,23 +3246,76 @@ function SettingsConsole({
 
   async function saveMCPDraft() {
     const command = mcpDraft.command.trim();
-    if (!command) {
+    const url = mcpDraft.url.trim();
+    if (mcpDraft.transport === 'stdio' && !command) {
       setNotice('MCP stdio server 必须填写命令');
       return;
     }
-    const id = mcpDraft.id.trim() || `mcp_${command.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase()}`;
-    await desktopApi.saveMCPServer({
-      id,
-      name: mcpDraft.name.trim() || id,
-      transport: 'stdio',
-      command,
-      args: mcpDraft.args.trim().split(/\s+/).filter(Boolean),
-      enabled: true,
-      trust: 'untrusted_until_wrapped',
-    });
-    setMCPDraft({ id: '', name: '', command: '', args: '' });
-    setNotice('MCP Server 已保存，可点击同步读取工具清单');
-    await refreshAll();
+    if (mcpDraft.transport !== 'stdio' && !url) {
+      setNotice('远程 MCP server 必须填写 URL');
+      return;
+    }
+    try {
+      const seed = command || new URL(url).hostname;
+      const id = mcpDraft.id.trim() || `mcp_${seed.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase()}`;
+      await desktopApi.saveMCPServer({
+        id,
+        name: mcpDraft.name.trim() || id,
+        transport: mcpDraft.transport,
+        command: mcpDraft.transport === 'stdio' ? command : undefined,
+        args: mcpDraft.transport === 'stdio' ? splitCommandArguments(mcpDraft.args) : undefined,
+        url: mcpDraft.transport === 'stdio' ? undefined : url,
+        env: parseStringJSONObject(mcpDraft.env, '环境变量'),
+        headers: parseStringJSONObject(mcpDraft.headers, 'HTTP Headers'),
+        enabled: true,
+        trust: 'untrusted_until_wrapped',
+      });
+      setMCPDraft({ id: '', name: '', transport: 'stdio', command: '', args: '', url: '', env: '', headers: '' });
+      setNotice('MCP Server 已保存，下一步可建立真实连接并同步清单');
+      await refreshAll();
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function invokeMCPToolFromSettings(server: MCPServerRecord, toolName: string) {
+    const key = `${server.id}:${toolName}`;
+    setMCPBusy(key);
+    try {
+      const inputText = mcpToolInputs[key]?.trim() || '{}';
+      const input = parseJSONObject(inputText, `${toolName} 输入`);
+      const result = await desktopApi.invokeMCPTool({ server_id: server.id, tool_name: toolName, input, timeout_ms: 60_000 });
+      setMCPToolResults((current) => ({ ...current, [key]: result }));
+      setNotice(result.is_error ? `MCP ${toolName} 返回错误` : `MCP ${toolName} 已真实执行`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setMCPToolResults((current) => ({ ...current, [key]: { error: message } }));
+      setNotice(message);
+    } finally {
+      setMCPBusy('');
+    }
+  }
+
+  async function runBrowserWorkbench(action: string, extra: Record<string, unknown> = {}) {
+    setBrowserWorkbenchBusy(action);
+    try {
+      const result = await desktopApi.executeBrowserAction({
+        action,
+        session_id: browserWorkbenchSessionID || undefined,
+        visible: true,
+        ...extra,
+      });
+      setBrowserWorkbenchResult(result);
+      if (action === 'close') setBrowserWorkbenchSessionID('');
+      else if (result.session_id) setBrowserWorkbenchSessionID(result.session_id);
+      setNotice(`浏览器 ${action} 已完成`);
+      return result;
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+      return null;
+    } finally {
+      setBrowserWorkbenchBusy('');
+    }
   }
 
   async function testDesktopNotification() {
@@ -3299,6 +3499,9 @@ function SettingsConsole({
   }
 
   function renderModelDetail() {
+    if (activeObject.id === 'routing') {
+      return <ModelRoutingWorkbench savedModels={savedModels} />;
+    }
     if (activeObject.id === 'codex-acp') {
       const providers = plugins.flatMap((plugin) => (
         pluginProviderConfigs(plugin).map((provider) => ({ plugin, provider }))
@@ -3444,6 +3647,9 @@ function SettingsConsole({
   }
 
   function renderChatEntranceDetail() {
+    if (activeObject.id === 'voice-video') {
+      return <MediaWorkbenchPanel />;
+    }
     if (activeObject.id === 'imessage') {
       const connected = imessageStatus?.connected ?? false;
       const sidecarRunning = imessageStatus?.sidecar_running ?? false;
@@ -3636,7 +3842,26 @@ function SettingsConsole({
   }
 
   function renderAutomationDetail() {
-    const existing = selectedAutomation();
+    return (
+      <CodexAutomationConsole
+        activeObjectID={activeObject.id}
+        automations={automations}
+        runs={automationRuns}
+        triggers={automationTriggers}
+        conversations={conversations}
+        savedModels={savedModels}
+        settings={settings}
+        secretStatus={secretStatus}
+        workspaceSettings={workspaceSettings}
+        selectAutomation={(id) => selectSettingsObject('automations', id)}
+        refreshAll={refreshAll}
+        setNotice={setNotice}
+        openConversation={openConversation}
+        createWithJoi={createAutomationWithJoi}
+      />
+    );
+    /* Legacy settings-form implementation is retained below for one release as a source-level rollback reference. */
+    const existing = selectedAutomation()!;
     const kind = existing?.kind ?? (activeObject.id === 'new-webhook' ? 'webhook' : 'schedule');
     const automationState = getAutomationDetailState({
       automation: existing,
@@ -3773,8 +3998,8 @@ function SettingsConsole({
               <KV label="最近结果" value={formatStatus(automationState.lastRunStatus)} />
             </dl>
             {automationState.banner && (
-              <p className={automationState.banner.tone === 'error' ? 'terminal-error' : 'logs-notice'}>
-                {automationState.banner.title} · {automationState.banner.message}
+              <p className={automationState.banner!.tone === 'error' ? 'terminal-error' : 'logs-notice'}>
+                {automationState.banner!.title} · {automationState.banner!.message}
               </p>
             )}
             {existing.kind === 'webhook' && (
@@ -3789,7 +4014,7 @@ function SettingsConsole({
                 </div>
                 {automationEndpoint?.automation_id === existing.id && (
                   <dl className="compact-kv">
-                    <KV label="触发地址" value={automationState.webhookUrl || automationEndpoint.url} />
+                    <KV label="触发地址" value={automationState.webhookUrl || automationEndpoint!.url} />
                     <KV label="验证密钥" value={automationState.secretConfigured ? '已配置' : '未配置'} />
                     {automationState.secretValueAvailable && <KV label="新密钥" value="已生成，只能复制一次" />}
                   </dl>
@@ -3855,6 +4080,9 @@ function SettingsConsole({
   }
 
   function renderMemoryDetail() {
+    if (activeObject.id === 'assistant-workspace') {
+      return <AssistantWorkspacePanel />;
+    }
     if (activeObject.id === 'memory-health') {
       const metrics = memoryMetrics;
       return (
@@ -4139,25 +4367,68 @@ function SettingsConsole({
     }
 
     if (activeObject.id === 'skills') {
+      const normalizedQuery = skillQuery.trim().toLowerCase();
+      const skillScopes = [...new Set(skills.map((skill) => String(skill.metadata?.scope || 'legacy')))];
+      const filteredSkills = skills.filter((skill) => {
+        const scope = String(skill.metadata?.scope || 'legacy');
+        if (skillScope !== 'all' && scope !== skillScope) return false;
+        if (!normalizedQuery) return true;
+        return [skill.name, skill.description, String(skill.metadata?.path || ''), String(skill.metadata?.invocation_name || '')]
+          .some((value) => value.toLowerCase().includes(normalizedQuery));
+      });
       return (
         <section className="settings-detail-panel">
-          <DetailHeader title="Skills" description="管理可被 Joi 匹配的技能包、触发语和能力依赖" />
-          <dl className="metrics"><KV label="已安装" value={`${skills.length} 个`} /><KV label="已启用" value={`${skills.filter((item) => item.enabled).length} 个`} /></dl>
-          <RecordList
-            emptyText="尚未安装 Skill。可通过 Plugin manifest 安装包含 skills 的插件。"
-            items={skills}
-            renderItem={(skill) => (
-              <article key={skill.id} className="row-card">
+          <DetailHeader title="Skills" description="发现并管理 Codex 兼容的 SKILL.md；正文仅在查看或本轮匹配后载入" />
+          <dl className="metrics">
+            <KV label="已发现" value={`${skills.length} 个`} />
+            <KV label="已启用" value={`${skills.filter((item) => item.enabled).length} 个`} />
+            <KV label="文件 Skill" value={`${skills.filter((item) => item.metadata?.source === 'filesystem_skill').length} 个`} />
+            <KV label="仅显式调用" value={`${skills.filter((item) => item.metadata?.allow_implicit_invocation === false).length} 个`} />
+          </dl>
+          <div className="detail-toolbar skill-toolbar">
+            <input aria-label="搜索 Skill" placeholder="搜索名称、描述或路径" value={skillQuery} onChange={(event) => setSkillQuery(event.target.value)} />
+            <select aria-label="Skill 来源" value={skillScope} onChange={(event) => setSkillScope(event.target.value)}>
+              <option value="all">全部来源</option>
+              {skillScopes.map((scope) => <option key={scope} value={scope}>{skillScopeLabel(scope)}</option>)}
+            </select>
+            <button type="button" className="secondary-button" disabled={skillBusy} onClick={() => void reloadSkills()}>{skillBusy ? '刷新中…' : '刷新发现'}</button>
+          </div>
+          {skillDetail ? (
+            <article className="skill-detail-card" aria-live="polite">
+              <div className="skill-detail-heading">
                 <div>
-                  <strong>{skill.name} · {skill.version}</strong>
-                  <p>{skill.description || '无描述'}</p>
-                  <small>触发：{skill.trigger_phrases.join('、') || '由 Agent 自动判断'}</small>
-                  <small>依赖能力：{skill.required_capabilities.join('、') || '无'}</small>
-                  <CollapsedData label="输出契约" value={{ output_contract: skill.output_contract, forbidden_capabilities: skill.forbidden_capabilities, metadata: skill.metadata }} />
+                  <strong>{skillDetail.skill.name}</strong>
+                  <small>{String(skillDetail.skill.metadata?.path || '数据库内置 Skill')}</small>
                 </div>
-                <button type="button" className={skill.enabled ? 'secondary-button' : ''} onClick={() => void toggleSkill(skill)}>{skill.enabled ? '停用' : '启用'}</button>
-              </article>
-            )}
+                <button type="button" className="secondary-button" onClick={() => setSkillDetail(null)}>关闭详情</button>
+              </div>
+              <pre tabIndex={0}>{skillDetail.instructions || '该旧版 Skill 没有文件正文。'}</pre>
+              <CollapsedData label="Frontmatter 与 agents/openai.yaml" value={{ frontmatter: skillDetail.frontmatter, openai: skillDetail.openai, resources: skillDetail.skill.metadata?.resources }} />
+            </article>
+          ) : null}
+          <RecordList
+            emptyText={skills.length ? '没有匹配当前筛选的 Skill。' : '尚未发现 Skill。可在 .agents/skills、~/.agents/skills、~/.codex/skills 或 Plugin 中添加。'}
+            items={filteredSkills}
+            renderItem={(skill) => {
+              const metadata = skill.metadata || {};
+              const interfaceMetadata = metadata.interface && typeof metadata.interface === 'object' ? metadata.interface as Record<string, unknown> : {};
+              return (
+                <article key={skill.id} className="row-card skill-row-card">
+                  <div>
+                    <strong>{String(interfaceMetadata.display_name || skill.name)} · {skill.version}</strong>
+                    <p>{String(interfaceMetadata.short_description || skill.description || '无描述')}</p>
+                    <small>{String(metadata.invocation_name || `$${skill.name}`)} · {skillScopeLabel(String(metadata.scope || 'legacy'))} · {metadata.allow_implicit_invocation === false ? '仅显式调用' : '可自动匹配'}</small>
+                    <small>{String(metadata.path || '数据库内置')} · 依赖能力：{skill.required_capabilities.join('、') || '无'}</small>
+                    {Array.isArray(metadata.validation_errors) && metadata.validation_errors.length ? <small className="skill-validation-error">格式问题：{metadata.validation_errors.map(String).join('；')}</small> : null}
+                  </div>
+                  <div className="skill-card-actions">
+                    <button type="button" className="secondary-button" disabled={!metadata.path || skillBusy} onClick={() => void inspectSkill(skill)}>查看</button>
+                    <button type="button" className="secondary-button" onClick={() => void copySkillInvocation(skill)}>复制调用名</button>
+                    <button type="button" className={skill.enabled ? 'secondary-button' : ''} onClick={() => void toggleSkill(skill)}>{skill.enabled ? '停用' : '启用'}</button>
+                  </div>
+                </article>
+              );
+            }}
           />
         </section>
       );
@@ -4248,12 +4519,23 @@ function SettingsConsole({
     if (activeObject.id === 'mcp') {
       return (
         <section className="settings-detail-panel">
-          <DetailHeader title="MCP" description="配置 stdio MCP Server、同步清单，并将工具包装成受控 Capability" />
+          <DetailHeader title="MCP 运行时" description="由 Joi 持有真实 MCP Client 连接，支持 stdio、Streamable HTTP 和 SSE；可实际调用工具，也可包装为受控 Capability 交给模型" />
           <div className="settings-form compact">
             <label className="field-row"><span>ID</span><input placeholder="留空自动生成" value={mcpDraft.id} onChange={(event) => setMCPDraft((current) => ({ ...current, id: event.target.value }))} /></label>
             <label className="field-row"><span>名称</span><input value={mcpDraft.name} onChange={(event) => setMCPDraft((current) => ({ ...current, name: event.target.value }))} /></label>
-            <label className="field-row"><span>命令</span><input placeholder="npx" value={mcpDraft.command} onChange={(event) => setMCPDraft((current) => ({ ...current, command: event.target.value }))} /></label>
-            <label className="field-row"><span>参数</span><input placeholder="-y @modelcontextprotocol/server-filesystem /path" value={mcpDraft.args} onChange={(event) => setMCPDraft((current) => ({ ...current, args: event.target.value }))} /></label>
+            <label className="field-row"><span>传输</span><select value={mcpDraft.transport} onChange={(event) => setMCPDraft((current) => ({ ...current, transport: event.target.value }))}><option value="stdio">stdio</option><option value="streamable_http">Streamable HTTP</option><option value="sse">SSE</option></select></label>
+            {mcpDraft.transport === 'stdio' ? (
+              <>
+                <label className="field-row"><span>命令</span><input placeholder="npx" value={mcpDraft.command} onChange={(event) => setMCPDraft((current) => ({ ...current, command: event.target.value }))} /></label>
+                <label className="field-row"><span>参数</span><input placeholder="-y @modelcontextprotocol/server-filesystem /path" value={mcpDraft.args} onChange={(event) => setMCPDraft((current) => ({ ...current, args: event.target.value }))} /></label>
+                <label className="field-row"><span>环境变量 JSON</span><textarea rows={3} placeholder={'{"KEY":"value"}'} value={mcpDraft.env} onChange={(event) => setMCPDraft((current) => ({ ...current, env: event.target.value }))} /></label>
+              </>
+            ) : (
+              <>
+                <label className="field-row"><span>URL</span><input placeholder="https://example.com/mcp" value={mcpDraft.url} onChange={(event) => setMCPDraft((current) => ({ ...current, url: event.target.value }))} /></label>
+                <label className="field-row"><span>Headers JSON</span><textarea rows={3} placeholder={'{"Authorization":"Bearer ..."}'} value={mcpDraft.headers} onChange={(event) => setMCPDraft((current) => ({ ...current, headers: event.target.value }))} /></label>
+              </>
+            )}
             <div className="detail-actions"><button type="button" onClick={() => void saveMCPDraft()}>保存 Server</button></div>
           </div>
           <RecordList
@@ -4263,16 +4545,24 @@ function SettingsConsole({
               <article key={server.id} className="row-card">
                 <div>
                   <strong>{server.name} · {formatStatus(server.status)}</strong>
-                  <p>{server.command ? `${server.command} ${(server.args ?? []).join(' ')}` : '未配置 stdio 命令'}</p>
+                  <p>{server.command ? `${server.command} ${(server.args ?? []).join(' ')}` : server.url || '未配置连接入口'}</p>
                   <small>{server.transport} · {server.trust} · 工具 {server.tools.length} · 资源 {server.resources.length} · Prompt {server.prompts.length}</small>
                   {server.last_sync_error ? <small className="error-text">{server.last_sync_error}</small> : null}
-                  {server.tools.map((tool) => (
-                    <div key={tool.name} className="connection-status">
-                      <strong>{tool.name}</strong>
-                      <small>{tool.description || '无描述'}{tool.wrapped_as ? ` · 已包装 ${tool.wrapped_as}` : ''}</small>
-                      {!tool.wrapped_as ? <button type="button" onClick={() => void wrapMCPTool(server, tool.name)}>包装为 Capability</button> : null}
+                  {server.tools.map((tool) => {
+                    const key = `${server.id}:${tool.name}`;
+                    return (
+                    <div key={tool.name} className="mcp-tool-runtime-card">
+                      <div><strong>{tool.name}</strong><small>{tool.description || '无描述'}{tool.wrapped_as ? ` · 已包装 ${tool.wrapped_as}` : ''}</small></div>
+                      <textarea rows={3} aria-label={`${tool.name} JSON 输入`} value={mcpToolInputs[key] || '{}'} onChange={(event) => setMCPToolInputs((current) => ({ ...current, [key]: event.target.value }))} />
+                      <div className="row-actions">
+                        <button type="button" disabled={Boolean(mcpBusy)} onClick={() => void invokeMCPToolFromSettings(server, tool.name)}>{mcpBusy === key ? '调用中…' : '真实调用'}</button>
+                        {!tool.wrapped_as ? <button className="secondary-button" type="button" onClick={() => void wrapMCPTool(server, tool.name)}>包装为 Capability</button> : null}
+                      </div>
+                      {mcpToolResults[key] !== undefined ? <CollapsedData label="查看调用结果" value={mcpToolResults[key]} /> : null}
                     </div>
-                  ))}
+                    );
+                  })}
+                  {(server.resources.length || server.prompts.length) ? <CollapsedData label="资源与 Prompt 清单" value={{ resources: server.resources, prompts: server.prompts }} /> : null}
                 </div>
                 <div className="row-actions">
                   <button type="button" onClick={() => void syncMCPServer(server.id)}>同步</button>
@@ -4284,6 +4574,10 @@ function SettingsConsole({
           />
         </section>
       );
+    }
+
+    if (activeObject.id === 'developer') {
+      return <DeveloperWorkbenchPanel workspaceSettings={workspaceSettings} />;
     }
 
     if (activeObject.id === 'filesystem') {
@@ -4302,15 +4596,50 @@ function SettingsConsole({
 
     if (activeObject.id === 'browser') {
       return (
-        <section className="settings-detail-panel">
-          <DetailHeader title="浏览器" description="管理浏览器工具开关、允许域名和私网访问边界" />
-          <div className="settings-form">
-            <label className="field-row"><span>启用浏览器能力</span><input checked={browserEnabled} type="checkbox" onChange={(event) => setBrowserEnabled(event.target.checked)} /></label>
-            <label className="field-row"><span>允许 Host</span><textarea rows={4} placeholder="example.com, docs.example.com" value={browserHostsText} onChange={(event) => setBrowserHostsText(event.target.value)} /></label>
-            <label className="field-row"><span>允许私有 Host</span><input checked={browserPrivateHosts} type="checkbox" onChange={(event) => setBrowserPrivateHosts(event.target.checked)} /></label>
-            <p className="empty">私网访问仍只允许上方白名单，不能绕过 Runtime 的 URL 与风险校验。</p>
-            <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ browser_enabled: browserEnabled, browser_allowed_hosts: splitSettingsList(browserHostsText), web_research_allow_private_hosts: browserPrivateHosts }, '浏览器能力设置已保存')}>保存</button></div>
-          </div>
+        <section className="settings-detail-panel browser-workbench-panel">
+          <DetailHeader title="自管浏览器" description="由 Joi Electron 直接持有隔离会话，支持多标签、DOM 观察、点击输入、上传、弹窗、控制台、网络、截图、Vision 和受控 CDP" />
+          <section className="workbench-card">
+            <div className="browser-workbench-address-row">
+              <div className="browser-workbench-nav">
+                <button type="button" aria-label="后退" disabled={!browserWorkbenchSessionID || Boolean(browserWorkbenchBusy)} onClick={() => void runBrowserWorkbench('back')}>←</button>
+                <button type="button" aria-label="前进" disabled={!browserWorkbenchSessionID || Boolean(browserWorkbenchBusy)} onClick={() => void runBrowserWorkbench('forward')}>→</button>
+                <button type="button" aria-label="刷新" disabled={!browserWorkbenchSessionID || Boolean(browserWorkbenchBusy)} onClick={() => void runBrowserWorkbench('reload')}>↻</button>
+              </div>
+              <input value={browserWorkbenchURL} onChange={(event) => setBrowserWorkbenchURL(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void runBrowserWorkbench(browserWorkbenchSessionID ? 'navigate' : 'open', { url: browserWorkbenchURL }); }} />
+              <button type="button" disabled={Boolean(browserWorkbenchBusy) || !browserWorkbenchURL.trim()} onClick={() => void runBrowserWorkbench(browserWorkbenchSessionID ? 'navigate' : 'open', { url: browserWorkbenchURL })}>{browserWorkbenchBusy === 'open' || browserWorkbenchBusy === 'navigate' ? '打开中…' : browserWorkbenchSessionID ? '前往' : '打开'}</button>
+            </div>
+            <div className="browser-session-line"><span className={`live-dot ${browserWorkbenchSessionID ? 'on' : ''}`} /><strong>{browserWorkbenchSessionID || '未启动浏览器会话'}</strong>{browserWorkbenchResult?.title ? <small>{browserWorkbenchResult.title}</small> : null}</div>
+            <div className="detail-actions workbench-action-wrap">
+              {[
+                ['observe', '观察 DOM'], ['vision', '视觉分析'], ['screenshot', '截图'], ['list_tabs', '标签页'], ['console', '控制台'], ['network', '网络'], ['get_images', '图片'],
+              ].map(([action, label]) => <button className="secondary-button" key={action} type="button" disabled={!browserWorkbenchSessionID || Boolean(browserWorkbenchBusy)} onClick={() => void runBrowserWorkbench(action)}>{browserWorkbenchBusy === action ? '处理中…' : label}</button>)}
+              <button type="button" disabled={!browserWorkbenchSessionID || Boolean(browserWorkbenchBusy)} onClick={() => void runBrowserWorkbench('new_tab', { url: 'about:blank' })}>新标签</button>
+              <button className="danger-button" type="button" disabled={!browserWorkbenchSessionID || Boolean(browserWorkbenchBusy)} onClick={() => void runBrowserWorkbench('close')}>关闭会话</button>
+            </div>
+          </section>
+          <section className="workbench-card">
+            <div className="inline-field-grid">
+              <label><span>CSS Selector</span><input value={browserWorkbenchSelector} onChange={(event) => setBrowserWorkbenchSelector(event.target.value)} /></label>
+              <label><span>输入文本</span><input value={browserWorkbenchText} onChange={(event) => setBrowserWorkbenchText(event.target.value)} /></label>
+            </div>
+            <div className="detail-actions">
+              <button className="secondary-button" type="button" disabled={!browserWorkbenchSessionID || !browserWorkbenchSelector.trim() || Boolean(browserWorkbenchBusy)} onClick={() => void runBrowserWorkbench('click', { selector: browserWorkbenchSelector })}>点击</button>
+              <button type="button" disabled={!browserWorkbenchSessionID || !browserWorkbenchSelector.trim() || Boolean(browserWorkbenchBusy)} onClick={() => void runBrowserWorkbench('type', { selector: browserWorkbenchSelector, text: browserWorkbenchText })}>输入</button>
+              <button className="secondary-button" type="button" disabled={!browserWorkbenchSessionID || Boolean(browserWorkbenchBusy)} onClick={() => void runBrowserWorkbench('press', { key: 'Enter' })}>按 Enter</button>
+              <button className="secondary-button" type="button" disabled={!browserWorkbenchSessionID || Boolean(browserWorkbenchBusy)} onClick={() => void runBrowserWorkbench('scroll', { delta_y: 720 })}>向下滚动</button>
+            </div>
+          </section>
+          {browserWorkbenchResult?.screenshot_path ? <img className="browser-workbench-screenshot" src={localPathURL(browserWorkbenchResult.screenshot_path)} alt="浏览器截图" /> : null}
+          {browserWorkbenchResult ? <CollapsedData label="查看浏览器运行结果" value={browserWorkbenchResult} /> : null}
+          <details className="settings-advanced">
+            <summary>网站访问边界</summary>
+            <div className="settings-form">
+              <label className="field-row"><span>启用浏览器能力</span><input checked={browserEnabled} type="checkbox" onChange={(event) => setBrowserEnabled(event.target.checked)} /></label>
+              <label className="field-row"><span>允许 Host</span><textarea rows={4} placeholder="example.com, docs.example.com" value={browserHostsText} onChange={(event) => setBrowserHostsText(event.target.value)} /></label>
+              <label className="field-row"><span>允许私有 Host</span><input checked={browserPrivateHosts} type="checkbox" onChange={(event) => setBrowserPrivateHosts(event.target.checked)} /></label>
+              <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ browser_enabled: browserEnabled, browser_allowed_hosts: splitSettingsList(browserHostsText), web_research_allow_private_hosts: browserPrivateHosts }, '浏览器能力设置已保存')}>保存边界</button></div>
+            </div>
+          </details>
         </section>
       );
     }
@@ -4708,20 +5037,14 @@ function SettingsConsole({
     if (activeObject.id === 'secrets') {
       return (
         <section className="settings-detail-panel">
-          <DetailHeader title="密钥管理" description="保存和查看本地钥匙串中的密钥状态" />
+          <DetailHeader title="密钥管理" description="管理当前桌面入口使用的本地凭证" />
           <div className="settings-form">
             <label className="field-row">
               <span>密钥类型</span>
               <select value={secretName} onChange={(event) => setSecretName(event.target.value)}>
-                <option value="MODEL_API_KEY">MODEL_API_KEY</option>
-                <option value="BRAVE_SEARCH_API_KEY">BRAVE_SEARCH_API_KEY</option>
-                <option value="GITHUB_TOKEN">GITHUB_TOKEN</option>
-                <option value="TELEGRAM_BOT_TOKEN">TELEGRAM_BOT_TOKEN</option>
-                <option value="PHOTON_PROJECT_SECRET">PHOTON_PROJECT_SECRET</option>
-                <option value="PHOTON_DASHBOARD_TOKEN">PHOTON_DASHBOARD_TOKEN</option>
-                <option value="WORKER_TOKEN">WORKER_TOKEN</option>
-                <option value="NODE_SECRET">NODE_SECRET</option>
-                <option value="ADMIN_TOKEN">ADMIN_TOKEN</option>
+                <option value="MODEL_API_KEY">模型服务密钥</option>
+                <option value="TELEGRAM_BOT_TOKEN">Telegram 机器人令牌</option>
+                <option value="WORKER_TOKEN">执行器连接凭证</option>
               </select>
             </label>
             <label className="field-row">
@@ -4738,210 +5061,86 @@ function SettingsConsole({
             </div>
           </div>
           <div className="secret-status">
-            {Object.entries(secretStatus?.secrets ?? {}).map(([name, present]) => (
-              <span key={name}>{name}：{present ? '已配置' : '缺失'}</span>
+            {Object.entries(secretStatus?.secrets ?? {}).filter(([name]) => isUserFacingSecret(name)).map(([name, present]) => (
+              <span key={name}>{secretDisplayName(name)}：{present ? '已配置' : '未配置'}</span>
             ))}
           </div>
         </section>
       );
     }
     if (activeObject.id === 'dangerous-actions') {
+      const pendingConfirmations = confirmations.filter((item) => item.status === 'pending');
       return (
         <section className="settings-detail-panel">
-          <DetailHeader title="危险操作" description="审批高风险能力请求" />
+          <DetailHeader title="待确认操作" description="需要你同意后才能继续的高风险操作" />
           <RecordList
             emptyText="暂无待确认请求。"
-            items={confirmations}
+            items={pendingConfirmations}
             renderItem={(item) => (
               <article key={item.id} className="row-card">
                 <div>
-                  <strong>{item.requested_action}</strong>
-                  <p>{item.capability_id} · 风险 {formatRiskLevel(item.risk_level)} · {formatStatus(item.status)}</p>
-                  <small>任务：{item.run_id}</small>
-                  {item.input ? <CollapsedData label="查看请求参数" value={item.input} /> : null}
+                  <strong>{confirmationActionLabel(item.requested_action, item.capability_id)}</strong>
+                  <p>风险 {formatRiskLevel(item.risk_level)}</p>
                 </div>
-                {item.status === 'pending' && (
-                  <div className="row-actions">
-                    <button type="button" onClick={() => decideConfirmation(item.id, true)}>批准</button>
-                    <button type="button" onClick={() => decideConfirmation(item.id, false)}>拒绝</button>
-                  </div>
-                )}
+                <div className="row-actions">
+                  <button type="button" onClick={() => decideConfirmation(item.id, true)}>批准</button>
+                  <button type="button" onClick={() => decideConfirmation(item.id, false)}>拒绝</button>
+                </div>
               </article>
             )}
           />
         </section>
       );
     }
-    if (activeObject.id === 'privacy-policy') {
-      return (
-        <section className="settings-detail-panel">
-          <DetailHeader title="隐私策略" description="控制数据处理边界和破坏性操作底线" />
-          <div className="settings-form">
-            <label className="field-row"><span>本地优先</span><input checked={privacyLocalOnly} type="checkbox" onChange={(event) => setPrivacyLocalOnly(event.target.checked)} /></label>
-            <label className="field-row"><span>禁止破坏性操作</span><input checked readOnly type="checkbox" /></label>
-            <p className="empty">关闭“本地优先”只允许明确配置的远端模型或 Worker；不会自动扩大文件、记忆或 Secret 范围。</p>
-            <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ privacy_local_only: privacyLocalOnly, destructive_operations_disabled: true }, '隐私策略已保存')}>保存</button></div>
-          </div>
-        </section>
-      );
-    }
-    if (activeObject.id === 'remote-permission') {
-      const effectiveRouting = executionRoutingForSettings({
-        ...(workspaceSettings ?? defaultWorkspaceSettings()),
-        node_assignment_policy: nodeAssignmentPolicy,
-        allow_remote_execution: allowRemoteExecution,
-        privacy_local_only: privacyLocalOnly,
-        remote_execution_requires_confirmation: remoteExecutionRequiresConfirmation,
-      });
-      return (
-        <section className="settings-detail-panel">
-          <DetailHeader title="远端执行权限" description="远端 Worker 的总开关与确认策略" />
-          <div className="settings-form">
-            <label className="field-row"><span>允许远端执行</span><input checked={allowRemoteExecution} type="checkbox" onChange={(event) => setAllowRemoteExecution(event.target.checked)} /></label>
-            <label className="field-row"><span>远端执行需确认</span><input checked={remoteExecutionRequiresConfirmation} type="checkbox" onChange={(event) => setRemoteExecutionRequiresConfirmation(event.target.checked)} /></label>
-            <p className="empty">即使允许远端执行，高风险 Capability 仍按各自风险等级进入确认队列。</p>
-            <div className="connection-status">
-              <span className={`live-dot ${effectiveRouting.allowWorker ? 'on' : ''}`} />
-              <strong>{effectiveRouting.allowWorker ? '自动 Worker 路由已生效' : '自动 Worker 路由已阻止'}</strong>
-              <small>{effectiveRouting.reason}</small>
-            </div>
-            <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ allow_remote_execution: allowRemoteExecution, remote_execution_requires_confirmation: remoteExecutionRequiresConfirmation }, '远端执行权限已保存')}>保存</button></div>
-          </div>
-        </section>
-      );
-    }
+    const effectiveRouting = executionRoutingForSettings({
+      ...(workspaceSettings ?? defaultWorkspaceSettings()),
+      node_assignment_policy: nodeAssignmentPolicy,
+      allow_remote_execution: allowRemoteExecution,
+      privacy_local_only: privacyLocalOnly,
+      remote_execution_requires_confirmation: remoteExecutionRequiresConfirmation,
+    });
     return (
       <section className="settings-detail-panel">
-        <DetailHeader title="诊断脱敏" description="导出日志和诊断包前移除 Secret、Token 与敏感路径" />
+        <DetailHeader title="安全策略" description="控制数据是否离开本机以及远端执行的确认方式" />
         <div className="settings-form">
-          <label className="field-row"><span>启用诊断脱敏</span><input checked={diagnosticRedactionEnabled} type="checkbox" onChange={(event) => setDiagnosticRedactionEnabled(event.target.checked)} /></label>
-          <p className="empty">导出过程保留错误码、Run ID 和组件状态；密钥值、Authorization Header 与用户目录会被替换。</p>
-          <div className="detail-actions"><button type="button" onClick={() => void saveWorkspacePatch({ diagnostic_redaction_enabled: diagnosticRedactionEnabled }, '诊断脱敏设置已保存')}>保存</button></div>
+          <label className="field-row"><span>本地优先</span><input checked={privacyLocalOnly} type="checkbox" onChange={(event) => setPrivacyLocalOnly(event.target.checked)} /></label>
+          <label className="field-row"><span>允许远端执行</span><input checked={allowRemoteExecution} type="checkbox" onChange={(event) => setAllowRemoteExecution(event.target.checked)} /></label>
+          <label className="field-row"><span>远端执行前确认</span><input checked={remoteExecutionRequiresConfirmation} disabled={!allowRemoteExecution} type="checkbox" onChange={(event) => setRemoteExecutionRequiresConfirmation(event.target.checked)} /></label>
+          <label className="field-row"><span>禁止破坏性操作</span><input checked readOnly type="checkbox" /></label>
+          <p className="empty">
+            {effectiveRouting.allowWorker
+              ? '远端执行可用；高风险操作仍会进入待确认操作。'
+              : '当前保持本机执行，远端执行器不会自动接收任务。'}
+          </p>
+          <div className="detail-actions">
+            <button type="button" onClick={() => void saveWorkspacePatch({
+              allow_remote_execution: allowRemoteExecution,
+              destructive_operations_disabled: true,
+              privacy_local_only: privacyLocalOnly,
+              remote_execution_requires_confirmation: remoteExecutionRequiresConfirmation,
+            }, '安全策略已保存')}>保存</button>
+          </div>
         </div>
       </section>
     );
   }
 
   function renderAdvancedDetail() {
-    {
-      return (
-        <section className="settings-detail-panel">
-          <DetailHeader title="诊断与支持" description="检查本机状态；需要技术支持时再导出脱敏诊断包" />
-          <dl className="metrics">
-            <KV label="本地数据" value={Boolean(health?.service_status?.sqlite) ? '正常' : '需要检查'} />
-            <KV label="今日模型调用" value={String(health?.model_latency?.model_calls_today ?? 0)} />
-            <KV label="已连接执行器" value={String(health?.worker_status?.length ?? 0)} />
-            <KV label="待处理问题" value={String(health?.warnings?.length ?? 0)} />
-          </dl>
-          <div className="detail-actions">
-            <button type="button" onClick={async () => {
-              const result = await desktopApi.exportDiagnostics();
-              setNotice(`诊断包已导出：${result.path}`);
-            }}>导出脱敏诊断包</button>
-          </div>
-          <DiagnosticsLogCleanup onNotice={setNotice} />
-          <ClosureReportPanel
-            continueProductTaskByID={continueProductTaskByID}
-            externalHandoffAudit={externalHandoffAudit}
-            report={closureReport}
-          />
-        </section>
-      );
-    }
-    if (activeObject.id === 'diagnostics') {
-      return (
-        <section className="settings-detail-panel">
-          <DetailHeader title="诊断包" description="导出本地运行诊断信息" />
-          <dl className="metrics">
-            <KV label="SQLite" value={formatBoolean(Boolean(health?.service_status?.sqlite))} />
-            <KV label="模型调用" value={String(health?.model_latency?.model_calls_today ?? 0)} />
-            <KV label="工作节点" value={String(health?.worker_status?.length ?? 0)} />
-            <KV label="警告" value={String(health?.warnings?.length ?? 0)} />
-          </dl>
-          <div className="detail-actions">
-            <button type="button" onClick={async () => {
-              const result = await desktopApi.exportDiagnostics();
-              setNotice(`诊断信息已导出：${result.path}`);
-            }}>导出诊断</button>
-          </div>
-          <DiagnosticsLogCleanup onNotice={setNotice} />
-          <ClosureReportPanel
-            continueProductTaskByID={continueProductTaskByID}
-            externalHandoffAudit={externalHandoffAudit}
-            report={closureReport}
-          />
-        </section>
-      );
-    }
-    if (activeObject.id === 'raw-data') {
-      return (
-        <section className="settings-detail-panel">
-          <DetailHeader title="原始数据" description="调试数据默认折叠，避免干扰普通设置流程" />
-          <CollapsedData label="系统状态" value={health ?? {}} />
-          <CollapsedData label="运行设置" value={settings ?? {}} />
-          <CollapsedData label="节点数据" value={nodes} />
-          <CollapsedData label="用量数据" value={{ usage, calls }} />
-          <CollapsedData label="闭环报告" value={closureReport ?? {}} />
-        </section>
-      );
-    }
-    if (activeObject.id === 'prompt-assembly') {
-      return (
-        <section className="settings-detail-panel">
-          <DetailHeader title="Prompt Assembly" description="查看最近运行的提示词组装信息" />
-          <dl className="metrics">
-            <KV label="任务 ID" value={trace?.id ?? '暂无'} />
-            <KV label="步骤数" value={`${stepCount} 步`} />
-            <KV label="模型" value={firstModelCall?.model_name ?? '无'} />
-            <KV label="延迟" value={`${firstModelCall?.latency_ms ?? 0} ms`} />
-          </dl>
-          <RecordList
-            emptyText="暂无提示词组装记录。"
-            items={trace?.prompt_assemblies ?? []}
-            renderItem={(item) => (
-              <article key={item.id} className="row-card compact">
-                <strong>提示词组装</strong>
-                <small>缓存键：{item.prompt_cache_key || '无'}</small>
-                <small>前缀：{item.prefix_hash || '无'} · 动态尾部：{item.dynamic_tail_hash || '无'}</small>
-              </article>
-            )}
-          />
-        </section>
-      );
-    }
-    if (activeObject.id === 'memory-context-pack') {
-      return (
-        <section className="settings-detail-panel">
-          <DetailHeader title="Memory Context Pack" description="查看最近运行召回的记忆上下文" />
-          <RecordList
-            emptyText="暂无记忆上下文记录。"
-            items={trace?.memory_context_packs ?? []}
-            renderItem={(item) => (
-              <article key={item.id} className="row-card compact">
-                <strong>{item.memory_profile_version}</strong>
-                <small>动态召回：{item.dynamic_retrieval?.length ?? 0} 条</small>
-                <CollapsedData label="高级详情" value={item} />
-              </article>
-            )}
-          />
-        </section>
-      );
-    }
     return (
       <section className="settings-detail-panel">
-        <DetailHeader title="Tool I/O" description="查看最近步骤的工具输入输出" />
-        <RecordList
-          emptyText="暂无工具输入输出。"
-          items={trace?.steps ?? []}
-          renderItem={(step) => (
-            <article key={step.id} className="row-card compact">
-              <strong>{formatStepType(step.step_type)}</strong>
-              <small>{step.title} · {formatStatus(step.status)}</small>
-              {step.input ? <CollapsedData label="查看输入" value={step.input} /> : null}
-              {step.output ? <CollapsedData label="查看输出" value={step.output} /> : null}
-            </article>
-          )}
-        />
+        <DetailHeader title="支持与诊断" description="检查本机状态，需要排查问题时再导出诊断包" />
+        <dl className="metrics">
+          <KV label="本地数据" value={Boolean(health?.service_status?.sqlite) ? '正常' : '需要检查'} />
+          <KV label="待处理问题" value={String(health?.warnings?.length ?? 0)} />
+          <KV label="诊断保护" value={diagnosticRedactionEnabled ? '自动脱敏' : '基础脱敏'} />
+        </dl>
+        <p className="empty">诊断包保存在本机；密钥、授权信息和完整用户路径不会直接导出。</p>
+        <div className="detail-actions">
+          <button type="button" onClick={async () => {
+            const result = await desktopApi.exportDiagnostics();
+            setNotice(`诊断包已导出：${result.path}`);
+          }}>导出脱敏诊断包</button>
+        </div>
       </section>
     );
   }
@@ -4958,14 +5157,24 @@ function SettingsConsole({
     return renderAdvancedDetail();
   }
 
+  if (activeCategory === 'automations') {
+    return (
+      <div className="settings-console automation-settings-console">
+        <main className="settings-detail automation-settings-detail">{renderAutomationDetail()}</main>
+      </div>
+    );
+  }
+
   return (
     <div className="settings-console">
-      <ScrollArea as="aside" className="settings-object-column">
-        <div className="settings-object-list" aria-label={`${activeCategoryMeta.label}对象`}>
+      <nav className="settings-object-tabs" aria-label={`${activeCategoryMeta.label}对象`}>
+        <div className="settings-object-list" role="tablist">
           {objectItems.map((item) => (
             <button
               key={item.id}
+              aria-selected={activeObject.id === item.id}
               className={`settings-object-item ${activeObject.id === item.id ? 'active' : ''}`}
+              role="tab"
               type="button"
               onClick={() => selectSettingsObject(activeCategory, item.id)}
             >
@@ -4973,7 +5182,7 @@ function SettingsConsole({
             </button>
           ))}
         </div>
-      </ScrollArea>
+      </nav>
       <ScrollArea as="main" className="settings-detail">
         {renderDetail()}
       </ScrollArea>
@@ -5057,6 +5266,7 @@ function normalizeModelBaseURL(value: string): string {
 function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], automations: AutomationDefinition[] = []) {
   if (category === 'models') {
     return [
+      { id: 'routing', label: '路由策略', description: '按 Agent 与任务用途选模型、降级和思考强度' },
       { id: 'codex-acp', label: 'Codex ACP', description: '本机 Codex 登录、连接测试与模型发现' },
       { id: 'openai', label: 'OpenAI', description: 'OpenAI API 与模型参数' },
       { id: 'deepseek', label: 'DeepSeek', description: 'DeepSeek API 连接与模型参数' },
@@ -5070,6 +5280,7 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
   }
   if (category === 'chatEntrances') {
     return [
+      { id: 'voice-video', label: '语音与视频', description: '录音、转写、朗读、视频生成与理解' },
       { id: 'telegram', label: 'Telegram', description: 'Telegram Bot 入口' },
       { id: 'imessage', label: 'iMessage', description: 'Photon 托管 iMessage 入口' },
       { id: 'desktop-notify', label: '桌面通知', description: '本机通知入口' },
@@ -5088,6 +5299,7 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
   }
   if (category === 'dataMemory') {
     return [
+      { id: 'assistant-workspace', label: '个人助理', description: '活动记录、日历、计划与渠道闭环' },
       { id: 'memory-health', label: '记忆健康', description: '召回质量、作用域与生命周期' },
       { id: 'memory-inbox', label: '待确认记忆', description: '审核记忆候选' },
       { id: 'confirmed-memory', label: '已确认记忆', description: '长期记忆库' },
@@ -5102,7 +5314,14 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
   if (category === 'capabilities') {
     return [
       { id: 'builtin', label: '能力概览', description: '查看 Joi 可以做什么以及访问范围' },
+      { id: 'mcp', label: 'MCP 运行时', description: '连接、同步并真正调用 MCP 工具' },
+      { id: 'browser', label: '浏览器', description: '自管会话、多标签、DOM、网络与视觉' },
+      { id: 'developer', label: '开发工具', description: '原生 LSP、LLDB、代码执行与沙箱' },
+      { id: 'filesystem', label: '文件系统', description: '工作区根目录与读写边界' },
+      { id: 'skills', label: 'Skills', description: '发现、检索并管理 Codex 兼容技能' },
       { id: 'plugins', label: 'Plugins', description: '安装并管理 provider 与扩展' },
+      { id: 'custom-tools', label: '工具流程', description: '受控 Capability Workflow' },
+      { id: 'github', label: 'GitHub', description: '令牌、默认仓库与 API' },
     ];
   }
   if (category === 'nodesExecution') {
@@ -5119,15 +5338,13 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
   }
   if (category === 'privacySecurity') {
     return [
+      { id: 'privacy-policy', label: '安全策略', description: '本地与远端执行边界' },
       { id: 'secrets', label: '密钥管理', description: '本地钥匙串与密钥状态' },
-      { id: 'privacy-policy', label: '隐私策略', description: '本地优先与数据边界' },
-      { id: 'remote-permission', label: '远端执行权限', description: '远端执行确认策略' },
-      { id: 'dangerous-actions', label: '危险操作', description: '高风险操作审批' },
-      { id: 'diagnostic-redaction', label: '诊断脱敏', description: '导出诊断前脱敏' },
+      { id: 'dangerous-actions', label: '待确认操作', description: '需要用户确认的高风险操作' },
     ];
   }
   return [
-    { id: 'diagnostics', label: '诊断与支持', description: '检查状态、导出诊断和修复问题' },
+    { id: 'diagnostics', label: '支持与诊断', description: '检查状态并导出脱敏诊断包' },
   ];
 }
 
@@ -5137,6 +5354,605 @@ function DetailHeader({ title, description }: { title: string; description: stri
       <h1>{title}</h1>
       <p>{description}</p>
     </header>
+  );
+}
+
+function ModelRoutingWorkbench({ savedModels }: { savedModels: AvailableModel[] }) {
+  const [policies, setPolicies] = useState<AgentModelPolicy[]>([]);
+  const [selectedAgentID, setSelectedAgentID] = useState('general_agent');
+  const [draft, setDraft] = useState<AgentModelPolicy | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+
+  async function loadPolicies() {
+    setBusy(true);
+    try {
+      const result = await desktopApi.listAgentModelPolicies();
+      setPolicies(result.policies ?? []);
+      const selected = result.policies.find((item) => item.agent_id === selectedAgentID) || result.policies[0] || null;
+      if (selected) {
+        setSelectedAgentID(selected.agent_id);
+        setDraft({ ...selected, fallback_model_ids: [...selected.fallback_model_ids] });
+      }
+      setStatus('');
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadPolicies();
+  }, []);
+
+  useEffect(() => {
+    const selected = policies.find((item) => item.agent_id === selectedAgentID);
+    if (selected) setDraft({ ...selected, fallback_model_ids: [...selected.fallback_model_ids] });
+  }, [policies, selectedAgentID]);
+
+  const modelOptions = useMemo(() => {
+    const values = new Map<string, string>();
+    for (const model of savedModels) values.set(model.id, model.display_name || model.id);
+    if (draft) {
+      for (const id of [draft.default_model_id, draft.cheap_model_id, draft.child_model_id, draft.tool_model_id, draft.long_context_model_id, ...draft.fallback_model_ids]) {
+        if (id && !values.has(id)) values.set(id, id);
+      }
+    }
+    return [...values.entries()].map(([id, label]) => ({ id, label }));
+  }, [draft, savedModels]);
+
+  async function savePolicy() {
+    if (!draft) return;
+    setBusy(true);
+    try {
+      const saved = await desktopApi.saveAgentModelPolicy({
+        ...draft,
+        fallback_model_ids: [...new Set(draft.fallback_model_ids.map((item) => item.trim()).filter(Boolean))],
+        max_failovers: Math.max(0, Math.min(8, Number(draft.max_failovers) || 0)),
+      });
+      setPolicies((current) => [...current.filter((item) => item.agent_id !== saved.agent_id), saved]);
+      setDraft(saved);
+      setStatus('路由策略已保存。模型失败时会在同一 Run 内记录尝试并按顺序降级。');
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function patchDraft(patch: Partial<AgentModelPolicy>) {
+    setDraft((current) => current ? { ...current, ...patch } : current);
+  }
+
+  return (
+    <section className="settings-detail-panel model-routing-workbench">
+      <DetailHeader title="模型路由" description="Agent 是岗位，模型是可替换的执行引擎；主任务、子 Agent、工具与长上下文可独立选型" />
+      <div className="settings-horizontal-split">
+        <div className="routing-agent-list" role="tablist" aria-label="Agent 路由策略">
+          {policies.map((policy) => (
+            <button
+              key={policy.agent_id}
+              className={selectedAgentID === policy.agent_id ? 'active' : ''}
+              role="tab"
+              aria-selected={selectedAgentID === policy.agent_id}
+              type="button"
+              onClick={() => setSelectedAgentID(policy.agent_id)}
+            >
+              <strong>{agentDisplayName(policy.agent_id)}</strong>
+              <small>{policy.enabled ? policy.default_model_id || '跟随默认' : '已停用'}</small>
+            </button>
+          ))}
+        </div>
+        {draft ? (
+          <div className="settings-form routing-policy-form">
+            <label className="field-row"><span>启用策略</span><input type="checkbox" checked={draft.enabled} onChange={(event) => patchDraft({ enabled: event.target.checked })} /></label>
+            <ModelRouteSelect label="默认模型" value={draft.default_model_id || ''} options={modelOptions} onChange={(value) => patchDraft({ default_model_id: value || undefined })} />
+            <label className="field-row">
+              <span>故障转移链</span>
+              <input
+                placeholder="model-a, model-b"
+                value={draft.fallback_model_ids.join(', ')}
+                onChange={(event) => patchDraft({ fallback_model_ids: splitSettingsList(event.target.value) })}
+              />
+            </label>
+            <ModelRouteSelect label="低成本任务" value={draft.cheap_model_id || ''} options={modelOptions} onChange={(value) => patchDraft({ cheap_model_id: value || undefined })} />
+            <ModelRouteSelect label="子 Agent" value={draft.child_model_id || ''} options={modelOptions} onChange={(value) => patchDraft({ child_model_id: value || undefined })} />
+            <ModelRouteSelect label="工具密集" value={draft.tool_model_id || ''} options={modelOptions} onChange={(value) => patchDraft({ tool_model_id: value || undefined })} />
+            <ModelRouteSelect label="长上下文" value={draft.long_context_model_id || ''} options={modelOptions} onChange={(value) => patchDraft({ long_context_model_id: value || undefined })} />
+            <label className="field-row"><span>思考强度</span><select value={draft.reasoning_effort || ''} onChange={(event) => patchDraft({ reasoning_effort: event.target.value })}><option value="">跟随模型</option><option value="none">None</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+            <label className="field-row"><span>最多降级次数</span><input type="number" min="0" max="8" value={draft.max_failovers} onChange={(event) => patchDraft({ max_failovers: Number(event.target.value) })} /></label>
+          </div>
+        ) : <p className="empty">{busy ? '正在读取路由策略…' : '暂无可用 Agent。'}</p>}
+      </div>
+      <div className="detail-actions">
+        <button className="secondary-button" type="button" disabled={busy} onClick={() => void loadPolicies()}>重新读取</button>
+        <button type="button" disabled={busy || !draft} onClick={() => void savePolicy()}>{busy ? '处理中…' : '保存路由策略'}</button>
+      </div>
+      {status ? <p className="settings-inline-status" role="status">{status}</p> : null}
+    </section>
+  );
+}
+
+function ModelRouteSelect({
+  label,
+  onChange,
+  options,
+  value,
+}: {
+  label: string;
+  onChange: (value: string) => void;
+  options: Array<{ id: string; label: string }>;
+  value: string;
+}) {
+  return (
+    <label className="field-row">
+      <span>{label}</span>
+      <select value={value} onChange={(event) => onChange(event.target.value)}>
+        <option value="">跟随默认</option>
+        {options.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+      </select>
+    </label>
+  );
+}
+
+function agentDisplayName(agentID: string) {
+  const labels: Record<string, string> = {
+    general_agent: '通用 Agent',
+    research_agent: '研究 Agent',
+    memory_agent: '记忆 Agent',
+    devops_agent: '运维 Agent',
+  };
+  return labels[agentID] || agentID;
+}
+
+function DeveloperWorkbenchPanel({ workspaceSettings }: { workspaceSettings: WorkspaceSettings | null }) {
+  const defaultRoot = workspaceSettings?.default_root || workspaceSettings?.allowed_roots?.[0] || '/Users/hao/project/Joi';
+  const [tab, setTab] = useState<'code' | 'lsp' | 'debugger'>('code');
+  const [language, setLanguage] = useState('javascript');
+  const [code, setCode] = useState("const values = [2, 3, 5];\nconsole.log(values.reduce((sum, value) => sum + value, 0));");
+  const [path, setPath] = useState(`${defaultRoot}/apps/joi-desktop/frontend/src/App.tsx`);
+  const [line, setLine] = useState('1');
+  const [character, setCharacter] = useState('0');
+  const [newName, setNewName] = useState('renamedSymbol');
+  const [debugTarget, setDebugTarget] = useState('');
+  const [debugSessionID, setDebugSessionID] = useState('');
+  const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [busy, setBusy] = useState('');
+  const [status, setStatus] = useState('');
+
+  async function execute(action: string, input: Record<string, unknown>) {
+    setBusy(action);
+    setStatus('');
+    try {
+      const response = await desktopApi.executeDeveloperAction({ action, input, permission_profile: 'danger_full_access' });
+      setResult(response.output);
+      const session = objectFromUnknown(response.output.session);
+      if (action === 'debugger_attach' && typeof session.id === 'string') setDebugSessionID(session.id);
+      if (action === 'debugger_stop') setDebugSessionID('');
+      setStatus(String(response.output.summary || `${action} 已完成`));
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  return (
+    <section className="settings-detail-panel developer-workbench-panel">
+      <DetailHeader title="原生开发工具" description="直接使用语言服务器、LLDB、短命代码内核与 macOS sandbox，输出会回到 Run Trace" />
+      <SettingsInlineTabs tabs={[['code', '代码执行'], ['lsp', 'LSP'], ['debugger', 'LLDB']]} active={tab} onChange={(value) => setTab(value as typeof tab)} />
+      {tab === 'code' ? (
+        <div className="workbench-pane">
+          <div className="settings-form">
+            <label className="field-row"><span>语言</span><select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="javascript">JavaScript</option><option value="typescript">TypeScript</option><option value="python">Python</option><option value="swift">Swift</option><option value="shell">Shell</option></select></label>
+            <label className="field-row workbench-code-field"><span>代码</span><textarea rows={9} value={code} onChange={(event) => setCode(event.target.value)} /></label>
+            <label className="field-row"><span>工作目录</span><input value={defaultRoot} readOnly /></label>
+          </div>
+          <div className="detail-actions">
+            <button type="button" disabled={Boolean(busy) || !code.trim()} onClick={() => void execute('execute_code', { language, code, cwd: defaultRoot, timeout_seconds: 60 })}>{busy === 'execute_code' ? '执行中…' : '执行代码'}</button>
+            <button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => void execute('sandbox_run', { cmd: ['/usr/bin/env', 'pwd'], cwd: defaultRoot, network: false })}>验证沙箱</button>
+          </div>
+        </div>
+      ) : null}
+      {tab === 'lsp' ? (
+        <div className="workbench-pane">
+          <div className="settings-form">
+            <label className="field-row"><span>源文件</span><input value={path} onChange={(event) => setPath(event.target.value)} /></label>
+            <label className="field-row"><span>位置</span><span className="inline-field-pair"><input type="number" min="1" value={line} onChange={(event) => setLine(event.target.value)} aria-label="行" /><input type="number" min="0" value={character} onChange={(event) => setCharacter(event.target.value)} aria-label="列" /></span></label>
+            <label className="field-row"><span>重命名为</span><input value={newName} onChange={(event) => setNewName(event.target.value)} /></label>
+          </div>
+          <div className="detail-actions workbench-action-wrap">
+            {[
+              ['lsp_diagnostics', '诊断'], ['lsp_symbols', '符号'], ['lsp_hover', '悬停'], ['lsp_definition', '定义'], ['lsp_references', '引用'], ['lsp_code_actions', '修复建议'],
+            ].map(([action, label]) => <button className="secondary-button" key={action} type="button" disabled={Boolean(busy) || !path.trim()} onClick={() => void execute(action, { path, line: Number(line), character: Number(character) })}>{busy === action ? '运行中…' : label}</button>)}
+            <button type="button" disabled={Boolean(busy) || !path.trim() || !newName.trim()} onClick={() => void execute('lsp_rename', { path, line: Number(line), character: Number(character), new_name: newName })}>应用重命名</button>
+            <button type="button" disabled={Boolean(busy) || !path.trim()} onClick={() => void execute('lsp_format', { path })}>格式化文件</button>
+          </div>
+        </div>
+      ) : null}
+      {tab === 'debugger' ? (
+        <div className="workbench-pane">
+          <div className="settings-form">
+            <label className="field-row"><span>可执行文件</span><input placeholder="/absolute/path/to/binary" value={debugTarget} onChange={(event) => setDebugTarget(event.target.value)} /></label>
+            <div className="field-row"><span>会话</span><div className="connection-status"><span className={`live-dot ${debugSessionID ? 'on' : ''}`} /><strong>{debugSessionID || '未连接'}</strong></div></div>
+          </div>
+          <div className="detail-actions workbench-action-wrap">
+            <button type="button" disabled={Boolean(busy) || !debugTarget.trim() || Boolean(debugSessionID)} onClick={() => void execute('debugger_attach', { target: debugTarget })}>启动 LLDB</button>
+            {[
+              ['debugger_threads', '线程'], ['debugger_stack', '调用栈'], ['debugger_locals', '局部变量'],
+            ].map(([action, label]) => <button className="secondary-button" key={action} type="button" disabled={Boolean(busy) || !debugSessionID} onClick={() => void execute(action, { session_id: debugSessionID })}>{label}</button>)}
+            <button className="secondary-button" type="button" disabled={Boolean(busy) || !debugSessionID} onClick={() => void execute('debugger_step', { session_id: debugSessionID, action: 'run' })}>运行</button>
+            <button type="button" disabled={Boolean(busy) || !debugSessionID} onClick={() => void execute('debugger_stop', { session_id: debugSessionID })}>结束会话</button>
+          </div>
+        </div>
+      ) : null}
+      {status ? <p className="settings-inline-status" role="status">{status}</p> : null}
+      {result ? <CollapsedData label="查看原生结果" value={result} /> : null}
+    </section>
+  );
+}
+
+function SettingsInlineTabs({
+  active,
+  onChange,
+  tabs,
+}: {
+  active: string;
+  onChange: (value: string) => void;
+  tabs: string[][];
+}) {
+  return (
+    <div className="settings-inline-tabs" role="tablist">
+      {tabs.map(([id, label]) => <button key={id} className={active === id ? 'active' : ''} role="tab" aria-selected={active === id} type="button" onClick={() => onChange(id)}>{label}</button>)}
+    </div>
+  );
+}
+
+function MediaWorkbenchPanel() {
+  const [tab, setTab] = useState<'voice' | 'video'>('voice');
+  const [recordingState, setRecordingState] = useState<'idle' | 'recording' | 'saving'>('idle');
+  const [speechText, setSpeechText] = useState('你好，我是 Joi。这是本机语音合成测试。');
+  const [speechVoice, setSpeechVoice] = useState('Ting-Ting');
+  const [speechRate, setSpeechRate] = useState('185');
+  const [videoPrompt, setVideoPrompt] = useState('一个清晰、克制的产品动效：蓝色光点沿白色网格移动，16:9。');
+  const [videoDuration, setVideoDuration] = useState('4');
+  const [videoAspect, setVideoAspect] = useState('16:9');
+  const [videoResolution, setVideoResolution] = useState('480p');
+  const [selectedMediaPath, setSelectedMediaPath] = useState('');
+  const [selectedMediaKind, setSelectedMediaKind] = useState<'image' | 'video'>('video');
+  const [transcribeVideo, setTranscribeVideo] = useState(false);
+  const [output, setOutput] = useState<Record<string, unknown> | null>(null);
+  const [busy, setBusy] = useState('');
+  const [status, setStatus] = useState('');
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const mediaInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => () => {
+    recorderRef.current?.stop();
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+  }, []);
+
+  async function runMedia(action: string, request: Record<string, unknown>) {
+    setBusy(action);
+    setStatus('');
+    try {
+      const result = await desktopApi.executeMediaAction({ action, ...request });
+      setOutput(result.output);
+      setStatus(String(result.output.summary || `${action} 已完成`));
+      return result.output;
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+      return null;
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function startRecording() {
+    setStatus('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      const candidates = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'];
+      const mimeType = candidates.find((candidate) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(candidate)) || '';
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recordingChunksRef.current = [];
+      recordingStreamRef.current = stream;
+      recorderRef.current = recorder;
+      recorder.ondataavailable = (event) => { if (event.data.size) recordingChunksRef.current.push(event.data); };
+      recorder.onstop = () => {
+        void (async () => {
+          setRecordingState('saving');
+          try {
+            const blob = new Blob(recordingChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+            const dataURL = await blobToDataURL(blob);
+            const saved = await runMedia('save_recording', { data_url: dataURL, mime_type: blob.type });
+            if (saved) setStatus('录音已保存，可直接转写或播放。');
+          } finally {
+            recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+            recordingStreamRef.current = null;
+            recorderRef.current = null;
+            setRecordingState('idle');
+          }
+        })();
+      };
+      recorder.start(250);
+      setRecordingState('recording');
+      setStatus('正在使用麦克风录音…');
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+      setRecordingState('idle');
+    }
+  }
+
+  function stopRecording() {
+    if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
+  }
+
+  async function transcribeCurrentAudio() {
+    const filePath = mediaOutputPath(output);
+    if (!filePath) {
+      setStatus('请先录音或选择可转写的音频。');
+      return;
+    }
+    const result = await runMedia('speech_transcribe', { path: filePath, model: 'tiny', language: 'auto' });
+    if (typeof result?.transcript === 'string') setSpeechText(result.transcript);
+  }
+
+  function chooseMedia(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0] as (File & { path?: string }) | undefined;
+    event.currentTarget.value = '';
+    if (!file?.path) {
+      setStatus('请在 Joi Desktop 安装版中选择本地图片或视频。');
+      return;
+    }
+    setSelectedMediaPath(file.path);
+    setSelectedMediaKind(file.type.startsWith('image/') ? 'image' : 'video');
+    setStatus(`已选择：${file.name}`);
+  }
+
+  const previewURL = mediaOutputPreviewURL(output);
+  const outputKind = mediaOutputKind(output);
+  const contactSheetURL = typeof output?.contact_sheet_url === 'string' ? output.contact_sheet_url : '';
+
+  return (
+    <section className="settings-detail-panel media-workbench-panel">
+      <DetailHeader title="语音与视频" description="录音、本地 Whisper 转写、macOS TTS、xAI 视频生成，以及基于 FFmpeg + Vision 的本地视频理解" />
+      <SettingsInlineTabs tabs={[['voice', '语音'], ['video', '视频']]} active={tab} onChange={(value) => setTab(value as typeof tab)} />
+      {tab === 'voice' ? (
+        <div className="workbench-pane media-voice-pane">
+          <section className="workbench-card">
+            <div className="workbench-card-heading"><div><strong>麦克风</strong><small>录音保存到 Joi 本地数据目录</small></div><span className={`live-dot ${recordingState === 'recording' ? 'on' : ''}`} /></div>
+            <div className="detail-actions">
+              {recordingState === 'recording'
+                ? <button className="danger-button" type="button" onClick={stopRecording}>停止并保存</button>
+                : <button type="button" disabled={recordingState === 'saving' || Boolean(busy)} onClick={() => void startRecording()}>{recordingState === 'saving' ? '保存中…' : '开始录音'}</button>}
+              <button className="secondary-button" type="button" disabled={Boolean(busy) || !mediaOutputPath(output)} onClick={() => void transcribeCurrentAudio()}>{busy === 'speech_transcribe' ? '转写中…' : '本地转写'}</button>
+            </div>
+          </section>
+          <section className="workbench-card">
+            <div className="workbench-card-heading"><div><strong>文字朗读</strong><small>本地 macOS 语音引擎，输出可播放音频</small></div></div>
+            <textarea rows={5} value={speechText} onChange={(event) => setSpeechText(event.target.value)} />
+            <div className="inline-field-grid">
+              <label><span>声音</span><input value={speechVoice} onChange={(event) => setSpeechVoice(event.target.value)} /></label>
+              <label><span>语速</span><input type="number" min="80" max="450" value={speechRate} onChange={(event) => setSpeechRate(event.target.value)} /></label>
+            </div>
+            <div className="detail-actions"><button type="button" disabled={Boolean(busy) || !speechText.trim()} onClick={() => void runMedia('text_to_speech', { text: speechText, voice: speechVoice, rate: Number(speechRate), format: 'mp3' })}>{busy === 'text_to_speech' ? '生成中…' : '生成朗读'}</button></div>
+          </section>
+        </div>
+      ) : null}
+      {tab === 'video' ? (
+        <div className="workbench-pane media-video-pane">
+          <section className="workbench-card">
+            <div className="workbench-card-heading"><div><strong>本地理解</strong><small>提取关键帧、媒体信息、画面文字和可选语音转写</small></div></div>
+            <input ref={mediaInputRef} className="visually-hidden" type="file" accept="image/*,video/*" onChange={chooseMedia} />
+            <div className="media-file-picker">
+              <button type="button" className="secondary-button" onClick={() => mediaInputRef.current?.click()}>选择图片或视频</button>
+              <span>{selectedMediaPath || '尚未选择'}</span>
+            </div>
+            {selectedMediaKind === 'video' ? <label className="compact-check"><input type="checkbox" checked={transcribeVideo} onChange={(event) => setTranscribeVideo(event.target.checked)} />同时用本地 Whisper 转写音轨</label> : null}
+            <div className="detail-actions"><button type="button" disabled={Boolean(busy) || !selectedMediaPath} onClick={() => void runMedia(selectedMediaKind === 'image' ? 'analyze_image' : 'analyze_video', { path: selectedMediaPath, transcribe: transcribeVideo, model: 'tiny', language: 'auto' })}>{busy.startsWith('analyze_') ? '分析中…' : '分析媒体'}</button></div>
+          </section>
+          <section className="workbench-card">
+            <div className="workbench-card-heading"><div><strong>生成视频</strong><small>xAI grok-imagine-video，完成后保存 MP4</small></div></div>
+            <textarea rows={5} value={videoPrompt} onChange={(event) => setVideoPrompt(event.target.value)} />
+            <div className="inline-field-grid three">
+              <label><span>时长</span><input type="number" min="1" max="15" value={videoDuration} onChange={(event) => setVideoDuration(event.target.value)} /></label>
+              <label><span>比例</span><select value={videoAspect} onChange={(event) => setVideoAspect(event.target.value)}><option>16:9</option><option>9:16</option><option>1:1</option><option>4:3</option><option>3:4</option></select></label>
+              <label><span>分辨率</span><select value={videoResolution} onChange={(event) => setVideoResolution(event.target.value)}><option>480p</option><option>720p</option></select></label>
+            </div>
+            <div className="detail-actions"><button type="button" disabled={Boolean(busy) || !videoPrompt.trim()} onClick={() => void runMedia('generate_video', { prompt: videoPrompt, duration_seconds: Number(videoDuration), aspect_ratio: videoAspect, resolution: videoResolution })}>{busy === 'generate_video' ? '生成与下载中…' : '生成视频'}</button></div>
+          </section>
+        </div>
+      ) : null}
+      {status ? <p className="settings-inline-status" role="status">{status}</p> : null}
+      {output ? (
+        <section className="media-output-card">
+          <div className="workbench-card-heading"><div><strong>最近结果</strong><small>{String(output.summary || output.mode || '')}</small></div></div>
+          {previewURL && outputKind === 'audio' ? <audio controls src={previewURL} /> : null}
+          {previewURL && outputKind === 'video' ? <video controls playsInline src={previewURL} /> : null}
+          {contactSheetURL ? <img src={contactSheetURL} alt="视频关键帧接触表" /> : null}
+          {typeof output.transcript === 'string' ? <pre>{output.transcript}</pre> : null}
+          {typeof output.recognized_text === 'string' && output.recognized_text ? <pre>{output.recognized_text}</pre> : null}
+          <CollapsedData label="查看媒体分析结果" value={output} />
+        </section>
+      ) : null}
+    </section>
+  );
+}
+
+function AssistantWorkspacePanel() {
+  const [tab, setTab] = useState<'activity' | 'calendar' | 'plans' | 'channels'>('activity');
+  const [snapshot, setSnapshot] = useState<AssistantWorkspaceSnapshot | null>(null);
+  const [busy, setBusy] = useState('');
+  const [status, setStatus] = useState('');
+  const [activityTitle, setActivityTitle] = useState('专注工作');
+  const [activityInterval, setActivityInterval] = useState('60');
+  const [calendarTitle, setCalendarTitle] = useState('回顾 Joi 进度');
+  const [calendarStart, setCalendarStart] = useState(nextLocalDateTimeValue(60));
+  const [calendarEnd, setCalendarEnd] = useState(nextLocalDateTimeValue(120));
+  const [calendarNotes, setCalendarNotes] = useState('');
+  const [planTitle, setPlanTitle] = useState('实现与验证计划');
+  const [planObjective, setPlanObjective] = useState('完成任务，为每个节点保留证据并复盘。');
+  const [selectedPlanID, setSelectedPlanID] = useState('');
+  const [planNodeTitle, setPlanNodeTitle] = useState('运行实际验收测试');
+  const [channelProvider, setChannelProvider] = useState('discord');
+  const [channelWebhook, setChannelWebhook] = useState('');
+  const [channelTarget, setChannelTarget] = useState('');
+  const [channelMessage, setChannelMessage] = useState('来自 Joi 个人助理的连接测试。');
+
+  async function refresh() {
+    setBusy('refresh');
+    try {
+      const next = await desktopApi.getAssistantWorkspace();
+      setSnapshot(next);
+      if (!selectedPlanID && next.plans[0]) setSelectedPlanID(next.plans[0].id);
+      setStatus('');
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  async function action(actionName: string, request: Record<string, unknown> = {}) {
+    setBusy(actionName);
+    setStatus('');
+    try {
+      const result = await desktopApi.executeAssistantAction({ action: actionName, ...request });
+      if (result.snapshot) setSnapshot(result.snapshot);
+      const item = objectFromUnknown(result.item);
+      if (actionName === 'create_plan' && typeof item.id === 'string') setSelectedPlanID(item.id);
+      setStatus(assistantActionStatus(actionName, result));
+      return result;
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+      return null;
+    } finally {
+      setBusy('');
+    }
+  }
+
+  const selectedPlan = snapshot?.plans.find((plan) => plan.id === selectedPlanID) || snapshot?.plans[0] || null;
+  const capture = snapshot?.capture;
+
+  return (
+    <section className="settings-detail-panel assistant-workspace-panel">
+      <DetailHeader title="个人助理工作台" description="把屏幕活动、日历草稿、证据化计划与外部渠道组成可观察、可停止、可复盘的闭环" />
+      <SettingsInlineTabs tabs={[['activity', '活动'], ['calendar', '日历'], ['plans', '计划'], ['channels', '渠道']]} active={tab} onChange={(value) => setTab(value as typeof tab)} />
+      {tab === 'activity' ? (
+        <div className="workbench-pane">
+          <section className="workbench-card assistant-capture-card">
+            <div className="workbench-card-heading">
+              <div><strong>工作活动捕获</strong><small>定时记录前台 app、窗口、截图和本地 OCR；原图只保存在 Joi 本地目录</small></div>
+              <span className={`assistant-capture-state ${capture?.active ? 'active' : ''}`}>{capture?.active ? '记录中' : '已停止'}</span>
+            </div>
+            <div className="inline-field-grid">
+              <label><span>会话名称</span><input value={activityTitle} onChange={(event) => setActivityTitle(event.target.value)} /></label>
+              <label><span>间隔（秒）</span><input type="number" min="15" max="3600" value={activityInterval} onChange={(event) => setActivityInterval(event.target.value)} /></label>
+            </div>
+            <div className="detail-actions">
+              {capture?.active
+                ? <button className="danger-button" type="button" disabled={Boolean(busy)} onClick={() => void action('stop_activity', { session_id: capture.session_id })}>停止并生成摘要</button>
+                : <button type="button" disabled={Boolean(busy)} onClick={() => void action('start_activity', { title: activityTitle, interval_seconds: Number(activityInterval) })}>开始记录</button>}
+              <button className="secondary-button" type="button" disabled={Boolean(busy) || !capture?.active} onClick={() => void action('capture_activity_now', { session_id: capture?.session_id })}>立即捕获一次</button>
+            </div>
+          </section>
+          <RecordList
+            emptyText="暂无活动记录。"
+            items={snapshot?.recent_activity.slice(0, 12) || []}
+            renderItem={(event) => (
+              <article className="row-card assistant-activity-row" key={event.id}>
+                {event.screenshot_path ? <img src={localPathURL(event.screenshot_path)} alt="活动截图" /> : null}
+                <div><strong>{event.app_name || '未知 app'}{event.window_title ? ` · ${event.window_title}` : ''}</strong><p>{compactQueueMessage(event.text || '未识别到可读文字')}</p><small>{formatShortTime(event.created_at)}</small></div>
+              </article>
+            )}
+          />
+        </div>
+      ) : null}
+      {tab === 'calendar' ? (
+        <div className="workbench-pane">
+          <section className="workbench-card">
+            <div className="workbench-card-heading"><div><strong>日历草稿</strong><small>先在 Joi 中审核，再显式发布到 macOS 默认日历</small></div></div>
+            <div className="settings-form">
+              <label className="field-row"><span>标题</span><input value={calendarTitle} onChange={(event) => setCalendarTitle(event.target.value)} /></label>
+              <label className="field-row"><span>开始</span><input type="datetime-local" value={calendarStart} onChange={(event) => setCalendarStart(event.target.value)} /></label>
+              <label className="field-row"><span>结束</span><input type="datetime-local" value={calendarEnd} onChange={(event) => setCalendarEnd(event.target.value)} /></label>
+              <label className="field-row"><span>备注</span><textarea rows={3} value={calendarNotes} onChange={(event) => setCalendarNotes(event.target.value)} /></label>
+            </div>
+            <div className="detail-actions"><button type="button" disabled={Boolean(busy) || !calendarTitle.trim() || !calendarStart} onClick={() => void action('create_calendar_item', { title: calendarTitle, start_at: new Date(calendarStart).toISOString(), end_at: calendarEnd ? new Date(calendarEnd).toISOString() : undefined, text: calendarNotes })}>保存草稿</button></div>
+          </section>
+          <RecordList
+            emptyText="暂无日历草稿。"
+            items={snapshot?.calendar || []}
+            renderItem={(item) => (
+              <article className="row-card" key={item.id}>
+                <div><strong>{item.title}</strong><p>{formatShortTime(item.start_at)}{item.end_at ? ` → ${formatShortTime(item.end_at)}` : ''}</p><small>{item.status === 'published' ? `已发布·${item.external_id || 'macOS 日历'}` : '待发布草稿'}</small></div>
+                {item.status !== 'published' ? <button type="button" disabled={Boolean(busy)} onClick={() => void action('publish_calendar_item', { id: item.id })}>发布到日历</button> : null}
+              </article>
+            )}
+          />
+        </div>
+      ) : null}
+      {tab === 'plans' ? (
+        <div className="workbench-pane">
+          <section className="workbench-card">
+            <div className="workbench-card-heading"><div><strong>创建计划</strong><small>每个节点有状态、依赖和证据，最后生成复盘</small></div></div>
+            <div className="settings-form">
+              <label className="field-row"><span>名称</span><input value={planTitle} onChange={(event) => setPlanTitle(event.target.value)} /></label>
+              <label className="field-row"><span>目标</span><textarea rows={3} value={planObjective} onChange={(event) => setPlanObjective(event.target.value)} /></label>
+            </div>
+            <div className="detail-actions"><button type="button" disabled={Boolean(busy) || !planTitle.trim()} onClick={() => void action('create_plan', { title: planTitle, objective: planObjective })}>创建计划</button></div>
+          </section>
+          {snapshot?.plans.length ? (
+            <div className="assistant-plan-workspace">
+              <select value={selectedPlan?.id || ''} onChange={(event) => setSelectedPlanID(event.target.value)}>{snapshot.plans.map((plan) => <option key={plan.id} value={plan.id}>{plan.title}</option>)}</select>
+              {selectedPlan ? (
+                <section className="workbench-card">
+                  <div className="workbench-card-heading"><div><strong>{selectedPlan.title}</strong><small>{selectedPlan.objective}</small></div><span>{selectedPlan.nodes.filter((node) => node.status === 'completed').length}/{selectedPlan.nodes.length}</span></div>
+                  <div className="assistant-plan-nodes">
+                    {selectedPlan.nodes.map((node) => (
+                      <button key={node.id} className={node.status === 'completed' ? 'completed' : ''} type="button" onClick={() => void action('update_plan_node', { id: node.id, metadata: { status: node.status === 'completed' ? 'pending' : 'completed', evidence: node.status === 'completed' ? [] : [{ kind: 'manual_confirmation', at: new Date().toISOString() }] } })}><span>{node.status === 'completed' ? '✓' : '○'}</span><strong>{node.title}</strong><small>{node.evidence.length} 条证据</small></button>
+                    ))}
+                  </div>
+                  <div className="inline-add-row"><input value={planNodeTitle} onChange={(event) => setPlanNodeTitle(event.target.value)} placeholder="新步骤" /><button type="button" disabled={Boolean(busy) || !planNodeTitle.trim()} onClick={() => void action('add_plan_node', { id: selectedPlan.id, title: planNodeTitle })}>添加</button></div>
+                  <div className="detail-actions"><button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => void action('review_plan', { id: selectedPlan.id })}>生成复盘</button></div>
+                  {selectedPlan.review_summary ? <p className="settings-inline-status">{selectedPlan.review_summary}</p> : null}
+                </section>
+              ) : null}
+            </div>
+          ) : <p className="empty">暂无计划。</p>}
+        </div>
+      ) : null}
+      {tab === 'channels' ? (
+        <div className="workbench-pane">
+          <section className="workbench-card">
+            <div className="workbench-card-heading"><div><strong>渠道连接</strong><small>Telegram / iMessage 复用现有连接；Discord / 飞书 webhook 仅写入 macOS Keychain</small></div></div>
+            <div className="settings-form">
+              <label className="field-row"><span>渠道</span><select value={channelProvider} onChange={(event) => setChannelProvider(event.target.value)}><option value="telegram">Telegram</option><option value="imessage">iMessage</option><option value="discord">Discord</option><option value="feishu">飞书</option><option value="email">邮件</option></select></label>
+              {(channelProvider === 'discord' || channelProvider === 'feishu') ? <label className="field-row"><span>Webhook</span><SecretInput placeholder="https://..." value={channelWebhook} visible={false} onChange={setChannelWebhook} onToggleVisible={() => undefined} /></label> : null}
+              <label className="field-row"><span>目标</span><input placeholder={channelProvider === 'email' ? 'name@example.com' : 'chat / space id'} value={channelTarget} onChange={(event) => setChannelTarget(event.target.value)} /></label>
+              <label className="field-row"><span>消息</span><textarea rows={3} value={channelMessage} onChange={(event) => setChannelMessage(event.target.value)} /></label>
+            </div>
+            <div className="detail-actions">
+              {(channelProvider === 'discord' || channelProvider === 'feishu') ? <button className="secondary-button" type="button" disabled={Boolean(busy) || !channelWebhook.trim()} onClick={() => void action('configure_channel', { provider: channelProvider, title: channelProvider === 'discord' ? 'Discord' : '飞书', enabled: true, metadata: { webhook_url: channelWebhook, configured: true } })}>保存连接</button> : null}
+              <button type="button" disabled={Boolean(busy) || !channelMessage.trim()} onClick={() => void action('send_channel_message', { provider: channelProvider, id: channelTarget, title: 'Joi', text: channelMessage, metadata: { target: channelTarget } })}>发送测试</button>
+            </div>
+          </section>
+          <div className="assistant-channel-grid">
+            {(snapshot?.channels || []).map((channel) => <article key={channel.id}><span className={`live-dot ${channel.enabled && channel.configured ? 'on' : ''}`} /><div><strong>{channel.name}</strong><small>{channel.status}</small></div></article>)}
+          </div>
+        </div>
+      ) : null}
+      {status ? <p className="settings-inline-status" role="status">{status}</p> : null}
+      <div className="detail-actions"><button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => void refresh()}>{busy === 'refresh' ? '刷新中…' : '刷新工作台'}</button></div>
+    </section>
   );
 }
 
@@ -5311,11 +6127,39 @@ function ConversationSidebar({
   }
 
   const isRoomContext = activeTab === 'chat' || activeTab === 'trace';
+  const conversationSections = splitSingleAgentConversations(conversations);
+
+  function renderConversationRow(item: ConversationSummary, channelRow: boolean) {
+    const active = currentConversationID === item.id || (!currentConversationID && chat?.conversation_id === item.id);
+    return (
+      <div key={item.id} className={`conversation-row-wrap ${channelRow ? 'channel-conversation-row' : ''} ${active && isRoomContext ? 'active' : ''}`}>
+        <button
+          className={`conversation-item conversation-chat-item ${active && isRoomContext ? 'active' : ''}`}
+          type="button"
+          onClick={() => loadConversation(item.id)}
+        >
+          <span className="thread-list-copy">
+            {channelRow ? (
+              <span className={`channel-source-badge channel-source-${classToken(item.channel)}`}>
+                {conversationChannelLabel(item.channel)}
+              </span>
+            ) : <strong>{conversationTitle(item)}</strong>}
+          </span>
+          <span className="thread-list-meta">
+            <time>{formatShortTime(item.updated_at)}</time>
+          </span>
+        </button>
+        <div className="conversation-row-actions">
+          <button type="button" onClick={() => void archiveConversation(item.id)}>归档</button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <aside className="im-sidebar app__sidebar tk-sidebar">
       <div className="thread-sidebar-heading">
-        <strong>线程</strong>
+        <strong>会话</strong>
         <span>{conversations.length}</span>
       </div>
       {searchOpen ? (
@@ -5325,37 +6169,33 @@ function ConversationSidebar({
         </label>
       ) : null}
       <ScrollArea className="conversation-list tk-sidebar-scroll">
-        {conversations.length ? conversations.map((item) => {
-          const active = currentConversationID === item.id || (!currentConversationID && chat?.conversation_id === item.id);
-          return (
-            <div key={item.id} className={`conversation-row-wrap ${active && isRoomContext ? 'active' : ''}`}>
-              <button
-                className={`conversation-item conversation-chat-item ${active && isRoomContext ? 'active' : ''}`}
-                type="button"
-                onClick={() => loadConversation(item.id)}
-              >
-                <span className="thread-list-copy">
-                  <strong>{conversationTitle(item)}</strong>
-                </span>
-                <span className="thread-list-meta">
-                  <time>{formatShortTime(item.updated_at)}</time>
-                </span>
-              </button>
-              <div className="conversation-row-actions">
-                <button type="button" onClick={() => void archiveConversation(item.id)}>归档</button>
-              </div>
+        {conversationSections.channels.length ? (
+          <section className="conversation-sidebar-section channel-sidebar-section" aria-label="渠道">
+            <div className="conversation-section-heading">
+              <strong>渠道</strong>
+              <span>{conversationSections.channels.length}</span>
             </div>
-          );
-        }) : (
+            {conversationSections.channels.map((item) => renderConversationRow(item, true))}
+          </section>
+        ) : null}
+        {conversationSections.threads.length ? (
+          <section className="conversation-sidebar-section thread-sidebar-section" aria-label="线程">
+            <div className="conversation-section-heading">
+              <strong>线程</strong>
+              <span>{conversationSections.threads.length}</span>
+            </div>
+            {conversationSections.threads.map((item) => renderConversationRow(item, false))}
+          </section>
+        ) : null}
+        {!conversations.length ? (
           <div className="thread-list-empty">
             <strong>{query ? '没有匹配线程' : (chat ? '当前线程' : '还没有线程')}</strong>
             <small>{query ? '换个关键词试试' : '点击左上角 + 创建新线程'}</small>
           </div>
-        )}
+        ) : null}
       </ScrollArea>
       <footer className="sidebar-footer">
         <span aria-hidden="true" className="user-avatar user-avatar-self">你</span>
-        <span className="sidebar-user-name">你</span>
         <button
           aria-label="设置"
           className="footer-settings-button"
@@ -5796,6 +6636,7 @@ function ChatHome({
   autoRightPanelCollapsed,
   chat,
   conversationMessages,
+  currentConversationID,
   currentThreadChannel,
   currentThreadTitle,
   cancelRun,
@@ -5812,8 +6653,11 @@ function ChatHome({
   openArtifact,
   openLoops,
   openRunTrace,
+  openConversation,
   loadConversationForMessage,
   pendingUserMessage,
+  pendingRunMessages,
+  queuedMessageMode,
   streamingAssistantMessage,
   proactiveMessages,
   productTasks,
@@ -5826,8 +6670,10 @@ function ChatHome({
   rollbackPersonaVersion,
   retryExternalConnectorEvent,
   removeAttachment,
+  cancelQueuedRunMessage,
   setActiveTab,
   setMessage,
+  setQueuedMessageMode,
   startRightPanelResize,
   updateMemory,
   submit,
@@ -5849,6 +6695,7 @@ function ChatHome({
   autoRightPanelCollapsed: boolean;
   chat: ChatResponse | null;
   conversationMessages: ConversationMessage[];
+  currentConversationID: string;
   currentThreadChannel: string;
   currentThreadTitle: string;
   cancelRun: (runID: string) => Promise<void>;
@@ -5865,8 +6712,11 @@ function ChatHome({
   openArtifact: (id: string) => Promise<void>;
   openLoops: OpenLoop[];
   openRunTrace: (runID: string, destination?: 'panel' | 'stage') => Promise<void>;
+  openConversation: (conversationID: string) => Promise<void>;
   loadConversationForMessage: (messageID: string) => Promise<boolean>;
   pendingUserMessage: ConversationMessage | null;
+  pendingRunMessages: RunQueuedMessage[];
+  queuedMessageMode: 'steering' | 'follow_up';
   streamingAssistantMessage: StreamingAssistantMessage | null;
   proactiveMessages: ProactiveMessage[];
   productTasks: ProductTask[];
@@ -5879,8 +6729,10 @@ function ChatHome({
   rollbackPersonaVersion: (personaID: string, targetVersion: number) => Promise<void>;
   retryExternalConnectorEvent: (eventID: string) => Promise<void>;
   removeAttachment: (id: string) => void;
+  cancelQueuedRunMessage: (messageID: string, runID: string) => Promise<void>;
   setActiveTab: (tab: Tab) => void;
   setMessage: (value: string) => void;
+  setQueuedMessageMode: (value: 'steering' | 'follow_up') => void;
   startRightPanelResize: (event: ReactPointerEvent<HTMLDivElement>) => void;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
   submit: (event?: FormEvent) => Promise<void>;
@@ -5892,12 +6744,19 @@ function ChatHome({
   updateProjectPersona: (req: UpdateProjectPersonaRequest) => Promise<void>;
   workspaceSettings: WorkspaceSettings | null;
 }) {
-  const fallbackSettledMessages = useMemo<ConversationMessage[]>(() => chat
+  const visibleChat = chat && (!currentConversationID || chat.conversation_id === currentConversationID)
+    ? chat
+    : null;
+  const currentStreamingAssistant = streamingAssistantMessage
+    && (!currentConversationID || streamingAssistantMessage.conversation_id === currentConversationID)
+    ? streamingAssistantMessage
+    : null;
+  const fallbackSettledMessages = useMemo<ConversationMessage[]>(() => visibleChat
       ? [
-        { id: chat.user_message_id, conversation_id: chat.conversation_id, role: 'user', content: lastPrompt },
-        ...(streamingAssistantMessage ? [] : [{ id: chat.assistant_message_id, conversation_id: chat.conversation_id, role: 'assistant' as const, content: chat.response, run_id: chat.run_id }]),
+        { id: visibleChat.user_message_id, conversation_id: visibleChat.conversation_id, role: 'user', content: lastPrompt },
+        ...(currentStreamingAssistant ? [] : [{ id: visibleChat.assistant_message_id, conversation_id: visibleChat.conversation_id, role: 'assistant' as const, content: visibleChat.response, run_id: visibleChat.run_id }]),
       ]
-      : [], [chat, lastPrompt, Boolean(streamingAssistantMessage)]);
+      : [], [currentStreamingAssistant, lastPrompt, visibleChat]);
   const settledMessages = conversationMessages.length ? conversationMessages : fallbackSettledMessages;
   const visibleThreads = useMemo(
     () => currentThreadTitle ? visibleMessengerThreads(messenger, activeRoom) : [],
@@ -5947,10 +6806,26 @@ function ChatHome({
     () => messagesForConversationHydration(settledMessages, restoredThreadMessages),
     [restoredThreadMessages, settledMessages],
   );
-  const assetConversationID = settledMessages[0]?.conversation_id || chat?.conversation_id || activeRoom?.conversation_id || '';
-  const streamingRunId = streamingAssistantMessage ? getMessageRunId(streamingAssistantMessage) : '';
-  const pendingLiveRunId = (isSubmitting || pendingUserMessage) ? latestActiveRunId(runEventsByRunId) : '';
-  const activeRunId = streamingRunId || chat?.run_id || trace?.id || pendingLiveRunId;
+  const assetConversationID = settledMessages[0]?.conversation_id || currentConversationID || visibleChat?.conversation_id || activeRoom?.conversation_id || '';
+  const scopedStreamingAssistant = currentStreamingAssistant
+    && (!assetConversationID || currentStreamingAssistant.conversation_id === assetConversationID)
+    ? currentStreamingAssistant
+    : null;
+  const scopedPendingUserMessage = pendingUserMessage
+    && (!assetConversationID || pendingUserMessage.conversation_id === assetConversationID)
+    ? pendingUserMessage
+    : null;
+  const chatRunId = visibleChat && (!assetConversationID || visibleChat.conversation_id === assetConversationID)
+    ? visibleChat.run_id
+    : '';
+  const traceRunId = trace && (!assetConversationID || trace.conversation_id === assetConversationID)
+    ? trace.id
+    : '';
+  const streamingRunId = scopedStreamingAssistant ? getMessageRunId(scopedStreamingAssistant) : '';
+  const pendingLiveRunId = (isSubmitting || scopedPendingUserMessage)
+    ? latestActiveRunId(runEventsByRunId, assetConversationID)
+    : '';
+  const activeRunId = pendingLiveRunId || streamingRunId || chatRunId || traceRunId || '';
   const { assetRunIds, candidateRunIds } = useMemo(() => {
     const candidates = new Set<string>();
     const assets = new Set<string>();
@@ -5966,12 +6841,14 @@ function ChatHome({
       candidates.add(streamingRunId);
       assets.add(streamingRunId);
     }
-    if (chat?.run_id) candidates.add(chat.run_id);
-    if (chat?.run_id && (!assetConversationID || !chat.conversation_id || chat.conversation_id === assetConversationID)) assets.add(chat.run_id);
-    if (trace?.id) candidates.add(trace.id);
+    if (chatRunId) {
+      candidates.add(chatRunId);
+      assets.add(chatRunId);
+    }
+    if (traceRunId) candidates.add(traceRunId);
     if (activeRunId) candidates.add(activeRunId);
     return { assetRunIds: assets, candidateRunIds: candidates };
-  }, [activeRunId, assetConversationID, chat?.conversation_id, chat?.run_id, projectionMessages, settledMessages, streamingRunId, trace?.id]);
+  }, [activeRunId, chatRunId, projectionMessages, settledMessages, streamingRunId, traceRunId]);
   const threadRunEventsByRunId = useMemo(
     () => pickRunEvents(runEventsByRunId, candidateRunIds),
     [candidateRunIds, runEventsByRunId],
@@ -5979,17 +6856,19 @@ function ChatHome({
   const currentAssetRunIds = useMemo(() => Array.from(assetRunIds), [assetRunIds]);
   const conversationProjection = useMemo(() => buildConversationRenderItems({
     messages: projectionMessages,
-    pendingUserMessage,
-    streamingAssistant: streamingAssistantMessage,
+    conversationId: assetConversationID,
+    pendingUserMessage: scopedPendingUserMessage,
+    streamingAssistant: scopedStreamingAssistant,
     runEventsByRunId: threadRunEventsByRunId,
     activeRunId,
     mode: inputMode,
-  }), [activeRunId, inputMode, pendingUserMessage, projectionMessages, threadRunEventsByRunId, streamingAssistantMessage]);
+  }), [activeRunId, assetConversationID, inputMode, projectionMessages, scopedPendingUserMessage, scopedStreamingAssistant, threadRunEventsByRunId]);
   const renderItems = conversationProjection.items;
   const hasThread = renderItems.length > 0;
-  const activeTaskBelongsToCurrentRun = Boolean(activeProductTask?.task.latest_run_id && activeProductTask.task.latest_run_id === (chat?.run_id || trace?.id));
-  const latestTask = chat?.product_task ? { task: chat.product_task, steps: [], deliverables: chat.artifacts ?? [] } : activeTaskBelongsToCurrentRun ? activeProductTask : null;
-  const executionActions = useMemo(() => projectRunTraceToActions(trace), [trace]);
+  const activeTaskBelongsToCurrentRun = Boolean(activeProductTask?.task.latest_run_id && activeProductTask.task.latest_run_id === (chatRunId || traceRunId));
+  const latestTask = visibleChat?.product_task ? { task: visibleChat.product_task, steps: [], deliverables: visibleChat.artifacts ?? [] } : activeTaskBelongsToCurrentRun ? activeProductTask : null;
+  const visibleTrace = traceRunId ? trace : null;
+  const executionActions = useMemo(() => projectRunTraceToActions(visibleTrace), [visibleTrace]);
   const visibleTraceActions = useMemo(() => visibleExecutionActions(executionActions), [executionActions]);
   const liveExecutionActions = activeExecutionActions.length > 0 ? activeExecutionActions : visibleTraceActions;
   const showInlineTaskCard = false;
@@ -5999,8 +6878,131 @@ function ChatHome({
   const [focusedMessageID, setFocusedMessageID] = useState('');
   const [focusMessageSerial, setFocusMessageSerial] = useState(0);
   const [threadLocateStatus, setThreadLocateStatus] = useState('');
+  const [conversationTreeOpen, setConversationTreeOpen] = useState(false);
+  const [conversationTree, setConversationTree] = useState<ConversationTree | null>(null);
+  const [conversationTreeBusy, setConversationTreeBusy] = useState(false);
+  const [conversationTreeStatus, setConversationTreeStatus] = useState('');
+  const [conversationBranchLabel, setConversationBranchLabel] = useState('');
+  const [conversationBranchSummary, setConversationBranchSummary] = useState('');
+  const [conversationCompactionSummary, setConversationCompactionSummary] = useState('');
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const conversationImportInputRef = useRef<HTMLInputElement | null>(null);
   const rightPanelCollapsed = manualRightPanelCollapsed || autoRightPanelCollapsed;
+
+  async function refreshConversationTree(conversationID = assetConversationID) {
+    if (!conversationID) {
+      setConversationTree(null);
+      return;
+    }
+    setConversationTreeBusy(true);
+    try {
+      const next = await desktopApi.getConversationTree(conversationID);
+      setConversationTree(next);
+      const active = findConversationTreeNode(next.root, next.active_conversation_id);
+      setConversationBranchLabel(active?.label || '');
+      setConversationBranchSummary(active?.summary || '');
+      setConversationCompactionSummary((current) => current || buildManualConversationSummary(settledMessages));
+      setConversationTreeStatus('');
+    } catch (err) {
+      setConversationTreeStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConversationTreeBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!conversationTreeOpen) return;
+    void refreshConversationTree();
+  }, [assetConversationID, conversationTreeOpen]);
+
+  async function createConversationBranch() {
+    if (!assetConversationID) return;
+    setConversationTreeBusy(true);
+    try {
+      const result = await desktopApi.createConversationBranch({
+        source_conversation_id: assetConversationID,
+        from_message_id: settledMessages[settledMessages.length - 1]?.id,
+        source_run_id: activeRunId || undefined,
+        title: conversationBranchLabel.trim() || undefined,
+      });
+      setConversationTreeStatus(`已创建分支，复制 ${result.copied_message_count} 条消息，原会话保持不变。`);
+      await openConversation(result.child_conversation_id);
+    } catch (err) {
+      setConversationTreeStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConversationTreeBusy(false);
+    }
+  }
+
+  async function saveConversationBranchMetadata() {
+    if (!assetConversationID) return;
+    setConversationTreeBusy(true);
+    try {
+      const next = await desktopApi.updateConversationBranch({
+        conversation_id: assetConversationID,
+        label: conversationBranchLabel,
+        summary: conversationBranchSummary,
+      });
+      setConversationTree(next);
+      setConversationTreeStatus('分支名称和说明已保存。');
+    } catch (err) {
+      setConversationTreeStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConversationTreeBusy(false);
+    }
+  }
+
+  async function compactCurrentConversation() {
+    if (!assetConversationID || !conversationCompactionSummary.trim()) return;
+    setConversationTreeBusy(true);
+    try {
+      const result = await desktopApi.compactConversation({
+        conversation_id: assetConversationID,
+        summary: conversationCompactionSummary.trim(),
+        keep_recent_messages: 8,
+        reason: 'manual_workbench',
+        source_run_id: activeRunId || undefined,
+      });
+      await refreshConversationTree(assetConversationID);
+      setConversationTreeStatus(`已压缩 ${result.covered_message_count} 条早期消息的模型上下文；完整记录未删除。`);
+    } catch (err) {
+      setConversationTreeStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConversationTreeBusy(false);
+    }
+  }
+
+  async function exportConversationTree() {
+    if (!assetConversationID) return;
+    setConversationTreeBusy(true);
+    try {
+      const result = await desktopApi.exportConversation({ conversation_id: assetConversationID });
+      setConversationTreeStatus(`已导出 ${result.message_count} 条消息与 ${result.branch_count} 个分支：${result.path}`);
+    } catch (err) {
+      setConversationTreeStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConversationTreeBusy(false);
+    }
+  }
+
+  async function importConversationTree(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0] as (File & { path?: string }) | undefined;
+    event.currentTarget.value = '';
+    if (!file?.path) {
+      setConversationTreeStatus('请在 Joi Desktop 安装版中选择 .joi-conversation.json 文件。');
+      return;
+    }
+    setConversationTreeBusy(true);
+    try {
+      const result = await desktopApi.importConversation({ path: file.path });
+      setConversationTreeStatus(`已导入 ${result.imported_conversation_ids.length} 个会话节点。`);
+      await openConversation(result.conversation_id);
+    } catch (err) {
+      setConversationTreeStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConversationTreeBusy(false);
+    }
+  }
 
   useEffect(() => {
     if (!focusedMessageID) return undefined;
@@ -6059,25 +7061,51 @@ function ChatHome({
   }
 
   function openThreadDetail(threadID: string) {
-    if (!threadID) return;
+    const thread = visibleThreads.find((item) => item.id === threadID);
+    if (!thread) return;
     setSelectedThreadID(threadID);
-    setManualRightPanelCollapsed(false);
-    setRightInspectorTab('threads');
+    void locateThreadSource(thread);
   }
 
   return (
     <section className={`chat-home companion-layout tk-workspace${rightPanelCollapsed ? ' companion-layout-right-collapsed' : ''}`}>
       <section className="chat-main-column tk-content-panel">
         <MessengerChatHeader
+          inspectorOpen={!rightPanelCollapsed}
+          conversationTreeOpen={conversationTreeOpen}
           sidebarCollapsed={sidebarCollapsed}
           threadChannel={currentThreadChannel}
           threadTitle={currentThreadTitle}
           toggleSidebarCollapsed={toggleSidebarCollapsed}
           onOpenInspector={() => setManualRightPanelCollapsed((current) => !current)}
+          onOpenConversationTree={() => setConversationTreeOpen((current) => !current)}
         />
 
+        {conversationTreeOpen ? (
+          <ConversationWorkbenchPopover
+            busy={conversationTreeBusy}
+            branchLabel={conversationBranchLabel}
+            branchSummary={conversationBranchSummary}
+            compactionSummary={conversationCompactionSummary}
+            importInputRef={conversationImportInputRef}
+            onBranch={() => void createConversationBranch()}
+            onClose={() => setConversationTreeOpen(false)}
+            onCompact={() => void compactCurrentConversation()}
+            onExport={() => void exportConversationTree()}
+            onImport={importConversationTree}
+            onOpenConversation={(conversationID) => void openConversation(conversationID)}
+            onRefresh={() => void refreshConversationTree()}
+            onSaveMetadata={() => void saveConversationBranchMetadata()}
+            setBranchLabel={setConversationBranchLabel}
+            setBranchSummary={setConversationBranchSummary}
+            setCompactionSummary={setConversationCompactionSummary}
+            status={conversationTreeStatus}
+            tree={conversationTree}
+          />
+        ) : null}
+
         {hasThread ? (
-          <ChatMessageScroller key={projectionMessages[0]?.conversation_id || chat?.conversation_id || activeRunId || 'thread'}>
+          <ChatMessageScroller key={projectionMessages[0]?.conversation_id || visibleChat?.conversation_id || activeRunId || 'thread'}>
             <>
               <MessageList
                 assistantAvatarSrc={joiAvatar}
@@ -6093,7 +7121,7 @@ function ChatHome({
                 threadAnnotations={threadMessageAnnotations}
                 useMessageScrollerItems
               />
-              {isSubmitting && !streamingAssistantMessage && !renderItems.some((item) => item.type === 'message' && item.role === 'assistant') && (
+              {isSubmitting && (pendingLiveRunId || scopedPendingUserMessage) && !scopedStreamingAssistant && !renderItems.some((item) => item.type === 'message' && item.role === 'assistant') && (
                 <article className="message-row assistant-message pending-message">
                   <img className="message-avatar assistant" src={joiAvatar} alt="Joi" />
                   <div className="message-bubble">
@@ -6111,12 +7139,57 @@ function ChatHome({
         )}
 
         <form className="composer tk-floating-panel" aria-busy={isSubmitting} onSubmit={submit}>
+          {isSubmitting ? (
+            <div className="composer-run-queue-toolbar" aria-label="运行中消息控制">
+              <span className="composer-run-live"><i aria-hidden="true" />运行中</span>
+              <div className="composer-run-mode-tabs" role="tablist" aria-label="追加消息方式">
+                <button
+                  className={queuedMessageMode === 'steering' ? 'active' : ''}
+                  role="tab"
+                  aria-selected={queuedMessageMode === 'steering'}
+                  type="button"
+                  onClick={() => setQueuedMessageMode('steering')}
+                >
+                  现在引导
+                </button>
+                <button
+                  className={queuedMessageMode === 'follow_up' ? 'active' : ''}
+                  role="tab"
+                  aria-selected={queuedMessageMode === 'follow_up'}
+                  type="button"
+                  onClick={() => setQueuedMessageMode('follow_up')}
+                >
+                  完成后继续
+                </button>
+              </div>
+            </div>
+          ) : null}
           <textarea
-            placeholder={isSubmitting ? '补充或修改当前任务...' : '和 Joi 说点什么，或交给她一个任务...'}
+            key={isSubmitting ? `run-queue-${queuedMessageMode}` : 'idle-composer'}
+            placeholder={isSubmitting
+              ? queuedMessageMode === 'steering' ? '立即引导当前运行...' : '当前运行完成后继续...'
+              : '和 Joi 说点什么，或交给她一个任务...'}
             value={message}
             onChange={(event) => setMessage(event.target.value)}
             onKeyDown={handleComposerKeyDown}
           />
+          {pendingRunMessages.length ? (
+            <div className="composer-run-queue" aria-label="等待处理的追加消息">
+              {pendingRunMessages.map((item) => (
+                <div className={`composer-run-queue-chip queue-${item.kind}`} key={item.id}>
+                  <span>{item.kind === 'steering' ? '引导' : '随后'} · {compactQueueMessage(item.content)}</span>
+                  <button
+                    type="button"
+                    aria-label="取消这条追加消息"
+                    title="取消排队"
+                    onClick={() => void cancelQueuedRunMessage(item.id, item.run_id)}
+                  >
+                    <CloseTabIcon />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : null}
           {attachments.length ? (
             <div className="composer-attachment-list" aria-label="已选择附件">
               {attachments.map((attachment) => (
@@ -6156,28 +7229,30 @@ function ChatHome({
             >
               <PaperclipIcon />
             </button>
-          </div>
-          {isSubmitting && !message.trim() && attachments.length === 0 ? (
-            <button
-              className="send-button stop-button"
-              disabled={!activeRunId}
-              type="button"
-              title={activeRunId ? '中断运行' : '等待运行 ID'}
-              onClick={() => void cancelRun(activeRunId)}
-            >
-              ■
-            </button>
-          ) : (
+            <span className="composer-tools-spacer" />
+            {isSubmitting ? (
+              <button
+                className="send-button stop-button"
+                disabled={!activeRunId}
+                type="button"
+                title={activeRunId ? '中断当前运行' : '等待运行 ID'}
+                aria-label="中断当前运行"
+                onClick={() => void cancelRun(activeRunId)}
+              >
+                ■
+              </button>
+            ) : null}
             <button
               className="send-button"
               disabled={!message.trim() && attachments.length === 0}
               type="button"
-              title={isSubmitting ? '追加到当前任务' : '发送'}
+              title={isSubmitting ? (queuedMessageMode === 'steering' ? '入队为当前引导' : '入队为完成后继续') : '发送'}
+              aria-label={isSubmitting ? '追加消息' : '发送消息'}
               onClick={() => void submit()}
             >
               ↑
             </button>
-          )}
+          </div>
         </form>
       </section>
       {!rightPanelCollapsed && (
@@ -6213,8 +7288,7 @@ function ChatHome({
               savedModels={savedModels}
               setActiveTab={setRightInspectorTab}
               settings={settings}
-              trace={trace}
-              traceSpanAudit={traceSpanAudit}
+              trace={visibleTrace}
               openRunTrace={openRunTrace}
               onLocateThreadSource={(thread) => void locateThreadSource(thread)}
               onSelectThread={setSelectedThreadID}
@@ -6234,18 +7308,25 @@ function ChatHome({
 }
 
 function MessengerChatHeader({
+  conversationTreeOpen,
+  inspectorOpen,
+  onOpenConversationTree,
   onOpenInspector,
   sidebarCollapsed,
   threadChannel,
   threadTitle,
   toggleSidebarCollapsed,
 }: {
+  conversationTreeOpen: boolean;
+  inspectorOpen: boolean;
+  onOpenConversationTree: () => void;
   onOpenInspector: () => void;
   sidebarCollapsed: boolean;
   threadChannel: string;
   threadTitle: string;
   toggleSidebarCollapsed: () => void;
 }) {
+  const messagingChannel = isMessagingConversationChannel(threadChannel);
   return (
     <header className="messenger-chat-header breadcrumb-bar">
       {sidebarCollapsed && (
@@ -6264,13 +7345,191 @@ function MessengerChatHeader({
         <img className="joi-thread-header-avatar" src={joiAvatar} alt="" />
         <div>
           <strong>Joi</strong>
-          <small>{threadTitle || '新线程'}{threadChannel ? ` · ${conversationChannelLabel(threadChannel)}` : ''}</small>
+          <div className="messenger-chat-source-line">
+            {messagingChannel ? (
+              <span className={`channel-source-badge channel-source-${classToken(threadChannel)}`}>
+                {conversationChannelLabel(threadChannel)}
+              </span>
+            ) : null}
+            <small>
+              {threadTitle || '新线程'}
+              {!messagingChannel && threadChannel ? ` · ${conversationChannelLabel(threadChannel)}` : ''}
+            </small>
+          </div>
         </div>
       </div>
-      <button className="observe-button" type="button" aria-label="展开观察面板" title="展开观察面板" onClick={onOpenInspector}>
+      <button
+        className={`observe-button conversation-tree-button ${conversationTreeOpen ? 'active' : ''}`}
+        type="button"
+        aria-expanded={conversationTreeOpen}
+        aria-label={conversationTreeOpen ? '关闭会话树' : '打开会话树与压缩'}
+        title="会话树与压缩"
+        onClick={onOpenConversationTree}
+      >
+        <ConversationTreeIcon />
+      </button>
+      <button
+        className={`observe-button ${inspectorOpen ? 'active' : ''}`}
+        type="button"
+        aria-expanded={inspectorOpen}
+        aria-label={inspectorOpen ? '收起观察面板' : '展开观察面板'}
+        title={inspectorOpen ? '收起观察面板' : '展开观察面板'}
+        onClick={onOpenInspector}
+      >
         <ExpandPanelIcon />
       </button>
     </header>
+  );
+}
+
+function ConversationWorkbenchPopover({
+  branchLabel,
+  branchSummary,
+  busy,
+  compactionSummary,
+  importInputRef,
+  onBranch,
+  onClose,
+  onCompact,
+  onExport,
+  onImport,
+  onOpenConversation,
+  onRefresh,
+  onSaveMetadata,
+  setBranchLabel,
+  setBranchSummary,
+  setCompactionSummary,
+  status,
+  tree,
+}: {
+  branchLabel: string;
+  branchSummary: string;
+  busy: boolean;
+  compactionSummary: string;
+  importInputRef: RefObject<HTMLInputElement | null>;
+  onBranch: () => void;
+  onClose: () => void;
+  onCompact: () => void;
+  onExport: () => void;
+  onImport: (event: ChangeEvent<HTMLInputElement>) => void;
+  onOpenConversation: (conversationID: string) => void;
+  onRefresh: () => void;
+  onSaveMetadata: () => void;
+  setBranchLabel: (value: string) => void;
+  setBranchSummary: (value: string) => void;
+  setCompactionSummary: (value: string) => void;
+  status: string;
+  tree: ConversationTree | null;
+}) {
+  const activeNode = tree ? findConversationTreeNode(tree.root, tree.active_conversation_id) : null;
+  return (
+    <section className="conversation-workbench-popover" role="dialog" aria-label="会话树与上下文压缩">
+      <header>
+        <div>
+          <strong>会话树</strong>
+          <small>{tree ? `${tree.node_count} 个节点 · 原记录始终保留` : '读取本地会话关系'}</small>
+        </div>
+        <div className="conversation-workbench-header-actions">
+          <button type="button" onClick={onRefresh} disabled={busy}>刷新</button>
+          <button className="icon-only" type="button" onClick={onClose} aria-label="关闭会话树"><CloseTabIcon /></button>
+        </div>
+      </header>
+      <div className="conversation-workbench-body">
+        <ScrollArea className="conversation-tree-scroll" contentClassName="conversation-tree-list">
+          {tree ? (
+            <ConversationTreeRows node={tree.root} depth={0} onOpenConversation={onOpenConversation} />
+          ) : (
+            <p className="empty">{busy ? '正在读取会话树…' : '当前还没有可展示的会话树。'}</p>
+          )}
+        </ScrollArea>
+        <ScrollArea className="conversation-workbench-controls-scroll" contentClassName="conversation-workbench-controls">
+          <section className="conversation-workbench-section">
+            <div className="conversation-workbench-section-title">
+              <strong>当前节点</strong>
+              <span>{activeNode ? `${activeNode.message_count} 条消息` : '—'}</span>
+            </div>
+            <label>
+              <span>分支名称</span>
+              <input value={branchLabel} placeholder="例如：方案 B" onChange={(event) => setBranchLabel(event.target.value)} />
+            </label>
+            <label>
+              <span>分支说明</span>
+              <textarea value={branchSummary} placeholder="这个分支验证什么，和主线有什么不同" onChange={(event) => setBranchSummary(event.target.value)} />
+            </label>
+            <div className="conversation-workbench-action-row">
+              <button type="button" onClick={onSaveMetadata} disabled={busy || !activeNode}>保存说明</button>
+              <button className="primary" type="button" onClick={onBranch} disabled={busy || !activeNode}>从当前末尾分支</button>
+            </div>
+          </section>
+          <section className="conversation-workbench-section">
+            <div className="conversation-workbench-section-title">
+              <strong>上下文压缩</strong>
+              <span>{activeNode?.latest_compaction ? `已覆盖 ${activeNode.latest_compaction.covered_message_count} 条` : '尚未手动压缩'}</span>
+            </div>
+            <p>只替换下一轮提供给模型的早期上下文，不删聊天记录；最近 8 条消息保持原文。</p>
+            <label>
+              <span>可恢复检查点摘要</span>
+              <textarea className="conversation-compaction-summary" value={compactionSummary} onChange={(event) => setCompactionSummary(event.target.value)} />
+            </label>
+            <button className="primary" type="button" onClick={onCompact} disabled={busy || !activeNode || !compactionSummary.trim()}>压缩当前上下文</button>
+          </section>
+          <section className="conversation-workbench-section conversation-portability-section">
+            <div className="conversation-workbench-section-title"><strong>迁移</strong><span>Joi JSON</span></div>
+            <input ref={importInputRef} className="visually-hidden" type="file" accept=".json,.joi-conversation.json" onChange={onImport} />
+            <div className="conversation-workbench-action-row">
+              <button type="button" onClick={onExport} disabled={busy || !tree}>导出整棵树</button>
+              <button type="button" onClick={() => importInputRef.current?.click()} disabled={busy}>导入会话树</button>
+            </div>
+          </section>
+        </ScrollArea>
+      </div>
+      {status ? <div className="conversation-workbench-status" role="status">{status}</div> : null}
+      {busy ? <div className="conversation-workbench-progress" aria-hidden="true" /> : null}
+    </section>
+  );
+}
+
+function ConversationTreeRows({
+  depth,
+  node,
+  onOpenConversation,
+}: {
+  depth: number;
+  node: ConversationTree['root'];
+  onOpenConversation: (conversationID: string) => void;
+}) {
+  return (
+    <div className="conversation-tree-branch">
+      <button
+        className={`conversation-tree-node ${node.active ? 'active' : ''}`}
+        style={{ '--conversation-tree-depth': depth } as CSSProperties}
+        type="button"
+        onClick={() => onOpenConversation(node.conversation_id)}
+      >
+        <span className="conversation-tree-rail" aria-hidden="true" />
+        <span className="conversation-tree-dot" aria-hidden="true" />
+        <span className="conversation-tree-node-copy">
+          <strong>{node.label || node.title}</strong>
+          <small>{node.message_count} 条消息{node.latest_compaction ? ` · 压缩 ${node.latest_compaction.covered_message_count} 条` : ''}</small>
+          {node.summary ? <em>{node.summary}</em> : null}
+        </span>
+        {node.active ? <span className="conversation-tree-active-badge">当前</span> : null}
+      </button>
+      {node.children.map((child) => (
+        <ConversationTreeRows key={child.conversation_id} node={child} depth={depth + 1} onOpenConversation={onOpenConversation} />
+      ))}
+    </div>
+  );
+}
+
+function ConversationTreeIcon() {
+  return (
+    <svg className="observe-button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <circle cx="6" cy="5" r="2" />
+      <circle cx="18" cy="11" r="2" />
+      <circle cx="6" cy="19" r="2" />
+      <path d="M6 7v10M8 11h8" />
+    </svg>
   );
 }
 
@@ -6515,7 +7774,6 @@ function CompanionInspectorPanel({
   selectedThreadID,
   threadLocateStatus,
   trace,
-  traceSpanAudit,
   openRunTrace,
   updateMemory,
   updateMessengerProject,
@@ -6546,7 +7804,6 @@ function CompanionInspectorPanel({
   selectedThreadID: string;
   threadLocateStatus: string;
   trace: RunTrace | null;
-  traceSpanAudit: { spans: RunTraceSpan[]; summary: RunTraceSpanSummary };
   openRunTrace: (runID: string, destination?: 'panel' | 'stage') => Promise<void>;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
   updateMessengerProject: (req: UpdateMessengerProjectRequest) => Promise<void>;
@@ -6564,8 +7821,7 @@ function CompanionInspectorPanel({
   const staticTabs: Array<[RightInspectorTab, string]> = [
     ['overview', '概览'],
     ['runs', '运行'],
-    ['threads', '线程'],
-    ['assets', '文件'],
+    ['assets', '产物'],
     ['memory', '记忆'],
   ];
   const memberTabLabel = selectedMember ? (selectedMemberPersona?.display_name || selectedMember.display_name || '成员') : '';
@@ -6666,21 +7922,8 @@ function CompanionInspectorPanel({
           workspaceSettings={workspaceSettings}
         />
       ) : effectiveTab === 'runs' ? (
-        <MessengerRunsPanel
-          messenger={messenger}
+        <CurrentRunSummaryPanel
           openRunTrace={openRunTrace}
-          trace={trace}
-          traceSpanAudit={traceSpanAudit}
-        />
-      ) : effectiveTab === 'threads' ? (
-        <MessengerThreadsPanel
-          locateStatus={threadLocateStatus}
-          messenger={messenger}
-          onLocateThreadSource={onLocateThreadSource}
-          onSelectThread={onSelectThread}
-          openRunTrace={openRunTrace}
-          room={activeRoom}
-          selectedThreadID={selectedThreadID}
           trace={trace}
         />
       ) : effectiveTab === 'assets' ? (
@@ -6864,18 +8107,16 @@ function MessengerOverviewPanel({
 
   if (room?.type === 'project_dm' && activePersona) {
     return (
-      <PrivateProjectOverviewPanel
+      <CurrentJoiOverviewPanel
         memories={memories}
         onOpenModelSettings={onOpenModelSettings}
         onOpenMemory={onOpenMemory}
         onSavePersona={onSavePersona}
-        onSaveProject={onSaveProject}
         persona={activePersona}
         project={activeProject}
         room={room}
         savedModels={savedModels}
         settings={settings}
-        workspaceSettings={workspaceSettings}
       />
     );
   }
@@ -7212,6 +8453,109 @@ function OverviewPersonaModelMenu({
         )}
       </div>
     </div>
+  );
+}
+
+function CurrentJoiOverviewPanel({
+  memories,
+  onOpenModelSettings,
+  onOpenMemory,
+  onSavePersona,
+  persona,
+  project,
+  room,
+  savedModels,
+  settings,
+}: {
+  memories: MemoryRecord[];
+  onOpenModelSettings: () => void;
+  onOpenMemory: () => void;
+  onSavePersona: (req: UpdateProjectPersonaRequest) => Promise<void>;
+  persona: ProjectPersona;
+  project: PersonaMessengerSnapshot['projects'][number] | null;
+  room: MessengerRoom;
+  savedModels: AvailableModel[];
+  settings: SettingsRecord | null;
+}) {
+  const modelOptions = useMemo(() => connectedModelOptions(savedModels, settings), [savedModels, settings]);
+  const defaultModelID = settings?.model_name || modelOptions[0]?.id || '';
+  const selectedModelID = normalizePersonaModelSelection(persona.model_strategy, modelOptions, defaultModelID);
+  const scopedMemories = useMemo(
+    () => memoriesForPrivateProject(memories, persona, project).filter((memory) => (
+      !isMemoryDisabled(memory) && !isLegacyJoiSurfaceMemory(memory)
+    )),
+    [memories, persona, project],
+  );
+  const [savingModel, setSavingModel] = useState(false);
+
+  async function saveModel(modelID: string) {
+    const nextModelID = normalizePersonaModelSelection(modelID, modelOptions, defaultModelID);
+    if (!nextModelID || nextModelID === selectedModelID) return;
+    setSavingModel(true);
+    try {
+      await onSavePersona({
+        persona_id: persona.id,
+        base_version: persona.version,
+        actor_id: 'desktop_user',
+        actor_role: 'project_owner',
+        room_id: room.id,
+        model_strategy: nextModelID,
+        change_reason: 'Update Joi model from conversation overview',
+      });
+    } finally {
+      setSavingModel(false);
+    }
+  }
+
+  return (
+    <section
+      id="right-inspector-overview"
+      className="right-panel-section current-joi-overview-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-overview"
+    >
+      <header className="current-joi-overview-header">
+        <img src={joiAvatar} alt="" />
+        <div>
+          <small>当前会话</small>
+          <h2>Joi</h2>
+        </div>
+      </header>
+      <div className="inspector-metric-grid current-joi-overview-metrics">
+        <KV label="状态" value={formatStatus(persona.status)} />
+        <KV label="可用记忆" value={`${scopedMemories.length} 条`} />
+      </div>
+      <section className="current-joi-model-card" aria-label="当前回复模型">
+        <div className="current-joi-section-heading">
+          <div>
+            <small>回复模型</small>
+            <h3>当前模型</h3>
+          </div>
+          <button type="button" onClick={onOpenModelSettings}>设置</button>
+        </div>
+        <select
+          aria-label="当前模型"
+          disabled={savingModel || modelOptions.length === 0}
+          value={selectedModelID}
+          onChange={(event) => void saveModel(event.target.value)}
+        >
+          {modelOptions.length === 0 ? (
+            <option value="">未接入模型</option>
+          ) : modelOptions.map((model) => (
+            <option key={modelOptionKey(model)} value={model.id}>
+              {modelOptionLabel(model)}
+            </option>
+          ))}
+        </select>
+      </section>
+      <button className="current-joi-memory-link" type="button" onClick={onOpenMemory}>
+        <span>
+          <strong>本轮记忆</strong>
+          <small>查看召回内容并反馈准确性</small>
+        </span>
+        <span aria-hidden="true">›</span>
+      </button>
+    </section>
   );
 }
 
@@ -7587,6 +8931,60 @@ function formatSpanTypeLabel(type: string) {
   return '运行记录';
 }
 
+function CurrentRunSummaryPanel({
+  openRunTrace,
+  trace,
+}: {
+  openRunTrace: (runID: string, destination?: 'panel' | 'stage') => Promise<void>;
+  trace: RunTrace | null;
+}) {
+  const visibleActions = useMemo(
+    () => visibleExecutionActions(projectRunTraceToActions(trace)),
+    [trace],
+  );
+  const recentActions = visibleActions.slice(-6);
+
+  return (
+    <section
+      id="right-inspector-runs"
+      className="right-panel-section current-run-summary-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-runs"
+    >
+      <header>
+        <small>当前对话</small>
+        <h2>运行</h2>
+      </header>
+      {trace ? (
+        <>
+          <div className="inspector-metric-grid">
+            <KV label="状态" value={formatStatus(trace.status)} />
+            <KV label="模型调用" value={String(trace.model_calls?.length ?? 0)} />
+            <KV label="动作" value={String(visibleActions.length)} />
+          </div>
+          {recentActions.length > 0 ? (
+            <div className="current-run-action-list">
+              <strong>最近动作</strong>
+              {recentActions.map((action) => (
+                <div key={action.id} className={`current-run-action-row status-${action.status}`}>
+                  <span className={`status-dot ${action.status === 'running' || action.status === 'queued' ? 'running' : action.status === 'waiting_approval' ? 'waiting' : action.status === 'failed' || action.status === 'blocked' || action.status === 'limited' ? 'failed' : 'done'}`} />
+                  <span>
+                    <strong>{executionActionTitle(action)}</strong>
+                    <small>{formatStatus(action.status)}</small>
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : <p className="empty">本次运行没有需要展示的外部动作。</p>}
+          <button className="current-run-detail-button" type="button" onClick={() => void openRunTrace(trace.id, 'panel')}>
+            查看完整执行过程
+          </button>
+        </>
+      ) : <p className="empty">当前对话还没有运行记录。</p>}
+    </section>
+  );
+}
+
 function MessengerRunsPanel({
   messenger,
   openRunTrace,
@@ -7934,10 +9332,10 @@ function MessengerAssetsPanel({
       aria-labelledby="right-inspector-tab-assets"
     >
       <header>
-        <small>会话内容</small>
-        <h2>文件与交付物</h2>
+        <small>当前对话</small>
+        <h2>产物</h2>
       </header>
-      {visible.length === 0 ? <p className="empty">{room?.title || '当前会话'} 暂无上传或生成资产。</p> : (
+      {visible.length === 0 ? <p className="empty">当前对话还没有上传文件或生成产物。</p> : (
         <div className="asset-mini-list">
           {visible.map((asset) => (
             <article key={asset.id} className={`asset-mini-row asset-source-${asset.source}${asset.previewUrl ? ' has-preview' : ''}`}>
@@ -8054,6 +9452,8 @@ function artifactAssetKindLabel(artifact: ArtifactSummary): string {
   const metadata = artifact.metadata ?? {};
   const mimeType = normalizeAssetToken(assetString(metadata.mime_type) || assetString(metadata.mimeType) || assetString(metadata.content_type) || assetString(metadata.contentType));
   if (type.includes('image') || format.startsWith('image/') || mimeType.startsWith('image/')) return '图片';
+  if (type.includes('video') || format.startsWith('video/') || mimeType.startsWith('video/')) return '视频';
+  if (type.includes('audio') || format.startsWith('audio/') || mimeType.startsWith('audio/')) return '音频';
   return '文件';
 }
 
@@ -8064,6 +9464,7 @@ function normalizeAssetToken(value: string) {
 function assetKindLabel(kind: string): string {
   if (kind === 'image') return '图片';
   if (kind === 'video') return '视频';
+  if (kind === 'audio') return '音频';
   return '文件';
 }
 
@@ -8503,8 +9904,9 @@ function CompanionLogsPanel({ runID }: { runID?: string }) {
 }
 
 function LogEntryRow({ log }: { log: LogEntry }) {
+  const failed = isLogFailure(log);
   return (
-    <article className={`log-entry-row log-level-${classToken(log.level)}`}>
+    <article className={`log-entry-row log-level-${classToken(failed ? 'error' : log.level)}`}>
       <header>
         <span className="log-level-pill">{formatLogLevel(log.level)}</span>
         <span>{formatRiskLevel(log.risk_level)}</span>
@@ -8512,7 +9914,7 @@ function LogEntryRow({ log }: { log: LogEntry }) {
       </header>
       <strong>{friendlyLogSummary(log)}</strong>
       <small>{[formatLogCategory(log.category), log.status ? formatStatus(log.status) : '', log.duration_ms ? formatMilliseconds(log.duration_ms) : ''].filter(Boolean).join(' · ')}</small>
-      {log.error ? <small className="terminal-error">本次运行遇到问题，可导出诊断记录后继续排查。</small> : null}
+      {failed ? <small className="terminal-error">本次运行遇到问题，可导出诊断记录后继续排查。</small> : null}
     </article>
   );
 }
@@ -8864,7 +10266,9 @@ function CompanionInsightPanel({
   trace: RunTrace | null;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
 }) {
-  const usedMemories = extractUsedMemories(trace).slice(0, 4);
+  const usedMemories = extractUsedMemories(trace)
+    .filter((result) => !isLegacyJoiSurfaceMemory(result.memory))
+    .slice(0, 4);
   const currentRunID = trace?.id || '';
   const pending = memories.filter((memory) => isMemoryProposalForRun(memory, currentRunID)).slice(0, 4);
 
@@ -8882,10 +10286,10 @@ function CompanionInsightPanel({
       aria-labelledby="right-inspector-tab-memory"
     >
       <h3>本次使用了这些记忆</h3>
-      <InsightList empty="本轮没有召回 confirmed memory。">
+      <InsightList empty="本轮没有使用已确认记忆。">
         {usedMemories.map((result) => (
-          <InsightItem key={`used-${result.memory.id}`} title={result.memory.summary || result.memory.type} body={result.memory.content}>
-            <small>匹配度 {Math.round(result.score * 100)}% · {formatMemoryReason(result.reason)}</small>
+          <InsightItem key={`used-${result.memory.id}`} title={memoryInsightTitle(result.memory)} body={memoryInsightBody(result.memory)}>
+            <small>匹配度 {memoryMatchPercent(result.score)}% · {formatMemoryReason(result.reason)}</small>
             <button type="button" onClick={() => updateMemory(result.memory.id, 'feedback_positive')}>准确</button>
             <button type="button" onClick={() => updateMemory(result.memory.id, 'feedback_negative')}>不准确</button>
             <button type="button" onClick={() => updateMemory(result.memory.id, 'disable')}>停用</button>
@@ -8895,7 +10299,7 @@ function CompanionInsightPanel({
       <h3>本次建议</h3>
       <InsightList empty="本轮没有新的学习建议。">
         {pending.map((memory) => (
-          <InsightItem key={memory.id} title={memory.summary || memory.type} body={memory.content}>
+          <InsightItem key={memory.id} title={memoryInsightTitle(memory)} body={memoryInsightBody(memory)}>
             {memoryProposalWhy(memory) ? <small>{memoryProposalWhy(memory)}</small> : null}
             <button type="button" onClick={() => updateMemory(memory.id, 'confirm')}>准确</button>
             <button type="button" onClick={() => editAndConfirm(memory)}>修改</button>
@@ -9114,6 +10518,16 @@ function isMemoryDisabled(memory: MemoryRecord) {
   return Boolean(memory.disabled || memory.disabled_at);
 }
 
+function isLegacyJoiSurfaceMemory(memory: MemoryRecord) {
+  const text = `${memory.summary || ''}\n${memory.content || ''}`;
+  return /五个项目人格|私人总群群主|群主\s*Owner/i.test(text)
+    || /预览\s*UI[\s\S]*(?:房间|成员详情)[\s\S]*线程[\s\S]*资产[\s\S]*记忆/i.test(text);
+}
+
+function memoryMatchPercent(score: number) {
+  return Math.max(0, Math.min(100, Math.round(score * 100)));
+}
+
 function isMemoryProposalForRun(memory: MemoryRecord, runID: string) {
   if (!runID || isMemoryDisabled(memory)) return false;
   if (memory.status === 'confirmed' || memory.status === 'rejected' || memory.status === 'deleted') return false;
@@ -9125,6 +10539,16 @@ function memoryProposalWhy(memory: MemoryRecord) {
   const why = typeof memory.metadata?.why === 'string' ? memory.metadata.why : '';
   const futureEffect = typeof memory.metadata?.futureEffect === 'string' ? memory.metadata.futureEffect : '';
   return [why, futureEffect].filter(Boolean).join(' · ');
+}
+
+function memoryInsightTitle(memory: MemoryRecord) {
+  return memory.summary?.trim() || memory.content?.trim() || memory.type || '记忆';
+}
+
+function memoryInsightBody(memory: MemoryRecord) {
+  const title = memoryInsightTitle(memory).replace(/\s+/g, ' ').trim();
+  const body = memory.content?.replace(/\s+/g, ' ').trim() || '';
+  return body && body !== title ? body : undefined;
 }
 
 function extractUsedMemories(trace: RunTrace | null): MemorySearchResult[] {
@@ -9155,9 +10579,12 @@ function normalizeMemorySearchResult(value: unknown): MemorySearchResult | null 
 
 function formatMemoryReason(reason?: string) {
   if (!reason) return '召回';
-  if (reason === 'sqlite_fts5') return '全文召回';
-  if (reason === 'sqlite_keyword_fallback') return '关键词召回';
-  return reason;
+  const normalized = reason.toLowerCase();
+  if (normalized === 'sqlite_fts5') return '全文召回';
+  if (normalized === 'sqlite_keyword_fallback') return '关键词召回';
+  if (normalized.includes('confirmed')) return normalized.includes('global') ? '全局已确认' : '已确认';
+  if (normalized.includes('semantic') || normalized.includes('vector')) return '语义召回';
+  return '相关记忆';
 }
 
 function ExecutionActionFlow({
@@ -10454,6 +11881,34 @@ function ConfirmationsPanel({ confirmations, decide }: { confirmations: Confirma
   );
 }
 
+function compactQueueMessage(value: string) {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  return normalized.length > 72 ? `${normalized.slice(0, 72)}…` : normalized;
+}
+
+function findConversationTreeNode(node: ConversationTree['root'], conversationID: string): ConversationTree['root'] | null {
+  if (node.conversation_id === conversationID) return node;
+  for (const child of node.children) {
+    const found = findConversationTreeNode(child, conversationID);
+    if (found) return found;
+  }
+  return null;
+}
+
+function buildManualConversationSummary(messages: ConversationMessage[]) {
+  const selected = messages.slice(-14);
+  if (!selected.length) return '';
+  const transcript = selected.map((item) => {
+    const role = item.role === 'assistant' ? 'Joi' : item.role === 'user' ? '用户' : item.role;
+    const content = item.content.replace(/\s+/g, ' ').trim();
+    return `${role}：${content.length > 320 ? `${content.slice(0, 320)}…` : content}`;
+  });
+  return [
+    '会话检查点（完整原始记录仍保留）',
+    ...transcript,
+  ].join('\n');
+}
+
 function compactIdentifier(value?: string) {
   if (!value) return '';
   return value.length > 22 ? `${value.slice(0, 14)}...${value.slice(-5)}` : value;
@@ -10782,7 +12237,7 @@ function TraceRuntimeSummary({ trace }: { trace: RunTrace }) {
       <InsightList empty="本次没有注入 confirmed memory。">
         {usedMemories.map((result) => (
           <InsightItem key={`trace-memory-${result.memory.id}`} title={result.memory.summary || result.memory.type} body={result.memory.content}>
-            <small>匹配度 {Math.round(result.score * 100)}% · {formatMemoryReason(result.reason)}</small>
+            <small>匹配度 {memoryMatchPercent(result.score)}% · {formatMemoryReason(result.reason)}</small>
           </InsightItem>
         ))}
       </InsightList>
@@ -10949,23 +12404,56 @@ function userFacingDisclosureLabel(label: string) {
   return '补充信息';
 }
 
+function skillScopeLabel(scope: string) {
+  const labels: Record<string, string> = {
+    repo: '当前仓库',
+    user: '用户 Skills',
+    compat: 'Codex 兼容',
+    admin: '管理员',
+    system: 'Joi 内置',
+    extra: '扩展来源',
+    legacy: '旧版注册项',
+  };
+  return labels[scope] || scope;
+}
+
 function capabilityDisplayName(id: string, fallbackDescription = '') {
   const labels: Record<string, string> = {
     bash: '运行受控命令',
     browser_open: '打开网页',
     browser_scroll: '浏览网页',
     debugger_attach: '连接调试器',
+    debugger_breakpoint: '设置调试断点',
+    debugger_step: '单步调试',
+    debugger_evaluate: '读取调试变量',
+    debugger_stop: '结束调试',
+    delegate_task: '创建子 Agent',
     desktop_app_list: '查看已安装应用',
     execute_code: '运行代码',
     file_analyze: '分析文件',
     github: '访问 GitHub',
     image_generate: '生成图片',
+    find_roots: '查找可操作窗口',
+    observe_ui: '观察界面',
+    search_ui: '搜索界面元素',
+    expand_ui: '展开界面元素',
+    inspect_ui: '检查界面元素',
+    read_text: '读取界面文本',
+    wait_for: '等待界面状态',
+    act_ui: '操作屏幕',
     ls: '查看文件夹',
     mcp_tool_call: '使用已授权扩展',
     read_file: '读取文件',
     session_search: '搜索历史会话',
+    session_summary: '读取会话摘要',
+    session_branch: '创建会话分支',
+    session_compact: '压缩会话上下文',
+    speech_transcribe: '转写语音',
     text_to_speech: '生成语音',
     video_generate: '生成视频',
+    lsp_definition: '查找代码定义',
+    lsp_references: '查找代码引用',
+    lsp_diagnostics: '检查代码诊断',
     web_extract: '读取网页内容',
     web_search: '搜索网页',
     workspace_search: '搜索工作区',
@@ -11071,7 +12559,7 @@ function friendlyLogSummary(log: LogEntry) {
     return message.length > 140 ? `${message.slice(0, 137)}…` : message;
   }
   const category = formatLogCategory(log.category);
-  if (log.error || ['failed', 'error', 'fatal'].includes(String(log.status || log.level).toLowerCase())) return `${category}遇到问题`;
+  if (isLogFailure(log)) return `${category}遇到问题`;
   return `${category}已记录`;
 }
 
@@ -11106,6 +12594,92 @@ function objectFromUnknown(value: unknown): Record<string, unknown> {
   return {};
 }
 
+function parseJSONObject(value: string, label: string): Record<string, unknown> {
+  const text = value.trim();
+  if (!text) return {};
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${label} 必须是 JSON 对象`);
+    return parsed as Record<string, unknown>;
+  } catch (err) {
+    if (err instanceof SyntaxError) throw new Error(`${label} JSON 格式不正确：${err.message}`);
+    throw err;
+  }
+}
+
+function parseStringJSONObject(value: string, label: string): Record<string, string> {
+  const parsed = parseJSONObject(value, label);
+  return Object.fromEntries(Object.entries(parsed).map(([key, item]) => [key, String(item)]));
+}
+
+function splitCommandArguments(value: string): string[] {
+  const matches = value.match(/"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S+/g) || [];
+  return matches.map((item) => {
+    const quoted = item.match(/^(['"])([\s\S]*)\1$/);
+    return quoted ? quoted[2].replace(/\\(['"\\])/g, '$1') : item;
+  }).filter(Boolean);
+}
+
+function blobToDataURL(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('Unable to read recording'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function mediaOutputAttachment(output: Record<string, unknown> | null): Record<string, unknown> {
+  return objectFromUnknown(output?.attachment);
+}
+
+function mediaOutputPath(output: Record<string, unknown> | null): string {
+  return typeof output?.file_path === 'string' ? output.file_path : '';
+}
+
+function mediaOutputPreviewURL(output: Record<string, unknown> | null): string {
+  const attachment = mediaOutputAttachment(output);
+  if (typeof attachment.preview_url === 'string') return attachment.preview_url;
+  if (typeof output?.preview_url === 'string') return output.preview_url;
+  return mediaOutputPath(output) ? localPathURL(mediaOutputPath(output)) : '';
+}
+
+function mediaOutputKind(output: Record<string, unknown> | null): string {
+  const attachment = mediaOutputAttachment(output);
+  if (typeof attachment.kind === 'string') return attachment.kind;
+  const mime = typeof output?.mime_type === 'string' ? output.mime_type : '';
+  return mime.startsWith('video/') ? 'video' : mime.startsWith('audio/') ? 'audio' : '';
+}
+
+function localPathURL(path: string): string {
+  if (!path) return '';
+  if (/^[a-z]+:/i.test(path)) return path;
+  return `file://${encodeURI(path)}`;
+}
+
+function nextLocalDateTimeValue(offsetMinutes: number): string {
+  const date = new Date(Date.now() + offsetMinutes * 60_000);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function assistantActionStatus(action: string, result: { item?: unknown; text?: string }) {
+  const labels: Record<string, string> = {
+    start_activity: '活动记录已启动。',
+    stop_activity: '活动记录已停止并生成摘要。',
+    capture_activity_now: '已保存一次真实屏幕活动。',
+    create_calendar_item: '日历草稿已保存。',
+    publish_calendar_item: '事件已发布到 macOS 日历。',
+    create_plan: '计划已创建。',
+    add_plan_node: '计划节点已添加。',
+    update_plan_node: '计划节点已更新。',
+    review_plan: '计划复盘已更新。',
+    configure_channel: '渠道密钥已保存到 macOS Keychain。',
+    send_channel_message: '消息已通过真实渠道发送。',
+  };
+  return result.text || labels[action] || `${action} 已完成。`;
+}
+
 function booleanFromUnknown(value: unknown): boolean {
   return value === true || value === 'true';
 }
@@ -11137,6 +12711,29 @@ function formatDisplayValue(value: unknown): string {
   if (Array.isArray(value)) return `${value.length} 项`;
   if (value === null || value === undefined) return '未设置';
   return '已配置';
+}
+
+function isUserFacingSecret(value: string) {
+  return ['MODEL_API_KEY', 'TELEGRAM_BOT_TOKEN', 'WORKER_TOKEN'].includes(value);
+}
+
+function confirmationActionLabel(action: string, capabilityID: string) {
+  const text = action.trim();
+  if (/[一-鿿]/.test(text)) return text;
+  const normalized = `${text} ${capabilityID}`.toLowerCase();
+  if (normalized.includes('apply_patch') || normalized.includes('file_write')) return '修改工作区文件';
+  if (normalized.includes('shell') || normalized.includes('command') || normalized.includes('bash')) return '运行本机命令';
+  if (normalized.includes('delete') || normalized.includes('remove')) return '删除内容';
+  return capabilityDisplayName(capabilityID);
+}
+
+function secretDisplayName(value: string) {
+  const labels: Record<string, string> = {
+    MODEL_API_KEY: '模型服务密钥',
+    TELEGRAM_BOT_TOKEN: 'Telegram 机器人令牌',
+    WORKER_TOKEN: '执行器连接凭证',
+  };
+  return labels[value] || '连接凭证';
 }
 
 function formatBoolean(value: boolean) {

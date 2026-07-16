@@ -19,6 +19,15 @@ export function getEventVisibility(event: NormalizedRunEvent, mode: ChatInputMod
   const itemType = event.itemType;
   const declared = normalizeDeclaredVisibility(event.visibility);
 
+  // The composer already renders pending queue entries as cancellable chips and
+  // delivered entries become normal user messages. Re-projecting the queue
+  // lifecycle as transcript rows leaves a stale "pending" row beside a
+  // completed run, which looks like the agent is still working. Keep the full
+  // lifecycle in Run Trace without duplicating it in the conversation.
+  if (isRunMessageQueueEvent(type)) {
+    return 'trace_only';
+  }
+
   if (declared === 'hidden') {
     return 'hidden';
   }
@@ -91,6 +100,12 @@ export function getEventVisibility(event: NormalizedRunEvent, mode: ChatInputMod
   }
 
   return 'trace_only';
+}
+
+function isRunMessageQueueEvent(type: string): boolean {
+  return type === 'run.message_queue_drained'
+    || type === 'run.message_queue_cancelled'
+    || /^run\.message_(?:steering|follow_up)_(?:queued|delivered|cancelled)$/.test(type);
 }
 
 function isExecutionProcessEvent(event: NormalizedRunEvent): boolean {

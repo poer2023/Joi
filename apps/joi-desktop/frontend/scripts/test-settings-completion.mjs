@@ -13,12 +13,17 @@ const store = readFileSync(resolve(root, 'packages/store/src/sqlite.ts'), 'utf8'
 const routedObjects = [
   'desktop-notify', 'webhook',
   'builtin', 'skills', 'plugins', 'mcp', 'web-search', 'filesystem', 'browser', 'github', 'custom-tools',
-  'assignment-policy', 'privacy-policy', 'remote-permission',
+  'assignment-policy',
 ];
 
 for (const id of routedObjects) {
   assert.match(app, new RegExp(`activeObject\\.id === '${id}'`), `missing independent settings renderer: ${id}`);
 }
+
+assert.match(app, /function renderPrivacyDetail\(\)/);
+assert.match(app, /id: 'privacy-policy', label: '安全策略'/);
+assert.match(app, /<DetailHeader title="安全策略"/);
+assert.doesNotMatch(app, /id: 'remote-permission'/);
 
 for (const method of [
   'SetCapabilityEnabled', 'SaveMCPServer', 'DeleteMCPServer', 'SetMCPServerEnabled',
@@ -51,8 +56,10 @@ assert.match(contract, /export type MemoryQualityMetrics/);
 assert.match(store, /memory\.scope_resolved/);
 assert.match(store, /FROM memory_fts/);
 assert.match(app, /节点分配策略已保存/);
-assert.match(app, /诊断脱敏设置已保存/);
-assert.match(app, /id: 'diagnostic-redaction'.+诊断脱敏/s);
+assert.match(app, /function renderAdvancedDetail\(\)/);
+assert.match(app, /<DetailHeader title="支持与诊断"/);
+assert.match(app, /导出脱敏诊断包/);
+assert.doesNotMatch(app, /id: 'diagnostic-redaction'/);
 assert.match(app, /executionRoutingForSettings\(workspaceSettings\)/);
 assert.match(app, /new-webhook/);
 assert.deepEqual(executionRoutingForSettings(null), { preferredNode: 'main-node', allowWorker: false, reason: 'privacy_local_only' });
@@ -72,4 +79,4 @@ assert.equal(executionRoutingForSettings({
 assert.match(store, /removeLegacyMCPPlaceholders/);
 assert.doesNotMatch(api, /Local MCP Registry/);
 
-console.log(`settings completion contract passed: ${routedObjects.length} formerly missing routes covered`);
+console.log(`settings completion contract passed: ${routedObjects.length} explicit routes plus current privacy/support fallback covered`);

@@ -234,20 +234,31 @@ export async function executeWebResearch(
     const finalURL = response.finalURL;
     const body = decodeUTF8(response.body);
     const extraction = extractReadableHTML(body);
-    const readable = truncateRunes(extraction.text, maxReadableTextRunes);
-    const links = [...body.matchAll(/href=["']([^"']+)["']/gi)].slice(0, 20).map((match) => match[1]);
+    const succeeded = response.statusCode >= 200 && response.statusCode < 300;
+    const readable = succeeded
+      ? truncateRunes(extraction.text, maxReadableTextRunes)
+      : { text: '', truncated: false };
+    const links = succeeded
+      ? [...body.matchAll(/href=["']([^"']+)["']/gi)].slice(0, 20).map((match) => match[1])
+      : [];
+    const failureClass = succeeded ? undefined : webResearchHTTPFailureClass(response.statusCode);
     return {
-      status: response.statusCode >= 200 && response.statusCode < 300 ? 'completed' : 'failed',
+      status: succeeded ? 'completed' : 'failed',
       url,
       final_url: finalURL,
-      fetch_status: response.statusCode >= 200 && response.statusCode < 300 ? 'succeeded' : 'http_error',
+      fetch_status: succeeded ? 'succeeded' : 'http_error',
       status_code: response.statusCode,
       content_type: headerValue(response.headers, 'content-type'),
-      title: extraction.title,
+      title: succeeded ? extraction.title : '',
       readable_text: readable.text,
       text_length: [...readable.text].length,
       links,
-      summary: summarizeReadableText(readable.text),
+      summary: succeeded
+        ? summarizeReadableText(readable.text)
+        : `Source could not be verified: HTTP ${response.statusCode} (${failureClass}) at ${finalURL}.`,
+      source_verified: succeeded,
+      failure_class: failureClass,
+      retryable: succeeded ? false : webResearchHTTPFailureRetryable(response.statusCode),
       extraction: {
         source: extraction.source,
         readable_text_truncated: readable.truncated,
@@ -715,6 +726,18 @@ function headerValue(headers: IncomingHttpHeaders, name: string): string {
   const value = headers[name.toLowerCase()];
   if (Array.isArray(value)) return String(value[0] || '').trim();
   return String(value || '').trim();
+}
+
+function webResearchHTTPFailureClass(statusCode: number): string {
+  if (statusCode === 401 || statusCode === 403) return 'origin_access_restricted';
+  if (statusCode === 404 || statusCode === 410) return 'origin_not_found';
+  if (statusCode === 408 || statusCode === 429) return 'origin_rate_limited';
+  if (statusCode >= 500) return 'origin_server_error';
+  return 'origin_http_error';
+}
+
+function webResearchHTTPFailureRetryable(statusCode: number): boolean {
+  return statusCode === 408 || statusCode === 429 || statusCode >= 500;
 }
 
 function isRedirectStatus(statusCode: number): boolean {

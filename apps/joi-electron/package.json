@@ -10,15 +10,22 @@
     "dev": "electron-vite dev",
     "build": "tsc --noEmit && electron-vite build",
     "package:mac": "pnpm build && electron-builder --mac dir --arm64 --config.mac.identity=null",
-    "test:contract": "node --experimental-strip-types scripts/test-github-connection.mjs && node --experimental-strip-types scripts/test-plugin-manager.mjs && node scripts/test-acp-ephemeral-launcher.mjs && node --experimental-strip-types scripts/test-acp-web-mcp.mjs && node --experimental-strip-types scripts/test-imessage-outbound.mjs && node --experimental-strip-types scripts/test-telegram-acp-routing.mjs && node --experimental-strip-types scripts/test-telegram-outbound.mjs && node scripts/test-preload-contract.mjs && node scripts/test-automation-webhook-server.mjs",
+    "test:contract": "node --experimental-strip-types scripts/test-github-connection.mjs && node --experimental-strip-types scripts/test-plugin-manager.mjs && node --experimental-strip-types scripts/test-mcp-runtime.mjs && node scripts/test-acp-ephemeral-launcher.mjs && node --experimental-strip-types scripts/test-acp-web-mcp.mjs && node --experimental-strip-types scripts/test-imessage-outbound.mjs && node --experimental-strip-types scripts/test-telegram-acp-routing.mjs && node --experimental-strip-types scripts/test-telegram-outbound.mjs && node scripts/test-main-window-lifecycle.mjs && node scripts/test-preload-contract.mjs && node scripts/test-automation-webhook-server.mjs && node --experimental-strip-types scripts/test-automation-capabilities.mjs && node --experimental-strip-types scripts/test-local-agent-capabilities.mjs && node --experimental-strip-types scripts/test-native-code-tools.mjs && node --experimental-strip-types scripts/test-media-analysis.mjs && node --experimental-strip-types scripts/test-assistant-runtime.mjs && node scripts/test-browser-workbench.mjs",
     "test:plugin-github-live": "node --experimental-strip-types scripts/test-plugin-manager-github-live.mjs"
   },
   "dependencies": {
+    "@injaneity/pi-computer-use": "0.4.3",
     "@joi/shared-types": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.29.0",
     "node-pty": "^1.1.0",
+    "pyright": "^1.1.411",
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "react-router-dom": "7.9.6",
+    "typescript": "^6.0.3",
+    "typescript-language-server": "^5.3.0",
+    "vscode-langservers-extracted": "^4.10.0",
+    "yaml": "2.9.0",
     "zod": "^4.4.3"
   },
   "build": {
@@ -52,6 +59,10 @@
       {
         "from": "resources/photon-sidecar",
         "to": "photon-sidecar"
+      },
+      {
+        "from": "node_modules/@injaneity/pi-computer-use",
+        "to": "pi-computer-use"
       }
     ],
     "mac": {
@@ -70,7 +81,6 @@
     "electron": "^42.4.1",
     "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
-    "typescript": "^6.0.3",
     "vite": "^7.3.3"
   }
 }
