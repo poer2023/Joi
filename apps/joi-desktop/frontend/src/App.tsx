@@ -701,6 +701,9 @@ export default function App() {
       ...current,
       [category]: objectID ?? current[category] ?? defaultSettingsObjectByCategory[category],
     }));
+    if (objectID) {
+      setSidebarPreference('collapsed');
+    }
   }
 
   function showNotice(value: string) {

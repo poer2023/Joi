@@ -24,6 +24,9 @@ assert.match(app, /function renderPrivacyDetail\(\)/);
 assert.match(app, /id: 'privacy-policy', label: '安全策略'/);
 assert.match(app, /<DetailHeader title="安全策略"/);
 assert.doesNotMatch(app, /id: 'remote-permission'/);
+assert.match(app, /if \(objectID\) \{\s*setSidebarPreference\('collapsed'\);\s*\}/);
+assert.match(app, /onClick=\{\(\) => selectSettingsObject\(section\.id\)\}/);
+assert.match(app, /onClick=\{\(\) => selectSettingsObject\(activeCategory, item\.id\)\}/);
 
 for (const method of [
   'SetCapabilityEnabled', 'SaveMCPServer', 'DeleteMCPServer', 'SetMCPServerEnabled',
