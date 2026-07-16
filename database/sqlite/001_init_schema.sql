@@ -1209,16 +1209,24 @@ CREATE TABLE IF NOT EXISTS automation_runs (
 
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
+  layer TEXT NOT NULL DEFAULT 'knowledge',
   type TEXT NOT NULL,
+  memory_key TEXT NOT NULL DEFAULT '',
   content TEXT NOT NULL,
   summary TEXT,
   scope_type TEXT NOT NULL DEFAULT 'global',
   scope_id TEXT,
   privacy_level TEXT NOT NULL DEFAULT 'internal',
+  evidence_kind TEXT NOT NULL DEFAULT 'legacy',
+  evidence_authority INTEGER NOT NULL DEFAULT 20,
+  evidence_count INTEGER NOT NULL DEFAULT 1,
   confidence REAL NOT NULL DEFAULT 0.5,
   status TEXT NOT NULL DEFAULT 'pending',
+  lifecycle_state TEXT NOT NULL DEFAULT 'active',
   source_event_ids TEXT NOT NULL DEFAULT '[]',
+  source_kind TEXT NOT NULL DEFAULT 'conversation',
   entities TEXT NOT NULL DEFAULT '[]',
+  context_tags TEXT NOT NULL DEFAULT '[]',
   success_count INTEGER NOT NULL DEFAULT 0,
   failure_count INTEGER NOT NULL DEFAULT 0,
   usage_count INTEGER NOT NULL DEFAULT 0,
@@ -1227,8 +1235,16 @@ CREATE TABLE IF NOT EXISTS memories (
   pinned INTEGER NOT NULL DEFAULT 0,
   disabled_at TEXT,
   merged_into_memory_id TEXT REFERENCES memories(id),
+  supersedes_memory_id TEXT REFERENCES memories(id),
   conflict_group_id TEXT,
   conflict_reason TEXT,
+  review_reason TEXT,
+  valid_from TEXT,
+  valid_until TEXT,
+  last_verified_at TEXT,
+  archived_at TEXT,
+  auto_managed INTEGER NOT NULL DEFAULT 1,
+  retention_policy TEXT NOT NULL DEFAULT 'standard',
   metadata TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1267,8 +1283,13 @@ CREATE TABLE IF NOT EXISTS memory_usage_logs (
   run_id TEXT REFERENCES runs(id),
   agent_id TEXT REFERENCES agents(id),
   retrieval_score REAL,
+  normalized_score REAL,
+  recalled INTEGER NOT NULL DEFAULT 1,
   injected INTEGER NOT NULL DEFAULT 0,
   used_in_answer INTEGER NOT NULL DEFAULT 0,
+  influence_state TEXT NOT NULL DEFAULT 'unknown',
+  rank INTEGER,
+  pipeline_version TEXT NOT NULL DEFAULT 'legacy',
   outcome TEXT,
   metadata TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -1281,6 +1302,87 @@ CREATE TABLE IF NOT EXISTS memory_feedback (
   feedback TEXT NOT NULL,
   comment TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS memory_observations (
+  id TEXT PRIMARY KEY,
+  memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+  memory_key TEXT NOT NULL,
+  layer TEXT NOT NULL,
+  type TEXT NOT NULL,
+  statement TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '',
+  scope_type TEXT NOT NULL DEFAULT 'user',
+  scope_id TEXT,
+  privacy_level TEXT NOT NULL DEFAULT 'internal',
+  evidence_kind TEXT NOT NULL,
+  evidence_authority INTEGER NOT NULL DEFAULT 20,
+  confidence REAL NOT NULL DEFAULT 0.5,
+  polarity INTEGER NOT NULL DEFAULT 0,
+  context_tags TEXT NOT NULL DEFAULT '[]',
+  source_event_id TEXT,
+  run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  status TEXT NOT NULL DEFAULT 'recorded',
+  review_reason TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS memory_events (
+  id TEXT PRIMARY KEY,
+  memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+  event_type TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT 'memory_runtime',
+  source_event_id TEXT,
+  run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+  before_json TEXT NOT NULL DEFAULT '{}',
+  after_json TEXT NOT NULL DEFAULT '{}',
+  reason TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS memory_policies (
+  id TEXT PRIMARY KEY,
+  version INTEGER NOT NULL,
+  config TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS memory_generation_inputs (
+  id TEXT PRIMARY KEY,
+  run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+  turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  user_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  eligible_after TEXT NOT NULL,
+  external_context_used INTEGER NOT NULL DEFAULT 0,
+  exclusion_reason TEXT NOT NULL DEFAULT '',
+  controls TEXT NOT NULL DEFAULT '{}',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  processed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memory_maintenance_runs (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'running',
+  trigger_source TEXT NOT NULL DEFAULT 'runtime',
+  processed_input_count INTEGER NOT NULL DEFAULT 0,
+  generated_observation_count INTEGER NOT NULL DEFAULT 0,
+  expired_count INTEGER NOT NULL DEFAULT 0,
+  merged_count INTEGER NOT NULL DEFAULT 0,
+  embedding_count INTEGER NOT NULL DEFAULT 0,
+  error_summary TEXT NOT NULL DEFAULT '',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  started_at TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS confirmations (
@@ -1369,6 +1471,8 @@ CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_type, scope_id);
 CREATE INDEX IF NOT EXISTS idx_memories_governance ON memories(status, pinned, disabled_at, merged_into_memory_id);
+CREATE INDEX IF NOT EXISTS idx_memories_layer_lifecycle ON memories(layer, lifecycle_state, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_memory_key ON memories(memory_key, scope_type, scope_id, status);
 CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
 CREATE INDEX IF NOT EXISTS idx_nodes_assign_enabled ON nodes(status, auto_assign_enabled, manual_assign_enabled);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -1398,6 +1502,10 @@ CREATE INDEX IF NOT EXISTS idx_proactive_feedback_message ON proactive_feedback(
 CREATE INDEX IF NOT EXISTS idx_memory_usage_run_id ON memory_usage_logs(run_id);
 CREATE INDEX IF NOT EXISTS idx_memory_usage_memory_id ON memory_usage_logs(memory_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_feedback_memory_id ON memory_feedback(memory_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_observations_key ON memory_observations(memory_key, scope_type, scope_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_events_memory ON memory_events(memory_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_generation_status ON memory_generation_inputs(status, eligible_after, created_at);
+CREATE INDEX IF NOT EXISTS idx_memory_maintenance_finished ON memory_maintenance_runs(finished_at DESC);
 CREATE INDEX IF NOT EXISTS idx_confirmation_requests_status ON confirmation_requests(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_principals_status ON principals(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_channel_identities_principal ON channel_identities(principal_id, channel);

@@ -22,6 +22,26 @@ import {
   type SkillScope,
   type SkillSelectionCandidate,
 } from '../../runtime/src/skills.ts';
+import {
+  attributeMemoryAnswerInfluence,
+  canonicalMemoryKey,
+  cosineSimilarity,
+  createTaskEpisodeObservation,
+  DEFAULT_MEMORY_POLICY,
+  extractMemoryObservations,
+  inferLegacyMemoryLayer,
+  inferMemoryContextTags,
+  lexicalSimilarity,
+  LOCAL_MEMORY_EMBEDDING_MODEL,
+  localMemoryVector,
+  MEMORY_PIPELINE_VERSION,
+  memoryEvidenceAuthority,
+  memoryGenerationExclusionReason,
+  memorySearchFeatures,
+  normalizeRelevanceScore,
+  type MemoryObservationDraft,
+  type MemoryPolicyConfig,
+} from './memory-engine.ts';
 import type {
   AvailableModel,
   AgentModelPolicy,
@@ -72,8 +92,12 @@ import type {
   MCPServerConfigRequest,
   MCPWrapToolRequest,
   MemoryRecord,
+  MemoryMaintenanceRun,
   MemoryQualityMetrics,
   MemorySearchResult,
+  MemorySettingsRecord,
+  MemorySystemSnapshot,
+  MemoryTaskControls,
   MessengerProject,
   MessengerRoom,
   MessengerThread,
@@ -416,6 +440,9 @@ export type ToolCallingPromptAssembly = {
   memory_profile_version: string;
   tool_schema_version: string;
   memory_results: MemorySearchResult[];
+  stable_memory_results: MemorySearchResult[];
+  dynamic_memory_results: MemorySearchResult[];
+  memory_controls: MemoryTaskControls;
   memory_scope: MemoryRetrievalScope;
   conversation_messages: Array<{ role: 'user' | 'assistant'; content: string }>;
   agent_capabilities: string[];
@@ -453,6 +480,7 @@ export type StartedToolCallingChat = {
   model_name: string;
   model_base_url?: string;
   model_reasoning_effort?: string;
+  memory_controls: MemoryTaskControls;
   prompt_assembly: ToolCallingPromptAssembly;
   product_task_id?: string;
   product_task?: ProductTask;
@@ -618,6 +646,8 @@ const promptConversationMessageLimit = 700;
 export class JoiSQLiteStore {
   private db: DatabaseSync;
   private options: JoiSQLiteStoreOptions;
+  private memoryMaintenanceTimer?: ReturnType<typeof setTimeout>;
+  private closed = false;
 
   constructor(options: JoiSQLiteStoreOptions) {
     this.options = options;
@@ -625,7 +655,9 @@ export class JoiSQLiteStore {
     this.db = new DatabaseSync(options.dbPath);
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
     this.ensurePreSchemaCompatibilityColumns();
+    this.ensureMemoryCompatibilityColumns();
     this.db.exec(options.schemaSql);
+    this.ensureMemorySystemSchema();
     this.ensureConversationClosureSchema();
     this.ensureAdvancedAgentSchema();
     this.ensureAgentWorkbenchSchema();
@@ -637,9 +669,13 @@ export class JoiSQLiteStore {
     this.classifyRecoverableRunsOnStartup();
     this.recoverInterruptedAutomationTriggersOnStartup();
     this.recoverTelegramInboundInboxOnStartup();
+    this.scheduleMemoryMaintenance('startup', 2_000);
   }
 
   close(): void {
+    this.closed = true;
+    if (this.memoryMaintenanceTimer) clearTimeout(this.memoryMaintenanceTimer);
+    this.memoryMaintenanceTimer = undefined;
     this.db.close();
   }
 
@@ -705,6 +741,190 @@ export class JoiSQLiteStore {
       ['env', "TEXT NOT NULL DEFAULT '{}'"],
       ['headers', "TEXT NOT NULL DEFAULT '{}'"],
     ] as const) ensure('mcp_servers', column, definition);
+  }
+
+  private ensureMemoryCompatibilityColumns(): void {
+    const ensure = (table: string, column: string, definition: string) => {
+      if (!this.tableExists(table) || this.columnExists(table, column)) return;
+      this.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${quoteIdentifier(column)} ${definition}`);
+    };
+    for (const [column, definition] of [
+      ['layer', "TEXT NOT NULL DEFAULT 'knowledge'"],
+      ['memory_key', "TEXT NOT NULL DEFAULT ''"],
+      ['evidence_kind', "TEXT NOT NULL DEFAULT 'legacy'"],
+      ['evidence_authority', 'INTEGER NOT NULL DEFAULT 20'],
+      ['evidence_count', 'INTEGER NOT NULL DEFAULT 1'],
+      ['lifecycle_state', "TEXT NOT NULL DEFAULT 'active'"],
+      ['source_kind', "TEXT NOT NULL DEFAULT 'conversation'"],
+      ['context_tags', "TEXT NOT NULL DEFAULT '[]'"],
+      ['supersedes_memory_id', 'TEXT REFERENCES memories(id)'],
+      ['review_reason', 'TEXT'],
+      ['valid_from', 'TEXT'],
+      ['valid_until', 'TEXT'],
+      ['last_verified_at', 'TEXT'],
+      ['archived_at', 'TEXT'],
+      ['auto_managed', 'INTEGER NOT NULL DEFAULT 1'],
+      ['retention_policy', "TEXT NOT NULL DEFAULT 'standard'"],
+    ] as const) ensure('memories', column, definition);
+    for (const [column, definition] of [
+      ['normalized_score', 'REAL'],
+      ['recalled', 'INTEGER NOT NULL DEFAULT 1'],
+      ['influence_state', "TEXT NOT NULL DEFAULT 'unknown'"],
+      ['rank', 'INTEGER'],
+      ['pipeline_version', "TEXT NOT NULL DEFAULT 'legacy'"],
+    ] as const) ensure('memory_usage_logs', column, definition);
+  }
+
+  private ensureMemorySystemSchema(): void {
+    this.ensureMemoryCompatibilityColumns();
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_observations (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+        memory_key TEXT NOT NULL,
+        layer TEXT NOT NULL,
+        type TEXT NOT NULL,
+        statement TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        scope_type TEXT NOT NULL DEFAULT 'user',
+        scope_id TEXT,
+        privacy_level TEXT NOT NULL DEFAULT 'internal',
+        evidence_kind TEXT NOT NULL,
+        evidence_authority INTEGER NOT NULL DEFAULT 20,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        polarity INTEGER NOT NULL DEFAULT 0,
+        context_tags TEXT NOT NULL DEFAULT '[]',
+        source_event_id TEXT,
+        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        status TEXT NOT NULL DEFAULT 'recorded',
+        review_reason TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS memory_events (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+        event_type TEXT NOT NULL,
+        actor TEXT NOT NULL DEFAULT 'memory_runtime',
+        source_event_id TEXT,
+        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        before_json TEXT NOT NULL DEFAULT '{}',
+        after_json TEXT NOT NULL DEFAULT '{}',
+        reason TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS memory_policies (
+        id TEXT PRIMARY KEY,
+        version INTEGER NOT NULL,
+        config TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS memory_generation_inputs (
+        id TEXT PRIMARY KEY,
+        run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+        turn_id TEXT REFERENCES turns(id) ON DELETE SET NULL,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        user_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        eligible_after TEXT NOT NULL,
+        external_context_used INTEGER NOT NULL DEFAULT 0,
+        exclusion_reason TEXT NOT NULL DEFAULT '',
+        controls TEXT NOT NULL DEFAULT '{}',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        processed_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS memory_maintenance_runs (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'running',
+        trigger_source TEXT NOT NULL DEFAULT 'runtime',
+        processed_input_count INTEGER NOT NULL DEFAULT 0,
+        generated_observation_count INTEGER NOT NULL DEFAULT 0,
+        expired_count INTEGER NOT NULL DEFAULT 0,
+        merged_count INTEGER NOT NULL DEFAULT 0,
+        embedding_count INTEGER NOT NULL DEFAULT 0,
+        error_summary TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        finished_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_memories_layer_lifecycle ON memories(layer, lifecycle_state, status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_memories_memory_key ON memories(memory_key, scope_type, scope_id, status);
+      CREATE INDEX IF NOT EXISTS idx_memory_observations_key ON memory_observations(memory_key, scope_type, scope_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_memory_events_memory ON memory_events(memory_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_memory_generation_status ON memory_generation_inputs(status, eligible_after, created_at);
+      CREATE INDEX IF NOT EXISTS idx_memory_maintenance_finished ON memory_maintenance_runs(finished_at DESC);
+    `);
+    const ensure = (table: string, column: string, definition: string) => {
+      if (!this.tableExists(table) || this.columnExists(table, column)) return;
+      this.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${quoteIdentifier(column)} ${definition}`);
+    };
+    for (const [column, definition] of [
+      ['processed_input_count', 'INTEGER NOT NULL DEFAULT 0'],
+      ['generated_observation_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ] as const) ensure('memory_maintenance_runs', column, definition);
+    this.exec(
+      `UPDATE memory_maintenance_runs
+       SET status='interrupted', error_summary=COALESCE(NULLIF(error_summary, ''), 'interrupted_before_store_restart'),
+           finished_at=COALESCE(finished_at, datetime('now'))
+       WHERE status='running'`,
+    );
+    const existing = this.get(`SELECT config FROM memory_policies WHERE status='active' ORDER BY version DESC LIMIT 1`);
+    const inherited = existing ? parseObject(existing.config) : {};
+    this.exec(
+      `INSERT INTO memory_policies (id, version, config, status)
+       VALUES ('memory_policy_v3', ?, ?, 'active')
+       ON CONFLICT(id) DO NOTHING`,
+      DEFAULT_MEMORY_POLICY.version,
+      json({ ...DEFAULT_MEMORY_POLICY, ...inherited, version: DEFAULT_MEMORY_POLICY.version }),
+    );
+    this.backfillLegacyMemoryMetadata();
+  }
+
+  private backfillLegacyMemoryMetadata(): void {
+    for (const row of this.all(`SELECT * FROM memories`)) {
+      const metadata = parseObject(row.metadata);
+      const type = optionalString(row.type) || 'note';
+      const layer = optionalString(row.layer) && optionalString(row.layer) !== 'knowledge'
+        ? optionalString(row.layer) as ReturnType<typeof inferLegacyMemoryLayer>
+        : inferLegacyMemoryLayer(type, metadata);
+      const tags = parseStringArray(row.context_tags);
+      const contextTags = tags.length ? tags : inferMemoryContextTags(`${optionalString(row.summary)} ${optionalString(row.content)}`);
+      const memoryKey = optionalString(row.memory_key)
+        || canonicalMemoryKey(optionalString(row.content) || '', layer, type, contextTags);
+      const status = optionalString(row.status) || 'pending';
+      const lifecycle = row.merged_into_memory_id
+        ? 'superseded'
+        : row.disabled_at
+          ? 'disabled'
+          : ['deleted', 'rejected', 'archived'].includes(status)
+            ? 'archived'
+            : status === 'conflicted'
+              ? 'review'
+              : ['pending', 'candidate', 'proposed', 'observed'].includes(status)
+                ? 'provisional'
+                : 'active';
+      this.exec(
+        `UPDATE memories
+         SET layer=?, memory_key=?, evidence_kind=COALESCE(NULLIF(evidence_kind, ''), 'legacy'),
+             evidence_authority=MAX(20, COALESCE(evidence_authority, 20)),
+             evidence_count=MAX(1, COALESCE(evidence_count, 1), COALESCE(CAST(json_extract(metadata, '$.duplicate_count') AS INTEGER), 0) + 1),
+             lifecycle_state=?, source_kind=COALESCE(NULLIF(source_kind, ''), NULLIF(json_extract(metadata, '$.candidate_source'), ''), 'conversation'),
+             context_tags=?, valid_from=COALESCE(valid_from, created_at), last_verified_at=COALESCE(last_verified_at, updated_at)
+         WHERE id=?`,
+        layer,
+        memoryKey,
+        lifecycle,
+        json(contextTags),
+        String(row.id),
+      );
+    }
   }
 
   recordAppLog(input: AppLogInput): LogEntry {
@@ -2211,8 +2431,13 @@ export class JoiSQLiteStore {
     );
     const agentCapabilities = normalizeAgentCapabilityList(parseArray(agent?.capabilities).map(String));
     const memoryScope = this.resolveMemoryRetrievalScope(req);
-    const memoryResults = this.searchPromptMemories(req.message || '', 8, memoryScope);
-    const memoryProfileVersion = memoryProfileVersionFor(memoryResults);
+    const memoryControls = this.effectiveMemoryControls(req);
+    const stableMemoryResults = memoryControls.use_memories ? this.stableMemoryProfile(memoryScope) : [];
+    const dynamicMemoryResults = memoryControls.use_memories ? this.searchPromptMemories(req.message || '', 8, memoryScope) : [];
+    const memoryResults = [...new Map(
+      [...stableMemoryResults, ...dynamicMemoryResults].map((result) => [result.memory.id, result]),
+    ).values()];
+    const memoryProfileVersion = memoryProfileVersionFor(stableMemoryResults);
     const conversationContext = this.buildPromptConversationContext(req.conversation_id);
     const skillCandidates = this.skillSelectionCandidates();
     const skillCatalog = renderSkillCatalog(skillCandidates, 8_000);
@@ -2254,7 +2479,9 @@ export class JoiSQLiteStore {
       '',
       'Stable Memory Profile',
       `version: ${memoryProfileVersion}`,
-      `confirmed_memory_count: ${memoryResults.length}`,
+      `confirmed_memory_count: ${stableMemoryResults.length}`,
+      `use_memories: ${memoryControls.use_memories}`,
+      JSON.stringify(stableMemoryResults.map(memoryPromptItem)),
       '',
       'Tool Schema Version',
       toolSchemaVersion,
@@ -2278,14 +2505,7 @@ export class JoiSQLiteStore {
       ...(selectedSkillInstructions ? ['', selectedSkillInstructions] : []),
       '',
       'Dynamic Memory Retrieval',
-      JSON.stringify(memoryResults.map((result) => ({
-        id: result.memory.id,
-        type: result.memory.type,
-        summary: result.memory.summary,
-        content: result.memory.content,
-        score: result.score,
-        reason: result.reason,
-      }))),
+      JSON.stringify(dynamicMemoryResults.map(memoryPromptItem)),
     ].join('\n');
     const prefixHash = hashText(cacheablePrefix);
     const dynamicTailHash = hashText(dynamicTail);
@@ -2298,6 +2518,9 @@ export class JoiSQLiteStore {
       memory_profile_version: memoryProfileVersion,
       tool_schema_version: toolSchemaVersion,
       memory_results: memoryResults,
+      stable_memory_results: stableMemoryResults,
+      dynamic_memory_results: dynamicMemoryResults,
+      memory_controls: memoryControls,
       memory_scope: memoryScope,
       conversation_messages: conversationContext.messages,
       agent_capabilities: agentCapabilities,
@@ -3024,13 +3247,16 @@ export class JoiSQLiteStore {
       this.appendCrossEntryHandoffEvent(runID, turnID, entryIdentity, req, productTask?.id);
       this.exec(
         `INSERT INTO memory_context_packs (id, run_id, agent_id, memory_profile_version, profile, project_facts, relevant_episodes, heuristics, anti_patterns, open_issues, dynamic_retrieval, metadata)
-         VALUES (?, ?, ?, ?, '[]', '[]', '[]', '[]', '[]', '[]', ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '[]', '[]', ?, ?)`,
         memoryPackID,
         runID,
         agentID,
         prompt.memory_profile_version,
-        json(prompt.memory_results || []),
-        json({ source: 'electron_ts_tool_calling', memory_result_count: prompt.memory_results?.length || 0, memory_scope: prompt.memory_scope }),
+        json(prompt.stable_memory_results || []),
+        json((prompt.dynamic_memory_results || []).filter((result) => result.memory.layer === 'knowledge')),
+        json((prompt.dynamic_memory_results || []).filter((result) => result.memory.layer === 'episode')),
+        json(prompt.dynamic_memory_results || []),
+        json({ source: 'electron_ts_tool_calling', pipeline_version: MEMORY_PIPELINE_VERSION, memory_result_count: prompt.memory_results?.length || 0, memory_scope: prompt.memory_scope, memory_controls: prompt.memory_controls }),
       );
       this.appendMemoryRecalledEvents(runID, turnID, memoryPackID, prompt.memory_results || [], prompt.memory_scope);
       this.recordMemoryRetrievalUsage(runID, agentID, prompt.memory_results || [], prompt.memory_scope);
@@ -3103,6 +3329,7 @@ export class JoiSQLiteStore {
       model_name: modelName,
       model_base_url: modelBaseURL,
       model_reasoning_effort: modelReasoningEffort,
+      memory_controls: prompt.memory_controls,
       prompt_assembly: prompt,
       product_task_id: productTask?.id,
       product_task: productTask,
@@ -3561,7 +3788,12 @@ export class JoiSQLiteStore {
         productTask = this.getProductTask(started.product_task_id).task;
       }
       if (!waitingConfirmation) {
-        this.insertPostRunMemoryProposal(started.run_id, started.turn_id, started.user_message);
+        this.recordPostRunMemoryLearning({
+          conversation_id: started.conversation_id,
+          message: started.user_message,
+          memory_controls: started.memory_controls,
+        }, started.run_id, started.turn_id, response);
+        this.attributeMemoryInfluence(started.run_id, response);
       }
       const persistedToolRunCount = this.persistedToolRunCountForRun(started.run_id);
       this.insertRunStep(started.run_id, 'model_call_finished', 'Model call finished', { agent_id: started.selected_agent_id, model_id: started.model_name, prompt_assembly_id: started.prompt_assembly_id }, { provider: started.provider, model: started.model_name, real_model: started.provider !== 'mock_provider', fallback_to_mock: false, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_count: persistedToolRunCount });
@@ -3909,13 +4141,16 @@ export class JoiSQLiteStore {
 
       this.exec(
         `INSERT INTO memory_context_packs (id, run_id, agent_id, memory_profile_version, profile, project_facts, relevant_episodes, heuristics, anti_patterns, open_issues, dynamic_retrieval, metadata)
-         VALUES (?, ?, ?, ?, '[]', '[]', '[]', '[]', '[]', '[]', ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '[]', '[]', ?, ?)`,
         memoryPackID,
         runID,
         agentID,
         prompt.memory_profile_version,
-        json(prompt.memory_results || []),
-        json({ source: 'electron_ts_tool_calling', memory_result_count: prompt.memory_results?.length || 0, memory_scope: prompt.memory_scope, selected_skills: prompt.selected_skills }),
+        json(prompt.stable_memory_results || []),
+        json((prompt.dynamic_memory_results || []).filter((result) => result.memory.layer === 'knowledge')),
+        json((prompt.dynamic_memory_results || []).filter((result) => result.memory.layer === 'episode')),
+        json(prompt.dynamic_memory_results || []),
+        json({ source: 'electron_ts_tool_calling', pipeline_version: MEMORY_PIPELINE_VERSION, memory_result_count: prompt.memory_results?.length || 0, memory_scope: prompt.memory_scope, memory_controls: prompt.memory_controls, selected_skills: prompt.selected_skills }),
       );
       this.appendMemoryRecalledEvents(runID, turnID, memoryPackID, prompt.memory_results || [], prompt.memory_scope);
       this.recordMemoryRetrievalUsage(runID, agentID, prompt.memory_results || [], prompt.memory_scope);
@@ -4119,7 +4354,8 @@ export class JoiSQLiteStore {
         productTask = this.getProductTask(productTask.id).task;
       }
       if (!waitingConfirmation) {
-        this.insertPostRunMemoryProposal(runID, turnID, message);
+        this.recordPostRunMemoryLearning(req, runID, turnID, response);
+        this.attributeMemoryInfluence(runID, response);
       }
 
       const persistedToolRunCount = this.persistedToolRunCountForRun(runID);
@@ -6751,20 +6987,215 @@ export class JoiSQLiteStore {
     this.exec(`UPDATE tool_workflows SET enabled=?, updated_at=datetime('now') WHERE name=?`, req.enabled ? 1 : 0, name);
   }
 
+  getMemorySystem(): MemorySystemSnapshot {
+    const row = this.get(`SELECT * FROM memory_maintenance_runs ORDER BY datetime(started_at) DESC LIMIT 1`);
+    return {
+      settings: this.getMemorySettings(),
+      latest_maintenance: row ? rowToMemoryMaintenance(row) : undefined,
+      metrics: this.memoryQualityMetrics(),
+    };
+  }
+
+  getMemorySettings(): MemorySettingsRecord {
+    const settings = this.desktopSettings();
+    const policy = this.memoryPolicyConfig();
+    return {
+      use_memories: settingBoolean(settings['memory.use_memories'], Boolean(policy.use_memories)),
+      generate_memories: settingBoolean(settings['memory.generate_memories'], Boolean(policy.generate_memories)),
+      disable_on_external_context: settingBoolean(settings['memory.disable_on_external_context'], Boolean(policy.disable_on_external_context)),
+      background_idle_seconds: clampMemoryIdleSeconds(Number(settings['memory.background_idle_seconds'] || policy.background_idle_seconds || DEFAULT_MEMORY_POLICY.background_idle_seconds)),
+      pipeline_version: MEMORY_PIPELINE_VERSION,
+    };
+  }
+
+  saveMemorySettings(req: Partial<MemorySettingsRecord>): MemorySettingsRecord {
+    const current = this.getMemorySettings();
+    const next: MemorySettingsRecord = {
+      use_memories: req.use_memories ?? current.use_memories,
+      generate_memories: req.generate_memories ?? current.generate_memories,
+      disable_on_external_context: req.disable_on_external_context ?? current.disable_on_external_context,
+      background_idle_seconds: clampMemoryIdleSeconds(req.background_idle_seconds ?? current.background_idle_seconds),
+      pipeline_version: MEMORY_PIPELINE_VERSION,
+    };
+    this.setDesktopSettings({
+      'memory.use_memories': String(next.use_memories),
+      'memory.generate_memories': String(next.generate_memories),
+      'memory.disable_on_external_context': String(next.disable_on_external_context),
+      'memory.background_idle_seconds': String(next.background_idle_seconds),
+    });
+    this.exec(
+      `UPDATE memory_policies SET config=?, updated_at=datetime('now') WHERE id='memory_policy_v3'`,
+      json({ ...this.memoryPolicyConfig(), ...next, version: DEFAULT_MEMORY_POLICY.version }),
+    );
+    if (next.generate_memories) this.scheduleMemoryMaintenance('settings_enabled', next.background_idle_seconds * 1_000);
+    return next;
+  }
+
+  runMemoryMaintenance(req: { trigger_source?: string } = {}): { run: MemoryMaintenanceRun } {
+    const triggerSource = req.trigger_source?.trim() || 'manual';
+    const maintenanceID = `mmrun_${newID()}`;
+    this.exec(
+      `INSERT INTO memory_maintenance_runs (id, status, trigger_source, started_at)
+       VALUES (?, 'running', ?, datetime('now'))`,
+      maintenanceID,
+      triggerSource,
+    );
+    let processedInputCount = 0;
+    let generatedObservationCount = 0;
+    let expiredCount = 0;
+    let mergedCount = 0;
+    let embeddingCount = 0;
+    try {
+      const policy = this.memoryPolicyConfig();
+      const processAllPending = ['manual', 'desktop_ui', 'test'].includes(triggerSource);
+      const inputs = this.all(
+        `SELECT * FROM memory_generation_inputs
+         WHERE status='pending' AND (?=1 OR datetime(eligible_after) <= datetime('now'))
+         ORDER BY datetime(created_at) ASC
+         LIMIT 50`,
+        processAllPending ? 1 : 0,
+      );
+      this.transaction(() => {
+        for (const input of inputs) {
+          const generated = this.processMemoryGenerationInput(input);
+          processedInputCount += 1;
+          generatedObservationCount += generated;
+        }
+
+        for (const row of this.all(`SELECT * FROM memories WHERE status <> 'deleted'`)) {
+          const memory = rowToMemory(row);
+          const metadata = parseObject(row.metadata);
+          const layer = inferLegacyMemoryLayer(memory.type, { ...metadata, layer: memory.layer });
+          const tags = memory.context_tags?.length ? memory.context_tags : inferMemoryContextTags(`${memory.summary} ${memory.content}`);
+          const memoryKey = memory.memory_key || canonicalMemoryKey(memory.content, layer, memory.type, tags);
+          const validUntil = memory.valid_until || memoryExpiryFromMetadata(metadata);
+          const expired = Boolean(validUntil && Number.isFinite(Date.parse(validUntil)) && Date.parse(validUntil) <= Date.now());
+          const provisionalExpired = ['pending', 'candidate', 'proposed', 'observed'].includes(memory.status)
+            && Date.now() - Date.parse(memory.created_at || nowIso()) > policy.provisional_retention_days * 86_400_000;
+          const nextStatus = expired || provisionalExpired ? 'archived' : memory.status;
+          const nextLifecycle = expired || provisionalExpired
+            ? 'expired'
+            : memory.merged_into_memory_id
+              ? 'superseded'
+              : memory.disabled
+                ? 'disabled'
+                : memory.status === 'conflicted'
+                  ? 'review'
+                  : ['pending', 'candidate', 'proposed', 'observed'].includes(memory.status)
+                    ? 'provisional'
+                    : memory.lifecycle_state || 'active';
+          if ((expired || provisionalExpired) && memory.lifecycle_state !== 'expired') expiredCount += 1;
+          this.exec(
+            `UPDATE memories
+             SET layer=?, memory_key=?, context_tags=?, status=?, lifecycle_state=?,
+                 valid_until=COALESCE(NULLIF(valid_until, ''), NULLIF(?, '')),
+                 disabled_at=CASE WHEN ?='expired' THEN COALESCE(disabled_at, datetime('now')) ELSE disabled_at END,
+                 archived_at=CASE WHEN ?='expired' THEN COALESCE(archived_at, datetime('now')) ELSE archived_at END,
+                 updated_at=CASE WHEN layer<>? OR memory_key<>? OR status<>? OR lifecycle_state<>? THEN datetime('now') ELSE updated_at END
+             WHERE id=?`,
+            layer,
+            memoryKey,
+            json(tags),
+            nextStatus,
+            nextLifecycle,
+            validUntil || '',
+            nextLifecycle,
+            nextLifecycle,
+            layer,
+            memoryKey,
+            nextStatus,
+            nextLifecycle,
+            memory.id,
+          );
+          const embedding = this.get(
+            `SELECT id FROM memory_embeddings WHERE memory_id=? AND embedding_model=? LIMIT 1`,
+            memory.id,
+            LOCAL_MEMORY_EMBEDDING_MODEL,
+          );
+          if (!embedding && nextLifecycle !== 'expired') {
+            this.upsertMemoryEmbedding(memory.id, `${memory.summary} ${memory.content} ${tags.join(' ')}`);
+            embeddingCount += 1;
+          }
+        }
+
+        const duplicateGroups = this.all(
+          `SELECT memory_key, layer, scope_type, COALESCE(scope_id, '') AS scope_id, COUNT(*) AS count
+           FROM memories
+           WHERE memory_key<>'' AND status IN ('confirmed','observed','pending')
+             AND lifecycle_state IN ('active','provisional','review') AND disabled_at IS NULL
+           GROUP BY memory_key, layer, scope_type, COALESCE(scope_id, '')
+           HAVING COUNT(*) > 1`,
+        );
+        for (const group of duplicateGroups) {
+          const rows = this.all(
+            `SELECT * FROM memories
+             WHERE memory_key=? AND layer=? AND scope_type=? AND COALESCE(scope_id, '')=?
+               AND status IN ('confirmed','observed','pending') AND disabled_at IS NULL
+             ORDER BY CASE status WHEN 'confirmed' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                      evidence_authority DESC, evidence_count DESC, confidence DESC, datetime(updated_at) DESC`,
+            String(group.memory_key),
+            String(group.layer),
+            String(group.scope_type),
+            String(group.scope_id),
+          );
+          const winner = rows[0];
+          if (!winner) continue;
+          for (const loser of rows.slice(1)) {
+            if (normalizeMemoryText(optionalString(winner.content) || '') !== normalizeMemoryText(optionalString(loser.content) || '')) continue;
+            const evidenceCount = Math.max(1, Number(winner.evidence_count || 1)) + Math.max(1, Number(loser.evidence_count || 1));
+            const sourceEventIDs = [...new Set([...parseStringArray(winner.source_event_ids), ...parseStringArray(loser.source_event_ids)])];
+            this.exec(
+              `UPDATE memories SET evidence_count=?, source_event_ids=?, confidence=MAX(confidence, ?), last_verified_at=datetime('now'), updated_at=datetime('now') WHERE id=?`,
+              evidenceCount,
+              json(sourceEventIDs),
+              Number(loser.confidence || 0),
+              String(winner.id),
+            );
+            this.exec(
+              `UPDATE memories SET status='superseded', lifecycle_state='superseded', merged_into_memory_id=?, disabled_at=datetime('now'), archived_at=datetime('now'), updated_at=datetime('now') WHERE id=?`,
+              String(winner.id),
+              String(loser.id),
+            );
+            this.insertMemoryEvolutionEvent(String(loser.id), 'auto_merged', '', '', {
+              merged_into_memory_id: String(winner.id),
+              maintenance_id: maintenanceID,
+            }, 'exact_duplicate_same_scope');
+            winner.evidence_count = evidenceCount;
+            winner.source_event_ids = json(sourceEventIDs);
+            mergedCount += 1;
+          }
+        }
+      });
+      this.exec(
+        `UPDATE memory_maintenance_runs
+         SET status='completed', processed_input_count=?, generated_observation_count=?, expired_count=?, merged_count=?, embedding_count=?,
+             metadata=?, finished_at=datetime('now') WHERE id=?`,
+        processedInputCount,
+        generatedObservationCount,
+        expiredCount,
+        mergedCount,
+        embeddingCount,
+        json({ pipeline_version: MEMORY_PIPELINE_VERSION, physical_delete: false }),
+        maintenanceID,
+      );
+    } catch (error) {
+      this.exec(
+        `UPDATE memory_maintenance_runs SET status='failed', error_summary=?, finished_at=datetime('now') WHERE id=?`,
+        error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
+        maintenanceID,
+      );
+      throw error;
+    }
+    return { run: rowToMemoryMaintenance(this.get(`SELECT * FROM memory_maintenance_runs WHERE id=?`, maintenanceID) || { id: maintenanceID, status: 'completed' }) };
+  }
+
   listMemories(filter: { query?: string; limit?: number } = {}): { memories: MemoryRecord[]; metrics: MemoryQualityMetrics } {
     const limit = clampLimit(filter.limit, 100);
     const query = filter.query?.trim();
     if (query) {
       const like = `%${escapeLike(query)}%`;
       const rows = this.all(
-        `SELECT id, type, content, COALESCE(summary, '') AS summary, scope_type, COALESCE(scope_id, '') AS scope_id,
-                privacy_level, confidence, status, source_event_ids, entities, success_count, failure_count,
-                usage_count, positive_feedback, negative_feedback, pinned, disabled_at,
-                COALESCE(merged_into_memory_id, '') AS merged_into_memory_id,
-                COALESCE(conflict_group_id, '') AS conflict_group_id,
-                COALESCE(conflict_reason, '') AS conflict_reason,
-                metadata, created_at, updated_at, last_used_at
-         FROM memories
+        `SELECT * FROM memories
          WHERE status='confirmed'
            AND disabled_at IS NULL
            AND merged_into_memory_id IS NULL
@@ -6779,14 +7210,7 @@ export class JoiSQLiteStore {
       return { memories: rows.map(rowToMemory), metrics: this.memoryQualityMetrics() };
     }
     const rows = this.all(
-      `SELECT id, type, content, COALESCE(summary, '') AS summary, scope_type, COALESCE(scope_id, '') AS scope_id,
-              privacy_level, confidence, status, source_event_ids, entities, success_count, failure_count,
-              usage_count, positive_feedback, negative_feedback, pinned, disabled_at,
-              COALESCE(merged_into_memory_id, '') AS merged_into_memory_id,
-              COALESCE(conflict_group_id, '') AS conflict_group_id,
-              COALESCE(conflict_reason, '') AS conflict_reason,
-              metadata, created_at, updated_at, last_used_at
-       FROM memories
+      `SELECT * FROM memories
        WHERE status <> 'deleted'
        ORDER BY pinned DESC, datetime(updated_at) DESC
        LIMIT ?`,
@@ -6857,17 +7281,29 @@ export class JoiSQLiteStore {
       };
     }
     const memoryID = `mem_${newID()}`;
+    const layer = inferLegacyMemoryLayer(type);
+    const contextTags = inferMemoryContextTags(`${summary} ${content}`);
+    const memoryKey = canonicalMemoryKey(content, layer, type, contextTags);
     this.exec(
-      `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence,
-                            status, source_event_ids, entities, metadata)
-       VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), 'internal', 0.7, 'pending', '[]', '[]', ?)`,
+      `INSERT INTO memories (
+         id, layer, type, memory_key, content, summary, scope_type, scope_id, privacy_level,
+         evidence_kind, evidence_authority, evidence_count, confidence, status, lifecycle_state,
+         source_event_ids, source_kind, entities, context_tags, review_reason, auto_managed, metadata
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), 'internal',
+                 'explicit', ?, 1, 0.7, 'pending', 'review',
+                 '[]', 'model_tool_candidate', '[]', ?, 'tool_candidate_requires_confirmation', 0, ?)`,
       memoryID,
+      layer,
       type,
+      memoryKey,
       content,
       summary,
       resolvedScope.scope_type,
       resolvedScope.scope_id,
+      memoryEvidenceAuthority('explicit'),
+      json(contextTags),
       json({
+        pipeline_version: MEMORY_PIPELINE_VERSION,
         source: input.source?.trim() || 'model_tool_candidate',
         created_by: 'memory_write_candidate',
         needs_user_review: true,
@@ -6897,6 +7333,8 @@ export class JoiSQLiteStore {
          SUM(CASE WHEN status='confirmed' AND disabled_at IS NULL AND merged_into_memory_id IS NULL
                        AND COALESCE(datetime(last_used_at), datetime(updated_at), datetime(created_at)) < datetime('now', '-90 days')
                   THEN 1 ELSE 0 END) AS stale_confirmed_count,
+         SUM(CASE WHEN status='observed' THEN 1 ELSE 0 END) AS observed_count,
+         SUM(CASE WHEN status IN ('archived','superseded') OR lifecycle_state IN ('archived','expired','superseded') THEN 1 ELSE 0 END) AS archived_count,
          MIN(CASE WHEN status IN ('pending','candidate','proposed','conflicted') THEN created_at END) AS oldest_candidate_at
        FROM memories`,
     );
@@ -6914,6 +7352,7 @@ export class JoiSQLiteStore {
       `SELECT COUNT(*) AS recalled_count,
               SUM(CASE WHEN injected=1 THEN 1 ELSE 0 END) AS injected_count,
               SUM(CASE WHEN used_in_answer=1 THEN 1 ELSE 0 END) AS used_in_answer_count,
+              SUM(CASE WHEN influence_state='inferred_used' THEN 1 ELSE 0 END) AS inferred_used_count,
               SUM(CASE WHEN injected=1 AND used_in_answer=0 THEN 1 ELSE 0 END) AS unused_injection_count
        FROM memory_usage_logs`,
     );
@@ -6926,6 +7365,13 @@ export class JoiSQLiteStore {
     for (const row of this.all(`SELECT scope_type, COUNT(*) AS count FROM memories WHERE status='confirmed' AND disabled_at IS NULL GROUP BY scope_type`)) {
       scopeCounts[optionalString(row.scope_type) || 'global'] = Number(row.count || 0);
     }
+    const layerCounts: Record<string, number> = {};
+    for (const row of this.all(`SELECT layer, COUNT(*) AS count FROM memories WHERE status='confirmed' AND disabled_at IS NULL GROUP BY layer`)) {
+      layerCounts[optionalString(row.layer) || 'knowledge'] = Number(row.count || 0);
+    }
+    const embeddingCount = Number(this.get(`SELECT COUNT(*) AS count FROM memory_embeddings WHERE embedding_model=?`, LOCAL_MEMORY_EMBEDDING_MODEL)?.count || 0);
+    const generationQueueCount = Number(this.get(`SELECT COUNT(*) AS count FROM memory_generation_inputs WHERE status='pending'`)?.count || 0);
+    const abstentionCount = Number(this.get(`SELECT COUNT(*) AS count FROM run_events WHERE event_type IN ('memory.retrieval.abstained','memory.learning.abstained')`)?.count || 0);
     const injectedCount = Number(usage?.injected_count || 0);
     const usedInAnswerCount = Number(usage?.used_in_answer_count || 0);
     return {
@@ -6942,22 +7388,456 @@ export class JoiSQLiteStore {
       negative_feedback_count: Number(feedback?.negative_feedback_count || 0),
       injection_use_rate: injectedCount > 0 ? usedInAnswerCount / injectedCount : 0,
       scope_counts: scopeCounts,
+      layer_counts: layerCounts,
+      inferred_used_count: Number(usage?.inferred_used_count || 0),
+      abstention_count: abstentionCount,
+      archived_count: Number(status?.archived_count || 0),
+      observed_count: Number(status?.observed_count || 0),
+      embedding_count: embeddingCount,
+      generation_queue_count: generationQueueCount,
       oldest_candidate_at: optionalString(status?.oldest_candidate_at),
     };
+  }
+
+  private memoryPolicyConfig(): MemoryPolicyConfig {
+    const row = this.get(`SELECT config FROM memory_policies WHERE status='active' ORDER BY version DESC, datetime(updated_at) DESC LIMIT 1`);
+    return { ...DEFAULT_MEMORY_POLICY, ...(row ? parseObject(row.config) : {}) } as MemoryPolicyConfig;
+  }
+
+  private effectiveMemoryControls(req: ChatRequest): MemoryTaskControls {
+    const defaults = this.getMemorySettings();
+    return {
+      use_memories: req.memory_controls?.use_memories ?? defaults.use_memories,
+      generate_memories: req.memory_controls?.generate_memories ?? defaults.generate_memories,
+      disable_on_external_context: req.memory_controls?.disable_on_external_context ?? defaults.disable_on_external_context,
+      external_context_used: req.memory_controls?.external_context_used,
+    };
+  }
+
+  private scheduleMemoryMaintenance(triggerSource: string, delayMs?: number): void {
+    if (this.closed) return;
+    if (this.memoryMaintenanceTimer) clearTimeout(this.memoryMaintenanceTimer);
+    const delay = Math.max(1_000, delayMs ?? this.getMemorySettings().background_idle_seconds * 1_000);
+    this.memoryMaintenanceTimer = setTimeout(() => {
+      this.memoryMaintenanceTimer = undefined;
+      if (this.closed) return;
+      try {
+        this.runMemoryMaintenance({ trigger_source: triggerSource });
+      } catch {
+        // runMemoryMaintenance persists its own failed run. A background failure
+        // must not keep the app or a chat run alive.
+      }
+    }, delay);
+    (this.memoryMaintenanceTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  }
+
+  private recordPostRunMemoryLearning(req: ChatRequest, runID: string, turnID: string, response = ''): void {
+    const controls = this.effectiveMemoryControls(req);
+    const run = this.get(
+      `SELECT r.conversation_id, r.user_message_id, r.resolved_mode, r.principal_id,
+              t.assistant_message_id, c.active_project_id, c.user_id
+       FROM runs r
+       LEFT JOIN turns t ON t.id=?
+       LEFT JOIN conversations c ON c.id=r.conversation_id
+       WHERE r.id=?`,
+      turnID,
+      runID,
+    );
+    if (!run) return;
+    const existing = this.get(`SELECT id FROM memory_generation_inputs WHERE run_id=? LIMIT 1`, runID);
+    if (existing) return;
+    const externalTool = this.get(
+      `SELECT id FROM tool_runs
+       WHERE run_id=? AND (
+         capability_id IN ('web_research','browser_navigate','browser_observe')
+         OR lower(COALESCE(tool_name, '')) LIKE 'mcp__%'
+         OR lower(COALESCE(tool_name, '')) LIKE '%web_search%'
+         OR lower(COALESCE(tool_name, '')) LIKE '%tool_search%'
+       ) LIMIT 1`,
+      runID,
+    );
+    const externalContextUsed = controls.external_context_used === true || Boolean(externalTool);
+    const generationReason = memoryGenerationExclusionReason(req.message || '');
+    const hardExclusion = generationReason === 'interrogative_prompt' ? '' : generationReason;
+    const exclusionReason = !controls.generate_memories
+      ? 'generation_disabled'
+      : controls.disable_on_external_context && externalContextUsed
+        ? 'external_context_guard'
+        : hardExclusion;
+    const observations = exclusionReason ? [] : extractMemoryObservations(req.message || '', {
+      projectID: optionalString(run.active_project_id),
+      userID: optionalString(run.principal_id) || optionalString(run.user_id) || 'desktop_user',
+      stateTTLDays: this.memoryPolicyConfig().state_ttl_days,
+    });
+    const immediate = observations.filter((observation) => observation.explicit || observation.correction);
+    const status = exclusionReason ? 'skipped' : immediate.length > 0 ? 'processed' : 'pending';
+    const eligibleAfter = new Date(Date.now() + this.getMemorySettings().background_idle_seconds * 1_000).toISOString();
+    const inputID = `mgin_${newID()}`;
+    this.exec(
+      `INSERT INTO memory_generation_inputs (
+         id, run_id, turn_id, conversation_id, user_message_id, assistant_message_id,
+         status, eligible_after, external_context_used, exclusion_reason, controls, metadata, processed_at
+       ) VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?, ?, CASE WHEN ?='pending' THEN NULL ELSE datetime('now') END)`,
+      inputID,
+      runID,
+      turnID,
+      optionalString(run.conversation_id) || '',
+      optionalString(run.user_message_id) || '',
+      optionalString(run.assistant_message_id) || '',
+      status,
+      eligibleAfter,
+      externalContextUsed ? 1 : 0,
+      exclusionReason,
+      json(controls),
+      json({ pipeline_version: MEMORY_PIPELINE_VERSION, immediate_observation_count: immediate.length }),
+      status,
+    );
+    if (exclusionReason) {
+      this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'memory.generation.skipped', {
+        item_type: 'memory_generation_input',
+        item_id: inputID,
+        status: 'skipped',
+        visibility: 'memory',
+        source: 'memory_runtime',
+        reason: exclusionReason,
+        external_context_used: externalContextUsed,
+        pipeline_version: MEMORY_PIPELINE_VERSION,
+      });
+      return;
+    }
+    if (immediate.length > 0) {
+      for (const observation of immediate) {
+        this.processMemoryObservation(observation, {
+          runID,
+          turnID,
+          conversationID: optionalString(run.conversation_id) || '',
+          sourceKind: 'explicit_conversation',
+        });
+      }
+      return;
+    }
+    this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), 'memory.generation.queued', {
+      item_type: 'memory_generation_input',
+      item_id: inputID,
+      status: 'pending',
+      visibility: 'memory',
+      source: 'memory_runtime',
+      eligible_after: eligibleAfter,
+      pipeline_version: MEMORY_PIPELINE_VERSION,
+    });
+    this.scheduleMemoryMaintenance('idle_timer');
+  }
+
+  private processMemoryGenerationInput(input: SQLiteRow): number {
+    const inputID = String(input.id);
+    if (optionalString(input.exclusion_reason)) {
+      this.exec(`UPDATE memory_generation_inputs SET status='skipped', processed_at=datetime('now') WHERE id=?`, inputID);
+      return 0;
+    }
+    const userMessage = this.get(`SELECT content FROM messages WHERE id=?`, optionalString(input.user_message_id) || '');
+    const assistantMessage = this.get(`SELECT content FROM messages WHERE id=?`, optionalString(input.assistant_message_id) || '');
+    const run = this.get(
+      `SELECT r.conversation_id, r.resolved_mode, r.principal_id, c.active_project_id, c.user_id,
+              (SELECT id FROM rooms WHERE conversation_id=r.conversation_id ORDER BY datetime(updated_at) DESC LIMIT 1) AS room_id
+       FROM runs r LEFT JOIN conversations c ON c.id=r.conversation_id WHERE r.id=?`,
+      optionalString(input.run_id) || '',
+    );
+    const request = optionalString(userMessage?.content);
+    const response = optionalString(assistantMessage?.content);
+    if (!request || !run) {
+      this.exec(
+        `UPDATE memory_generation_inputs SET status='skipped', exclusion_reason='source_messages_missing', processed_at=datetime('now') WHERE id=?`,
+        inputID,
+      );
+      return 0;
+    }
+    const observations = extractMemoryObservations(request, {
+      projectID: optionalString(run.active_project_id),
+      roomID: optionalString(run.room_id),
+      userID: optionalString(run.principal_id) || optionalString(run.user_id) || 'desktop_user',
+      stateTTLDays: this.memoryPolicyConfig().state_ttl_days,
+    });
+    if (response && ['serious_task', 'background_task'].includes(optionalString(run.resolved_mode) || '')) {
+      const episode = createTaskEpisodeObservation({
+        request,
+        outcome: response,
+        projectID: optionalString(run.active_project_id),
+        userID: optionalString(run.principal_id) || optionalString(run.user_id) || 'desktop_user',
+      });
+      if (episode) observations.push(episode);
+    }
+    for (const observation of observations) {
+      this.processMemoryObservation(observation, {
+        runID: optionalString(input.run_id) || '',
+        turnID: optionalString(input.turn_id) || '',
+        conversationID: optionalString(input.conversation_id) || '',
+        sourceKind: 'background_generation',
+      });
+    }
+    this.exec(
+      `UPDATE memory_generation_inputs SET status='processed', processed_at=datetime('now'),
+         metadata=json_set(COALESCE(metadata, '{}'), '$.generated_observation_count', ?, '$.pipeline_version', ?)
+       WHERE id=?`,
+      observations.length,
+      MEMORY_PIPELINE_VERSION,
+      inputID,
+    );
+    const runID = optionalString(input.run_id) || '';
+    if (observations.length === 0 && runID) {
+      this.insertRunEvent(runID, optionalString(input.turn_id) || '', this.nextRunEventSeq(runID), 'memory.learning.abstained', {
+        item_type: 'memory_generation_input',
+        item_id: inputID,
+        status: 'skipped',
+        visibility: 'memory',
+        source: 'memory_runtime',
+        reason: 'no_durable_observation',
+        pipeline_version: MEMORY_PIPELINE_VERSION,
+      });
+    }
+    return observations.length;
+  }
+
+  private processMemoryObservation(
+    observation: MemoryObservationDraft,
+    source: { runID: string; turnID: string; conversationID: string; sourceKind: string },
+  ): string {
+    const observationID = `mobs_${newID()}`;
+    this.exec(
+      `INSERT INTO memory_observations (
+         id, memory_key, layer, type, statement, summary, scope_type, scope_id, privacy_level,
+         evidence_kind, evidence_authority, confidence, polarity, context_tags, source_event_id,
+         run_id, turn_id, conversation_id, status, review_reason, metadata
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), 'recorded', NULLIF(?, ''), ?)`,
+      observationID,
+      observation.memoryKey,
+      observation.layer,
+      observation.type,
+      observation.statement,
+      observation.summary,
+      observation.scopeType,
+      observation.scopeID,
+      observation.privacyLevel,
+      observation.evidenceKind,
+      observation.evidenceAuthority,
+      observation.confidence,
+      observation.polarity,
+      json(observation.contextTags),
+      source.turnID || source.runID,
+      source.runID,
+      source.turnID,
+      source.conversationID,
+      observation.reviewReason,
+      json({ pipeline_version: MEMORY_PIPELINE_VERSION, source_kind: source.sourceKind, why: observation.why, future_effect: observation.futureEffect }),
+    );
+    const existing = this.get(
+      `SELECT * FROM memories
+       WHERE memory_key=? AND layer=? AND scope_type=? AND COALESCE(scope_id, '')=?
+         AND status NOT IN ('deleted','rejected','superseded','archived') AND disabled_at IS NULL
+       ORDER BY evidence_authority DESC, evidence_count DESC, confidence DESC, datetime(updated_at) DESC
+       LIMIT 1`,
+      observation.memoryKey,
+      observation.layer,
+      observation.scopeType,
+      observation.scopeID,
+    );
+    if (existing && normalizeMemoryText(optionalString(existing.content) || '') === normalizeMemoryText(observation.statement)) {
+      const memory = rowToMemory(existing);
+      const evidenceCount = Math.max(1, memory.evidence_count || 1) + 1;
+      const shouldPromote = memory.status === 'observed'
+        && evidenceCount >= this.memoryPolicyConfig().implicit_promotion_evidence
+        && memory.privacy_level !== 'private';
+      const sourceEventIDs = [...new Set([...(memory.source_event_ids || []), source.runID, source.turnID, source.conversationID].filter(Boolean))];
+      this.exec(
+        `UPDATE memories
+         SET evidence_count=?, evidence_kind=?, evidence_authority=MAX(evidence_authority, ?),
+             confidence=MAX(confidence, ?), status=?, lifecycle_state=?, source_event_ids=?,
+             context_tags=?, last_verified_at=datetime('now'), updated_at=datetime('now') WHERE id=?`,
+        evidenceCount,
+        shouldPromote ? 'repeated_behavior' : observation.evidenceKind,
+        observation.evidenceAuthority,
+        shouldPromote ? 0.82 : observation.confidence,
+        shouldPromote ? 'confirmed' : memory.status,
+        shouldPromote ? 'active' : memory.lifecycle_state || 'provisional',
+        json(sourceEventIDs),
+        json([...new Set([...(memory.context_tags || []), ...observation.contextTags])]),
+        memory.id,
+      );
+      this.exec(`UPDATE memory_observations SET memory_id=?, status=? WHERE id=?`, memory.id, shouldPromote ? 'promoted' : 'linked', observationID);
+      this.insertMemoryEvolutionEvent(memory.id, shouldPromote ? 'auto_promoted' : 'evidence_reinforced', source.runID, source.turnID, {
+        evidence_count: evidenceCount,
+        status: shouldPromote ? 'confirmed' : memory.status,
+      }, shouldPromote ? 'independent_evidence_threshold_reached' : 'matching_observation');
+      return memory.id;
+    }
+    if (existing) {
+      const conflictGroupID = optionalString(existing.conflict_group_id) || `mcg_${newID()}`;
+      const candidateID = this.createMemoryFromObservation({
+        ...observation,
+        reviewRequired: true,
+        reviewReason: observation.correction ? 'correction_requires_confirmation' : 'same_topic_requires_review',
+      }, observationID, source, optionalString(existing.id), conflictGroupID);
+      this.exec(`UPDATE memories SET conflict_group_id=?, updated_at=datetime('now') WHERE id=?`, conflictGroupID, String(existing.id));
+      return candidateID;
+    }
+    return this.createMemoryFromObservation(observation, observationID, source);
+  }
+
+  private createMemoryFromObservation(
+    observation: MemoryObservationDraft,
+    observationID: string,
+    source: { runID: string; turnID: string; conversationID: string; sourceKind: string },
+    supersedesMemoryID = '',
+    conflictGroupID = '',
+  ): string {
+    const memoryID = `mem_${newID()}`;
+    const taskOutcome = observation.evidenceKind === 'task_outcome';
+    const status = taskOutcome ? 'confirmed' : observation.reviewRequired ? 'pending' : 'observed';
+    const lifecycle = taskOutcome ? 'active' : observation.reviewRequired ? 'review' : 'provisional';
+    const sourceEventIDs = [...new Set([source.runID, source.turnID, source.conversationID].filter(Boolean))];
+    const retentionPolicy = observation.layer === 'state' ? 'ttl' : observation.layer === 'episode' ? 'episodic' : 'standard';
+    this.exec(
+      `INSERT INTO memories (
+         id, layer, type, memory_key, content, summary, scope_type, scope_id, privacy_level,
+         evidence_kind, evidence_authority, evidence_count, confidence, status, lifecycle_state,
+         source_event_ids, source_kind, entities, context_tags, supersedes_memory_id, conflict_group_id,
+         review_reason, valid_from, valid_until, last_verified_at, auto_managed, retention_policy, metadata
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, 1, ?, ?, ?, ?, ?, '[]', ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), datetime('now'), NULLIF(?, ''), datetime('now'), 1, ?, ?)`,
+      memoryID,
+      observation.layer,
+      observation.type,
+      observation.memoryKey,
+      observation.statement,
+      observation.summary,
+      observation.scopeType,
+      observation.scopeID,
+      observation.privacyLevel,
+      observation.evidenceKind,
+      observation.evidenceAuthority,
+      observation.confidence,
+      status,
+      lifecycle,
+      json(sourceEventIDs),
+      source.sourceKind,
+      json(observation.contextTags),
+      supersedesMemoryID,
+      conflictGroupID,
+      observation.reviewReason,
+      observation.expiresAt || '',
+      retentionPolicy,
+      json({
+        pipeline_version: MEMORY_PIPELINE_VERSION,
+        observation_id: observationID,
+        polarity: observation.polarity,
+        why: observation.why,
+        futureEffect: observation.futureEffect,
+        explicit: observation.explicit,
+        correction: observation.correction,
+        dedup_key: observation.memoryKey,
+      }),
+    );
+    this.exec(`UPDATE memory_observations SET memory_id=?, status=? WHERE id=?`, memoryID, status === 'confirmed' ? 'promoted' : observation.reviewRequired ? 'needs_review' : 'linked', observationID);
+    this.upsertMemoryEmbedding(memoryID, `${observation.summary} ${observation.statement} ${observation.contextTags.join(' ')}`);
+    this.insertMemoryEvolutionEvent(memoryID, status === 'confirmed' ? 'auto_confirmed_episode' : observation.reviewRequired ? 'candidate_created' : 'observation_created', source.runID, source.turnID, {
+      layer: observation.layer,
+      status,
+      evidence_kind: observation.evidenceKind,
+      supersedes_memory_id: supersedesMemoryID || undefined,
+    }, observation.reviewReason || observation.why);
+    return memoryID;
+  }
+
+  private insertMemoryEvolutionEvent(memoryID: string, eventType: string, runID: string, turnID: string, after: unknown, reason: string): void {
+    this.exec(
+      `INSERT INTO memory_events (id, memory_id, event_type, actor, source_event_id, run_id, before_json, after_json, reason, metadata)
+       VALUES (?, NULLIF(?, ''), ?, 'memory_runtime', NULLIF(?, ''), NULLIF(?, ''), '{}', ?, ?, ?)`,
+      `mevt_${newID()}`,
+      memoryID,
+      eventType,
+      turnID || runID,
+      runID,
+      json(after || {}),
+      reason,
+      json({ pipeline_version: MEMORY_PIPELINE_VERSION }),
+    );
+    if (!runID) return;
+    this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), `memory.lifecycle.${eventType}`, {
+      item_type: 'memory',
+      item_id: memoryID,
+      status: 'completed',
+      visibility: 'memory',
+      source: 'memory_runtime',
+      reason,
+      after,
+      pipeline_version: MEMORY_PIPELINE_VERSION,
+    });
+  }
+
+  private upsertMemoryEmbedding(memoryID: string, text: string): void {
+    const vector = localMemoryVector(text);
+    this.exec(`DELETE FROM memory_embeddings WHERE memory_id=? AND embedding_model=?`, memoryID, LOCAL_MEMORY_EMBEDDING_MODEL);
+    this.exec(
+      `INSERT INTO memory_embeddings (id, memory_id, embedding_model, embedding, created_at)
+       VALUES (?, ?, ?, ?, datetime('now'))`,
+      `memb_${newID()}`,
+      memoryID,
+      LOCAL_MEMORY_EMBEDDING_MODEL,
+      json(vector),
+    );
+  }
+
+  private attributeMemoryInfluence(runID: string, response: string): void {
+    const answer = response.trim();
+    if (!answer) return;
+    for (const row of this.all(
+      `SELECT mul.id AS usage_log_id, mul.memory_id, m.content, m.summary, m.context_tags
+       FROM memory_usage_logs mul JOIN memories m ON m.id=mul.memory_id
+       WHERE mul.run_id=? AND mul.pipeline_version=? AND mul.injected=1`,
+      runID,
+      MEMORY_PIPELINE_VERSION,
+    )) {
+      const attribution = attributeMemoryAnswerInfluence(answer, `${optionalString(row.summary)} ${optionalString(row.content)} ${parseStringArray(row.context_tags).join(' ')}`);
+      this.exec(
+        `UPDATE memory_usage_logs
+         SET used_in_answer=?, influence_state=?, outcome=?,
+             metadata=json_set(COALESCE(metadata, '{}'), '$.influence_score', ?, '$.influence_method', 'local_similarity_attribution_v1',
+               '$.influence_components.similarity', ?, '$.influence_components.lexical', ?,
+               '$.influence_components.anchor_coverage', ?, '$.influence_components.matched_anchors', ?)
+         WHERE id=?`,
+        attribution.used ? 1 : 0,
+        attribution.used ? 'inferred_used' : 'not_used',
+        attribution.used ? 'inferred_used' : 'not_used',
+        attribution.score,
+        attribution.similarity,
+        attribution.lexical,
+        attribution.anchorCoverage,
+        attribution.matchedAnchors,
+        String(row.usage_log_id),
+      );
+      if (attribution.used) this.exec(`UPDATE memories SET success_count=success_count+1 WHERE id=?`, String(row.memory_id));
+      this.appendRunEventV2({
+        run_id: runID,
+        event_type: 'memory.influence_attributed',
+        item_type: 'memory',
+        item_id: optionalString(row.memory_id),
+        status: 'completed',
+        source: 'memory_runtime',
+        visibility: 'memory',
+        payload: {
+          memory_id: optionalString(row.memory_id),
+          influence_state: attribution.used ? 'inferred_used' : 'not_used',
+          influence_score: attribution.score,
+          method: 'local_similarity_attribution_v1',
+          pipeline_version: MEMORY_PIPELINE_VERSION,
+        },
+      });
+    }
   }
 
   listMemoriesUsedForRun(runID: string): { memories: MemorySearchResult[] } {
     const id = runID.trim();
     if (!id) throw new Error('run_id is required');
     const rows = this.all(
-      `SELECT m.id, m.type, m.content, COALESCE(m.summary, '') AS summary, m.scope_type, COALESCE(m.scope_id, '') AS scope_id,
-              m.privacy_level, m.confidence, m.status, m.source_event_ids, m.entities, m.success_count, m.failure_count,
-              m.usage_count, m.positive_feedback, m.negative_feedback, m.pinned, m.disabled_at,
-              COALESCE(m.merged_into_memory_id, '') AS merged_into_memory_id,
-              COALESCE(m.conflict_group_id, '') AS conflict_group_id,
-              COALESCE(m.conflict_reason, '') AS conflict_reason,
-              m.metadata, m.created_at, m.updated_at, m.last_used_at,
-              re.payload_json AS event_payload
+      `SELECT m.*, re.payload_json AS event_payload
        FROM run_events re
        JOIN memories m ON m.id = COALESCE(
          NULLIF(re.item_id, ''),
@@ -6975,6 +7855,13 @@ export class JoiSQLiteStore {
           memory: rowToMemory(row),
           score: optionalNumber(payload.score) || 0,
           reason: optionalString(payload.reason) || 'memory.recalled',
+          retrieval_source: optionalString(payload.retrieval_source),
+          matched_terms: parseStringArray(payload.matched_terms),
+          scope_match: optionalString(payload.scope_match),
+          injected: payload.injected !== false,
+          used_in_answer: false,
+          influence_state: 'unknown',
+          score_components: numericRecord(payload.score_components),
         };
       }),
     };
@@ -6991,14 +7878,7 @@ export class JoiSQLiteStore {
       where.push(`status IN ('pending', 'candidate', 'proposed', 'conflicted')`);
     }
     const rows = this.all(
-      `SELECT id, type, content, COALESCE(summary, '') AS summary, scope_type, COALESCE(scope_id, '') AS scope_id,
-              privacy_level, confidence, status, source_event_ids, entities, success_count, failure_count,
-              usage_count, positive_feedback, negative_feedback, pinned, disabled_at,
-              COALESCE(merged_into_memory_id, '') AS merged_into_memory_id,
-              COALESCE(conflict_group_id, '') AS conflict_group_id,
-              COALESCE(conflict_reason, '') AS conflict_reason,
-              metadata, created_at, updated_at, last_used_at
-       FROM memories
+      `SELECT * FROM memories
        WHERE ${where.join(' AND ')}
        ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
        LIMIT ?`,
@@ -7103,14 +7983,30 @@ export class JoiSQLiteStore {
     switch (action) {
       case 'confirm':
         this.transaction(() => {
+          const current = this.get(`SELECT * FROM memories WHERE id=?`, id);
+          if (!current) throw new Error(`memory not found: ${id}`);
           this.exec(
             `UPDATE memories
-             SET status='confirmed', disabled_at=NULL,
+             SET status='confirmed', lifecycle_state='active', disabled_at=NULL, archived_at=NULL,
+                 review_reason=NULL, conflict_reason=NULL, last_verified_at=datetime('now'),
                  metadata=json_set(COALESCE(metadata, '{}'), '$.confirmed_by', 'desktop_ui', '$.confirmed_at', datetime('now')),
                  updated_at=datetime('now')
              WHERE id=?`,
             id,
           );
+          const supersedesMemoryID = optionalString(current.supersedes_memory_id);
+          if (supersedesMemoryID) {
+            this.exec(
+              `UPDATE memories
+               SET status='superseded', lifecycle_state='superseded', merged_into_memory_id=?,
+                   disabled_at=datetime('now'), archived_at=datetime('now'), updated_at=datetime('now')
+               WHERE id=?`,
+              id,
+              supersedesMemoryID,
+            );
+          }
+          this.upsertMemoryEmbedding(id, `${optionalString(current.summary)} ${optionalString(current.content)} ${parseStringArray(current.context_tags).join(' ')}`);
+          this.insertMemoryEvolutionEvent(id, 'confirmed', req.run_id || '', '', { status: 'confirmed', supersedes_memory_id: supersedesMemoryID || undefined }, 'desktop_ui_confirmation');
           this.insertMemoryFeedback(id, req.run_id, 'confirm', req.comment || req.reason || '');
         });
         return;
@@ -7121,7 +8017,7 @@ export class JoiSQLiteStore {
         const summary = req.summary?.trim() || titleFromMessage(content);
         this.transaction(() => {
           const existing = this.get(
-            `SELECT type, scope_type, scope_id, privacy_level, confidence, source_event_ids, entities, metadata
+            `SELECT *
              FROM memories
              WHERE id=?`,
             id,
@@ -7137,25 +8033,45 @@ export class JoiSQLiteStore {
             corrected_at: nowIso(),
             correction_reason: req.reason || req.comment || '',
           };
+          const type = optionalString(existing.type) || 'preference';
+          const inferredLayer = inferLegacyMemoryLayer(type, parseObject(existing.metadata));
+          const storedLayer = optionalString(existing.layer);
+          const layer = !storedLayer || (storedLayer === 'knowledge' && inferredLayer !== 'knowledge') ? inferredLayer : storedLayer;
+          const contextTags = parseStringArray(existing.context_tags).length > 0
+            ? parseStringArray(existing.context_tags)
+            : inferMemoryContextTags(`${summary} ${content}`);
+          const memoryKey = canonicalMemoryKey(content, layer as 'profile' | 'knowledge' | 'state' | 'episode', type, contextTags);
           this.exec(
-            `INSERT INTO memories (id, type, content, summary, scope_type, scope_id, privacy_level, confidence,
-                                  status, source_event_ids, entities, metadata)
-             VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, 'confirmed', ?, ?, ?)`,
+            `INSERT INTO memories (
+               id, layer, type, memory_key, content, summary, scope_type, scope_id, privacy_level,
+               evidence_kind, evidence_authority, evidence_count, confidence, status, lifecycle_state,
+               source_event_ids, source_kind, entities, context_tags, supersedes_memory_id,
+               valid_from, valid_until, last_verified_at, auto_managed, retention_policy, metadata
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, 'correction', ?, ?, ?, 'confirmed', 'active',
+                       ?, 'desktop_ui_correction', ?, ?, ?, datetime('now'), NULLIF(?, ''), datetime('now'), 0, ?, ?)`,
             replacementID,
-            optionalString(existing.type) || 'preference',
+            layer,
+            type,
+            memoryKey,
             content,
             summary,
             optionalString(existing.scope_type) || 'global',
             optionalString(existing.scope_id) || '',
             optionalString(existing.privacy_level) || 'internal',
+            memoryEvidenceAuthority('correction'),
+            Number(existing.evidence_count || 1) + 1,
             optionalNumber(existing.confidence) || 0.7,
             json([...new Set(sourceEventIDs)]),
             json(parseArray(existing.entities)),
+            json(contextTags),
+            id,
+            optionalString(existing.valid_until) || '',
+            optionalString(existing.retention_policy) || 'standard',
             json(metadata),
           );
           this.exec(
             `UPDATE memories
-             SET status='superseded', merged_into_memory_id=?, disabled_at=datetime('now'),
+             SET status='superseded', lifecycle_state='superseded', merged_into_memory_id=?, disabled_at=datetime('now'), archived_at=datetime('now'),
                  metadata=json_set(COALESCE(metadata, '{}'), '$.edited_by', 'desktop_ui', '$.edited_at', datetime('now'), '$.superseded_by', ?),
                  updated_at=datetime('now')
              WHERE id=?`,
@@ -7163,6 +8079,8 @@ export class JoiSQLiteStore {
             replacementID,
             id,
           );
+          this.upsertMemoryEmbedding(replacementID, `${summary} ${content} ${contextTags.join(' ')}`);
+          this.insertMemoryEvolutionEvent(replacementID, 'corrected', req.run_id || '', '', { supersedes_memory_id: id, content }, req.reason || req.comment || 'desktop_ui_correction');
           this.insertMemoryFeedback(id, req.run_id, 'edit', req.comment || req.reason || '', replacementID);
         });
         return;
@@ -7171,7 +8089,7 @@ export class JoiSQLiteStore {
         this.transaction(() => {
           this.exec(
             `UPDATE memories
-             SET status='rejected', disabled_at=datetime('now'),
+             SET status='rejected', lifecycle_state='archived', disabled_at=datetime('now'), archived_at=datetime('now'),
                  metadata=json_set(COALESCE(metadata, '{}'), '$.rejected_by', 'desktop_ui', '$.reject_reason', ?, '$.rejected_at', datetime('now')),
                  updated_at=datetime('now')
              WHERE id=?`,
@@ -7185,7 +8103,7 @@ export class JoiSQLiteStore {
         this.transaction(() => {
           this.exec(
             `UPDATE memories
-             SET status='deleted', disabled_at=datetime('now'),
+             SET status='deleted', lifecycle_state='archived', disabled_at=datetime('now'), archived_at=datetime('now'),
                  metadata=json_set(COALESCE(metadata, '{}'), '$.deleted_by', 'desktop_ui', '$.delete_reason', ?, '$.deleted_at', datetime('now')),
                  updated_at=datetime('now')
              WHERE id=?`,
@@ -7211,10 +8129,10 @@ export class JoiSQLiteStore {
         this.exec(`UPDATE memories SET pinned=0, updated_at=datetime('now') WHERE id=?`, id);
         return;
       case 'disable':
-        this.exec(`UPDATE memories SET disabled_at=datetime('now'), updated_at=datetime('now') WHERE id=?`, id);
+        this.exec(`UPDATE memories SET lifecycle_state='disabled', disabled_at=datetime('now'), updated_at=datetime('now') WHERE id=?`, id);
         return;
       case 'enable':
-        this.exec(`UPDATE memories SET disabled_at=NULL, updated_at=datetime('now') WHERE id=?`, id);
+        this.exec(`UPDATE memories SET lifecycle_state=CASE WHEN status='confirmed' THEN 'active' ELSE 'provisional' END, disabled_at=NULL, archived_at=NULL, updated_at=datetime('now') WHERE id=?`, id);
         return;
       case 'feedback_positive':
       case 'feedback_negative':
@@ -7230,15 +8148,20 @@ export class JoiSQLiteStore {
       }
       case 'mark_conflict':
         this.exec(
-          `UPDATE memories SET status='conflicted', conflict_group_id=?, conflict_reason=?, updated_at=datetime('now') WHERE id=?`,
+          `UPDATE memories SET status='conflicted', lifecycle_state='review', conflict_group_id=?, conflict_reason=?, review_reason=?, updated_at=datetime('now') WHERE id=?`,
           req.target_id || id,
           req.reason || '',
+          req.reason || 'manual_conflict',
           id,
         );
         return;
       case 'merge_into':
         if (!req.target_id) throw new Error('merge_into requires target_id');
-        this.exec(`UPDATE memories SET merged_into_memory_id=?, updated_at=datetime('now') WHERE id=?`, req.target_id, id);
+        this.exec(
+          `UPDATE memories SET status='superseded', lifecycle_state='superseded', merged_into_memory_id=?, disabled_at=datetime('now'), archived_at=datetime('now'), updated_at=datetime('now') WHERE id=?`,
+          req.target_id,
+          id,
+        );
         return;
       default:
         throw new Error(`unsupported memory action: ${action}`);
@@ -11781,8 +12704,29 @@ export class JoiSQLiteStore {
         memory_context_pack_id: memoryPackID,
         ...scope,
         recalled_count: results.length,
+        stable_profile_count: results.filter((result) => result.retrieval_source === 'stable_profile').length,
+        dynamic_retrieval_count: results.filter((result) => result.retrieval_source !== 'stable_profile').length,
+        pipeline_version: MEMORY_PIPELINE_VERSION,
       },
     });
+    if (!results.some((result) => result.retrieval_source !== 'stable_profile')) {
+      this.appendRunEventV2({
+        run_id: runID,
+        turn_id: turnID,
+        event_type: 'memory.retrieval.abstained',
+        item_type: 'memory_context_pack',
+        item_id: memoryPackID,
+        status: 'skipped',
+        source: 'memory_runtime',
+        visibility: 'memory',
+        payload: {
+          memory_context_pack_id: memoryPackID,
+          reason: 'no_relevant_dynamic_memory',
+          relevance_threshold: this.memoryPolicyConfig().relevance_threshold,
+          pipeline_version: MEMORY_PIPELINE_VERSION,
+        },
+      });
+    }
     for (const result of results) {
       const memory = result.memory;
       if (!memory?.id) continue;
@@ -11799,6 +12743,7 @@ export class JoiSQLiteStore {
           memory_context_pack_id: memoryPackID,
           memory_id: memory.id,
           memory_type: memory.type,
+          memory_layer: memory.layer,
           summary: memory.summary,
           content: memory.content,
           reason: result.reason,
@@ -11807,6 +12752,10 @@ export class JoiSQLiteStore {
           matched_terms: result.matched_terms,
           scope_match: result.scope_match,
           pinned: memory.pinned,
+          stage: result.retrieval_source === 'stable_profile' ? 'stable_profile' : 'dynamic_retrieval',
+          score_components: result.score_components || {},
+          injected: result.injected ?? true,
+          pipeline_version: MEMORY_PIPELINE_VERSION,
         },
       });
     }
@@ -11818,7 +12767,7 @@ export class JoiSQLiteStore {
     results: MemorySearchResult[],
     scope: MemoryRetrievalScope,
   ): void {
-    for (const result of results) {
+    for (const [index, result] of results.entries()) {
       if (!result.memory.id) continue;
       const existing = this.get(
         `SELECT id FROM memory_usage_logs WHERE memory_id=? AND run_id=? AND injected=1 LIMIT 1`,
@@ -11827,20 +12776,28 @@ export class JoiSQLiteStore {
       );
       if (existing) continue;
       this.exec(
-        `INSERT INTO memory_usage_logs (id, memory_id, run_id, agent_id, retrieval_score, injected, used_in_answer, outcome, metadata)
-         VALUES (?, ?, ?, ?, ?, 1, 0, 'injected', ?)`,
+        `INSERT INTO memory_usage_logs (
+           id, memory_id, run_id, agent_id, retrieval_score, normalized_score,
+           recalled, injected, used_in_answer, influence_state, rank, pipeline_version, outcome, metadata
+         ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 0, 'unknown', ?, ?, 'injected', ?)`,
         `mulog_${newID()}`,
         result.memory.id,
         runID,
         agentID,
         result.score,
+        normalizeRelevanceScore(result.score),
+        index + 1,
+        MEMORY_PIPELINE_VERSION,
         json({
-          source: 'prompt_memory_retrieval_v2',
+          source: 'prompt_memory_retrieval_v3',
           reason: result.reason,
           retrieval_source: result.retrieval_source,
           matched_terms: result.matched_terms || [],
           scope_match: result.scope_match,
+          stage: result.retrieval_source === 'stable_profile' ? 'stable_profile' : 'dynamic_retrieval',
+          score_components: result.score_components || {},
           memory_scope: scope,
+          pipeline_version: MEMORY_PIPELINE_VERSION,
         }),
       );
       this.exec(
@@ -12089,6 +13046,49 @@ export class JoiSQLiteStore {
     };
   }
 
+  private stableMemoryProfile(scope: MemoryRetrievalScope): MemorySearchResult[] {
+    const scopeClauses = [`scope_type='global'`];
+    const scopeParams: SQLiteValue[] = [];
+    if (scope.user_ids.length > 0) {
+      scopeClauses.push(`(scope_type='user' AND scope_id IN (${placeholders(scope.user_ids.length)}))`);
+      scopeParams.push(...scope.user_ids);
+    }
+    if (scope.project_ids.length > 0) {
+      scopeClauses.push(`(scope_type='project' AND scope_id IN (${placeholders(scope.project_ids.length)}))`);
+      scopeParams.push(...scope.project_ids);
+    }
+    const policy = this.memoryPolicyConfig();
+    const rows = this.all(
+      `SELECT * FROM memories
+       WHERE layer='profile'
+         AND status='confirmed'
+         AND lifecycle_state='active'
+         AND privacy_level IN ('public', 'internal')
+         AND disabled_at IS NULL
+         AND merged_into_memory_id IS NULL
+         AND (valid_until IS NULL OR datetime(valid_until) > datetime('now'))
+         AND ${activeMemoryTTLWhereClause('memories')}
+         AND (${scopeClauses.join(' OR ')})
+       ORDER BY pinned DESC, evidence_authority DESC, evidence_count DESC,
+                confidence DESC, datetime(updated_at) DESC
+       LIMIT ?`,
+      ...scopeParams,
+      Math.max(1, Math.min(policy.stable_profile_limit, 12)),
+    );
+    return rows.map((row) => ({
+      memory: rowToMemory(row),
+      score: 1,
+      reason: '稳定用户档案：已确认、当前有效且与当前作用域一致。',
+      retrieval_source: 'stable_profile',
+      matched_terms: [],
+      scope_match: optionalString(row.scope_type) || 'global',
+      injected: true,
+      used_in_answer: false,
+      influence_state: 'unknown',
+      score_components: { stable_profile: 1 },
+    }));
+  }
+
   private searchPromptMemories(query: string, limit: number, scope: MemoryRetrievalScope): MemorySearchResult[] {
     const scopeClauses = [`memories.scope_type='global'`];
     const scopeParams: SQLiteValue[] = [];
@@ -12104,74 +13104,136 @@ export class JoiSQLiteStore {
       scopeClauses.push(`(memories.scope_type='project' AND memories.scope_id IN (${placeholders(scope.project_ids.length)}))`);
       scopeParams.push(...scope.project_ids);
     }
-    const selectedColumns = `memories.id, memories.type, memories.content, COALESCE(memories.summary, '') AS summary,
-      memories.scope_type, COALESCE(memories.scope_id, '') AS scope_id, memories.privacy_level, memories.confidence,
-      memories.status, memories.source_event_ids, memories.entities, memories.success_count, memories.failure_count,
-      memories.usage_count, memories.positive_feedback, memories.negative_feedback, memories.pinned, memories.disabled_at,
-      COALESCE(memories.merged_into_memory_id, '') AS merged_into_memory_id,
-      COALESCE(memories.conflict_group_id, '') AS conflict_group_id,
-      COALESCE(memories.conflict_reason, '') AS conflict_reason, memories.metadata, memories.created_at,
-      memories.updated_at, memories.last_used_at`;
+    const activeWhere = `memories.status='confirmed'
+      AND memories.lifecycle_state='active'
+      AND memories.privacy_level IN ('public', 'internal')
+      AND memories.disabled_at IS NULL
+      AND memories.merged_into_memory_id IS NULL
+      AND (memories.valid_until IS NULL OR datetime(memories.valid_until) > datetime('now'))
+      AND ${activeMemoryTTLWhereClause('memories')}
+      AND (${scopeClauses.join(' OR ')})`;
     const governanceRows = this.all(
-      `SELECT ${selectedColumns}, 'governance' AS retrieval_source
+      `SELECT memories.*, embeddings.embedding, 'governance' AS retrieval_source
        FROM memories
-       WHERE memories.status='confirmed'
-         AND memories.disabled_at IS NULL
-         AND memories.merged_into_memory_id IS NULL
-         AND ${activeMemoryTTLWhereClause('memories')}
-         AND (${scopeClauses.join(' OR ')})
+       LEFT JOIN memory_embeddings embeddings
+         ON embeddings.memory_id=memories.id AND embeddings.embedding_model=?
+       WHERE ${activeWhere}
        ORDER BY memories.pinned DESC, memories.confidence DESC, datetime(memories.updated_at) DESC
-       LIMIT 60`,
+       LIMIT 240`,
+      LOCAL_MEMORY_EMBEDDING_MODEL,
       ...scopeParams,
     );
     const terms = memorySearchTerms(query);
     const ftsQuery = terms.map((term) => `"${term.replace(/"/g, '""')}"`).join(' OR ');
     const exactRows = ftsQuery ? this.all(
-      `SELECT ${selectedColumns}, 'fts' AS retrieval_source, bm25(memory_fts) AS fts_rank
+      `SELECT memories.*, embeddings.embedding, 'fts' AS retrieval_source, bm25(memory_fts) AS fts_rank
        FROM memory_fts
        JOIN memories ON memories.id=memory_fts.memory_id
+       LEFT JOIN memory_embeddings embeddings
+         ON embeddings.memory_id=memories.id AND embeddings.embedding_model=?
        WHERE memory_fts MATCH ?
-         AND memories.status='confirmed'
-         AND memories.disabled_at IS NULL
-         AND memories.merged_into_memory_id IS NULL
-         AND ${activeMemoryTTLWhereClause('memories')}
-         AND (${scopeClauses.join(' OR ')})
+         AND ${activeWhere}
        ORDER BY bm25(memory_fts), memories.pinned DESC, memories.confidence DESC
-       LIMIT 60`,
+       LIMIT 120`,
+      LOCAL_MEMORY_EMBEDDING_MODEL,
       ftsQuery,
       ...scopeParams,
     ) : [];
+    const substringClauses = terms.map(() => `(memories.content LIKE ? ESCAPE '\\' OR memories.summary LIKE ? ESCAPE '\\' OR memories.type LIKE ? ESCAPE '\\')`);
+    const substringParams = terms.flatMap((term) => {
+      const like = `%${escapeLike(term)}%`;
+      return [like, like, like];
+    });
+    const substringRows = substringClauses.length > 0 ? this.all(
+      `SELECT memories.*, embeddings.embedding, 'substring' AS retrieval_source
+       FROM memories
+       LEFT JOIN memory_embeddings embeddings
+         ON embeddings.memory_id=memories.id AND embeddings.embedding_model=?
+       WHERE ${activeWhere} AND (${substringClauses.join(' OR ')})
+       ORDER BY memories.pinned DESC, memories.confidence DESC, datetime(memories.updated_at) DESC
+       LIMIT 120`,
+      LOCAL_MEMORY_EMBEDDING_MODEL,
+      ...scopeParams,
+      ...substringParams,
+    ) : [];
     const rowsByID = new Map<string, SQLiteRow>();
     for (const row of governanceRows) rowsByID.set(String(row.id), row);
+    for (const row of substringRows) rowsByID.set(String(row.id), row);
     for (const row of exactRows) rowsByID.set(String(row.id), row);
+    const queryText = query.trim();
+    const queryVector = localMemoryVector(queryText);
+    const queryFeatures = new Set(memorySearchFeatures(queryText));
+    const queryTags = inferMemoryContextTags(queryText).filter((tag) => tag !== 'context:general');
+    const policy = this.memoryPolicyConfig();
     const scored: MemorySearchResult[] = [...rowsByID.values()].map((row) => {
       const memory = rowToMemory(row);
-      const haystack = `${memory.type} ${memory.summary} ${memory.content} ${(memory.entities || []).join(' ')}`.toLowerCase();
+      const memoryText = `${memory.type} ${memory.summary} ${memory.content} ${(memory.entities || []).join(' ')} ${(memory.context_tags || []).join(' ')}`;
+      const haystack = memoryText.toLowerCase();
       const matchedTerms = terms.filter((term) => haystack.includes(term));
       const retrievalSource = optionalString(row.retrieval_source) || 'governance';
-      const feedbackBoost = Math.min(memory.positive_feedback * 0.03, 0.15) - Math.min(memory.negative_feedback * 0.08, 0.4);
-      const scopeBoost = memory.scope_type === 'room' ? 0.2 : memory.scope_type === 'project' ? 0.15 : memory.scope_type === 'user' ? 0.1 : 0;
-      const score = Number(memory.confidence || 0)
-        + (memory.pinned ? 0.25 : 0)
-        + matchedTerms.length * 0.35
-        + (retrievalSource === 'fts' ? 0.5 : 0)
-        + feedbackBoost
-        + scopeBoost;
+      const memoryVector = parseNumberArray(row.embedding);
+      const semantic = cosineSimilarity(queryVector, memoryVector.length > 0 ? memoryVector : localMemoryVector(memoryText));
+      const lexical = lexicalSimilarity(queryText, memoryText);
+      const memoryFeatures = new Set(memorySearchFeatures(memoryText));
+      let featureMatches = 0;
+      for (const feature of queryFeatures) if (memoryFeatures.has(feature)) featureMatches += 1;
+      const keyword = queryFeatures.size > 0 ? featureMatches / queryFeatures.size : 0;
+      const memoryTags = new Set(memory.context_tags || []);
+      const context = queryTags.length > 0 ? queryTags.filter((tag) => memoryTags.has(tag)).length / queryTags.length : 0;
+      const scopeScore = memory.scope_type === 'room' ? 1 : memory.scope_type === 'project' ? 0.9 : memory.scope_type === 'user' ? 0.85 : 0.65;
+      const confidence = normalizeRelevanceScore(memory.confidence || 0);
+      const updatedAt = Date.parse(memory.updated_at || memory.created_at || '');
+      const ageDays = Number.isFinite(updatedAt) ? Math.max(0, (Date.now() - updatedAt) / 86_400_000) : 365;
+      const recency = normalizeRelevanceScore(Math.exp(-ageDays / 180));
+      const usage = normalizeRelevanceScore(Math.log1p(memory.usage_count) / Math.log(21));
+      const feedbackTotal = memory.positive_feedback + memory.negative_feedback;
+      const feedback = feedbackTotal > 0
+        ? normalizeRelevanceScore(memory.positive_feedback / feedbackTotal)
+        : 0.5;
+      const pinned = memory.pinned ? 1 : 0;
+      const scoreComponents = {
+        local_similarity: normalizeRelevanceScore(semantic),
+        keyword: normalizeRelevanceScore(keyword),
+        lexical: normalizeRelevanceScore(lexical),
+        context: normalizeRelevanceScore(context),
+        scope: normalizeRelevanceScore(scopeScore),
+        confidence,
+        recency,
+        usage,
+        feedback,
+        pinned,
+      };
+      const weighted = semantic * 0.28
+        + keyword * 0.27
+        + lexical * 0.16
+        + context * 0.07
+        + scopeScore * 0.07
+        + confidence * 0.06
+        + recency * 0.04
+        + usage * 0.025
+        + feedback * 0.025
+        + pinned * 0.03;
+      const exactMatch = retrievalSource === 'fts' || retrievalSource === 'substring';
+      const score = normalizeRelevanceScore(exactMatch && matchedTerms.length > 0 ? Math.max(weighted, 0.72) : weighted);
       return {
         memory,
         score,
         reason: matchedTerms.length > 0
-          ? `${retrievalSource} matched ${matchedTerms.length} prompt term${matchedTerms.length === 1 ? '' : 's'}; scope=${memory.scope_type}`
-          : `stable confirmed memory; scope=${memory.scope_type}`,
-        retrieval_source: retrievalSource,
+          ? `混合检索命中 ${matchedTerms.length} 个查询词，作用域=${memory.scope_type}，相关度=${score.toFixed(2)}`
+          : `本地相似度与上下文综合命中，作用域=${memory.scope_type}，相关度=${score.toFixed(2)}`,
+        retrieval_source: exactMatch ? retrievalSource : 'local_similarity',
         matched_terms: matchedTerms,
         scope_match: memory.scope_type,
+        injected: true,
+        used_in_answer: false,
+        influence_state: 'unknown',
+        score_components: scoreComponents,
       };
     });
     return scored
-      .filter((item) => item.score > 0 || item.memory.pinned)
+      .filter((item) => item.score >= policy.relevance_threshold)
       .sort((a, b) => b.score - a.score || Number(b.memory.pinned) - Number(a.memory.pinned))
-      .slice(0, Math.max(1, Math.min(limit, 12)));
+      .slice(0, Math.max(1, Math.min(limit, policy.dynamic_limit, 12)));
   }
 
   private insertTurnItem(
@@ -15338,15 +16400,23 @@ function rowToToolRun(row: SQLiteRow): ToolRunRecord {
 
 function rowToMemory(row: SQLiteRow): MemoryRecord {
   const disabledAt = optionalString(row.disabled_at);
+  const metadata = parseObject(row.metadata);
+  const type = optionalString(row.type) || 'note';
   return {
     id: String(row.id),
-    type: optionalString(row.type) || 'note',
+    layer: optionalString(row.layer) || inferLegacyMemoryLayer(type, metadata),
+    type,
+    memory_key: optionalString(row.memory_key),
     content: String(row.content),
     summary: optionalString(row.summary) || '',
     scope_type: optionalString(row.scope_type) || 'global',
     scope_id: optionalString(row.scope_id),
     privacy_level: optionalString(row.privacy_level) || 'internal',
+    evidence_kind: optionalString(row.evidence_kind) || 'legacy',
+    evidence_authority: Number(row.evidence_authority ?? memoryEvidenceAuthority('legacy')),
+    evidence_count: Number(row.evidence_count ?? 1),
     status: optionalString(row.status) || 'pending',
+    lifecycle_state: optionalString(row.lifecycle_state) || (disabledAt ? 'disabled' : 'active'),
     confidence: Number(row.confidence ?? 0.5),
     pinned: Boolean(Number(row.pinned ?? 0)),
     disabled: Boolean(disabledAt),
@@ -15357,14 +16427,41 @@ function rowToMemory(row: SQLiteRow): MemoryRecord {
     positive_feedback: Number(row.positive_feedback ?? 0),
     negative_feedback: Number(row.negative_feedback ?? 0),
     source_event_ids: parseArray(row.source_event_ids).map(String),
+    source_kind: optionalString(row.source_kind) || optionalString(metadata.source) || 'legacy',
     entities: parseArray(row.entities).map(String),
+    context_tags: parseStringArray(row.context_tags),
     merged_into_memory_id: optionalString(row.merged_into_memory_id),
+    supersedes_memory_id: optionalString(row.supersedes_memory_id),
     conflict_group_id: optionalString(row.conflict_group_id),
     conflict_reason: optionalString(row.conflict_reason),
-    metadata: parseObject(row.metadata),
+    review_reason: optionalString(row.review_reason),
+    valid_from: optionalString(row.valid_from),
+    valid_until: optionalString(row.valid_until),
+    last_verified_at: optionalString(row.last_verified_at),
+    archived_at: optionalString(row.archived_at),
+    auto_managed: Boolean(Number(row.auto_managed ?? 1)),
+    retention_policy: optionalString(row.retention_policy) || 'standard',
+    metadata,
     created_at: optionalString(row.created_at),
     updated_at: optionalString(row.updated_at),
     last_used_at: optionalString(row.last_used_at),
+  };
+}
+
+function rowToMemoryMaintenance(row: SQLiteRow): MemoryMaintenanceRun {
+  return {
+    id: optionalString(row.id) || '',
+    status: optionalString(row.status) || 'unknown',
+    trigger_source: optionalString(row.trigger_source) || 'unknown',
+    processed_input_count: Number(row.processed_input_count || 0),
+    generated_observation_count: Number(row.generated_observation_count || 0),
+    expired_count: Number(row.expired_count || 0),
+    merged_count: Number(row.merged_count || 0),
+    embedding_count: Number(row.embedding_count || 0),
+    error_summary: optionalString(row.error_summary),
+    metadata: parseObject(row.metadata),
+    started_at: optionalString(row.started_at),
+    finished_at: optionalString(row.finished_at),
   };
 }
 
@@ -16265,6 +17362,63 @@ function memorySearchTerms(query: string): string[] {
     if (term.length >= 2) terms.add(term);
   }
   return [...terms].slice(0, 12);
+}
+
+function memoryPromptItem(result: MemorySearchResult): Record<string, unknown> {
+  return {
+    id: result.memory.id,
+    layer: result.memory.layer || 'knowledge',
+    type: result.memory.type,
+    summary: result.memory.summary,
+    content: result.memory.content,
+    scope: result.memory.scope_type || 'global',
+    score: result.score,
+    reason: result.reason,
+  };
+}
+
+function settingBoolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) return false;
+  return fallback;
+}
+
+function clampMemoryIdleSeconds(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_MEMORY_POLICY.background_idle_seconds;
+  return Math.max(30, Math.min(86_400, Math.round(value)));
+}
+
+function normalizeMemoryText(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, ' ').replace(/[，。！？、,.!?;；:："'“”‘’]/gu, '').trim();
+}
+
+function memoryExpiryFromMetadata(metadata: Record<string, unknown>): string {
+  const ttl = parseObject(metadata.ttl);
+  const expiry = parseObject(metadata.expiry);
+  return optionalString(metadata.valid_until)
+    || optionalString(metadata.expires_at)
+    || optionalString(metadata.expiresAt)
+    || optionalString(metadata.ttl_until)
+    || optionalString(ttl.until)
+    || optionalString(expiry.expires_at)
+    || '';
+}
+
+function parseNumberArray(value: unknown): number[] {
+  return parseArray(value)
+    .map((item) => Number(item))
+    .filter((item) => Number.isFinite(item));
+}
+
+function numericRecord(value: unknown): Record<string, number> {
+  const source = parseObject(value);
+  return Object.fromEntries(
+    Object.entries(source)
+      .map(([key, item]) => [key, Number(item)] as const)
+      .filter(([, item]) => Number.isFinite(item)),
+  );
 }
 
 function activeMemoryTTLWhereClause(tableName: string): string {

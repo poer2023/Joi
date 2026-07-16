@@ -23,6 +23,14 @@ export type ChatRequest = {
   runtime_mode?: RuntimeMode;
   permission_profile?: PermissionProfile;
   attachments?: unknown[];
+  memory_controls?: Partial<MemoryTaskControls>;
+};
+
+export type MemoryTaskControls = {
+  use_memories: boolean;
+  generate_memories: boolean;
+  disable_on_external_context: boolean;
+  external_context_used?: boolean;
 };
 
 export type MessengerRoomType = 'private_hub' | 'project_dm' | 'shared' | 'human_dm' | 'external_mirror' | string;
@@ -1542,13 +1550,19 @@ export type SystemHealth = {
 
 export type MemoryRecord = {
   id: string;
+  layer?: 'profile' | 'knowledge' | 'state' | 'episode' | string;
   type: string;
+  memory_key?: string;
   content: string;
   summary: string;
   scope_type?: string;
   scope_id?: string;
   privacy_level?: string;
+  evidence_kind?: string;
+  evidence_authority?: number;
+  evidence_count?: number;
   status: string;
+  lifecycle_state?: string;
   confidence: number;
   pinned: boolean;
   disabled?: boolean;
@@ -1559,10 +1573,20 @@ export type MemoryRecord = {
   positive_feedback: number;
   negative_feedback: number;
   source_event_ids?: string[];
+  source_kind?: string;
   entities?: string[];
+  context_tags?: string[];
   merged_into_memory_id?: string;
+  supersedes_memory_id?: string;
   conflict_group_id?: string;
   conflict_reason?: string;
+  review_reason?: string;
+  valid_from?: string;
+  valid_until?: string;
+  last_verified_at?: string;
+  archived_at?: string;
+  auto_managed?: boolean;
+  retention_policy?: string;
   recent_usage?: MemoryUsageLog[];
   metadata?: Record<string, unknown>;
   created_at?: string;
@@ -1575,8 +1599,13 @@ export type MemoryUsageLog = {
   run_id: string;
   agent_id: string;
   retrieval_score: number;
+  normalized_score?: number;
+  recalled?: boolean;
   injected: boolean;
   used_in_answer: boolean;
+  influence_state?: 'unknown' | 'not_used' | 'inferred_used' | 'explicitly_used' | string;
+  rank?: number;
+  pipeline_version?: string;
   outcome: string;
   metadata?: Record<string, unknown>;
   created_at?: string;
@@ -1589,6 +1618,10 @@ export type MemorySearchResult = {
   retrieval_source?: 'fts' | 'governance' | string;
   matched_terms?: string[];
   scope_match?: 'global' | 'user' | 'room' | 'project' | string;
+  injected?: boolean;
+  used_in_answer?: boolean;
+  influence_state?: string;
+  score_components?: Record<string, number>;
 };
 
 export type MemoryQualityMetrics = {
@@ -1605,7 +1638,43 @@ export type MemoryQualityMetrics = {
   negative_feedback_count: number;
   injection_use_rate: number;
   scope_counts: Record<string, number>;
+  layer_counts?: Record<string, number>;
+  inferred_used_count?: number;
+  abstention_count?: number;
+  archived_count?: number;
+  observed_count?: number;
+  embedding_count?: number;
+  generation_queue_count?: number;
   oldest_candidate_at?: string;
+};
+
+export type MemorySettingsRecord = {
+  use_memories: boolean;
+  generate_memories: boolean;
+  disable_on_external_context: boolean;
+  background_idle_seconds: number;
+  pipeline_version: string;
+};
+
+export type MemoryMaintenanceRun = {
+  id: string;
+  status: string;
+  trigger_source: string;
+  processed_input_count: number;
+  generated_observation_count: number;
+  expired_count: number;
+  merged_count: number;
+  embedding_count: number;
+  error_summary?: string;
+  metadata?: Record<string, unknown>;
+  started_at?: string;
+  finished_at?: string;
+};
+
+export type MemorySystemSnapshot = {
+  settings: MemorySettingsRecord;
+  latest_maintenance?: MemoryMaintenanceRun;
+  metrics: MemoryQualityMetrics;
 };
 
 export type MemoryCandidateFilter = {
@@ -2362,6 +2431,9 @@ export type DesktopBindings = {
   SetToolWorkflowEnabled(req: { name: string; enabled: boolean }): Promise<void>;
   GetSystemHealth(): Promise<SystemHealth>;
   ListMemories(filter: { query?: string; limit?: number }): Promise<{ memories: MemoryRecord[]; metrics: MemoryQualityMetrics }>;
+  GetMemorySystem(): Promise<MemorySystemSnapshot>;
+  SaveMemorySettings(req: Partial<MemorySettingsRecord>): Promise<MemorySettingsRecord>;
+  RunMemoryMaintenance(req?: { trigger_source?: string }): Promise<{ run: MemoryMaintenanceRun }>;
   UpdateMemory(req: { id: string; action: string; feedback?: string; comment?: string; target_id?: string; reason?: string; content?: string; summary?: string; scope_type?: string; run_id?: string }): Promise<void>;
   ListMemoriesUsedForRun(runID: string): Promise<{ memories: MemorySearchResult[] }>;
   ListMemoryCandidates(filter: MemoryCandidateFilter): Promise<{ memories: MemoryRecord[] }>;
@@ -2501,6 +2573,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'GetAssistantWorkspace',
   'GetExternalHandoffAudit',
   'GetLogEntry',
+  'GetMemorySystem',
   'GetModelUsage',
   'GetOnboardingStatus',
   'GetProductTask',
@@ -2577,6 +2650,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'RestoreBackup',
   'RestoreConversation',
   'RotateAutomationWebhookSecret',
+  'RunMemoryMaintenance',
   'RedirectRun',
   'ResumeApprovalRun',
   'RetryExternalConnectorEvent',
@@ -2586,6 +2660,7 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'SaveModelSettings',
   'SaveAgentModelPolicy',
   'SaveIMessageConfig',
+  'SaveMemorySettings',
   'SaveOperationalSettings',
   'SaveSecret',
   'SaveTelegramConfig',

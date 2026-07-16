@@ -45,6 +45,7 @@ try {
     backupSQLiteFiles(dbPath, backupRoot);
     applyConversationClosureSchema(db);
     applyAutomationSchema(db);
+    applyMemoryOSSchema(db);
     audit.applied = true;
     audit.after = schemaAudit(db);
   } else {
@@ -72,7 +73,11 @@ function finish(result) {
 }
 
 function schemaAudit(db) {
-  const requiredTables = ['principals', 'channel_identities', 'conversation_entry_links', 'task_entry_links', 'notification_deliveries', 'automation_definitions', 'automation_triggers', 'automation_runs'];
+  const requiredTables = [
+    'principals', 'channel_identities', 'conversation_entry_links', 'task_entry_links', 'notification_deliveries',
+    'automation_definitions', 'automation_triggers', 'automation_runs',
+    'memory_observations', 'memory_events', 'memory_policies', 'memory_generation_inputs', 'memory_maintenance_runs',
+  ];
   const requiredColumns = {
     conversations: ['principal_id'],
     runs: ['principal_id', 'entry_channel', 'requested_mode', 'resolved_mode', 'mode_source', 'terminal_status', 'terminal_reason', 'resume_token', 'parent_run_id', 'redirected_from_run_id', 'cancel_requested_at', 'resumed_at'],
@@ -85,6 +90,9 @@ function schemaAudit(db) {
     automation_definitions: ['id', 'kind', 'slug', 'enabled', 'trigger_config', 'prompt_template', 'input_mode', 'permission_profile', 'preferred_node', 'allow_worker', 'conversation_id', 'principal_id', 'dedup_policy', 'retry_policy', 'max_concurrency', 'notification_policy', 'next_fire_at', 'last_fire_at', 'metadata'],
     automation_triggers: ['id', 'automation_id', 'trigger_type', 'dedup_key', 'payload', 'status', 'fire_at', 'claimed_at', 'claim_token', 'run_id', 'product_task_id', 'attempt_count', 'next_attempt_at', 'error_code', 'error_message'],
     automation_runs: ['id', 'automation_id', 'trigger_id', 'run_id', 'product_task_id', 'status', 'attempt_number', 'started_at', 'finished_at', 'output_summary', 'error_code', 'error_message', 'metadata'],
+    memories: ['layer', 'memory_key', 'evidence_kind', 'evidence_authority', 'evidence_count', 'lifecycle_state', 'source_kind', 'context_tags', 'supersedes_memory_id', 'review_reason', 'valid_from', 'valid_until', 'last_verified_at', 'archived_at', 'auto_managed', 'retention_policy'],
+    memory_usage_logs: ['normalized_score', 'recalled', 'influence_state', 'rank', 'pipeline_version'],
+    memory_maintenance_runs: ['processed_input_count', 'generated_observation_count'],
   };
   const requiredIndexes = [
     'idx_automation_definitions_kind',
@@ -93,6 +101,12 @@ function schemaAudit(db) {
     'idx_automation_triggers_definition',
     'idx_automation_runs_definition',
     'idx_automation_runs_trigger',
+    'idx_memories_layer_lifecycle',
+    'idx_memories_memory_key',
+    'idx_memory_observations_key',
+    'idx_memory_events_memory',
+    'idx_memory_generation_status',
+    'idx_memory_maintenance_finished',
   ];
   const missing = [];
   for (const table of requiredTables) {
@@ -115,6 +129,58 @@ function schemaAudit(db) {
 function applyAutomationSchema(db) {
   const migrationPath = join(resolve(import.meta.dirname, '..'), 'database/migrations/012_automation_os.sql');
   db.exec(readFileSync(migrationPath, 'utf8'));
+}
+
+function applyMemoryOSSchema(db) {
+  const ensure = (table, column, definition) => {
+    if (tableExists(db, table) && !columnExists(db, table, column)) {
+      db.exec(`ALTER TABLE ${quoteIdentifier(table)} ADD COLUMN ${quoteIdentifier(column)} ${definition}`);
+    }
+  };
+  for (const [column, definition] of [
+    ['layer', "TEXT NOT NULL DEFAULT 'knowledge'"],
+    ['memory_key', "TEXT NOT NULL DEFAULT ''"],
+    ['evidence_kind', "TEXT NOT NULL DEFAULT 'legacy'"],
+    ['evidence_authority', 'INTEGER NOT NULL DEFAULT 20'],
+    ['evidence_count', 'INTEGER NOT NULL DEFAULT 1'],
+    ['lifecycle_state', "TEXT NOT NULL DEFAULT 'active'"],
+    ['source_kind', "TEXT NOT NULL DEFAULT 'conversation'"],
+    ['context_tags', "TEXT NOT NULL DEFAULT '[]'"],
+    ['supersedes_memory_id', 'TEXT'],
+    ['review_reason', 'TEXT'],
+    ['valid_from', 'TEXT'],
+    ['valid_until', 'TEXT'],
+    ['last_verified_at', 'TEXT'],
+    ['archived_at', 'TEXT'],
+    ['auto_managed', 'INTEGER NOT NULL DEFAULT 1'],
+    ['retention_policy', "TEXT NOT NULL DEFAULT 'standard'"],
+  ]) ensure('memories', column, definition);
+  for (const [column, definition] of [
+    ['normalized_score', 'REAL'],
+    ['recalled', 'INTEGER NOT NULL DEFAULT 1'],
+    ['influence_state', "TEXT NOT NULL DEFAULT 'unknown'"],
+    ['rank', 'INTEGER'],
+    ['pipeline_version', "TEXT NOT NULL DEFAULT 'legacy'"],
+  ]) ensure('memory_usage_logs', column, definition);
+  for (const [column, definition] of [
+    ['processed_input_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ['generated_observation_count', 'INTEGER NOT NULL DEFAULT 0'],
+  ]) ensure('memory_maintenance_runs', column, definition);
+
+  const sqliteSchema = readFileSync(join(resolve(import.meta.dirname, '..'), 'database/sqlite/001_init_schema.sql'), 'utf8');
+  const createTablesAt = sqliteSchema.indexOf('CREATE TABLE IF NOT EXISTS memory_observations');
+  const createTablesEnd = sqliteSchema.indexOf('CREATE TABLE IF NOT EXISTS confirmations', createTablesAt);
+  if (createTablesAt < 0 || createTablesEnd < 0) throw new Error('SQLite schema is missing the memory OS table section');
+  db.exec(sqliteSchema.slice(createTablesAt, createTablesEnd));
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_memories_layer_lifecycle ON memories(layer, lifecycle_state, status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memories_memory_key ON memories(memory_key, scope_type, scope_id, status);
+    CREATE INDEX IF NOT EXISTS idx_memory_observations_key ON memory_observations(memory_key, scope_type, scope_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memory_events_memory ON memory_events(memory_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memory_generation_status ON memory_generation_inputs(status, eligible_after, created_at);
+    CREATE INDEX IF NOT EXISTS idx_memory_maintenance_finished ON memory_maintenance_runs(finished_at DESC);
+    INSERT OR IGNORE INTO schema_migrations (version) VALUES ('014_memory_os_codex_alma');
+  `);
 }
 
 function applyConversationClosureSchema(db) {

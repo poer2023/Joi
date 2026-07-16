@@ -68,8 +68,11 @@ import {
   type MemoryCorrectionRequest,
   type MemoryDeleteRequest,
   type MemoryRecord,
+  type MemoryMaintenanceRun,
   type MemoryQualityMetrics,
   type MemorySearchResult,
+  type MemorySettingsRecord,
+  type MemorySystemSnapshot,
   type MessengerProject,
   type MessengerRoom,
   type ModelCall,
@@ -211,8 +214,11 @@ export type {
   MemoryCorrectionRequest,
   MemoryDeleteRequest,
   MemoryRecord,
+  MemoryMaintenanceRun,
   MemoryQualityMetrics,
   MemorySearchResult,
+  MemorySettingsRecord,
+  MemorySystemSnapshot,
   MessengerProject,
   MessengerRoom,
   ModelCall,
@@ -2085,6 +2091,61 @@ function bindings(): DesktopBindings {
           warnings: [],
         };
       },
+      async GetMemorySystem(): Promise<MemorySystemSnapshot> {
+        const allMemories = previewMemoryRecords();
+        const confirmed = allMemories.filter((memory) => memory.status === 'confirmed' && !memory.disabled);
+        const candidates = allMemories.filter((memory) => ['pending', 'candidate', 'proposed', 'conflicted'].includes(memory.status));
+        return {
+          settings: {
+            use_memories: true,
+            generate_memories: true,
+            disable_on_external_context: true,
+            background_idle_seconds: 300,
+            pipeline_version: 'memory_os_v3_codex_alma',
+          },
+          metrics: {
+            confirmed_count: confirmed.length,
+            candidate_count: candidates.length,
+            old_candidate_count: 0,
+            stale_confirmed_count: 0,
+            duplicate_candidate_count: 0,
+            recalled_count: 0,
+            injected_count: 0,
+            used_in_answer_count: 0,
+            unused_injection_count: 0,
+            positive_feedback_count: 0,
+            negative_feedback_count: 0,
+            injection_use_rate: 0,
+            scope_counts: {},
+            layer_counts: Object.fromEntries(['profile', 'knowledge', 'state', 'episode'].map((layer) => [layer, confirmed.filter((memory) => memory.layer === layer).length])),
+          },
+        };
+      },
+      async SaveMemorySettings(payload: Partial<MemorySettingsRecord>): Promise<MemorySettingsRecord> {
+        return {
+          use_memories: payload.use_memories ?? true,
+          generate_memories: payload.generate_memories ?? true,
+          disable_on_external_context: payload.disable_on_external_context ?? true,
+          background_idle_seconds: payload.background_idle_seconds ?? 300,
+          pipeline_version: 'memory_os_v3_codex_alma',
+        };
+      },
+      async RunMemoryMaintenance(): Promise<{ run: MemoryMaintenanceRun }> {
+        return {
+          run: {
+            id: `preview_maintenance_${Date.now()}`,
+            status: 'completed',
+            trigger_source: 'desktop_ui',
+            processed_input_count: 0,
+            generated_observation_count: 0,
+            expired_count: 0,
+            merged_count: 0,
+            embedding_count: 0,
+            started_at: new Date().toISOString(),
+            finished_at: new Date().toISOString(),
+          },
+        };
+      },
       async ListMemories(filter: { query?: string; limit?: number } = {}) {
         const query = filter.query?.trim().toLowerCase() ?? '';
         const allMemories = previewMemoryRecords();
@@ -2629,6 +2690,9 @@ export const desktopApi = {
   listToolRuns: () => bindings().ListToolRuns(),
   setToolWorkflowEnabled: (req: { name: string; enabled: boolean }) => bindings().SetToolWorkflowEnabled(req),
   getSystemHealth: () => bindings().GetSystemHealth(),
+  getMemorySystem: () => bindings().GetMemorySystem(),
+  saveMemorySettings: (req: Partial<MemorySettingsRecord>) => bindings().SaveMemorySettings(req),
+  runMemoryMaintenance: (req: { trigger_source?: string } = {}) => bindings().RunMemoryMaintenance(req),
   listMemories: (filter: { query?: string; limit?: number }) => bindings().ListMemories(filter),
   updateMemory: (req: { id: string; action: string; feedback?: string; comment?: string; target_id?: string; reason?: string; content?: string; summary?: string; scope_type?: string; run_id?: string }) => bindings().UpdateMemory(req),
   listMemoriesUsedForRun: (runID: string) => bindings().ListMemoriesUsedForRun(runID),

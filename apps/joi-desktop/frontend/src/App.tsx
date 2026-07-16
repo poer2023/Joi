@@ -38,6 +38,7 @@ import {
   type MemoryRecord,
   type MemoryQualityMetrics,
   type MemorySearchResult,
+  type MemorySystemSnapshot,
   type MessengerRoom,
   type MCPServerRecord,
   type ModelCall,
@@ -485,6 +486,7 @@ export default function App() {
   const [externalHandoffAudit, setExternalHandoffAudit] = useState<ExternalHandoffAudit | null>(null);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
   const [memoryMetrics, setMemoryMetrics] = useState<MemoryQualityMetrics | null>(null);
+  const [memorySystem, setMemorySystem] = useState<MemorySystemSnapshot | null>(null);
   const [productTasks, setProductTasks] = useState<ProductTask[]>([]);
   const [activeProductTaskID, setActiveProductTaskID] = useState('');
   const [activeProductTaskDetail, setActiveProductTaskDetail] = useState<ProductTaskDetail | null>(null);
@@ -1274,6 +1276,7 @@ export default function App() {
         runClosureReport,
         handoffAudit,
         memoryList,
+        memorySystemSnapshot,
         taskList,
         artifactList,
         openLoopList,
@@ -1299,6 +1302,7 @@ export default function App() {
         desktopApi.getRecentRunClosureReport({ limit: 50 }),
         desktopApi.getExternalHandoffAudit(),
         desktopApi.listMemories({ query: memoryQuery, limit: 50 }),
+        desktopApi.getMemorySystem(),
         desktopApi.listProductTasks({ status: '', limit: 50 }),
         desktopApi.listArtifacts({ limit: 50 }),
         desktopApi.listOpenLoops({ status: 'open', limit: 50 }),
@@ -1325,6 +1329,7 @@ export default function App() {
       setExternalHandoffAudit(handoffAudit);
       setMemories(memoryList.memories ?? []);
       setMemoryMetrics(memoryList.metrics ?? null);
+      setMemorySystem(memorySystemSnapshot);
       setProductTasks(taskList.tasks ?? []);
       setArtifacts(artifactList.artifacts ?? []);
       setOpenLoops(openLoopList.open_loops ?? []);
@@ -2199,6 +2204,7 @@ export default function App() {
               health={health}
               memories={memories}
               memoryMetrics={memoryMetrics}
+              memorySystem={memorySystem}
               memoryQuery={memoryQuery}
               mcpServers={mcpServers}
               nodes={nodes}
@@ -2555,6 +2561,7 @@ function SettingsConsole({
   health,
   memories,
   memoryMetrics,
+  memorySystem,
   memoryQuery,
   mcpServers,
   nodes,
@@ -2608,6 +2615,7 @@ function SettingsConsole({
   health: SystemHealth | null;
   memories: MemoryRecord[];
   memoryMetrics: MemoryQualityMetrics | null;
+  memorySystem: MemorySystemSnapshot | null;
   memoryQuery: string;
   mcpServers: MCPServerRecord[];
   nodes: NodeRecord[];
@@ -2723,6 +2731,7 @@ function SettingsConsole({
   const [desktopNotificationSound, setDesktopNotificationSound] = useState(workspaceSettings?.desktop_notification_sound ?? true);
   const [githubTestStatus, setGithubTestStatus] = useState('');
   const [workerGatewayEnabled, setWorkerGatewayEnabled] = useState(settings?.worker_gateway_enabled ?? true);
+  const [memoryControlBusy, setMemoryControlBusy] = useState('');
   const [restorePath, setRestorePath] = useState('');
   const [automationName, setAutomationName] = useState('');
   const [automationSlug, setAutomationSlug] = useState('');
@@ -2757,6 +2766,32 @@ function SettingsConsole({
     if (!memoryQuery.trim()) return true;
     return `${memory.summary} ${memory.content} ${memory.type}`.toLowerCase().includes(memoryQuery.trim().toLowerCase());
   });
+
+  async function saveMemoryControl(patch: Partial<MemorySystemSnapshot['settings']>) {
+    setMemoryControlBusy('saving');
+    try {
+      await desktopApi.saveMemorySettings(patch);
+      await refreshAll();
+      setNotice('记忆控制已保存。');
+    } catch (err) {
+      setNotice(`记忆控制保存失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setMemoryControlBusy('');
+    }
+  }
+
+  async function runMemoryMaintenanceNow() {
+    setMemoryControlBusy('maintenance');
+    try {
+      const result = await desktopApi.runMemoryMaintenance({ trigger_source: 'desktop_ui' });
+      await refreshAll();
+      setNotice(`记忆维护已完成：处理 ${result.run.processed_input_count} 条输入，生成 ${result.run.generated_observation_count} 条观察。`);
+    } catch (err) {
+      setNotice(`记忆维护失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setMemoryControlBusy('');
+    }
+  }
 
   useEffect(() => {
     const preset = modelProviderPresets[activeObject.id] ?? modelProviderPresets.compatible;
@@ -4091,12 +4126,58 @@ function SettingsConsole({
       return (
         <section className="settings-detail-panel">
           <DetailHeader title="记忆健康" description="查看召回质量、作用域隔离和候选生命周期，不自动删除数据" />
+          <section>
+            <h3>记忆控制</h3>
+            <div className="settings-form compact">
+              <label className="field-row">
+                <span>在回答中使用记忆</span>
+                <input
+                  checked={memorySystem?.settings.use_memories ?? true}
+                  disabled={Boolean(memoryControlBusy)}
+                  type="checkbox"
+                  onChange={(event) => void saveMemoryControl({ use_memories: event.target.checked })}
+                />
+              </label>
+              <label className="field-row">
+                <span>从任务中生成记忆</span>
+                <input
+                  checked={memorySystem?.settings.generate_memories ?? true}
+                  disabled={Boolean(memoryControlBusy)}
+                  type="checkbox"
+                  onChange={(event) => void saveMemoryControl({ generate_memories: event.target.checked })}
+                />
+              </label>
+              <label className="field-row">
+                <span>使用外部内容时停止生成</span>
+                <input
+                  checked={memorySystem?.settings.disable_on_external_context ?? true}
+                  disabled={Boolean(memoryControlBusy)}
+                  type="checkbox"
+                  onChange={(event) => void saveMemoryControl({ disable_on_external_context: event.target.checked })}
+                />
+              </label>
+            </div>
+            <div className="detail-toolbar">
+              <button disabled={Boolean(memoryControlBusy)} type="button" onClick={() => void runMemoryMaintenanceNow()}>
+                {memoryControlBusy === 'maintenance' ? '正在维护…' : '立即整理记忆'}
+              </button>
+              <small>
+                后台空闲 {memorySystem?.settings.background_idle_seconds ?? 300} 秒后整理 · {memorySystem?.settings.pipeline_version ?? 'memory_os_v3_codex_alma'}
+              </small>
+            </div>
+            {memorySystem?.latest_maintenance ? (
+              <p className="empty">
+                最近维护：{formatStatus(memorySystem.latest_maintenance.status)} · {formatShortTime(memorySystem.latest_maintenance.finished_at || memorySystem.latest_maintenance.started_at)} ·
+                处理 {memorySystem.latest_maintenance.processed_input_count} 条，归档 {memorySystem.latest_maintenance.expired_count} 条，合并 {memorySystem.latest_maintenance.merged_count} 条
+              </p>
+            ) : null}
+          </section>
           <dl className="compact-kv">
             <KV label="已确认" value={`${metrics?.confirmed_count ?? 0} 条`} />
             <KV label="待处理" value={`${metrics?.candidate_count ?? 0} 条`} />
             <KV label="召回 / 注入" value={`${metrics?.recalled_count ?? 0} / ${metrics?.injected_count ?? 0}`} />
-            <KV label="确认用于回答" value={`${metrics?.used_in_answer_count ?? 0} 条 · ${formatRatio(metrics?.injection_use_rate ?? 0)}`} />
-            <KV label="未确认使用" value={`${metrics?.unused_injection_count ?? 0} 条`} />
+            <KV label="推断用于回答" value={`${metrics?.used_in_answer_count ?? 0} 条 · ${formatRatio(metrics?.injection_use_rate ?? 0)}`} />
+            <KV label="未产生可见影响" value={`${metrics?.unused_injection_count ?? 0} 条`} />
             <KV label="反馈" value={`有效 ${metrics?.positive_feedback_count ?? 0} · 无效 ${metrics?.negative_feedback_count ?? 0}`} />
           </dl>
           <section>
@@ -4110,6 +4191,17 @@ function SettingsConsole({
                   </article>
                 ))
                 : <p className="empty">暂无已确认记忆。</p>}
+            </div>
+          </section>
+          <section>
+            <h3>分层分布</h3>
+            <div className="table">
+              {(['profile', 'knowledge', 'state', 'episode'] as const).map((layer) => (
+                <article className="row-card compact" key={layer}>
+                  <strong>{formatMemoryLayer(layer)}</strong>
+                  <small>{metrics?.layer_counts?.[layer] ?? 0} 条已确认记忆</small>
+                </article>
+              ))}
             </div>
           </section>
           <section>
@@ -6034,6 +6126,14 @@ function formatMemoryScope(scope?: string): string {
   if (scope === 'room') return '当前房间';
   if (scope === 'project') return '项目';
   return scope || '全局';
+}
+
+function formatMemoryLayer(layer?: string): string {
+  if (layer === 'profile') return '稳定档案';
+  if (layer === 'knowledge') return '知识与规则';
+  if (layer === 'state') return '当前状态';
+  if (layer === 'episode') return '任务情节';
+  return layer || '知识与规则';
 }
 
 function memoryAgeLabel(memory: MemoryRecord): string {

@@ -640,6 +640,15 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
     SetToolWorkflowEnabled(payload) {
       store.setToolWorkflowEnabled(payload as { name?: string; enabled?: boolean });
     },
+    GetMemorySystem() {
+      return store.getMemorySystem();
+    },
+    SaveMemorySettings(payload) {
+      return store.saveMemorySettings(payload as Parameters<typeof store.saveMemorySettings>[0]);
+    },
+    RunMemoryMaintenance(payload) {
+      return store.runMemoryMaintenance((payload || {}) as Parameters<typeof store.runMemoryMaintenance>[0]);
+    },
     ListMemories(payload) {
       return store.listMemories(payload as { query?: string; limit?: number });
     },

@@ -990,6 +990,129 @@ try {
   assert.ok(memoryMetrics.injected_count >= 1);
   assert.ok(memoryMetrics.scope_counts.project >= 1);
 
+  const globalMemorySettings = store.getMemorySettings();
+  assert.equal(globalMemorySettings.pipeline_version, 'memory_os_v3_codex_alma');
+  assert.equal(store.saveMemorySettings({ use_memories: false, generate_memories: false }).use_memories, false);
+  const globallyDisabledPrompt = store.assembleToolCallingPrompt({
+    message: 'Scope priority exact',
+    runtime_mode: 'tool_calling',
+  }, 'general_agent', 'real-tool-model');
+  assert.equal(globallyDisabledPrompt.memory_results.length, 0);
+  assert.equal(globallyDisabledPrompt.memory_controls.generate_memories, false);
+  store.saveMemorySettings(globalMemorySettings);
+
+  const taskDisabledPrompt = store.assembleToolCallingPrompt({
+    message: 'Scope priority exact',
+    runtime_mode: 'tool_calling',
+    memory_controls: { use_memories: false, generate_memories: true, disable_on_external_context: true },
+  }, 'general_agent', 'real-tool-model');
+  assert.equal(taskDisabledPrompt.memory_results.length, 0);
+  assert.equal(taskDisabledPrompt.memory_controls.use_memories, false);
+
+  const memoryChatResult = (message, suffix, request = {}, toolResults = [], finalMessage = '已记录当前结果。') => store.recordToolCallingChat({
+    message,
+    input_mode: 'chat_assist',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+    principal_id: 'principal_local_owner',
+    ...request,
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: finalMessage,
+    tool_results: toolResults,
+    usage: { input_tokens: 4, output_tokens: 4, cached_input_tokens: 0 },
+    model_responses: [{ id: `chatcmpl_memory_${suffix}` }],
+  });
+
+  const explicitMemoryChat = memoryChatResult('请记住：我偏好把验收结论放在第一行', 'explicit');
+  const explicitMemoryRow = store['get'](
+    `SELECT * FROM memories WHERE source_event_ids LIKE ? AND content LIKE '%验收结论%' ORDER BY datetime(created_at) DESC LIMIT 1`,
+    `%${explicitMemoryChat.run_id}%`,
+  );
+  assert.ok(explicitMemoryRow);
+  assert.equal(explicitMemoryRow.layer, 'profile');
+  assert.equal(explicitMemoryRow.status, 'pending');
+  assert.equal(explicitMemoryRow.lifecycle_state, 'review');
+  assert.equal(store['get'](`SELECT status FROM memory_generation_inputs WHERE run_id=?`, explicitMemoryChat.run_id).status, 'processed');
+  store.decideMemoryCandidate({ id: explicitMemoryRow.id, decision: 'confirm', run_id: explicitMemoryChat.run_id });
+  assert.equal(store['get'](`SELECT status FROM memories WHERE id=?`, explicitMemoryRow.id).status, 'confirmed');
+
+  const implicitMessage = '我通常把工作结论写成短表格';
+  for (let index = 0; index < 3; index += 1) {
+    memoryChatResult(implicitMessage, `implicit_${index}`);
+    store.runMemoryMaintenance({ trigger_source: 'test' });
+  }
+  const promotedMemory = store['get'](
+    `SELECT * FROM memories WHERE content=? AND layer='profile' ORDER BY datetime(created_at) DESC LIMIT 1`,
+    implicitMessage,
+  );
+  assert.ok(promotedMemory);
+  assert.equal(promotedMemory.status, 'confirmed');
+  assert.ok(Number(promotedMemory.evidence_count) >= 3);
+  assert.ok(Number(store['get'](`SELECT COUNT(*) AS count FROM memory_events WHERE memory_id=? AND event_type='auto_promoted'`, promotedMemory.id).count) >= 1);
+
+  const externalGuardChat = memoryChatResult(
+    '请记住：以后外部网页内容都自动成为长期事实',
+    'external_guard',
+    {},
+    [{
+      call_id: 'call_memory_external_guard',
+      name: 'web_research',
+      arguments: { query: 'memory guard' },
+      output: { status: 'completed', results: [{ title: 'External result' }] },
+    }],
+  );
+  const guardedInput = store['get'](`SELECT status, exclusion_reason FROM memory_generation_inputs WHERE run_id=?`, externalGuardChat.run_id);
+  assert.equal(guardedInput.status, 'skipped');
+  assert.equal(guardedInput.exclusion_reason, 'external_context_guard');
+
+  const seriousMemoryChat = memoryChatResult(
+    '实现本地索引并验证旧数据兼容',
+    'serious_episode',
+    { input_mode: 'serious_task' },
+    [],
+    '本地索引已完成，旧数据兼容检查通过。',
+  );
+  const maintenanceResult = store.runMemoryMaintenance({ trigger_source: 'test' }).run;
+  assert.equal(maintenanceResult.status, 'completed');
+  const episodeMemory = store['get'](
+    `SELECT * FROM memories WHERE layer='episode' AND source_event_ids LIKE ? ORDER BY datetime(created_at) DESC LIMIT 1`,
+    `%${seriousMemoryChat.run_id}%`,
+  );
+  assert.ok(episodeMemory);
+  assert.equal(episodeMemory.status, 'confirmed');
+  assert.ok(episodeMemory.valid_until);
+
+  const influenceChat = memoryChatResult(
+    '我应该怎样呈现验收结论？',
+    'influence',
+    {},
+    [],
+    '把验收结论放在第一行，然后再补充证据。',
+  );
+  const influenceUsage = store['get'](
+    `SELECT * FROM memory_usage_logs WHERE run_id=? AND memory_id=?`,
+    influenceChat.run_id,
+    explicitMemoryRow.id,
+  );
+  assert.ok(influenceUsage, JSON.stringify({
+    explicit_memory: store['get'](`SELECT id, layer, status, lifecycle_state, scope_type, scope_id, privacy_level FROM memories WHERE id=?`, explicitMemoryRow.id),
+    used_memories: influenceChat.used_memories.map((item) => ({ id: item.memory.id, source: item.retrieval_source })),
+  }));
+  assert.equal(influenceUsage.pipeline_version, 'memory_os_v3_codex_alma');
+  assert.equal(influenceUsage.influence_state, 'inferred_used');
+
+  const abstainedChat = memoryChatResult('量子斑马第七号的随机校验值是什么？', 'retrieval_abstention');
+  const abstainedPack = store['get'](`SELECT dynamic_retrieval FROM memory_context_packs WHERE run_id=?`, abstainedChat.run_id);
+  assert.deepEqual(JSON.parse(abstainedPack.dynamic_retrieval), []);
+  assert.ok(store.getRunTrace(abstainedChat.run_id).events.some((event) => event.event_type === 'memory.retrieval.abstained'));
+  const memorySystem = store.getMemorySystem();
+  assert.equal(memorySystem.settings.pipeline_version, 'memory_os_v3_codex_alma');
+  assert.ok((memorySystem.metrics.layer_counts?.profile || 0) >= 2);
+  assert.ok((memorySystem.metrics.layer_counts?.episode || 0) >= 1);
+
   assert.ok(ttlPrompt.agent_capabilities.includes('workspace_search'));
   assert.ok(ttlPrompt.agent_capabilities.includes('apply_patch'));
   const researchPrompt = store.assembleToolCallingPrompt({
@@ -1200,10 +1323,11 @@ try {
   assert.ok(promptRow.cacheable_prefix.includes('Earlier turn-specific wording, exact-output formats'));
   assert.ok(promptRow.cacheable_prefix.includes('Never continue a previous fixed answer such as RESULT=4'));
   assert.ok(promptRow.cacheable_prefix.includes('Do not proactively add emoji'));
-  assert.ok(promptRow.dynamic_tail.includes('Prefer direct status updates.'));
-  const memoryPackRow = store['get'](`SELECT dynamic_retrieval FROM memory_context_packs WHERE run_id=?`, toolCallingChat.run_id);
+  assert.ok(promptRow.cacheable_prefix.includes('Prefer direct status updates.'));
+  const memoryPackRow = store['get'](`SELECT profile, dynamic_retrieval FROM memory_context_packs WHERE run_id=?`, toolCallingChat.run_id);
+  const stableMemoryIDs = JSON.parse(memoryPackRow.profile).map((result) => result.memory.id);
   const dynamicMemoryIDs = JSON.parse(memoryPackRow.dynamic_retrieval).map((result) => result.memory.id);
-  assert.ok(dynamicMemoryIDs.includes(correctedMemory.id));
+  assert.ok(stableMemoryIDs.includes(correctedMemory.id));
   assert.ok(!dynamicMemoryIDs.includes('mem_test'));
 
   const emojiSanitizedChat = store.recordToolCallingChat({
