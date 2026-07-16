@@ -1671,8 +1671,58 @@ export type MemoryMaintenanceRun = {
   finished_at?: string;
 };
 
+export type PersonaConstitutionRecord = {
+  id: string;
+  version: number;
+  name: string;
+  identity: string;
+  character_profile: {
+    age?: number;
+    gender?: string;
+    occupation?: string;
+    work_history?: string;
+    city_life?: string;
+    appearance?: Record<string, unknown>;
+    personality?: string[];
+    likes?: string[];
+    dislikes?: string[];
+    quirks?: string[];
+    daily_habits?: string[];
+  };
+  relationship: {
+    role?: string;
+    history?: string;
+    intimacy?: string;
+    romantic?: boolean;
+    romantic_boundary?: string;
+    power_dynamic?: string;
+    address_style?: string;
+    interaction_rules?: string[];
+  };
+  default_user: {
+    age?: number;
+    gender?: string;
+    name?: string;
+    relationship?: string;
+    fixed_fields?: string[];
+    unknown_fields_rule?: string;
+  };
+  principles: string[];
+  voice: string[];
+  disagreement_style: string;
+  uncertainty_style: string;
+  boundaries: string[];
+  compiled_prompt: string;
+  status: string;
+  source_event_ids: string[];
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+};
+
 export type MemorySystemSnapshot = {
   settings: MemorySettingsRecord;
+  constitution?: PersonaConstitutionRecord;
   latest_maintenance?: MemoryMaintenanceRun;
   metrics: MemoryQualityMetrics;
 };

@@ -4127,6 +4127,22 @@ function SettingsConsole({
         <section className="settings-detail-panel">
           <DetailHeader title="记忆健康" description="查看召回质量、作用域隔离和候选生命周期，不自动删除数据" />
           <section>
+            <h3>硬记忆 · 人格宪法</h3>
+            {memorySystem?.constitution ? (
+              <article className="row-card compact">
+                <strong>{memorySystem.constitution.name} Constitution v{memorySystem.constitution.version} · {memorySystem.constitution.status === 'active' ? '已启用' : formatStatus(memorySystem.constitution.status)}</strong>
+                <small>{memorySystem.constitution.identity}</small>
+                <small>
+                  用户明确编写 · 始终进入稳定提示词 · 不参与自动召回、衰减、合并或删除
+                </small>
+                <details className="settings-advanced">
+                  <summary>查看完整硬记忆</summary>
+                  <pre tabIndex={0}>{memorySystem.constitution.compiled_prompt}</pre>
+                </details>
+              </article>
+            ) : <p className="empty">尚未加载 Joi 人格宪法。</p>}
+          </section>
+          <section>
             <h3>记忆控制</h3>
             <div className="settings-form compact">
               <label className="field-row">
@@ -4196,10 +4212,10 @@ function SettingsConsole({
           <section>
             <h3>分层分布</h3>
             <div className="table">
-              {(['profile', 'knowledge', 'state', 'episode'] as const).map((layer) => (
+              {(['persona', 'profile', 'knowledge', 'state', 'episode'] as const).map((layer) => (
                 <article className="row-card compact" key={layer}>
                   <strong>{formatMemoryLayer(layer)}</strong>
-                  <small>{metrics?.layer_counts?.[layer] ?? 0} 条已确认记忆</small>
+                  <small>{metrics?.layer_counts?.[layer] ?? 0} 条{layer === 'persona' ? '用户编写硬记忆' : '已确认记忆'}</small>
                 </article>
               ))}
             </div>
@@ -6129,6 +6145,7 @@ function formatMemoryScope(scope?: string): string {
 }
 
 function formatMemoryLayer(layer?: string): string {
+  if (layer === 'persona') return '人格宪法';
   if (layer === 'profile') return '稳定档案';
   if (layer === 'knowledge') return '知识与规则';
   if (layer === 'state') return '当前状态';

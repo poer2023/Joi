@@ -76,7 +76,7 @@ function schemaAudit(db) {
   const requiredTables = [
     'principals', 'channel_identities', 'conversation_entry_links', 'task_entry_links', 'notification_deliveries',
     'automation_definitions', 'automation_triggers', 'automation_runs',
-    'memory_observations', 'memory_events', 'memory_policies', 'memory_generation_inputs', 'memory_maintenance_runs',
+    'persona_constitutions', 'memory_observations', 'memory_events', 'memory_policies', 'memory_generation_inputs', 'memory_maintenance_runs',
   ];
   const requiredColumns = {
     conversations: ['principal_id'],
@@ -93,6 +93,7 @@ function schemaAudit(db) {
     memories: ['layer', 'memory_key', 'evidence_kind', 'evidence_authority', 'evidence_count', 'lifecycle_state', 'source_kind', 'context_tags', 'supersedes_memory_id', 'review_reason', 'valid_from', 'valid_until', 'last_verified_at', 'archived_at', 'auto_managed', 'retention_policy'],
     memory_usage_logs: ['normalized_score', 'recalled', 'influence_state', 'rank', 'pipeline_version'],
     memory_maintenance_runs: ['processed_input_count', 'generated_observation_count'],
+    persona_constitutions: ['character_profile', 'relationship', 'default_user', 'compiled_prompt', 'status'],
   };
   const requiredIndexes = [
     'idx_automation_definitions_kind',
@@ -166,6 +167,34 @@ function applyMemoryOSSchema(db) {
     ['processed_input_count', 'INTEGER NOT NULL DEFAULT 0'],
     ['generated_observation_count', 'INTEGER NOT NULL DEFAULT 0'],
   ]) ensure('memory_maintenance_runs', column, definition);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS persona_constitutions (
+      id TEXT PRIMARY KEY,
+      version INTEGER NOT NULL UNIQUE,
+      name TEXT NOT NULL DEFAULT 'Joi',
+      identity TEXT NOT NULL,
+      character_profile TEXT NOT NULL DEFAULT '{}',
+      relationship TEXT NOT NULL DEFAULT '{}',
+      default_user TEXT NOT NULL DEFAULT '{}',
+      principles TEXT NOT NULL DEFAULT '[]',
+      voice TEXT NOT NULL DEFAULT '[]',
+      disagreement_style TEXT NOT NULL DEFAULT '',
+      uncertainty_style TEXT NOT NULL DEFAULT '',
+      boundaries TEXT NOT NULL DEFAULT '[]',
+      compiled_prompt TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'active',
+      source_event_ids TEXT NOT NULL DEFAULT '[]',
+      metadata TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+  for (const [column, definition] of [
+    ['character_profile', "TEXT NOT NULL DEFAULT '{}'"],
+    ['relationship', "TEXT NOT NULL DEFAULT '{}'"],
+    ['default_user', "TEXT NOT NULL DEFAULT '{}'"],
+  ]) ensure('persona_constitutions', column, definition);
 
   const sqliteSchema = readFileSync(join(resolve(import.meta.dirname, '..'), 'database/sqlite/001_init_schema.sql'), 'utf8');
   const createTablesAt = sqliteSchema.indexOf('CREATE TABLE IF NOT EXISTS memory_observations');

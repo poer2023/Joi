@@ -19,6 +19,22 @@ try {
   });
 
   const initialWorkspaceSettings = store.getWorkspaceSettings();
+  const authoredMemorySystem = store.getMemorySystem();
+  assert.equal(authoredMemorySystem.constitution?.id, 'constitution_joi_v2');
+  assert.equal(authoredMemorySystem.constitution?.version, 2);
+  assert.equal(authoredMemorySystem.constitution?.status, 'active');
+  assert.match(authoredMemorySystem.constitution?.identity || '', /我叫 Joi，24 岁/);
+  assert.match(authoredMemorySystem.constitution?.compiled_prompt || '', /Default User:\n- Age: 30\n- Gender: 男性/);
+  assert.equal(authoredMemorySystem.metrics.layer_counts?.persona, 1);
+  const authoredPrompt = store.assembleToolCallingPrompt({
+    message: '你是谁，我们是什么关系？',
+    runtime_mode: 'tool_calling',
+    memory_controls: { use_memories: false, generate_memories: false, disable_on_external_context: true },
+  }, 'general_agent', 'real-tool-model');
+  assert.match(authoredPrompt.cacheable_prefix, /Persona Constitution — user-authored hard memory/);
+  assert.match(authoredPrompt.cacheable_prefix, /我叫 Joi，24 岁/);
+  assert.match(authoredPrompt.cacheable_prefix, /Default User:\n- Age: 30\n- Gender: 男性/);
+  assert.equal(authoredPrompt.memory_results.length, 0, 'persona hard memory stays outside learned-memory retrieval');
   assert.equal(store.resolveAgentIDForTool('Research Agent'), 'research_agent');
   assert.equal(store.resolveAgentIDForTool('research'), 'research_agent');
   assert.equal(store.resolveAgentIDForTool(''), 'research_agent');
@@ -87,6 +103,11 @@ try {
   assert.equal(conversations[0].message_count, 2);
   assert.equal(store.listConversations({ view: 'all', query: 'store test ping', limit: 10 }).conversations[0].id, response.conversation_id);
   assert.equal(store.listConversations({ view: 'all', query: 'no-such-session-token', limit: 10 }).conversations.length, 0);
+  const initialMessenger = store.listPersonaMessenger();
+  const joiPersona = initialMessenger.personas.find((persona) => persona.id === 'per_joi_desktop');
+  assert.equal(joiPersona?.tagline, '24 岁产品运营白领 · 你的亲密朋友');
+  assert.match(joiPersona?.self_intro || '', /我们不是恋人/);
+  assert.match(String(store['get'](`SELECT system_prompt FROM agents WHERE id='per_joi_desktop'`)?.system_prompt || ''), /我叫 Joi，今年 24 岁/);
 
   const detail = store.getConversation(response.conversation_id);
   assert.deepEqual(detail.messages.map((message) => message.role), ['user', 'assistant']);
@@ -999,6 +1020,7 @@ try {
   }, 'general_agent', 'real-tool-model');
   assert.equal(globallyDisabledPrompt.memory_results.length, 0);
   assert.equal(globallyDisabledPrompt.memory_controls.generate_memories, false);
+  assert.match(globallyDisabledPrompt.cacheable_prefix, /Joi Persona Constitution v2/);
   store.saveMemorySettings(globalMemorySettings);
 
   const taskDisabledPrompt = store.assembleToolCallingPrompt({
@@ -1110,6 +1132,8 @@ try {
   assert.ok(store.getRunTrace(abstainedChat.run_id).events.some((event) => event.event_type === 'memory.retrieval.abstained'));
   const memorySystem = store.getMemorySystem();
   assert.equal(memorySystem.settings.pipeline_version, 'memory_os_v3_codex_alma');
+  assert.equal(memorySystem.constitution?.version, 2);
+  assert.equal(memorySystem.metrics.layer_counts?.persona, 1);
   assert.ok((memorySystem.metrics.layer_counts?.profile || 0) >= 2);
   assert.ok((memorySystem.metrics.layer_counts?.episode || 0) >= 1);
 

@@ -247,6 +247,27 @@ CREATE TABLE IF NOT EXISTS persona_versions (
   UNIQUE(persona_id, version)
 );
 
+CREATE TABLE IF NOT EXISTS persona_constitutions (
+  id TEXT PRIMARY KEY,
+  version INTEGER NOT NULL UNIQUE,
+  name TEXT NOT NULL DEFAULT 'Joi',
+  identity TEXT NOT NULL,
+  character_profile TEXT NOT NULL DEFAULT '{}',
+  relationship TEXT NOT NULL DEFAULT '{}',
+  default_user TEXT NOT NULL DEFAULT '{}',
+  principles TEXT NOT NULL DEFAULT '[]',
+  voice TEXT NOT NULL DEFAULT '[]',
+  disagreement_style TEXT NOT NULL DEFAULT '',
+  uncertainty_style TEXT NOT NULL DEFAULT '',
+  boundaries TEXT NOT NULL DEFAULT '[]',
+  compiled_prompt TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  source_event_ids TEXT NOT NULL DEFAULT '[]',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS rooms (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL,

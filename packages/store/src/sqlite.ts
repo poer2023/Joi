@@ -42,6 +42,10 @@ import {
   type MemoryObservationDraft,
   type MemoryPolicyConfig,
 } from './memory-engine.ts';
+import {
+  compilePersonaConstitution,
+  DEFAULT_JOI_PERSONA_CONSTITUTION,
+} from './persona-constitution.ts';
 import type {
   AvailableModel,
   AgentModelPolicy,
@@ -111,6 +115,7 @@ import type {
   OpenLoop,
   PermissionProfile,
   PersonaCandidate,
+  PersonaConstitutionRecord,
   PersonaMessengerExportRequest,
   PersonaMessengerExportResult,
   PreviewExternalPersonaMessageRequest,
@@ -778,6 +783,26 @@ export class JoiSQLiteStore {
   private ensureMemorySystemSchema(): void {
     this.ensureMemoryCompatibilityColumns();
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS persona_constitutions (
+        id TEXT PRIMARY KEY,
+        version INTEGER NOT NULL UNIQUE,
+        name TEXT NOT NULL DEFAULT 'Joi',
+        identity TEXT NOT NULL,
+        character_profile TEXT NOT NULL DEFAULT '{}',
+        relationship TEXT NOT NULL DEFAULT '{}',
+        default_user TEXT NOT NULL DEFAULT '{}',
+        principles TEXT NOT NULL DEFAULT '[]',
+        voice TEXT NOT NULL DEFAULT '[]',
+        disagreement_style TEXT NOT NULL DEFAULT '',
+        uncertainty_style TEXT NOT NULL DEFAULT '',
+        boundaries TEXT NOT NULL DEFAULT '[]',
+        compiled_prompt TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',
+        source_event_ids TEXT NOT NULL DEFAULT '[]',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
       CREATE TABLE IF NOT EXISTS memory_observations (
         id TEXT PRIMARY KEY,
         memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
@@ -869,12 +894,18 @@ export class JoiSQLiteStore {
       ['processed_input_count', 'INTEGER NOT NULL DEFAULT 0'],
       ['generated_observation_count', 'INTEGER NOT NULL DEFAULT 0'],
     ] as const) ensure('memory_maintenance_runs', column, definition);
+    for (const [column, definition] of [
+      ['character_profile', "TEXT NOT NULL DEFAULT '{}'"],
+      ['relationship', "TEXT NOT NULL DEFAULT '{}'"],
+      ['default_user', "TEXT NOT NULL DEFAULT '{}'"],
+    ] as const) ensure('persona_constitutions', column, definition);
     this.exec(
       `UPDATE memory_maintenance_runs
        SET status='interrupted', error_summary=COALESCE(NULLIF(error_summary, ''), 'interrupted_before_store_restart'),
            finished_at=COALESCE(finished_at, datetime('now'))
        WHERE status='running'`,
     );
+    this.seedAuthoredPersonaConstitution();
     const existing = this.get(`SELECT config FROM memory_policies WHERE status='active' ORDER BY version DESC LIMIT 1`);
     const inherited = existing ? parseObject(existing.config) : {};
     this.exec(
@@ -885,6 +916,56 @@ export class JoiSQLiteStore {
       json({ ...DEFAULT_MEMORY_POLICY, ...inherited, version: DEFAULT_MEMORY_POLICY.version }),
     );
     this.backfillLegacyMemoryMetadata();
+  }
+
+  private seedAuthoredPersonaConstitution(): void {
+    const persona = DEFAULT_JOI_PERSONA_CONSTITUTION;
+    const compiledPrompt = compilePersonaConstitution(persona);
+    this.exec(
+      `INSERT INTO persona_constitutions (
+         id, version, name, identity, character_profile, relationship, default_user,
+         principles, voice, disagreement_style, uncertainty_style, boundaries,
+         compiled_prompt, status, source_event_ids, metadata
+       ) VALUES ('constitution_joi_v2', 2, 'Joi', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+       ON CONFLICT(version) DO NOTHING`,
+      persona.identity || '',
+      json(persona.characterProfile || {}),
+      json(persona.relationship || {}),
+      json(persona.defaultUser || {}),
+      json(persona.principles || []),
+      json(persona.voice || []),
+      persona.disagreementStyle || '',
+      persona.uncertaintyStyle || '',
+      json(persona.boundaries || []),
+      compiledPrompt,
+      json(['user_directive_2026-07-14_persona_correction']),
+      json({
+        source: 'user_explicit_correction',
+        pipeline_version: MEMORY_PIPELINE_VERSION,
+        immutable_persona_layer: true,
+        persona_kind: 'authored_companion_character',
+        gender_assumption: 'female',
+      }),
+    );
+    this.exec(
+      `UPDATE persona_constitutions
+       SET compiled_prompt=?, updated_at=updated_at
+       WHERE id='constitution_joi_v2' AND COALESCE(compiled_prompt, '')=''`,
+      compiledPrompt,
+    );
+    const higherActive = this.get(
+      `SELECT id FROM persona_constitutions WHERE status='active' AND version > 2 ORDER BY version DESC LIMIT 1`,
+    );
+    if (higherActive) {
+      this.exec(`UPDATE persona_constitutions SET status='superseded' WHERE id='constitution_joi_v2'`);
+      return;
+    }
+    this.exec(`UPDATE persona_constitutions SET status='active' WHERE id='constitution_joi_v2'`);
+    this.exec(
+      `UPDATE persona_constitutions
+       SET status='superseded', updated_at=datetime('now')
+       WHERE version < 2 AND status='active'`,
+    );
   }
 
   private backfillLegacyMemoryMetadata(): void {
@@ -2437,7 +2518,13 @@ export class JoiSQLiteStore {
     const memoryResults = [...new Map(
       [...stableMemoryResults, ...dynamicMemoryResults].map((result) => [result.memory.id, result]),
     ).values()];
-    const memoryProfileVersion = memoryProfileVersionFor(stableMemoryResults);
+    const constitutionRow = this.get(
+      `SELECT * FROM persona_constitutions WHERE status='active' ORDER BY version DESC LIMIT 1`,
+    );
+    const constitutionPrompt = optionalString(constitutionRow?.compiled_prompt)
+      || compilePersonaConstitution(DEFAULT_JOI_PERSONA_CONSTITUTION);
+    const constitutionVersion = Number(constitutionRow?.version || DEFAULT_JOI_PERSONA_CONSTITUTION.version);
+    const memoryProfileVersion = `${memoryProfileVersionFor(stableMemoryResults)}:persona-v${constitutionVersion}`;
     const conversationContext = this.buildPromptConversationContext(req.conversation_id);
     const skillCandidates = this.skillSelectionCandidates();
     const skillCatalog = renderSkillCatalog(skillCandidates, 8_000);
@@ -2450,9 +2537,9 @@ export class JoiSQLiteStore {
     });
     const selectedSkillInstructions = renderSelectedSkillInstructions(selectedSkills);
     const cacheablePrefix = [
-      'Joi Electron Tool Calling Runtime',
-      '- You are running inside the local Electron-native Joi Desktop app.',
-      '- Your product identity is Joi. When asked who you are, say you are Joi, the local Joi Desktop assistant.',
+      'Joi Electron Tool Calling Runtime — execution policy outside Persona Constitution',
+      '- You are running inside the local Electron-native Joi Desktop app. This is execution context, not personal identity, occupation, personality, or relationship.',
+      '- Your product identity is Joi. Personal identity and relationship come from the user-authored Persona Constitution below; do not replace them with runtime labels such as assistant, tool, or execution partner.',
       `- The selected model id for this run is ${cleanModelName}. When asked what model is being used, answer from this selected model id.`,
       '- Do not claim to be Claude, ChatGPT, Anthropic, OpenAI, or another assistant brand unless the selected model id explicitly says so.',
       '- Use only the provided capability tools. Do not claim that a tool ran unless a tool result is present.',
@@ -2469,6 +2556,9 @@ export class JoiSQLiteStore {
       '- Never continue a previous fixed answer such as RESULT=4 merely because it appears in conversation history; answer the latest request normally.',
       '- Keep ordinary chat replies concise by default. Prefer the fewest sentences that answer the user directly.',
       '- Do not proactively add emoji, decorative symbols, or celebratory icons to assistant replies. Only include emoji when the user explicitly asks to discuss, quote, transform, or generate emoji content.',
+      '',
+      'Persona Constitution — user-authored hard memory, always active and excluded from automatic decay or retrieval ranking',
+      constitutionPrompt,
       '',
       'Agent',
       `id: ${cleanAgentID}`,
@@ -6989,8 +7079,12 @@ export class JoiSQLiteStore {
 
   getMemorySystem(): MemorySystemSnapshot {
     const row = this.get(`SELECT * FROM memory_maintenance_runs ORDER BY datetime(started_at) DESC LIMIT 1`);
+    const constitution = this.get(
+      `SELECT * FROM persona_constitutions WHERE status='active' ORDER BY version DESC LIMIT 1`,
+    );
     return {
       settings: this.getMemorySettings(),
+      constitution: constitution ? rowToPersonaConstitution(constitution) : undefined,
       latest_maintenance: row ? rowToMemoryMaintenance(row) : undefined,
       metrics: this.memoryQualityMetrics(),
     };
@@ -7369,6 +7463,9 @@ export class JoiSQLiteStore {
     for (const row of this.all(`SELECT layer, COUNT(*) AS count FROM memories WHERE status='confirmed' AND disabled_at IS NULL GROUP BY layer`)) {
       layerCounts[optionalString(row.layer) || 'knowledge'] = Number(row.count || 0);
     }
+    layerCounts.persona = Number(this.get(
+      `SELECT COUNT(*) AS count FROM persona_constitutions WHERE status='active'`,
+    )?.count || 0);
     const embeddingCount = Number(this.get(`SELECT COUNT(*) AS count FROM memory_embeddings WHERE embedding_model=?`, LOCAL_MEMORY_EMBEDDING_MODEL)?.count || 0);
     const generationQueueCount = Number(this.get(`SELECT COUNT(*) AS count FROM memory_generation_inputs WHERE status='pending'`)?.count || 0);
     const abstentionCount = Number(this.get(`SELECT COUNT(*) AS count FROM run_events WHERE event_type IN ('memory.retrieval.abstained','memory.learning.abstained')`)?.count || 0);
@@ -14200,6 +14297,78 @@ export class JoiSQLiteStore {
     `);
   }
 
+  private upgradeJoiProjectPersonaFromConstitution(personaID: string): void {
+    if (!this.tableExists('personas') || !this.tableExists('persona_versions')) return;
+    const current = this.get(`SELECT * FROM personas WHERE id=?`, personaID);
+    if (!current) return;
+    const currentMetadata = parseObject(current.metadata);
+    if (Number(currentMetadata.persona_constitution_version || 0) >= 2) return;
+
+    const versionRow = this.get(
+      `SELECT COALESCE(MAX(version), 0) AS version FROM persona_versions WHERE persona_id=?`,
+      personaID,
+    );
+    const nextVersion = Math.max(Number(current.version || 0) + 1, Number(versionRow?.version || 0) + 1, 6);
+    const tagline = '24 岁产品运营白领 · 你的亲密朋友';
+    const selfIntro = '我叫 Joi，今年 24 岁，在消费互联网公司做产品运营。你是我很亲近的朋友，但我们不是恋人；我会像朋友一样自然关心、吐槽、支持和直说，不把自己介绍成桌面助理或执行工具。';
+    const traits = {
+      ...parseObject(current.traits),
+      directness: 0.76,
+      warmth: 0.72,
+      humor: 0.34,
+      verbosity: 0.45,
+      initiative: 0.62,
+      risk_sensitivity: 0.7,
+      divergence: 0.42,
+      persona_constitution_version: 2,
+      age: 24,
+      gender: 'female',
+      relationship: 'close_friend_non_romantic',
+    };
+    const metadata = {
+      ...currentMetadata,
+      persona_constitution_version: 2,
+      identity_source: 'user_explicit_correction_2026-07-14',
+      ai_identity_label: '人物人格',
+    };
+    const after = {
+      ...current,
+      tagline,
+      self_intro: selfIntro,
+      traits,
+      disagreement_style: '像亲近朋友一样直接说出不同意见，给出理由，但不居高临下。',
+      uncertainty_style: '记不清或不知道就直接说，不编造两人共同经历。',
+      version: nextVersion,
+      metadata,
+    };
+    this.exec(
+      `INSERT INTO persona_versions (
+         id, persona_id, version, changed_by, change_reason, before_json, after_json, created_at
+       ) VALUES (?, ?, ?, 'desktop_user', ?, ?, ?, datetime('now'))
+       ON CONFLICT(persona_id, version) DO NOTHING`,
+      `pver_${personaID}_${nextVersion}`,
+      personaID,
+      nextVersion,
+      '用户明确纠正 Joi 自我认知：24 岁女性白领，与 30 岁男性用户是亲密朋友但不是恋人。',
+      json(current),
+      json(after),
+    );
+    this.exec(
+      `UPDATE personas
+       SET tagline=?, self_intro=?, traits=?, disagreement_style=?, uncertainty_style=?,
+           version=?, metadata=?, updated_at=datetime('now')
+       WHERE id=?`,
+      tagline,
+      selfIntro,
+      json(traits),
+      after.disagreement_style,
+      after.uncertainty_style,
+      nextVersion,
+      json(metadata),
+      personaID,
+    );
+  }
+
   private syncPersonaMessengerRooms(): void {
     const defaultProjectID = 'prj_joi_desktop';
     const defaultPersonaID = 'per_joi_desktop';
@@ -14230,12 +14399,14 @@ export class JoiSQLiteStore {
         json(['chat', 'memory', 'trace', 'terminal', 'tool_request']),
         json({ system_seed: true, ai_identity_label: '项目人格' }),
       );
+      this.upgradeJoiProjectPersonaFromConstitution(defaultPersonaID);
+      const defaultPersona = this.get(`SELECT * FROM personas WHERE id=?`, defaultPersonaID);
       this.upsertPersonaAgent(
         defaultPersonaID,
-        'Joi',
-        '本地桌面 Agent OS 项目人格',
-        '我负责把本地 Joi 的消息、任务、记忆和运行日志组织成可验证的工作空间。',
-        ['chat', 'memory', 'trace', 'terminal', 'tool_request'],
+        optionalString(defaultPersona?.display_name) || 'Joi',
+        optionalString(defaultPersona?.tagline) || '24 岁产品运营白领 · 你的亲密朋友',
+        optionalString(defaultPersona?.self_intro) || '我叫 Joi，今年 24 岁，在消费互联网公司做产品运营。',
+        parseStringArray(defaultPersona?.capabilities),
       );
       this.exec(
         `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, active_project_id, lifecycle_status, metadata, created_at, updated_at)
@@ -16445,6 +16616,29 @@ function rowToMemory(row: SQLiteRow): MemoryRecord {
     created_at: optionalString(row.created_at),
     updated_at: optionalString(row.updated_at),
     last_used_at: optionalString(row.last_used_at),
+  };
+}
+
+function rowToPersonaConstitution(row: SQLiteRow): PersonaConstitutionRecord {
+  return {
+    id: optionalString(row.id) || 'constitution_joi_v2',
+    version: Number(row.version || DEFAULT_JOI_PERSONA_CONSTITUTION.version),
+    name: optionalString(row.name) || 'Joi',
+    identity: optionalString(row.identity) || DEFAULT_JOI_PERSONA_CONSTITUTION.identity || '',
+    character_profile: parseObject(row.character_profile) as PersonaConstitutionRecord['character_profile'],
+    relationship: parseObject(row.relationship) as PersonaConstitutionRecord['relationship'],
+    default_user: parseObject(row.default_user) as PersonaConstitutionRecord['default_user'],
+    principles: parseStringArray(row.principles),
+    voice: parseStringArray(row.voice),
+    disagreement_style: optionalString(row.disagreement_style) || '',
+    uncertainty_style: optionalString(row.uncertainty_style) || '',
+    boundaries: parseStringArray(row.boundaries),
+    compiled_prompt: optionalString(row.compiled_prompt) || '',
+    status: optionalString(row.status) || 'active',
+    source_event_ids: parseStringArray(row.source_event_ids),
+    metadata: parseObject(row.metadata),
+    created_at: optionalString(row.created_at),
+    updated_at: optionalString(row.updated_at),
   };
 }
 
