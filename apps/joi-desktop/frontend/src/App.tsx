@@ -97,8 +97,9 @@ import '@xterm/xterm/css/xterm.css';
 type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
 type SettingsTab = Exclude<Tab, 'chat'>;
 type SettingsCategory = 'models' | 'chatEntrances' | 'automations' | 'observability' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
+type SelectSettingsObject = (category: SettingsCategory, objectID?: string) => void;
 type ExecutionTarget = 'main-node' | 'auto' | 'local-worker-1' | 'vps-la-1';
-type RightInspectorTab = 'overview' | 'runs' | 'threads' | 'assets' | 'memory' | 'member';
+type RightInspectorTab = 'overview' | 'runs' | 'assets' | 'memory' | 'member';
 type MessengerRoomMember = NonNullable<MessengerRoom['members']>[number];
 type MessengerThread = PersonaMessengerSnapshot['threads'][number];
 type ComposerAttachment = {
@@ -191,7 +192,7 @@ const defaultSettingsObjectByCategory: Record<SettingsCategory, string> = {
   dataMemory: 'memory-inbox',
   capabilities: 'builtin',
   nodesExecution: 'main-node',
-  privacySecurity: 'secrets',
+  privacySecurity: 'privacy-policy',
   advanced: 'diagnostics',
 };
 const DEFAULT_SIDEBAR_WIDTH = 250;
@@ -1635,7 +1636,9 @@ export default function App() {
   return (
     <main ref={shellRef} data-theme="light" className={`im-app-shell app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${inSettingsArea ? 'settings-mode' : ''}`} style={shellStyle}>
       {inSettingsArea ? (
-        <SettingsTopControls collapsed={sidebarCollapsed} goBack={() => setActiveTab('chat')} toggleCollapsed={toggleSidebarCollapsed} />
+        <div className="settings-window-titlebar">
+          <SettingsTopControls collapsed={sidebarCollapsed} goBack={() => setActiveTab('chat')} toggleCollapsed={toggleSidebarCollapsed} />
+        </div>
       ) : (
         <SidebarTopControls
           collapsed={sidebarCollapsed}
@@ -1666,7 +1669,7 @@ export default function App() {
           trace={trace}
         />
       )}
-      {!sidebarCollapsed && <div aria-label="调整侧边栏宽度" className="sidebar-resizer" role="separator" onPointerDown={startSidebarResize} />}
+      {!sidebarCollapsed && !inSettingsArea && <div aria-label="调整侧边栏宽度" className="sidebar-resizer" role="separator" onPointerDown={startSidebarResize} />}
 
       <section className="im-workspace app__editor tk-content-panel">
         <NotificationStack
@@ -2101,10 +2104,10 @@ function SettingsSidebar({
 }: {
   activeCategory: SettingsCategory;
   collapsed: boolean;
-  selectSettingsObject: (category: SettingsCategory, objectID?: string) => void;
+  selectSettingsObject: SelectSettingsObject;
 }) {
   if (collapsed) {
-    return <aside aria-hidden="true" className="im-sidebar sidebar-placeholder app__sidebar tk-sidebar" />;
+    return <aside aria-hidden="true" className="im-sidebar settings-sidebar sidebar-placeholder app__sidebar tk-sidebar" />;
   }
 
   return (
@@ -2204,7 +2207,7 @@ function SettingsConsole({
   rotateWorkerToken: () => Promise<void>;
   savedModels: AvailableModel[];
   secretStatus: SecretStatus | null;
-  selectSettingsObject: (category: SettingsCategory, objectID?: string) => void;
+  selectSettingsObject: SelectSettingsObject;
   setMemoryQuery: (value: string) => void;
   setNodeDisabled: (nodeID: string, disabled: boolean) => Promise<void>;
   setNotice: (value: string) => void;
@@ -2589,7 +2592,7 @@ function SettingsConsole({
   async function saveSecret() {
     await desktopApi.saveSecret({ name: secretName, value: secretValue });
     setSecretValue('');
-    setNotice(`${secretName} 已保存到钥匙串`);
+    setNotice(`${secretDisplayName(secretName)}已保存到钥匙串`);
     await refreshAll();
   }
 
@@ -3476,7 +3479,7 @@ function SettingsConsole({
     if (activeObject.id === 'secrets') {
       return (
         <section className="settings-detail-panel">
-          <DetailHeader title="密钥管理" description="保存和查看本地钥匙串中的密钥状态" />
+          <DetailHeader title="密钥管理" description="管理当前桌面入口使用的本地凭证" />
           <div className="settings-form">
             <label className="field-row">
               <span>密钥类型</span>
@@ -3508,24 +3511,23 @@ function SettingsConsole({
       );
     }
     if (activeObject.id === 'dangerous-actions') {
+      const pendingConfirmations = confirmations.filter((item) => item.status === 'pending');
       return (
         <section className="settings-detail-panel">
-          <DetailHeader title="危险操作" description="审批高风险能力请求" />
+          <DetailHeader title="待确认操作" description="需要你同意后才能继续的高风险操作" />
           <RecordList
             emptyText="暂无待确认请求。"
-            items={confirmations}
+            items={pendingConfirmations}
             renderItem={(item) => (
               <article key={item.id} className="row-card">
                 <div>
-                  <strong>{item.requested_action || capabilityDisplayName(item.capability_id)}</strong>
-                  <p>风险 {formatRiskLevel(item.risk_level)} · {formatStatus(item.status)}</p>
+                  <strong>{confirmationActionLabel(item.requested_action, item.capability_id)}</strong>
+                  <p>风险 {formatRiskLevel(item.risk_level)}</p>
                 </div>
-                {item.status === 'pending' && (
-                  <div className="row-actions">
-                    <button type="button" onClick={() => decideConfirmation(item.id, true)}>批准</button>
-                    <button type="button" onClick={() => decideConfirmation(item.id, false)}>拒绝</button>
-                  </div>
-                )}
+                <div className="row-actions">
+                  <button type="button" onClick={() => decideConfirmation(item.id, true)}>批准</button>
+                  <button type="button" onClick={() => decideConfirmation(item.id, false)}>拒绝</button>
+                </div>
               </article>
             )}
           />
@@ -3534,11 +3536,10 @@ function SettingsConsole({
     }
     return (
       <section className="settings-detail-panel">
-        <DetailHeader title={activeObject.label} description={`${activeObject.label} 配置`} />
+        <DetailHeader title="安全策略" description="控制数据是否离开本机以及远端执行的确认方式" />
         <div className="capability-grid">
-          <CapabilityToggle label="默认本地优先" enabled />
+          <CapabilityToggle label="本地优先" enabled />
           <CapabilityToggle label="远端执行需确认" enabled />
-          <CapabilityToggle label="诊断信息脱敏" enabled={activeObject.id === 'diagnostic-redaction'} />
           <CapabilityToggle label="破坏性操作禁止" enabled />
         </div>
       </section>
@@ -3548,25 +3549,19 @@ function SettingsConsole({
   function renderAdvancedDetail() {
     return (
       <section className="settings-detail-panel">
-        <DetailHeader title="诊断与支持" description="检查本机状态；需要技术支持时再导出脱敏诊断包" />
+        <DetailHeader title="支持与诊断" description="检查本机状态，需要排查问题时再导出诊断包" />
         <dl className="metrics">
           <KV label="本地数据" value={Boolean(health?.service_status?.sqlite) ? '正常' : '需要检查'} />
-          <KV label="今日模型调用" value={String(health?.model_latency?.model_calls_today ?? 0)} />
-          <KV label="已连接执行器" value={String(health?.worker_status?.length ?? 0)} />
           <KV label="待处理问题" value={String(health?.warnings?.length ?? 0)} />
+          <KV label="诊断保护" value="自动脱敏" />
         </dl>
+        <p className="empty">诊断包保存在本机；密钥、授权信息和完整用户路径不会直接导出。</p>
         <div className="detail-actions">
           <button type="button" onClick={async () => {
             const result = await desktopApi.exportDiagnostics();
             setNotice(`诊断包已导出：${result.path}`);
           }}>导出脱敏诊断包</button>
         </div>
-        <DiagnosticsLogCleanup onNotice={setNotice} />
-        <ClosureReportPanel
-          continueProductTaskByID={continueProductTaskByID}
-          externalHandoffAudit={externalHandoffAudit}
-          report={closureReport}
-        />
       </section>
     );
   }
@@ -3585,12 +3580,14 @@ function SettingsConsole({
 
   return (
     <div className="settings-console">
-      <ScrollArea as="aside" className="settings-object-column">
-        <div className="settings-object-list" aria-label={`${activeCategoryMeta.label}对象`}>
+      <nav className="settings-object-tabs" aria-label={`${activeCategoryMeta.label}对象`}>
+        <div className="settings-object-list" role="tablist">
           {objectItems.map((item) => (
             <button
               key={item.id}
+              aria-selected={activeObject.id === item.id}
               className={`settings-object-item ${activeObject.id === item.id ? 'active' : ''}`}
+              role="tab"
               type="button"
               onClick={() => selectSettingsObject(activeCategory, item.id)}
             >
@@ -3598,7 +3595,7 @@ function SettingsConsole({
             </button>
           ))}
         </div>
-      </ScrollArea>
+      </nav>
       <ScrollArea as="main" className="settings-detail">
         {renderDetail()}
       </ScrollArea>
@@ -3748,15 +3745,13 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
   }
   if (category === 'privacySecurity') {
     return [
+      { id: 'privacy-policy', label: '安全策略', description: '本地与远端执行边界' },
       { id: 'secrets', label: '密钥管理', description: '本地钥匙串与密钥状态' },
-      { id: 'privacy-policy', label: '隐私策略', description: '本地优先与数据边界' },
-      { id: 'remote-permission', label: '远端执行权限', description: '远端执行确认策略' },
-      { id: 'dangerous-actions', label: '危险操作', description: '高风险操作审批' },
-      { id: 'diagnostic-redaction', label: '诊断脱敏', description: '导出诊断前脱敏' },
+      { id: 'dangerous-actions', label: '待确认操作', description: '需要用户确认的高风险操作' },
     ];
   }
   return [
-    { id: 'diagnostics', label: '诊断与支持', description: '检查状态、导出诊断和修复问题' },
+    { id: 'diagnostics', label: '支持与诊断', description: '检查状态并导出脱敏诊断包' },
   ];
 }
 
@@ -4643,16 +4638,17 @@ function ChatHome({
   }
 
   function openThreadDetail(threadID: string) {
-    if (!threadID) return;
+    const thread = visibleThreads.find((item) => item.id === threadID);
+    if (!thread) return;
     setSelectedThreadID(threadID);
-    setManualRightPanelCollapsed(false);
-    setRightInspectorTab('threads');
+    void locateThreadSource(thread);
   }
 
   return (
     <section className={`chat-home companion-layout tk-workspace${rightPanelCollapsed ? ' companion-layout-right-collapsed' : ''}`}>
       <section className="chat-main-column tk-content-panel">
         <MessengerChatHeader
+          inspectorOpen={!rightPanelCollapsed}
           room={activeRoom}
           persona={activePersona}
           personas={messenger?.personas ?? []}
@@ -4821,6 +4817,7 @@ function ChatHome({
 }
 
 function MessengerChatHeader({
+  inspectorOpen,
   onOpenInspector,
   persona,
   personas,
@@ -4828,6 +4825,7 @@ function MessengerChatHeader({
   room,
   routeLock,
 }: {
+  inspectorOpen: boolean;
   onOpenInspector: () => void;
   persona: ProjectPersona | null;
   personas: ProjectPersona[];
@@ -4860,7 +4858,14 @@ function MessengerChatHeader({
       {lockedPersona ? (
         <span className="route-lock-chip">@{lockedPersona.display_name} 已锁定</span>
       ) : null}
-      <button className="observe-button" type="button" aria-label="展开观察面板" title="展开观察面板" onClick={onOpenInspector}>
+      <button
+        className={`observe-button ${inspectorOpen ? 'active' : ''}`}
+        type="button"
+        aria-expanded={inspectorOpen}
+        aria-label={inspectorOpen ? '收起观察面板' : '展开观察面板'}
+        title={inspectorOpen ? '收起观察面板' : '展开观察面板'}
+        onClick={onOpenInspector}
+      >
         <ExpandPanelIcon />
       </button>
     </header>
@@ -5159,8 +5164,7 @@ function CompanionInspectorPanel({
   const staticTabs: Array<[RightInspectorTab, string]> = [
     ['overview', '概览'],
     ['runs', '运行'],
-    ['threads', '线程'],
-    ['assets', '文件'],
+    ['assets', '产物'],
     ['memory', '记忆'],
   ];
   const memberTabLabel = selectedMember ? (selectedMemberPersona?.display_name || selectedMember.display_name || '成员') : '';
@@ -5262,21 +5266,8 @@ function CompanionInspectorPanel({
           workspaceSettings={workspaceSettings}
         />
       ) : effectiveTab === 'runs' ? (
-        <MessengerRunsPanel
-          messenger={messenger}
+        <CurrentRunSummaryPanel
           openRunTrace={openRunTrace}
-          trace={trace}
-          traceSpanAudit={traceSpanAudit}
-        />
-      ) : effectiveTab === 'threads' ? (
-        <MessengerThreadsPanel
-          locateStatus={threadLocateStatus}
-          messenger={messenger}
-          onLocateThreadSource={onLocateThreadSource}
-          onSelectThread={onSelectThread}
-          openRunTrace={openRunTrace}
-          room={activeRoom}
-          selectedThreadID={selectedThreadID}
           trace={trace}
         />
       ) : effectiveTab === 'assets' ? (
@@ -5462,19 +5453,16 @@ function MessengerOverviewPanel({
 
   if (room?.type === 'project_dm' && activePersona) {
     return (
-      <PrivateProjectOverviewPanel
-        exportCurrentMessengerData={exportCurrentMessengerData}
+      <CurrentJoiOverviewPanel
         memories={memories}
         onOpenModelSettings={onOpenModelSettings}
         onOpenMemory={onOpenMemory}
         onSavePersona={onSavePersona}
-        onSaveProject={onSaveProject}
         persona={activePersona}
         project={activeProject}
         room={room}
         savedModels={savedModels}
         settings={settings}
-        workspaceSettings={workspaceSettings}
       />
     );
   }
@@ -5556,6 +5544,109 @@ function MessengerOverviewPanel({
           导出数据
         </button>
       </div>
+    </section>
+  );
+}
+
+function CurrentJoiOverviewPanel({
+  memories,
+  onOpenModelSettings,
+  onOpenMemory,
+  onSavePersona,
+  persona,
+  project,
+  room,
+  savedModels,
+  settings,
+}: {
+  memories: MemoryRecord[];
+  onOpenModelSettings: () => void;
+  onOpenMemory: () => void;
+  onSavePersona: (req: UpdateProjectPersonaRequest) => Promise<void>;
+  persona: ProjectPersona;
+  project: PersonaMessengerSnapshot['projects'][number] | null;
+  room: MessengerRoom;
+  savedModels: AvailableModel[];
+  settings: SettingsRecord | null;
+}) {
+  const modelOptions = useMemo(() => connectedModelOptions(savedModels, settings), [savedModels, settings]);
+  const defaultModelID = settings?.model_name || modelOptions[0]?.id || '';
+  const selectedModelID = normalizePersonaModelSelection(persona.model_strategy, modelOptions, defaultModelID);
+  const scopedMemories = useMemo(
+    () => memoriesForPrivateProject(memories, persona, project).filter((memory) => (
+      !isMemoryDisabled(memory) && !isLegacyJoiSurfaceMemory(memory)
+    )),
+    [memories, persona, project],
+  );
+  const [savingModel, setSavingModel] = useState(false);
+
+  async function saveModel(modelID: string) {
+    const nextModelID = normalizePersonaModelSelection(modelID, modelOptions, defaultModelID);
+    if (!nextModelID || nextModelID === selectedModelID) return;
+    setSavingModel(true);
+    try {
+      await onSavePersona({
+        persona_id: persona.id,
+        base_version: persona.version,
+        actor_id: 'desktop_user',
+        actor_role: 'project_owner',
+        room_id: room.id,
+        model_strategy: nextModelID,
+        change_reason: 'Update Joi model from conversation overview',
+      });
+    } finally {
+      setSavingModel(false);
+    }
+  }
+
+  return (
+    <section
+      id="right-inspector-overview"
+      className="right-panel-section current-joi-overview-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-overview"
+    >
+      <header className="current-joi-overview-header">
+        <img src={joiAvatar} alt="" />
+        <div>
+          <small>当前会话</small>
+          <h2>Joi</h2>
+        </div>
+      </header>
+      <div className="inspector-metric-grid current-joi-overview-metrics">
+        <KV label="状态" value={formatStatus(persona.status)} />
+        <KV label="可用记忆" value={`${scopedMemories.length} 条`} />
+      </div>
+      <section className="current-joi-model-card" aria-label="当前回复模型">
+        <div className="current-joi-section-heading">
+          <div>
+            <small>回复模型</small>
+            <h3>当前模型</h3>
+          </div>
+          <button type="button" onClick={onOpenModelSettings}>设置</button>
+        </div>
+        <select
+          aria-label="当前模型"
+          disabled={savingModel || modelOptions.length === 0}
+          value={selectedModelID}
+          onChange={(event) => void saveModel(event.target.value)}
+        >
+          {modelOptions.length === 0 ? (
+            <option value="">未接入模型</option>
+          ) : modelOptions.map((model) => (
+            <option key={modelOptionKey(model)} value={model.id}>
+              {modelOptionLabel(model)}
+            </option>
+          ))}
+        </select>
+      </section>
+      <button className="current-joi-memory-link" type="button" onClick={onOpenMemory}>
+        <span>
+          <strong>本轮记忆</strong>
+          <small>查看召回内容并反馈准确性</small>
+        </span>
+        <span aria-hidden="true">›</span>
+      </button>
     </section>
   );
 }
@@ -5937,6 +6028,60 @@ function formatSpanTypeLabel(type: string) {
   return '运行记录';
 }
 
+function CurrentRunSummaryPanel({
+  openRunTrace,
+  trace,
+}: {
+  openRunTrace: (runID: string, destination?: 'panel' | 'stage') => Promise<void>;
+  trace: RunTrace | null;
+}) {
+  const visibleActions = useMemo(
+    () => visibleExecutionActions(projectRunTraceToActions(trace)),
+    [trace],
+  );
+  const recentActions = visibleActions.slice(-6);
+
+  return (
+    <section
+      id="right-inspector-runs"
+      className="right-panel-section current-run-summary-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-runs"
+    >
+      <header>
+        <small>当前对话</small>
+        <h2>运行</h2>
+      </header>
+      {trace ? (
+        <>
+          <div className="inspector-metric-grid">
+            <KV label="状态" value={formatStatus(trace.status)} />
+            <KV label="模型调用" value={String(trace.model_calls?.length ?? 0)} />
+            <KV label="动作" value={String(visibleActions.length)} />
+          </div>
+          {recentActions.length > 0 ? (
+            <div className="current-run-action-list">
+              <strong>最近动作</strong>
+              {recentActions.map((action) => (
+                <div key={action.id} className={`current-run-action-row status-${action.status}`}>
+                  <span className={`status-dot ${action.status === 'running' || action.status === 'queued' ? 'running' : action.status === 'waiting_approval' ? 'waiting' : action.status === 'failed' || action.status === 'blocked' || action.status === 'limited' ? 'failed' : 'done'}`} />
+                  <span>
+                    <strong>{executionActionTitle(action)}</strong>
+                    <small>{formatStatus(action.status)}</small>
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : <p className="empty">本次运行没有需要展示的外部动作。</p>}
+          <button className="current-run-detail-button" type="button" onClick={() => void openRunTrace(trace.id, 'panel')}>
+            查看完整执行过程
+          </button>
+        </>
+      ) : <p className="empty">当前对话还没有运行记录。</p>}
+    </section>
+  );
+}
+
 function MessengerRunsPanel({
   messenger,
   openRunTrace,
@@ -6284,10 +6429,10 @@ function MessengerAssetsPanel({
       aria-labelledby="right-inspector-tab-assets"
     >
       <header>
-        <small>会话内容</small>
-        <h2>文件与交付物</h2>
+        <small>当前对话</small>
+        <h2>产物</h2>
       </header>
-      {visible.length === 0 ? <p className="empty">{room?.title || '当前会话'} 暂无上传或生成资产。</p> : (
+      {visible.length === 0 ? <p className="empty">当前对话还没有上传文件或生成产物。</p> : (
         <div className="asset-mini-list">
           {visible.map((asset) => (
             <article key={asset.id} className={`asset-mini-row asset-source-${asset.source}${asset.previewUrl ? ' has-preview' : ''}`}>
@@ -7174,7 +7319,9 @@ function CompanionInsightPanel({
   trace: RunTrace | null;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
 }) {
-  const usedMemories = extractUsedMemories(trace).slice(0, 4);
+  const usedMemories = extractUsedMemories(trace)
+    .filter((result) => !isLegacyJoiSurfaceMemory(result.memory))
+    .slice(0, 4);
   const currentRunID = trace?.id || '';
   const pending = memories.filter((memory) => isMemoryProposalForRun(memory, currentRunID)).slice(0, 4);
 
@@ -7194,8 +7341,8 @@ function CompanionInsightPanel({
       <h3>本次使用了这些记忆</h3>
       <InsightList empty="本次没有使用已确认记忆。">
         {usedMemories.map((result) => (
-          <InsightItem key={`used-${result.memory.id}`} title={result.memory.summary || result.memory.type} body={result.memory.content}>
-            <small>匹配度 {Math.round(result.score * 100)}% · {formatMemoryReason(result.reason)}</small>
+          <InsightItem key={`used-${result.memory.id}`} title={memoryInsightTitle(result.memory)} body={memoryInsightBody(result.memory)}>
+            <small>匹配度 {memoryMatchPercent(result.score)}% · {formatMemoryReason(result.reason)}</small>
             <button type="button" onClick={() => updateMemory(result.memory.id, 'feedback_positive')}>准确</button>
             <button type="button" onClick={() => updateMemory(result.memory.id, 'feedback_negative')}>不准确</button>
             <button type="button" onClick={() => updateMemory(result.memory.id, 'disable')}>停用</button>
@@ -7205,7 +7352,7 @@ function CompanionInsightPanel({
       <h3>本次建议</h3>
       <InsightList empty="本轮没有新的学习建议。">
         {pending.map((memory) => (
-          <InsightItem key={memory.id} title={memory.summary || memory.type} body={memory.content}>
+          <InsightItem key={memory.id} title={memoryInsightTitle(memory)} body={memoryInsightBody(memory)}>
             {memoryProposalWhy(memory) ? <small>{memoryProposalWhy(memory)}</small> : null}
             <button type="button" onClick={() => updateMemory(memory.id, 'confirm')}>准确</button>
             <button type="button" onClick={() => editAndConfirm(memory)}>修改</button>
@@ -7424,6 +7571,16 @@ function isMemoryDisabled(memory: MemoryRecord) {
   return Boolean(memory.disabled || memory.disabled_at);
 }
 
+function isLegacyJoiSurfaceMemory(memory: MemoryRecord) {
+  const text = `${memory.summary || ''}\n${memory.content || ''}`;
+  return /五个项目人格|私人总群群主|群主\s*Owner/i.test(text)
+    || /预览\s*UI[\s\S]*(?:房间|成员详情)[\s\S]*线程[\s\S]*资产[\s\S]*记忆/i.test(text);
+}
+
+function memoryMatchPercent(score: number) {
+  return Math.max(0, Math.min(100, Math.round(score * 100)));
+}
+
 function isMemoryProposalForRun(memory: MemoryRecord, runID: string) {
   if (!runID || isMemoryDisabled(memory)) return false;
   if (memory.status === 'confirmed' || memory.status === 'rejected' || memory.status === 'deleted') return false;
@@ -7435,6 +7592,16 @@ function memoryProposalWhy(memory: MemoryRecord) {
   const why = typeof memory.metadata?.why === 'string' ? memory.metadata.why : '';
   const futureEffect = typeof memory.metadata?.futureEffect === 'string' ? memory.metadata.futureEffect : '';
   return [why, futureEffect].filter(Boolean).join(' · ');
+}
+
+function memoryInsightTitle(memory: MemoryRecord) {
+  return memory.summary?.trim() || memory.content?.trim() || memory.type || '记忆';
+}
+
+function memoryInsightBody(memory: MemoryRecord) {
+  const title = memoryInsightTitle(memory).replace(/\s+/g, ' ').trim();
+  const body = memory.content?.replace(/\s+/g, ' ').trim() || '';
+  return body && body !== title ? body : undefined;
 }
 
 function extractUsedMemories(trace: RunTrace | null): MemorySearchResult[] {
@@ -7465,9 +7632,12 @@ function normalizeMemorySearchResult(value: unknown): MemorySearchResult | null 
 
 function formatMemoryReason(reason?: string) {
   if (!reason) return '召回';
-  if (reason === 'sqlite_fts5') return '全文召回';
-  if (reason === 'sqlite_keyword_fallback') return '关键词召回';
-  return reason;
+  const normalized = reason.toLowerCase();
+  if (normalized === 'sqlite_fts5') return '全文召回';
+  if (normalized === 'sqlite_keyword_fallback') return '关键词召回';
+  if (normalized.includes('confirmed')) return normalized.includes('global') ? '全局已确认' : '已确认';
+  if (normalized.includes('semantic') || normalized.includes('vector')) return '语义召回';
+  return '相关记忆';
 }
 
 function ExecutionActionFlow({
@@ -9189,6 +9359,16 @@ function nodeDisplayName(value?: string) {
 
 function isUserFacingSecret(value: string) {
   return ['MODEL_API_KEY', 'TELEGRAM_BOT_TOKEN', 'WORKER_TOKEN'].includes(value);
+}
+
+function confirmationActionLabel(action: string, capabilityID: string) {
+  const text = action.trim();
+  if (/[一-鿿]/.test(text)) return text;
+  const normalized = `${text} ${capabilityID}`.toLowerCase();
+  if (normalized.includes('apply_patch') || normalized.includes('file_write')) return '修改工作区文件';
+  if (normalized.includes('shell') || normalized.includes('command') || normalized.includes('bash')) return '运行本机命令';
+  if (normalized.includes('delete') || normalized.includes('remove')) return '删除内容';
+  return capabilityDisplayName(capabilityID);
 }
 
 function secretDisplayName(value: string) {

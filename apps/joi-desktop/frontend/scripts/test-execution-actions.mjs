@@ -102,12 +102,14 @@ try {
         step_type: 'tool_finished',
         title: 'Tool runtime finished',
         status: 'succeeded',
+        error: {},
         output: { status: 'succeeded', source_url: 'https://example.com', summary: 'Example Domain' },
       },
     ]));
     assert.equal(actions.length, 1);
     assert.equal(actions[0].title, '读取网页');
     assert.equal(actions[0].kind, 'web');
+    assert.equal(actions[0].status, 'completed');
     assert.equal(actions[0].description, '本轮执行了工具：已读取网页并提取正文');
     assert.equal(actions[0].sourceLabel, 'example.com');
     assert.equal(actions[0].completedLabel, '已读取网页 · example.com');

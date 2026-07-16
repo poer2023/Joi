@@ -565,11 +565,19 @@ function makeAction(input: {
 function statusForSteps(steps: RunStep[]): ExecutionActionStatus {
   if (steps.some((step) => step.status === 'waiting_approval' || step.status === 'waiting_confirmation' || step.step_type === 'approval_requested')) return 'waiting_approval';
   if (steps.some((step) => step.step_type.includes('blocked') || step.status === 'blocked')) return 'blocked';
-  if (steps.some((step) => step.step_type.includes('failed') || step.status === 'failed' || step.error)) return 'failed';
+  if (steps.some((step) => step.step_type.includes('failed') || step.status === 'failed' || hasStepError(step.error))) return 'failed';
   if (steps.some((step) => step.status === 'running')) return 'running';
   if (steps.some((step) => step.step_type === 'task_dispatched')) return 'queued';
   if (steps.every((step) => step.status === 'succeeded' || step.status === 'success' || step.status === 'completed')) return 'completed';
   return normalizeActionStatus(steps[steps.length - 1]?.status);
+}
+
+function hasStepError(error: unknown) {
+  if (!error) return false;
+  if (typeof error === 'string') return error.trim().length > 0;
+  if (Array.isArray(error)) return error.length > 0;
+  if (typeof error === 'object') return Object.keys(error).length > 0;
+  return true;
 }
 
 function totalDuration(steps: RunStep[]) {
