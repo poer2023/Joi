@@ -59,7 +59,7 @@ try {
   assert.ok(cppCommand.args.includes('--output-json'));
   assert.ok(cppCommand.args.includes('--language'));
   assert.equal(cppCommand.args[cppCommand.args.indexOf('--language') + 1], 'zh');
-  assert.match(cppCommand.args[cppCommand.args.indexOf('--prompt') + 1], /简体中文.*Joi/);
+  assert.equal(cppCommand.args.includes('--prompt'), false, 'voice input must not seed a prompt that can leak into silence');
   assert.ok(commands.some((command) => command.binary.includes('ffmpeg') && command.args.includes('16000')));
   const durationCommand = commands.find((command) => command.binary.includes('ffprobe'));
   assert.ok(durationCommand?.args.at(-1)?.endsWith('/input.wav'), 'whisper.cpp duration must use normalized WAV for MediaRecorder WebM compatibility');

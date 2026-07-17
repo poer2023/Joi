@@ -22,7 +22,7 @@
 
 ## Interaction Rules
 
-- Chinese mode must call whisper.cpp with `--language zh` and a short Simplified Chinese/Joi vocabulary prompt.
+- Chinese mode must call whisper.cpp with `--language zh` and no seed prompt that could leak into quiet recordings.
 - The renderer sends the recorded data directly to a dedicated transient transcription action.
 - The main process may create a file only inside a unique OS temporary directory required by FFmpeg/whisper.cpp.
 - The temporary directory must be removed in `finally`, on success and failure.

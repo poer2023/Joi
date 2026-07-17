@@ -10,11 +10,11 @@
     "model": "small",
     "model_path": "/Users/hao/Library/Application Support/Joi/models/whisper/ggml-small.bin",
     "language": "zh",
-    "source_path": "/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-advanced-media-yiqD1j/joi-speech-1784301752677-674c12e3.wav",
+    "source_path": "/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-advanced-media-AWoMnG/joi-speech-1784302133718-8e711757.wav",
     "source_size": 310630,
     "duration_seconds": 7.042,
-    "elapsed_seconds": 1.86,
-    "transcript": "你好,我是Joi。这是一段本地语音识别测试,今天的验证码是42。",
+    "elapsed_seconds": 1.39,
+    "transcript": "你好,我是Joy。這是一段本地語音識別測試,今天的驗證碼是42。",
     "segment_count": 1,
     "summary": "Transcribed 7.04 seconds of audio with local Whisper."
   }

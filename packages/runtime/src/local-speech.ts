@@ -195,7 +195,6 @@ export async function executeLocalSpeechTranscription(
       '--model', String(runtime.model_path),
       '--file', normalizedPath,
       '--language', language,
-      ...(language === 'zh' ? ['--prompt', '以下是简体中文普通话转写，产品名称写作 Joi。'] : []),
       '--threads', '8',
       '--output-json',
       '--output-file', outputPrefix,
