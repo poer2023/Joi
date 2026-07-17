@@ -3,9 +3,11 @@ set -euo pipefail
 
 MODEL_DIR="${JOI_WHISPER_MODEL_DIR:-$HOME/Library/Application Support/Joi/models/whisper}"
 MODEL_PATH="$MODEL_DIR/ggml-small.bin"
-DOWNLOAD_PATH="$MODEL_PATH.download"
 MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/c521a4b02f422512d734391fdf08bb08c0862f68/ggml-small.bin?download=true"
 MODEL_SHA256="1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
+VAD_MODEL_PATH="$MODEL_DIR/ggml-silero-v6.2.0.bin"
+VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin?download=true"
+VAD_MODEL_SHA256="2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
 WHISPER_CPP="/opt/homebrew/bin/whisper-cli"
 
 if [[ ! -x "$WHISPER_CPP" ]]; then
@@ -18,24 +20,37 @@ fi
 
 mkdir -p "$MODEL_DIR"
 
-if [[ -f "$MODEL_PATH" ]]; then
-  INSTALLED_SHA="$(shasum -a 256 "$MODEL_PATH" | awk '{print $1}')"
-  if [[ "$INSTALLED_SHA" == "$MODEL_SHA256" ]]; then
-    echo "Whisper Small is already installed and verified: $MODEL_PATH"
-    exit 0
+install_verified_model() {
+  local label="$1"
+  local target_path="$2"
+  local source_url="$3"
+  local expected_sha="$4"
+  local download_path="$target_path.download"
+
+  if [[ -f "$target_path" ]]; then
+    local installed_sha
+    installed_sha="$(shasum -a 256 "$target_path" | awk '{print $1}')"
+    if [[ "$installed_sha" == "$expected_sha" ]]; then
+      echo "$label is already installed and verified: $target_path"
+      return
+    fi
+    echo "Existing $label checksum does not match; refusing to overwrite it automatically." >&2
+    exit 3
   fi
-  echo "Existing Whisper Small checksum does not match; refusing to overwrite it automatically." >&2
-  exit 3
-fi
 
-curl -L --fail --retry 3 --progress-bar -o "$DOWNLOAD_PATH" "$MODEL_URL"
-DOWNLOADED_SHA="$(shasum -a 256 "$DOWNLOAD_PATH" | awk '{print $1}')"
-if [[ "$DOWNLOADED_SHA" != "$MODEL_SHA256" ]]; then
-  rm -f "$DOWNLOAD_PATH"
-  echo "Whisper Small checksum verification failed." >&2
-  exit 4
-fi
+  curl -L --fail --retry 3 --progress-bar -o "$download_path" "$source_url"
+  local downloaded_sha
+  downloaded_sha="$(shasum -a 256 "$download_path" | awk '{print $1}')"
+  if [[ "$downloaded_sha" != "$expected_sha" ]]; then
+    rm -f "$download_path"
+    echo "$label checksum verification failed." >&2
+    exit 4
+  fi
 
-mv "$DOWNLOAD_PATH" "$MODEL_PATH"
-echo "Installed verified Whisper Small model: $MODEL_PATH"
+  mv "$download_path" "$target_path"
+  echo "Installed verified $label: $target_path"
+}
+
+install_verified_model "Whisper Small model" "$MODEL_PATH" "$MODEL_URL" "$MODEL_SHA256"
+install_verified_model "Silero VAD model" "$VAD_MODEL_PATH" "$VAD_MODEL_URL" "$VAD_MODEL_SHA256"
 echo "Runtime: $WHISPER_CPP (Apple Metal backend)"

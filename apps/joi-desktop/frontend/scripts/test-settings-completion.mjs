@@ -85,6 +85,8 @@ assert.doesNotMatch(app, /addRecordedAttachment/);
 assert.doesNotMatch(app, /录音已附加/);
 assert.match(ipc, /withTemporaryMediaDataURL/);
 assert.match(ipc, /speech_transcribe_recording/);
+assert.match(ipc, /executeLocalSpeechTranscription\(\{ \.\.\.req, path, use_vad: true \}/);
+assert.match(ipc, /output_dir: dirname\(path\)/);
 assert.match(mediaAnalysis, /finally \{\s*await rm\(temporaryDir, \{ recursive: true, force: true \}\);/);
 assert.match(app, /className=\{`composer-attachment-button composer-voice-button/);
 assert.match(app, /onSpeak=\{\(messageID, content\) => void speakAssistantMessage/);

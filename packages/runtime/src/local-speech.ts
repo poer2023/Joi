@@ -20,6 +20,7 @@ type LocalSpeechOptions = {
   whisper_path?: string;
   whisper_cpp_path?: string;
   whisper_model_dir?: string;
+  whisper_vad_model_path?: string;
   timeout_seconds?: number;
   run_command?: (
     binary: string,
@@ -37,10 +38,11 @@ const allowedWhisperModels = new Set([
 const preferredWhisperCppModel = 'small';
 const defaultWhisperCppPath = '/opt/homebrew/bin/whisper-cli';
 const defaultOpenAIWhisperPath = '/opt/homebrew/bin/whisper';
+const defaultWhisperVadModelName = 'ggml-silero-v6.2.0.bin';
 
 export async function inspectLocalWhisperRuntime(
   request: Record<string, unknown> = {},
-  options: Pick<LocalSpeechOptions, 'whisper_cpp_path' | 'whisper_model_dir' | 'whisper_path'> = {},
+  options: Pick<LocalSpeechOptions, 'whisper_cpp_path' | 'whisper_model_dir' | 'whisper_vad_model_path' | 'whisper_path'> = {},
 ): Promise<Record<string, unknown>> {
   const model = boundedToken(request.model, 80) || preferredWhisperCppModel;
   if (!allowedWhisperModels.has(model)) throw new Error(`unsupported local Whisper model: ${model}`);
@@ -49,8 +51,13 @@ export async function inspectLocalWhisperRuntime(
     const binaryPath = options.whisper_cpp_path || defaultWhisperCppPath;
     const modelDir = options.whisper_model_dir || join(homedir(), 'Library', 'Application Support', 'Joi', 'models', 'whisper');
     const modelPath = join(modelDir, 'ggml-small.bin');
-    const [binary, modelFile] = await Promise.all([fileStatus(binaryPath), fileStatus(modelPath)]);
-    const ready = binary.ready && modelFile.ready;
+    const vadModelPath = options.whisper_vad_model_path || join(modelDir, defaultWhisperVadModelName);
+    const [binary, modelFile, vadModelFile] = await Promise.all([
+      fileStatus(binaryPath),
+      fileStatus(modelPath),
+      fileStatus(vadModelPath),
+    ]);
+    const ready = binary.ready && modelFile.ready && vadModelFile.ready;
     return {
       status: ready ? 'ready' : 'missing',
       ready,
@@ -62,11 +69,16 @@ export async function inspectLocalWhisperRuntime(
       binary_path: binaryPath,
       model_path: modelPath,
       model_size: modelFile.size,
+      vad_ready: vadModelFile.ready,
+      vad_model_path: vadModelPath,
+      vad_model_size: vadModelFile.size,
       error_summary: ready
         ? ''
         : !binary.ready
           ? `whisper.cpp is not installed at ${binaryPath}`
-          : `Whisper Small model is not installed at ${modelPath}`,
+          : !modelFile.ready
+            ? `Whisper Small model is not installed at ${modelPath}`
+            : `Silero VAD model is not installed at ${vadModelPath}`,
     };
   }
 
@@ -170,6 +182,7 @@ export async function executeLocalSpeechTranscription(
   const model = boundedToken(request.model, 80) || preferredWhisperCppModel;
   if (!allowedWhisperModels.has(model)) throw new Error(`unsupported local Whisper model: ${model}`);
   const language = boundedToken(request.language, 40) || (model.endsWith('.en') ? 'en' : 'auto');
+  const useVad = request.use_vad === true;
   const timeoutSeconds = boundedNumber(options.timeout_seconds, 300, 30, 900);
   const run = options.run_command || runCommand;
   const resultDir = join(options.output_dir, `whisper-${Date.now()}-${randomUUID().slice(0, 8)}`);
@@ -196,6 +209,14 @@ export async function executeLocalSpeechTranscription(
       '--file', normalizedPath,
       '--language', language,
       '--threads', '8',
+      ...(useVad ? [
+        '--vad',
+        '--vad-model', String(runtime.vad_model_path),
+        '--vad-threshold', '0.5',
+        '--vad-min-speech-duration-ms', '200',
+        '--vad-min-silence-duration-ms', '250',
+        '--vad-speech-pad-ms', '100',
+      ] : []),
       '--output-json',
       '--output-file', outputPrefix,
       '--no-prints',
@@ -239,7 +260,10 @@ export async function executeLocalSpeechTranscription(
     segmentCount = Array.isArray(parsed.segments) ? parsed.segments.length : 0;
     durationSeconds = await mediaDuration(sourcePath, options, run);
   }
-  if (!transcript) throw new Error('local Whisper returned an empty transcript');
+  if (!transcript) throw new Error('没有检测到清晰的人声，请靠近麦克风后重试。');
+  if (isDegenerateSpeechTranscript(transcript)) {
+    throw new Error('本次录音的识别结果异常，请靠近麦克风后重试。');
+  }
   return {
     status: 'completed',
     capability: 'speech_transcribe',
@@ -249,6 +273,8 @@ export async function executeLocalSpeechTranscription(
     acceleration: runtime.acceleration,
     model,
     model_path: runtime.model_path,
+    vad_enabled: useVad,
+    vad_model_path: useVad ? runtime.vad_model_path : '',
     language,
     source_path: sourcePath,
     source_size: sourceStat.size,
@@ -258,6 +284,31 @@ export async function executeLocalSpeechTranscription(
     segment_count: segmentCount,
     summary: `Transcribed ${durationSeconds.toFixed(2)} seconds of audio with local Whisper.`,
   };
+}
+
+export function isDegenerateSpeechTranscript(value: string): boolean {
+  const compact = value
+    .normalize('NFKC')
+    .toLocaleLowerCase()
+    .replace(/[\p{P}\p{S}\s]+/gu, '');
+  if (compact.length < 12) return false;
+
+  const maxUnitLength = Math.min(24, Math.floor(compact.length / 3));
+  for (let unitLength = 2; unitLength <= maxUnitLength; unitLength += 1) {
+    for (let start = 0; start < unitLength && start + unitLength <= compact.length; start += 1) {
+      const unit = compact.slice(start, start + unitLength);
+      let count = 0;
+      let cursor = 0;
+      while (cursor <= compact.length - unitLength) {
+        const found = compact.indexOf(unit, cursor);
+        if (found < 0) break;
+        count += 1;
+        cursor = found + unitLength;
+      }
+      if (count >= 3 && (count * unitLength) / compact.length >= 0.72) return true;
+    }
+  }
+  return false;
 }
 
 async function fileStatus(path: string): Promise<{ ready: boolean; size: number }> {

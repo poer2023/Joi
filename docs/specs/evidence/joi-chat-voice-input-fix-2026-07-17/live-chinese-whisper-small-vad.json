@@ -1,0 +1,27 @@
+{
+  "fixture_text": "自己不就是最好的例子吗，是吧。",
+  "silence_padding_seconds": {
+    "before": 1,
+    "after": 12
+  },
+  "result": {
+    "status": "completed",
+    "capability": "speech_transcribe",
+    "mode": "local_whisper_cpp_v1",
+    "provider": "local_whisper_cpp",
+    "engine": "whisper.cpp",
+    "acceleration": "Apple Metal",
+    "model": "small",
+    "model_path": "/Users/hao/Library/Application Support/Joi/models/whisper/ggml-small.bin",
+    "vad_enabled": true,
+    "vad_model_path": "/Users/hao/Library/Application Support/Joi/models/whisper/ggml-silero-v6.2.0.bin",
+    "language": "zh",
+    "source_path": "/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-advanced-media-letqGB/short-chinese-with-silence.wav",
+    "source_size": 516910,
+    "duration_seconds": 16.151,
+    "elapsed_seconds": 0.89,
+    "transcript": "自己不就是最好的例子吗?是吧?",
+    "segment_count": 1,
+    "summary": "Transcribed 16.15 seconds of audio with local Whisper."
+  }
+}

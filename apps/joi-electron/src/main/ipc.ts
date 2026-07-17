@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { testGitHubConnection } from './github';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { join, relative, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { z } from 'zod';
 import { desktopIpcMethods, type DesktopIpcMethod, type JoiInvokeRequest } from '../../../../packages/shared-types/src/preload-api';
@@ -903,8 +903,8 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
         return {
           action,
           output: await withTemporaryMediaDataURL(req.data_url, req.mime_type || '', async (path) => (
-            executeLocalSpeechTranscription({ ...req, path } as Record<string, unknown>, {
-              output_dir: join(mediaRoot, 'transcriptions'),
+            executeLocalSpeechTranscription({ ...req, path, use_vad: true } as Record<string, unknown>, {
+              output_dir: dirname(path),
               whisper_model_dir: whisperModelDir,
               timeout_seconds: 900,
             })
