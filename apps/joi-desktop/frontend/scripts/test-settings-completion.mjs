@@ -9,6 +9,8 @@ const api = readFileSync(resolve(root, 'apps/joi-desktop/frontend/src/api/deskto
 const contract = readFileSync(resolve(root, 'packages/shared-types/src/desktop-api.ts'), 'utf8');
 const schema = readFileSync(resolve(root, 'database/sqlite/001_init_schema.sql'), 'utf8');
 const store = readFileSync(resolve(root, 'packages/store/src/sqlite.ts'), 'utf8');
+const ipc = readFileSync(resolve(root, 'apps/joi-electron/src/main/ipc.ts'), 'utf8');
+const mediaAnalysis = readFileSync(resolve(root, 'apps/joi-electron/src/main/media-analysis.ts'), 'utf8');
 
 const routedObjects = [
   'desktop-notify', 'webhook',
@@ -75,6 +77,15 @@ assert.match(app, /Small（推荐 · 中英均衡）/);
 assert.match(app, /本地转写引擎/);
 assert.match(api, /Apple Metal/);
 assert.match(store, /speech_transcription_model: settings\['speech\.transcription_model'\] \|\| 'small'/);
+assert.match(store, /speech_transcription_language: settings\['speech\.transcription_language'\] \|\| 'zh'/);
+assert.match(app, /action: 'speech_transcribe_recording'/);
+assert.match(app, /speech_transcription_language \|\| 'zh'/);
+assert.doesNotMatch(app, /action: 'save_recording'/);
+assert.doesNotMatch(app, /addRecordedAttachment/);
+assert.doesNotMatch(app, /录音已附加/);
+assert.match(ipc, /withTemporaryMediaDataURL/);
+assert.match(ipc, /speech_transcribe_recording/);
+assert.match(mediaAnalysis, /finally \{\s*await rm\(temporaryDir, \{ recursive: true, force: true \}\);/);
 assert.match(app, /className=\{`composer-attachment-button composer-voice-button/);
 assert.match(app, /onSpeak=\{\(messageID, content\) => void speakAssistantMessage/);
 assert.doesNotMatch(app, /return <MediaWorkbenchPanel/);

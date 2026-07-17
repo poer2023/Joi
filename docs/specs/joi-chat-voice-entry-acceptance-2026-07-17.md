@@ -35,8 +35,9 @@
 ## Interaction Rules
 
 - The microphone button is explicit and toggles between start and stop.
-- Stopping saves the recording locally, attaches it to the current composer, transcribes it locally, and places the transcript in the composer for review before sending.
-- Permission, recording, saving, and transcription failures remain visible and do not send a message automatically.
+- Stopping passes the recording to a transient local transcription action and places only the transcript in the composer for review before sending.
+- The transient recording is deleted after transcription and never appears as a composer attachment.
+- Permission, recording, temporary capture, and transcription failures remain visible and do not send a message automatically.
 - The assistant message “朗读” action uses the saved voice/rate and offers a second click to stop playback.
 
 ## Verification

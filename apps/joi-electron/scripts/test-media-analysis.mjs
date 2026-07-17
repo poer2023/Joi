@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { analyzeImageFile, saveMediaDataURL } from '../src/main/media-analysis.ts';
+import { analyzeImageFile, withTemporaryMediaDataURL } from '../src/main/media-analysis.ts';
 
 const tempDir = mkdtempSync(join(tmpdir(), 'joi-media-analysis-'));
 const imagePath = join(tempDir, 'fixture.png');
@@ -41,13 +41,29 @@ try png.write(to: URL(fileURLWithPath: output))
   assert.match(String(image.text).toUpperCase(), /JOI.*IMAGE.*REAL.*TEST/);
 
   const encoded = Buffer.from('local audio fixture').toString('base64');
-  const saved = await saveMediaDataURL(`data:audio/webm;codecs=opus;base64,${encoded}`, join(tempDir, 'recordings'));
+  let temporaryPath = '';
+  const saved = await withTemporaryMediaDataURL(`data:audio/webm;codecs=opus;base64,${encoded}`, 'audio/webm', async (path, output) => {
+    temporaryPath = path;
+    assert.ok(existsSync(path));
+    assert.equal(output.status, 'completed');
+    assert.equal(output.mime_type, 'audio/webm');
+    assert.equal('attachment' in output, false);
+    return output;
+  });
   assert.equal(saved.status, 'completed');
-  assert.equal(saved.mime_type, 'audio/webm');
-  assert.equal(saved.attachment.kind, 'audio');
-  assert.ok(existsSync(String(saved.file_path)));
+  assert.equal(existsSync(temporaryPath), false);
+
+  let failedTemporaryPath = '';
+  await assert.rejects(
+    withTemporaryMediaDataURL(`data:audio/webm;codecs=opus;base64,${encoded}`, 'audio/webm', async (path) => {
+      failedTemporaryPath = path;
+      throw new Error('transcription fixture failure');
+    }),
+    /transcription fixture failure/,
+  );
+  assert.equal(existsSync(failedTemporaryPath), false);
 } finally {
   rmSync(tempDir, { recursive: true, force: true });
 }
 
-console.log('image analysis and recording persistence tests passed');
+console.log('image analysis and transient recording cleanup tests passed');

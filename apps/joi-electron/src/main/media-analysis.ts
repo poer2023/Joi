@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { basename, extname, join } from 'node:path';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 type ProcessResult = { stdout: string; stderr: string; exit_code: number; duration_ms: number };
@@ -35,15 +36,23 @@ export async function saveMediaDataURL(
     preview_url: pathToFileURL(path).href,
     mime_type: mimeType,
     size: payload.length,
-    attachment: {
-      id: `attachment_${randomUUID().replace(/-/g, '')}`,
-      name: basename(path),
-      kind: mimeType.startsWith('video/') ? 'video' : 'audio',
-      mime_type: mimeType,
-      size: payload.length,
-      preview_url: pathToFileURL(path).href,
-    },
   };
+}
+
+export async function withTemporaryMediaDataURL<T>(
+  dataURL: string,
+  preferredMime: string,
+  task: (path: string, saved: Record<string, unknown>) => Promise<T>,
+): Promise<T> {
+  const temporaryDir = await mkdtemp(join(tmpdir(), 'joi-voice-input-'));
+  try {
+    const saved = await saveMediaDataURL(dataURL, temporaryDir, preferredMime);
+    const path = typeof saved.file_path === 'string' ? saved.file_path : '';
+    if (!path) throw new Error('temporary recording did not return a local path');
+    return await task(path, saved);
+  } finally {
+    await rm(temporaryDir, { recursive: true, force: true });
+  }
 }
 
 export async function analyzeImageFile(

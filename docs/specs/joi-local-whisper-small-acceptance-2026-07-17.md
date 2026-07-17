@@ -25,7 +25,7 @@
 
 ## Interaction Rules
 
-- Chat microphone saves the recording, runs local transcription, and places the text into the composer for review.
+- Chat microphone uses a short-lived OS-temporary recording, runs local transcription, deletes the recording, and places only the text into the composer for review.
 - Recording never sends a message automatically.
 - The status block refreshes when the Voice settings screen opens.
 - Permission, recording, model, and transcription failures remain visible.

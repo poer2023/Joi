@@ -2192,7 +2192,7 @@ export type DeveloperWorkbenchResult = {
 };
 
 export type MediaWorkbenchRequest = {
-  action: 'save_recording' | 'text_to_speech' | 'speech_status' | 'speech_transcribe' | 'analyze_image' | string;
+  action: 'speech_transcribe_recording' | 'text_to_speech' | 'speech_status' | 'speech_transcribe' | 'analyze_image' | string;
   path?: string;
   data_url?: string;
   mime_type?: string;

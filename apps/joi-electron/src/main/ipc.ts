@@ -128,7 +128,7 @@ import { resolveACPBridgeGrant } from './acp-web-bridge';
 import { MCPRuntimeManager } from './mcp-runtime.ts';
 import { BrowserWorkbenchManager } from './browser-workbench.ts';
 import { executeCodeCapability } from './code-execution-capabilities.ts';
-import { analyzeImageFile, saveMediaDataURL } from './media-analysis.ts';
+import { analyzeImageFile, withTemporaryMediaDataURL } from './media-analysis.ts';
 import { AssistantRuntimeManager } from './assistant-runtime.ts';
 import { approvalResumeCapabilityInput, approvalResumeContinuationMessage } from './approval-resume.ts';
 
@@ -898,9 +898,18 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
       const action = String(req.action || '').trim();
       const mediaRoot = join(app.getPath('userData'), 'media-workbench');
       const whisperModelDir = join(app.getPath('userData'), 'models', 'whisper');
-      if (action === 'save_recording') {
-        if (!req.data_url) throw new Error('save_recording data_url is required');
-        return { action, output: await saveMediaDataURL(req.data_url, join(mediaRoot, 'recordings'), req.mime_type) };
+      if (action === 'speech_transcribe_recording') {
+        if (!req.data_url) throw new Error('speech_transcribe_recording data_url is required');
+        return {
+          action,
+          output: await withTemporaryMediaDataURL(req.data_url, req.mime_type || '', async (path) => (
+            executeLocalSpeechTranscription({ ...req, path } as Record<string, unknown>, {
+              output_dir: join(mediaRoot, 'transcriptions'),
+              whisper_model_dir: whisperModelDir,
+              timeout_seconds: 900,
+            })
+          )),
+        };
       }
       if (action === 'text_to_speech') {
         return {

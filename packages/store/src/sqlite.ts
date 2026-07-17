@@ -11381,7 +11381,7 @@ export class JoiSQLiteStore {
       speech_voice: settings['speech.voice'] || 'Ting-Ting',
       speech_rate: Number(settings['speech.rate'] || 185),
       speech_transcription_model: settings['speech.transcription_model'] || 'small',
-      speech_transcription_language: settings['speech.transcription_language'] || 'auto',
+      speech_transcription_language: settings['speech.transcription_language'] || 'zh',
     });
   }
 
@@ -11416,7 +11416,7 @@ export class JoiSQLiteStore {
       'speech.voice': settings.speech_voice || 'Ting-Ting',
       'speech.rate': String(settings.speech_rate || 185),
       'speech.transcription_model': settings.speech_transcription_model || 'small',
-      'speech.transcription_language': settings.speech_transcription_language || 'auto',
+      'speech.transcription_language': settings.speech_transcription_language || 'zh',
     });
   }
 
@@ -20260,7 +20260,7 @@ function normalizeWorkspaceSettings(input: WorkspaceSettings): WorkspaceSettings
     speech_transcription_model: ['tiny', 'base', 'small'].includes(String(input.speech_transcription_model || ''))
       ? String(input.speech_transcription_model)
       : 'small',
-    speech_transcription_language: (input.speech_transcription_language || 'auto').trim() || 'auto',
+    speech_transcription_language: (input.speech_transcription_language || 'zh').trim() || 'zh',
   };
 }
 

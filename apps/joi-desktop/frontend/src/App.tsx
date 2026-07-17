@@ -981,13 +981,6 @@ export default function App() {
     ]);
   }
 
-  function addComposerAttachment(attachment: ComposerAttachment) {
-    setComposerAttachments((current) => [
-      ...current.filter((item) => item.id !== attachment.id),
-      attachment,
-    ]);
-  }
-
   function removeComposerAttachment(id: string) {
     setComposerAttachments((current) => {
       const target = current.find((item) => item.id === id);
@@ -2373,7 +2366,6 @@ export default function App() {
               roomRouteLock={roomRouteLock}
               setActiveTab={setActiveTab}
               addAttachments={addComposerAttachments}
-              addRecordedAttachment={addComposerAttachment}
               setMessage={setMessage}
               setQueuedMessageMode={setQueuedMessageMode}
               cancelQueuedRunMessage={cancelQueuedRunMessage}
@@ -5992,7 +5984,7 @@ function VoiceSettingsPanel({
   const [voice, setVoice] = useState(settings?.speech_voice || 'Ting-Ting');
   const [rate, setRate] = useState(String(settings?.speech_rate || 185));
   const [model, setModel] = useState(settings?.speech_transcription_model || 'small');
-  const [language, setLanguage] = useState(settings?.speech_transcription_language || 'auto');
+  const [language, setLanguage] = useState(settings?.speech_transcription_language || 'zh');
   const [busy, setBusy] = useState(false);
   const [runtimeLoading, setRuntimeLoading] = useState(true);
   const [runtimeStatus, setRuntimeStatus] = useState<Record<string, unknown> | null>(null);
@@ -6001,7 +5993,7 @@ function VoiceSettingsPanel({
     setVoice(settings?.speech_voice || 'Ting-Ting');
     setRate(String(settings?.speech_rate || 185));
     setModel(settings?.speech_transcription_model || 'small');
-    setLanguage(settings?.speech_transcription_language || 'auto');
+    setLanguage(settings?.speech_transcription_language || 'zh');
   }, [settings?.speech_rate, settings?.speech_transcription_language, settings?.speech_transcription_model, settings?.speech_voice]);
 
   useEffect(() => {
@@ -6032,7 +6024,7 @@ function VoiceSettingsPanel({
         speech_voice: voice.trim() || 'Ting-Ting',
         speech_rate: Math.max(80, Math.min(450, Number(rate) || 185)),
         speech_transcription_model: model,
-        speech_transcription_language: language.trim() || 'auto',
+        speech_transcription_language: language.trim() || 'zh',
       });
     } finally {
       setBusy(false);
@@ -7076,7 +7068,6 @@ function SidebarIcon({ name }: { name: 'plus' | 'search' | 'collapse' | 'expand'
 
 function ChatHome({
   addAttachments,
-  addRecordedAttachment,
   activePersona,
   activeProductTask,
   activeRoom,
@@ -7138,7 +7129,6 @@ function ChatHome({
   workspaceSettings,
 }: {
   addAttachments: (files: FileList | File[]) => void;
-  addRecordedAttachment: (attachment: ComposerAttachment) => void;
   activePersona: ProjectPersona | null;
   activeProductTask: ProductTaskDetail | null;
   activeRoom: MessengerRoom | null;
@@ -7258,26 +7248,18 @@ function ChatHome({
           setVoiceState('saving');
           try {
             const blob = new Blob(recordingChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-            const saved = await desktopApi.executeMediaAction({
-              action: 'save_recording',
-              data_url: await blobToDataURL(blob),
-              mime_type: blob.type,
-            });
-            const attachment = composerAttachmentFromMediaOutput(saved.output);
-            if (attachment) addRecordedAttachment(attachment);
-            const path = mediaOutputPath(saved.output);
-            if (!path) throw new Error('录音保存后没有返回本地路径');
             setVoiceState('transcribing');
             setVoiceStatus('正在本地转写…');
             const transcription = await desktopApi.executeMediaAction({
-              action: 'speech_transcribe',
-              path,
+              action: 'speech_transcribe_recording',
+              data_url: await blobToDataURL(blob),
+              mime_type: blob.type,
               model: workspaceSettings?.speech_transcription_model || 'small',
-              language: workspaceSettings?.speech_transcription_language || 'auto',
+              language: workspaceSettings?.speech_transcription_language || 'zh',
             });
             const transcript = typeof transcription.output.transcript === 'string' ? transcription.output.transcript.trim() : '';
             if (transcript) setMessage([message.trim(), transcript].filter(Boolean).join('\n'));
-            setVoiceStatus(transcript ? '转写已放入输入框，确认后再发送。' : '录音已附加，但没有识别到文字。');
+            setVoiceStatus(transcript ? '转写已放入输入框，确认后再发送。' : '没有识别到文字，请再试一次。');
           } catch (err) {
             setVoiceStatus(err instanceof Error ? err.message : String(err));
           } finally {
@@ -12174,7 +12156,7 @@ function defaultWorkspaceSettings(): WorkspaceSettings {
     speech_voice: 'Ting-Ting',
     speech_rate: 185,
     speech_transcription_model: 'small',
-    speech_transcription_language: 'auto',
+    speech_transcription_language: 'zh',
   };
 }
 
@@ -13534,22 +13516,6 @@ function blobToDataURL(blob: Blob): Promise<string> {
 
 function mediaOutputAttachment(output: Record<string, unknown> | null): Record<string, unknown> {
   return objectFromUnknown(output?.attachment);
-}
-
-function composerAttachmentFromMediaOutput(output: Record<string, unknown> | null): ComposerAttachment | null {
-  const attachment = mediaOutputAttachment(output);
-  const id = typeof attachment.id === 'string' ? attachment.id : '';
-  const name = typeof attachment.name === 'string' ? attachment.name : '';
-  const mimeType = typeof attachment.mime_type === 'string' ? attachment.mime_type : 'audio/webm';
-  if (!id || !name) return null;
-  return {
-    id,
-    name,
-    size: Number(attachment.size) || 0,
-    mime_type: mimeType,
-    kind: 'audio',
-    preview_url: typeof attachment.preview_url === 'string' ? attachment.preview_url : mediaOutputPreviewURL(output),
-  };
 }
 
 function mediaOutputPath(output: Record<string, unknown> | null): string {

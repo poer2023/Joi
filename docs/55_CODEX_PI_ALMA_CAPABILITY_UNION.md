@@ -28,7 +28,7 @@
 | 项目与任务 | goals、计划与任务 | 可由扩展实现 | project selector、todo sync | 本次新增 `project_list`、`task_list/view/update` |
 | 交互询问与自动化 | request input、automations | 扩展 | plan/todo、外部入口 | 已有 `request_user_input`、暂停草案式自动化 |
 | 子 Agent / 任务委派 | 原生多 Agent | 核心明确不内置，可由扩展实现 | task delegation | 本次新增 `delegate_task`：代码 Orchestrator 创建独立子会话/Run，子 Agent 禁止递归委派 |
-| 语音输入、TTS | 非核心 | 非核心 | Whisper、TTS | 本机 `say + FFmpeg` TTS；转写默认使用 `whisper.cpp + ggml-small.bin + Apple Metal`，音频以可播放附件持久化 |
+| 语音输入、TTS | 非核心 | 非核心 | Whisper、TTS | 本机 `say + FFmpeg` TTS；聊天语音输入默认使用 `whisper.cpp + ggml-small.bin + Apple Metal` 中文转写，临时录音转写后删除，不作为附件持久化 |
 | LSP、调试器 | 可通过 Shell/插件 | 可通过扩展 | 未作为核心工具展示 | 本次新增 clangd/sourcekit-lsp definition/references/diagnostics 与持久 LLDB 会话 |
 | 视频生成与理解 | 支持媒体/插件扩展 | 可由扩展实现 | 当前设置未展示视频后端 | 已于 2026-07-17 退出产品范围；UI、能力注册、IPC 与运行时均不再暴露 |
 
