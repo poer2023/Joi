@@ -322,6 +322,10 @@ function latestActiveRunId(
   return latest;
 }
 
+function runMessageQueuesEqual(current: RunQueuedMessage[], next: RunQueuedMessage[]): boolean {
+  return current.length === next.length && JSON.stringify(current) === JSON.stringify(next);
+}
+
 function runEventsBelongToConversation(events: NormalizedRunEvent[], conversationID: string): boolean {
   if (!conversationID) return true;
   const explicitConversationIDs = new Set(events.map((event) => event.conversationId).filter(Boolean));
@@ -463,6 +467,7 @@ export default function App() {
   const [archivedConversations, setArchivedConversations] = useState<ConversationSummary[]>([]);
   const [trashedConversations, setTrashedConversations] = useState<ConversationSummary[]>([]);
   const [currentConversationID, setCurrentConversationID] = useState('');
+  const [loadingConversationID, setLoadingConversationID] = useState('');
   const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([]);
   const [messenger, setMessenger] = useState<PersonaMessengerSnapshot | null>(null);
   const [currentRoomID, setCurrentRoomID] = useState('room_private_hub');
@@ -540,6 +545,9 @@ export default function App() {
 
   const stepCount = useMemo(() => trace?.steps?.length ?? 0, [trace]);
   const firstModelCall = trace?.model_calls?.[0] ?? chat?.model_calls?.[0];
+  const activeRunID = useMemo(() => (
+    isSubmitting ? latestActiveRunId(runEventsByRunId) || chat?.run_id || trace?.id || '' : ''
+  ), [chat?.run_id, isSubmitting, runEventsByRunId, trace?.id]);
   const inSettingsArea = activeTab !== 'chat' && activeTab !== 'trace';
   const autoSidebarCollapsed = sidebarPreference === 'auto' && windowWidth < sidebarWidth + CHAT_MAIN_MIN_WIDTH;
   const sidebarCollapsed = sidebarPreference === 'collapsed' || autoSidebarCollapsed;
@@ -616,20 +624,27 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const runID = isSubmitting
-      ? latestActiveRunId(runEventsByRunId) || chat?.run_id || trace?.id || ''
-      : '';
-    if (!runID) {
-      if (!isSubmitting) setPendingRunMessages([]);
+    if (!activeRunID) {
+      if (!isSubmitting) {
+        setPendingRunMessages((current) => current.length > 0 ? [] : current);
+      }
       return undefined;
     }
     let cancelled = false;
+    let refreshing = false;
     const refreshQueue = async () => {
+      if (refreshing) return;
+      refreshing = true;
       try {
-        const result = await desktopApi.listRunMessages({ run_id: runID, status: 'pending' });
-        if (!cancelled) setPendingRunMessages(result.messages ?? []);
+        const result = await desktopApi.listRunMessages({ run_id: activeRunID, status: 'pending' });
+        if (!cancelled) {
+          const nextMessages = result.messages ?? [];
+          setPendingRunMessages((current) => runMessageQueuesEqual(current, nextMessages) ? current : nextMessages);
+        }
       } catch {
         // The run event stream remains authoritative if queue inspection briefly races startup.
+      } finally {
+        refreshing = false;
       }
     };
     void refreshQueue();
@@ -638,7 +653,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [chat?.run_id, isSubmitting, runEventsByRunId, trace?.id]);
+  }, [activeRunID, isSubmitting]);
 
   useEffect(() => {
     let animationFrame = 0;
@@ -1555,16 +1570,22 @@ export default function App() {
     if (loadConversationRequestRef.current !== requestID) return false;
     const messages = detail.messages ?? [];
     const latestRunID = detail.conversation.latest_run_id || undefined;
-    newThreadRequestedRef.current = false;
-    setCurrentConversationID(detail.conversation.id);
-    setConversationMessages(messages);
-    setChat(null);
     const runTraces = await loadConversationRunTraces(messages, latestRunID);
     if (loadConversationRequestRef.current !== requestID) return false;
     const focusedTrace = latestRunID
       ? runTraces.find((runTrace) => runTrace.id === latestRunID) || null
       : runTraces[runTraces.length - 1] || null;
+    newThreadRequestedRef.current = false;
+    setCurrentConversationID(detail.conversation.id);
+    setConversationMessages(messages);
+    setChat(null);
     setTrace(focusedTrace);
+    setPendingUserMessage(null);
+    setStreamingAssistantMessage(null);
+    setActiveExecutionActions([]);
+    setActiveExecutionStatus('pending');
+    pendingAssistantIDRef.current = '';
+    pendingConversationIDRef.current = '';
     if (runTraces.length > 0) {
       setRunEventsByRunId((current) => (
         runTraces.reduce(
@@ -1582,22 +1603,18 @@ export default function App() {
     loadConversationRequestRef.current = requestID;
     setError('');
     setNotice('');
-    newThreadRequestedRef.current = false;
-    setCurrentConversationID(conversationID);
-    setConversationMessages([]);
-    setChat(null);
-    setTrace(null);
-    setPendingUserMessage(null);
-    setStreamingAssistantMessage(null);
-    setActiveExecutionActions([]);
-    setActiveExecutionStatus('pending');
-    pendingAssistantIDRef.current = '';
-    pendingConversationIDRef.current = '';
+    setLoadingConversationID(conversationID);
     try {
       const detail = await desktopApi.getConversation(conversationID);
       await applyLoadedConversation(detail, requestID);
     } catch (err) {
-      showError(err instanceof Error ? err.message : String(err));
+      if (loadConversationRequestRef.current === requestID) {
+        showError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (loadConversationRequestRef.current === requestID) {
+        setLoadingConversationID('');
+      }
     }
   }
 
@@ -1606,17 +1623,17 @@ export default function App() {
     loadConversationRequestRef.current = requestID;
     setError('');
     setNotice('');
-    setConversationMessages([]);
-    setChat(null);
-    setTrace(null);
-    setPendingUserMessage(null);
-    setStreamingAssistantMessage(null);
-    setActiveExecutionActions([]);
-    setActiveExecutionStatus('pending');
-    pendingAssistantIDRef.current = '';
-    pendingConversationIDRef.current = '';
+    setLoadingConversationID('');
     const detail = await findConversationDetailForMessage(messageID);
-    return applyLoadedConversation(detail, requestID);
+    if (loadConversationRequestRef.current !== requestID) return false;
+    setLoadingConversationID(detail.conversation.id);
+    try {
+      return await applyLoadedConversation(detail, requestID);
+    } finally {
+      if (loadConversationRequestRef.current === requestID) {
+        setLoadingConversationID('');
+      }
+    }
   }
 
   async function createAutomationWithJoi(request: string): Promise<void> {
@@ -1810,20 +1827,24 @@ export default function App() {
   }
 
   async function decideConfirmation(id: string, approve: boolean, scope: 'one_call' | 'current_run' = 'one_call') {
-    const runID = confirmations.find((item) => item.id === id)?.run_id || trace?.id || chat?.run_id || '';
-    await desktopApi.decideConfirmation({
-      id,
-      approve,
-      actor: 'desktop_admin',
-      reason: approve ? `approved_in_desktop:${scope}` : 'rejected_in_desktop',
-      scope,
-    });
-    if (runID) {
-      const runTrace = await desktopApi.getRunTrace(runID);
-      setTrace(runTrace);
-      setRunEventsByRunId((current) => mergeRunEvents(current, runID, normalizeTraceEvents(runTrace)));
+    try {
+      const runID = confirmations.find((item) => item.id === id)?.run_id || trace?.id || chat?.run_id || '';
+      await desktopApi.decideConfirmation({
+        id,
+        approve,
+        actor: 'desktop_user',
+        reason: approve ? `approved_in_desktop:${scope}` : 'rejected_in_desktop',
+        scope,
+      });
+      if (runID) {
+        const runTrace = await desktopApi.getRunTrace(runID);
+        setTrace(runTrace);
+        setRunEventsByRunId((current) => mergeRunEvents(current, runID, normalizeTraceEvents(runTrace)));
+      }
+      await refreshAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
     }
-    await refreshAll();
   }
 
   async function cancelRun(runID: string) {
@@ -1891,6 +1912,7 @@ export default function App() {
 
   function startNewChat() {
     loadConversationRequestRef.current += 1;
+    setLoadingConversationID('');
     newThreadRequestedRef.current = true;
     Object.keys(runCompletedFallbackTimersRef.current).forEach(clearRunCompletedFallback);
     setActiveTab('chat');
@@ -2052,6 +2074,7 @@ export default function App() {
           collapsed={sidebarCollapsed}
           conversations={filteredConversations}
           currentConversationID={currentConversationID}
+          loadingConversationID={loadingConversationID}
           loadConversation={loadConversation}
           query={threadQuery}
           searchOpen={threadSearchOpen}
@@ -6222,6 +6245,7 @@ function ConversationSidebar({
   collapsed,
   conversations,
   currentConversationID,
+  loadingConversationID,
   loadConversation,
   query,
   searchOpen,
@@ -6235,6 +6259,7 @@ function ConversationSidebar({
   collapsed: boolean;
   conversations: ConversationSummary[];
   currentConversationID: string;
+  loadingConversationID: string;
   loadConversation: (conversationID: string) => Promise<void>;
   query: string;
   searchOpen: boolean;
@@ -6255,8 +6280,11 @@ function ConversationSidebar({
       <div key={item.id} className={`conversation-row-wrap ${channelRow ? 'channel-conversation-row' : ''} ${active && isRoomContext ? 'active' : ''}`}>
         <button
           className={`conversation-item conversation-chat-item ${active && isRoomContext ? 'active' : ''}`}
+          aria-busy={loadingConversationID === item.id || undefined}
           type="button"
-          onClick={() => loadConversation(item.id)}
+          onClick={() => {
+            if (loadingConversationID !== item.id) void loadConversation(item.id);
+          }}
         >
           <span className="thread-list-copy">
             {channelRow ? (
@@ -7285,7 +7313,6 @@ function ChatHome({
             </div>
           ) : null}
           <textarea
-            key={isSubmitting ? `run-queue-${queuedMessageMode}` : 'idle-composer'}
             placeholder={isSubmitting
               ? queuedMessageMode === 'steering' ? '立即引导当前运行...' : '当前运行完成后继续...'
               : '和 Joi 说点什么，或交给她一个任务...'}

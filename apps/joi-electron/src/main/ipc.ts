@@ -130,6 +130,7 @@ import { BrowserWorkbenchManager } from './browser-workbench.ts';
 import { executeCodeCapability } from './code-execution-capabilities.ts';
 import { analyzeImageFile, analyzeVideoFile, saveMediaDataURL } from './media-analysis.ts';
 import { AssistantRuntimeManager } from './assistant-runtime.ts';
+import { approvalResumeCapabilityInput, approvalResumeContinuationMessage } from './approval-resume.ts';
 
 const invokeRequestSchema = z.object({
   method: z.enum(desktopIpcMethods),
@@ -701,13 +702,13 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
       return store.decideApproval(payload as ApprovalDecisionRequest);
     },
     async ResumeApprovalRun(payload) {
-      return resumeApprovalRunFromPayload(payload as ApprovalResumeRunRequest, window, store, secrets);
+      return resumeApprovalRunFromPayload(payload as ApprovalResumeRunRequest, window, store, secrets, pluginManager);
     },
     async DecideConfirmation(payload) {
       const req = payload as Parameters<typeof store.decideConfirmation>[0];
       store.decideConfirmation(req);
       if (req.approve && req.id) {
-        await resumeApprovalRunFromPayload({ approval_request_id: req.id, run_id: '' }, window, store, secrets);
+        await resumeApprovalRunFromPayload({ approval_request_id: req.id, run_id: '' }, window, store, secrets, pluginManager);
       }
     },
     InterruptRun(payload) {
@@ -1176,6 +1177,7 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
               summary: `${capability} is disabled in Joi Settings.`,
               permission_profile: grantedPermissionProfile,
               bridge_trace_id: request_id,
+              duration_ms: Math.max(1, Date.now() - startedAt),
             };
             safeRecordAppLog(store, {
               level: 'warn',
@@ -1186,6 +1188,32 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
               message: `ACP capability ${capability} was blocked`,
               duration_ms: Date.now() - startedAt,
               payload: { capability, request_id, reason: 'capability_disabled', permission_profile: grantedPermissionProfile },
+            });
+            return output;
+          }
+          if (electronCapabilityRequiresConfirmation(canonicalCapability)) {
+            const requestedAction = String(capabilityPayload.reason || capabilityPayload.goal || `Execute ${canonicalCapability}`);
+            const output = {
+              status: 'waiting_confirmation',
+              capability: canonicalCapability,
+              risk: capabilityRisk,
+              requested_action: requestedAction,
+              message: capabilityRisk === 'browser_interaction'
+                ? '这个交互能力需要你确认后才会执行。'
+                : '这个工作区写入能力需要你确认后才会执行。',
+              permission_profile: grantedPermissionProfile,
+              bridge_trace_id: request_id,
+              duration_ms: Math.max(1, Date.now() - startedAt),
+            };
+            safeRecordAppLog(store, {
+              level: 'info',
+              risk_level: capabilityRisk,
+              category: 'approval',
+              feature_key: `acp_bridge.${capability}.waiting_confirmation`,
+              source: 'acp_mcp_bridge',
+              message: `ACP capability ${capability} is waiting for confirmation`,
+              duration_ms: output.duration_ms,
+              payload: { capability, request_id, requested_action: requestedAction, permission_profile: grantedPermissionProfile },
             });
             return output;
           }
@@ -1231,6 +1259,9 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
               capability,
               permission_profile: grantedPermissionProfile,
               bridge_trace_id: request_id,
+              duration_ms: Number.isFinite(Number(executed.output.duration_ms))
+                ? Math.max(0, Math.round(Number(executed.output.duration_ms)))
+                : Math.max(1, Date.now() - startedAt),
             };
             const outputStatus = String(output.status || 'completed');
             safeRecordAppLog(store, {
@@ -2378,6 +2409,7 @@ async function resumeApprovalRunFromPayload(
   window: BrowserWindow,
   store: JoiSQLiteStore,
   secrets: KeychainSecretStore,
+  pluginManager?: JoiPluginManager,
 ) {
   const approvalRequestID = payload.approval_request_id?.trim() || '';
   if (!approvalRequestID) throw new Error('approval_request_id is required');
@@ -2387,7 +2419,14 @@ async function resumeApprovalRunFromPayload(
     throw new Error('approval run_id does not match confirmation request');
   }
   const settings = store.getSettings();
-  await resumeElectronToolCallingRun(resume, settings, await resolveAPIKeyForModelEndpoint(settings, secrets), store, secrets);
+  await resumeElectronToolCallingRun(
+    resume,
+    settings,
+    await resolveAPIKeyForModelEndpoint(settings, secrets),
+    store,
+    secrets,
+    pluginManager,
+  );
   const trace = store.getRunTrace(resume.run_id);
   emitRunEvents(window, trace);
   return { resumed: true, trace };
@@ -2399,6 +2438,7 @@ async function resumeElectronToolCallingRun(
   apiKey: string,
   store: JoiSQLiteStore,
   secrets: KeychainSecretStore,
+  pluginManager?: JoiPluginManager,
 ) {
   const modelName = (resume.model_name || settings.model_name || '').trim();
   const resumeReq: ChatRequest = {
@@ -2415,29 +2455,38 @@ async function resumeElectronToolCallingRun(
   if (!approvedCapabilities.has(resumeCapability)) {
     throw new Error(`Capability ${resume.capability_id} is no longer allowed for agent ${resume.agent_id}.`);
   }
+  const approvedInput = approvalResumeCapabilityInput(resume.input);
   let toolResult: PersistedToolResult;
+  const approvedToolStartedAt = Date.now();
   try {
-    const executed = await executeElectronCapability(resume.capability_id, resume.input, resumeReq, store, secrets);
+    const executed = await executeElectronCapability(resume.capability_id, approvedInput, resumeReq, store, secrets);
+    const output = executed?.output || {
+      status: 'policy_blocked',
+      capability: resume.capability_id,
+      summary: `Capability ${resume.capability_id} is not enabled for approval resume.`,
+    };
     toolResult = {
       call_id: resume.call_id,
       name: resume.capability_id,
-      arguments: resume.input,
-      output: executed?.output || {
-        status: 'policy_blocked',
-        capability: resume.capability_id,
-        summary: `Capability ${resume.capability_id} is not enabled for approval resume.`,
+      arguments: approvedInput,
+      output: {
+        ...output,
+        duration_ms: Number.isFinite(Number(output.duration_ms))
+          ? Math.max(0, Math.round(Number(output.duration_ms)))
+          : Math.max(1, Date.now() - approvedToolStartedAt),
       },
     };
   } catch (error) {
     toolResult = {
       call_id: resume.call_id,
       name: resume.capability_id,
-      arguments: resume.input,
+      arguments: approvedInput,
       output: {
         status: 'failed',
         capability: resume.capability_id,
         error: error instanceof Error ? error.message : String(error),
         summary: `Approved capability ${resume.capability_id} failed during resume.`,
+        duration_ms: Math.max(1, Date.now() - approvedToolStartedAt),
       },
     };
   }
@@ -2446,8 +2495,46 @@ async function resumeElectronToolCallingRun(
   let modelError = '';
   let usage = { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 };
   let modelResponses: Array<Record<string, unknown>> = [];
+  let continuationToolResults: PersistedToolResult[] = [];
   const baseURL = modelBaseURLForSettings(settings);
-  if (baseURL.trim() && modelName && apiKey.trim()) {
+  const continuationMessage = approvalResumeContinuationMessage(resume.capability_id, toolResult.output);
+  const continuationReq: ChatRequest = {
+    ...resumeReq,
+    message: continuationMessage,
+    permission_profile: 'read_only',
+  };
+  const continuationPrompt = store.assembleToolCallingPrompt(continuationReq, resume.agent_id, modelName);
+  const resolvedACPProvider = pluginManager?.resolveProvider(
+    resume.provider,
+    'read_only',
+    resumeAgentCapabilities,
+  );
+  if (resolvedACPProvider) {
+    try {
+      const finalTurn = await runACPChatTurn({
+        ...withACPParentContext(resolvedACPProvider, resume.run_id, resume.conversation_id, 0),
+        model: modelName,
+        system_message: continuationPrompt.system_message,
+        messages: [
+          ...continuationPrompt.conversation_messages.map((message) => ({ role: message.role, content: message.content })),
+          { role: 'user', content: continuationMessage },
+        ],
+      });
+      finalMessage = finalTurn.final_message.trim() || finalMessage;
+      usage = finalTurn.usage;
+      modelResponses = finalTurn.model_responses;
+      continuationToolResults = finalTurn.tool_results.map((item) => ({
+        call_id: item.call_id,
+        name: item.name,
+        arguments: item.arguments || {},
+        output: item.output,
+      }));
+    } catch (error) {
+      modelError = error instanceof Error ? error.message : String(error);
+    }
+  } else if (resume.provider.startsWith('acp_')) {
+    modelError = `ACP provider ${resume.provider} is unavailable during approval resume.`;
+  } else if (baseURL.trim() && modelName && apiKey.trim()) {
     try {
       const finalTurn = await runChatCompletionsToolTurn({
         base_url: baseURL,
@@ -2462,7 +2549,7 @@ async function resumeElectronToolCallingRun(
             tool_calls: [{
               id: resume.call_id,
               type: 'function',
-              function: { name: resume.capability_id, arguments: JSON.stringify(resume.input) },
+              function: { name: resume.capability_id, arguments: JSON.stringify(approvedInput) },
             }],
           },
           {
@@ -2499,6 +2586,12 @@ async function resumeElectronToolCallingRun(
       finalMessage = finalTurn.final_message.trim() || finalMessage;
       usage = finalTurn.usage;
       modelResponses = finalTurn.model_responses;
+      continuationToolResults = finalTurn.tool_results.map((item) => ({
+        call_id: item.call_id,
+        name: item.name,
+        arguments: item.arguments || {},
+        output: item.output,
+      }));
     } catch (error) {
       modelError = error instanceof Error ? error.message : String(error);
     }
@@ -2507,10 +2600,11 @@ async function resumeElectronToolCallingRun(
   }
 
   store.completeApprovedToolCallingResume(resume.confirmation_id, {
-    provider: settings.model_provider || resume.provider || 'openai_compatible',
+    provider: resume.provider || settings.model_provider || 'openai_compatible',
     model_name: modelName || resume.model_name || 'model',
     final_message: finalMessage,
     tool_result: toolResult,
+    tool_results: continuationToolResults,
     model_error: modelError || undefined,
     usage,
     model_responses: modelResponses,

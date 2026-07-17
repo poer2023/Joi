@@ -1441,6 +1441,48 @@ try {
     assert.match(waitingMarkup, />等待确认</);
     assert.match(waitingMarkup, />允许一次</);
   }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [
+        { id: 'msg_approved_user', conversation_id: 'conv_approved', role: 'user', content: '帮我写入文件' },
+        { id: 'msg_approved_assistant', conversation_id: 'conv_approved', role: 'assistant', content: '写入并核验完成。', metadata: { run_id: 'run_approved' } },
+      ],
+      activeRunId: '',
+      runEventsByRunId: {
+        run_approved: [
+          event('approval.requested', {
+            confirmation_id: 'confirm_approved',
+            call_id: 'call_approved',
+            capability: 'apply_patch',
+            target_path: '/Users/hao/project/Joi/config.json',
+            risk: 'workspace_write',
+            status: 'waiting_confirmation',
+            seq: 1,
+          }, { run_id: 'run_approved', item_id: 'call_approved', visibility: 'approval' }),
+          event('approval.resolved', {
+            confirmation_id: 'confirm_approved',
+            call_id: 'call_approved',
+            capability: 'apply_patch',
+            risk: 'workspace_write',
+            status: 'approved',
+            decision: 'approved',
+            approved: true,
+            seq: 2,
+          }, { run_id: 'run_approved', item_id: 'call_approved', visibility: 'approval' }),
+          event('run.completed', { status: 'succeeded', seq: 3 }, { run_id: 'run_approved', visibility: 'trace_only', terminal: true }),
+        ],
+      },
+      mode: 'serious_task',
+    });
+    const approvalLine = result.items.find((item) => item.type === 'transcript_line' && item.kind === 'approval');
+    assert.equal(approvalLine.status, 'completed');
+    assert.match(approvalLine.label, /^已批准 · 写入文件/);
+    const approvedMarkup = renderMessageList(result.items);
+    assert.match(approvedMarkup, />已批准</);
+    assert.doesNotMatch(approvedMarkup, />允许一次</);
+    assert.doesNotMatch(approvedMarkup, />等待确认</);
+  }
 } finally {
   rmSync(outDir, { recursive: true, force: true });
 }

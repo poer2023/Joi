@@ -235,6 +235,8 @@ export async function runACPChatTurn(req: ACPChatTurnRequest): Promise<ToolCalli
   const callbacks = committedAnswerCallbacks(req.callbacks);
   const toolCalls = new Map<string, ToolCall>();
   const toolResults: ToolResult[] = [];
+  const toolStartedAt = new Map<string, number>();
+  const toolPermissions = new Map<string, ACPToolPermissionTrace>();
   const usage = emptyUsage();
   let responseText = '';
   let deltaIndex = 0;
@@ -274,12 +276,13 @@ export async function runACPChatTurn(req: ACPChatTurnRequest): Promise<ToolCalli
       if (update.sessionUpdate === 'tool_call') {
         const call = acpToolCall(update);
         toolCalls.set(call.id, call);
+        if (!toolStartedAt.has(call.id)) toolStartedAt.set(call.id, Date.now());
         callbacks?.onToolCallRequested?.({ step: 1, call });
         if (update.status === 'in_progress' || update.status === 'pending' || !update.status) {
           callbacks?.onToolStarted?.({ step: 1, call });
         }
         if (update.status === 'completed' || update.status === 'failed') {
-          finishACPTool(update, call, toolResults, callbacks);
+          finishACPTool(update, call, toolResults, callbacks, toolStartedAt.get(call.id), toolPermissions.get(call.id));
         }
         return;
       }
@@ -287,14 +290,20 @@ export async function runACPChatTurn(req: ACPChatTurnRequest): Promise<ToolCalli
         const existing = toolCalls.get(update.toolCallId) || acpToolCall(update);
         const call = mergeACPToolCall(existing, update);
         toolCalls.set(call.id, call);
+        if (!toolStartedAt.has(call.id)) toolStartedAt.set(call.id, Date.now());
         if (update.rawOutput !== undefined) {
           callbacks?.onToolOutputDelta?.({ step: 1, call, output: acpOutput(update.rawOutput) });
         }
         if (update.status === 'completed' || update.status === 'failed') {
-          finishACPTool(update, call, toolResults, callbacks);
+          finishACPTool(update, call, toolResults, callbacks, toolStartedAt.get(call.id), toolPermissions.get(call.id));
         }
       }
     }, (permission, outcome, decision) => {
+      toolPermissions.set(permission.toolCall.toolCallId, {
+        allowed: decision.allow,
+        policy_capability: decision.capability_id || '',
+        policy_reason: decision.reason,
+      });
       callbacks?.onModelDelta?.({
         step: 1,
         payload: {
@@ -420,12 +429,14 @@ export async function runACPChatTurn(req: ACPChatTurnRequest): Promise<ToolCalli
     callbacks?.onAssistantCompleted?.({ step: promptTurn + 1, text: responseText, finish_reason: finalStopReason, usage_status: usageStatus });
     callbacks?.onModelCompleted?.({ step: promptTurn + 1, finish_reason: finalStopReason, usage_status: usageStatus });
     const distinctToolResults = [...new Map(toolResults.map((result) => [result.call_id, result])).values()];
-    const failedToolCount = distinctToolResults.filter((result) => String(result.output.status || '').toLowerCase() === 'failed').length;
-    const succeededToolCount = distinctToolResults.length - failedToolCount;
+    const waitingToolCount = distinctToolResults.filter((result) => String(result.output.status || '').toLowerCase() === 'waiting_confirmation').length;
+    const waitingForConfirmation = waitingToolCount > 0;
+    const failedToolCount = distinctToolResults.filter((result) => ['failed', 'policy_blocked', 'blocked', 'denied'].includes(String(result.output.status || '').toLowerCase())).length;
+    const succeededToolCount = distinctToolResults.length - failedToolCount - waitingToolCount;
     await callbacks?.onEvent?.({
       type: 'work_summary.updated',
       step: 1,
-      status: 'completed',
+      status: waitingForConfirmation ? 'waiting_confirmation' : 'completed',
       detail: {
         phase: 'verified',
         summary: distinctToolResults.length === 0
@@ -1077,40 +1088,154 @@ function safeCapabilitySegment(value: string): boolean {
   return /^[A-Za-z0-9._-]+$/.test(value);
 }
 
+type ACPToolPermissionTrace = {
+  allowed: boolean;
+  policy_capability: string;
+  policy_reason: string;
+};
+
 function acpToolCall(update: ToolCallUpdate): ToolCall {
+  const capability = inferACPToolCapability(update);
   return {
     id: update.toolCallId,
     name: update.title || update.toolCallId,
     arguments: isRecord(update.rawInput) ? update.rawInput : update.rawInput === undefined ? {} : { value: update.rawInput },
     raw_arguments: update.rawInput,
+    metadata: {
+      protocol: 'acp',
+      kind: update.kind || 'other',
+      title: update.title || '',
+      ...(capability ? { capability } : {}),
+    },
   };
 }
 
 function mergeACPToolCall(call: ToolCall, update: ToolCallUpdate): ToolCall {
+  const capability = inferACPToolCapability(update) || String(call.metadata?.capability || '').trim();
   return {
     ...call,
     name: update.title || call.name,
     arguments: update.rawInput === undefined ? call.arguments : isRecord(update.rawInput) ? update.rawInput : { value: update.rawInput },
     raw_arguments: update.rawInput === undefined ? call.raw_arguments : update.rawInput,
+    metadata: {
+      ...(call.metadata || {}),
+      protocol: 'acp',
+      kind: update.kind || call.metadata?.kind || 'other',
+      title: update.title || call.metadata?.title || call.name,
+      ...(capability ? { capability } : {}),
+    },
   };
 }
 
-function finishACPTool(update: ToolCallUpdate, call: ToolCall, results: ToolResult[], callbacks?: ToolCallingCallbacks) {
+function finishACPTool(
+  update: ToolCallUpdate,
+  call: ToolCall,
+  results: ToolResult[],
+  callbacks?: ToolCallingCallbacks,
+  startedAt?: number,
+  permission?: ACPToolPermissionTrace,
+) {
   if (results.some((result) => result.call_id === call.id)) return;
+  const output = normalizeACPToolOutput(update, call, startedAt, permission);
   const result: ToolResult = {
     call_id: call.id,
     name: call.name,
     arguments: call.arguments,
-    output: {
-      status: update.status === 'failed' ? 'failed' : 'succeeded',
-      protocol: 'acp',
-      kind: update.kind || 'other',
-      raw_output: update.rawOutput ?? update.content ?? null,
-    },
+    output,
   };
   results.push(result);
-  if (update.status === 'failed') callbacks?.onToolFailed?.({ step: 1, call, result, error: new Error(`${call.name} failed`) });
+  if (output.status === 'waiting_confirmation') callbacks?.onApprovalRequired?.({ step: 1, call, result });
+  else if (['failed', 'policy_blocked', 'blocked', 'denied'].includes(String(output.status || '').toLowerCase())) {
+    callbacks?.onToolFailed?.({ step: 1, call, result, error: new Error(String(output.error || `${call.name} failed`)) });
+  }
   else callbacks?.onToolCompleted?.({ step: 1, call, result });
+}
+
+function normalizeACPToolOutput(
+  update: ToolCallUpdate,
+  call: ToolCall,
+  startedAt?: number,
+  permission?: ACPToolPermissionTrace,
+): Record<string, unknown> {
+  const rawOutput = update.rawOutput ?? update.content ?? null;
+  const embedded = embeddedACPToolOutput(rawOutput);
+  const capability = String(embedded.capability || call.metadata?.capability || inferACPToolCapability(update) || '').trim();
+  const denied = permission?.allowed === false;
+  const status = denied
+    ? 'policy_blocked'
+    : String(embedded.status || (update.status === 'failed' ? 'failed' : 'succeeded')).trim().toLowerCase();
+  const durationMs = Math.max(1, Date.now() - (startedAt || Date.now()));
+  const error = denied
+    ? permission?.policy_reason || 'ACP permission denied'
+    : firstACPToolError(embedded, rawOutput, status, call.name);
+  return {
+    ...embedded,
+    status,
+    protocol: 'acp',
+    kind: update.kind || call.metadata?.kind || 'other',
+    ...(capability ? { capability } : {}),
+    duration_ms: durationMs,
+    ...(permission ? {
+      policy_allowed: permission.allowed,
+      policy_capability: permission.policy_capability || null,
+      policy_reason: permission.policy_reason,
+    } : {}),
+    ...(error ? { error } : {}),
+    raw_output: rawOutput,
+  };
+}
+
+function embeddedACPToolOutput(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) return {};
+  const result = isRecord(value.result) ? value.result : {};
+  for (const candidate of [value.structuredContent, result.structuredContent]) {
+    if (isRecord(candidate)) return candidate;
+  }
+  const content = Array.isArray(result.content) ? result.content : Array.isArray(value.content) ? value.content : [];
+  for (const item of content) {
+    if (!isRecord(item) || typeof item.text !== 'string') continue;
+    try {
+      const parsed = JSON.parse(item.text);
+      if (isRecord(parsed)) return parsed;
+    } catch {
+      // Non-JSON MCP text is ordinary raw tool output.
+    }
+  }
+  return {};
+}
+
+function firstACPToolError(embedded: Record<string, unknown>, rawOutput: unknown, status: string, toolName: string): string {
+  if (!['failed', 'policy_blocked', 'blocked', 'denied'].includes(status)) return '';
+  for (const value of [embedded.error, embedded.error_message, embedded.summary, embedded.message]) {
+    if (typeof value === 'string' && value.trim()) return redactACPErrorText(value.trim()).slice(0, 4_096);
+  }
+  if (isRecord(rawOutput) && typeof rawOutput.formatted_output === 'string' && rawOutput.formatted_output.trim()) {
+    return redactACPErrorText(rawOutput.formatted_output.trim()).slice(0, 4_096);
+  }
+  return `${toolName} failed`;
+}
+
+function inferACPToolCapability(update: ToolCallUpdate): string {
+  const mcpIdentity = trustedMCPIdentity(update);
+  if (mcpIdentity) {
+    if (mcpIdentity.server === 'joi_capabilities' || mcpIdentity.server === 'joi_web') return mcpIdentity.tool;
+    return 'mcp_tool_call';
+  }
+  const rawInput = isRecord(update.rawInput) ? update.rawInput : {};
+  if (typeof rawInput.command === 'string' || Array.isArray(rawInput.command)) return 'shell_command';
+  if (typeof rawInput.server === 'string' && typeof rawInput.tool === 'string') return 'mcp_tool_call';
+  if (String(rawInput.type || '').toLowerCase() === 'websearch' || isRecord(rawInput.action)) return 'web_research';
+  const kind = String(update.kind || '').toLowerCase();
+  if (['edit', 'move', 'delete'].includes(kind)) return 'apply_patch';
+  if (kind === 'read') return 'file_read';
+  if (kind === 'search') return 'workspace_search';
+  if (kind === 'fetch') return 'web_research';
+  const title = String(update.title || '').toLowerCase();
+  if (title.startsWith('read file ')) return 'file_read';
+  if (title.startsWith('list files ') || title.startsWith('search files ')) return 'workspace_search';
+  if (title === 'editing files' || title.startsWith('edit file ')) return 'apply_patch';
+  if (title.startsWith('web search:') || title.startsWith('open page:')) return 'web_research';
+  return '';
 }
 
 function acpOutput(value: unknown): Record<string, unknown> {
