@@ -2,6 +2,8 @@
 
 本文只记录本机安装版和本地包的真实能力，不把菜单占位或计划项算作已支持。
 
+> 2026-07-17 产品边界更新：视频生成与视频理解已从 Joi 当前产品范围移除。下文的视频实测仅作为 2026-07-16 历史记录，不代表当前安装版能力。
+
 ## 本机基线
 
 - Codex.app：`26.707.72221`（CLI `0.144.2`）
@@ -28,7 +30,7 @@
 | 子 Agent / 任务委派 | 原生多 Agent | 核心明确不内置，可由扩展实现 | task delegation | 本次新增 `delegate_task`：代码 Orchestrator 创建独立子会话/Run，子 Agent 禁止递归委派 |
 | 语音输入、TTS | 非核心 | 非核心 | Whisper、TTS | 本次新增本机 `say + FFmpeg` TTS 与本机 Whisper 转写，音频以可播放附件持久化 |
 | LSP、调试器 | 可通过 Shell/插件 | 可通过扩展 | 未作为核心工具展示 | 本次新增 clangd/sourcekit-lsp definition/references/diagnostics 与持久 LLDB 会话 |
-| 视频生成 | 支持媒体/插件扩展 | 可由扩展实现 | 当前设置未展示视频后端 | 本次新增 xAI `grok-imagine-video` 异步生成、下载、MP4 校验与可播放附件 |
+| 视频生成与理解 | 支持媒体/插件扩展 | 可由扩展实现 | 当前设置未展示视频后端 | 已于 2026-07-17 退出产品范围；UI、能力注册、IPC 与运行时均不再暴露 |
 
 ## “够用”的当前停止线
 
@@ -38,7 +40,7 @@
 2. 上下文链：记忆 → 历史会话 → 项目 → 技能 → 本机工具发现。
 3. 控制链：持久任务 → 用户确认 → 自动化草案 → Run Trace。
 
-本轮已把会话分支/压缩、受控子 Agent、语音、LSP、LLDB 和视频从计划项升级为真实后端；未接入的注册项仍继续返回明确的 `not_configured`，不以占位结果冒充成功。
+本轮保留会话分支/压缩、受控子 Agent、语音、LSP 和 LLDB 真实后端；视频能力已在 2026-07-17 的产品边界调整中移除。未接入的注册项仍继续返回明确的 `not_configured`，不以占位结果冒充成功。
 
 ## 安装版实测结论
 
@@ -48,7 +50,7 @@
 - 子 Agent：模型在自然语言任务中主动创建独立 `research_agent` conversation/run；`Research Agent` 友好名称也能一次解析，子 run 正确记录 `parent_run_id`，递归委派关闭。
 - 语音：本地生成 WAV 并由 Whisper 精确转写，assistant 消息显示原生音频播放控件。
 - 开发工具：`clangd` 返回定义与诊断；LLDB 完成 attach、断点、run、表达式求值、step 和 stop。
-- 视频：xAI 异步请求完成并下载真实 MP4；`ffprobe` 验证为 480×480 H.264/AAC、1.041667 秒，assistant 消息显示视频时间轴。
+- 历史视频验收（非当前能力）：2026-07-16 曾完成一次 xAI MP4 链路实测；该能力已于次日退役，不再进入当前 UI、工具清单或运行时。
 
 完整 ID、哈希、产物和回归结果见 `docs/specs/evidence/joi-advanced-agent-capabilities-2026-07-16/installed-app/installed-app-comparison-report.json`。
 

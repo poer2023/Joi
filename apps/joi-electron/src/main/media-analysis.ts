@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -70,66 +70,6 @@ export async function analyzeImageFile(
   };
 }
 
-export async function analyzeVideoFile(
-  sourcePath: string,
-  outputDir: string,
-  options: { signal?: AbortSignal; max_frames?: number } = {},
-): Promise<Record<string, unknown>> {
-  const source = await requireMediaFile(sourcePath);
-  const analysisID = `video-analysis-${Date.now()}-${randomUUID().slice(0, 8)}`;
-  const analysisDir = join(outputDir, analysisID);
-  await mkdir(analysisDir, { recursive: true });
-  const probe = await probeMedia(sourcePath, options.signal);
-  const duration = mediaDuration(probe);
-  const maxFrames = Math.max(1, Math.min(12, Math.round(options.max_frames || 6)));
-  const interval = Math.max(0.25, duration > 0 ? duration / maxFrames : 1);
-  const framePattern = join(analysisDir, 'frame-%02d.jpg');
-  const extracted = await runProcess('/opt/homebrew/bin/ffmpeg', [
-    '-hide_banner', '-loglevel', 'error', '-y', '-i', sourcePath,
-    '-vf', `fps=1/${interval},scale=960:-2:force_original_aspect_ratio=decrease`,
-    '-frames:v', String(maxFrames), framePattern,
-  ], { signal: options.signal, timeout_ms: 180_000 });
-  if (extracted.exit_code !== 0) throw new Error(`video frame extraction failed: ${safeError(extracted)}`);
-  const frames = (await readdir(analysisDir))
-    .filter((name) => /^frame-\d+\.jpg$/.test(name))
-    .sort()
-    .map((name) => join(analysisDir, name));
-  if (!frames.length) throw new Error('video analysis produced no keyframes');
-  const ocr = await recognizeText(frames, analysisDir, options.signal);
-  const contactSheet = join(analysisDir, 'contact-sheet.jpg');
-  const tiled = await runProcess('/opt/homebrew/bin/ffmpeg', [
-    '-hide_banner', '-loglevel', 'error', '-y',
-    '-pattern_type', 'glob', '-i', join(analysisDir, 'frame-*.jpg'),
-    '-vf', `tile=${Math.min(3, frames.length)}x${Math.ceil(frames.length / Math.min(3, frames.length))}:padding=8:margin=8:color=white`,
-    '-frames:v', '1', contactSheet,
-  ], { signal: options.signal, timeout_ms: 120_000 });
-  const hasContactSheet = tiled.exit_code === 0;
-  const keyframes = frames.map((path, index) => ({
-    path,
-    preview_url: pathToFileURL(path).href,
-    timestamp_seconds: Math.round(index * interval * 1000) / 1000,
-    text: ocr[index]?.text || '',
-    observations: ocr[index]?.observations || [],
-  }));
-  const recognizedText = [...new Set(keyframes.map((frame) => frame.text.trim()).filter(Boolean))].join('\n');
-  return {
-    status: 'completed',
-    capability: 'video_analyze',
-    mode: 'ffmpeg_keyframes_macos_vision_v1',
-    source_path: sourcePath,
-    source_size: source.size,
-    duration_seconds: duration,
-    media: probe,
-    frame_count: keyframes.length,
-    keyframes,
-    contact_sheet_path: hasContactSheet ? contactSheet : undefined,
-    contact_sheet_url: hasContactSheet ? pathToFileURL(contactSheet).href : undefined,
-    recognized_text: recognizedText,
-    analysis_dir: analysisDir,
-    summary: `Analyzed ${duration.toFixed(2)} seconds of video across ${keyframes.length} keyframe(s).`,
-  };
-}
-
 async function probeMedia(path: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
   const result = await runProcess('/opt/homebrew/bin/ffprobe', [
     '-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', path,
@@ -141,13 +81,6 @@ async function probeMedia(path: string, signal?: AbortSignal): Promise<Record<st
   } catch {
     throw new Error('ffprobe returned invalid JSON');
   }
-}
-
-function mediaDuration(probe: Record<string, unknown>): number {
-  const format = record(probe.format);
-  const streams = Array.isArray(probe.streams) ? probe.streams.map(record) : [];
-  const raw = Number(format.duration) || Math.max(0, ...streams.map((stream) => Number(stream.duration) || 0));
-  return Number.isFinite(raw) && raw > 0 ? Math.round(raw * 1000) / 1000 : 0;
 }
 
 async function recognizeText(paths: string[], outputDir: string, signal?: AbortSignal): Promise<OCRResult[]> {

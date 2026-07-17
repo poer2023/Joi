@@ -1578,6 +1578,10 @@ export type WorkspaceSettings = {
   wechat_claw_enabled?: boolean;
   wechat_claw_endpoint?: string;
   wechat_claw_allowed_senders?: string[];
+  speech_voice?: string;
+  speech_rate?: number;
+  speech_transcription_model?: string;
+  speech_transcription_language?: string;
 };
 
 export type GitHubConnectionResult = {
@@ -2188,21 +2192,16 @@ export type DeveloperWorkbenchResult = {
 };
 
 export type MediaWorkbenchRequest = {
-  action: 'save_recording' | 'text_to_speech' | 'speech_transcribe' | 'analyze_image' | 'analyze_video' | 'generate_video' | string;
+  action: 'save_recording' | 'text_to_speech' | 'speech_transcribe' | 'analyze_image' | string;
   path?: string;
   data_url?: string;
   mime_type?: string;
   text?: string;
-  prompt?: string;
   voice?: string;
   language?: string;
   model?: string;
   format?: string;
   rate?: number;
-  duration_seconds?: number;
-  aspect_ratio?: string;
-  resolution?: string;
-  transcribe?: boolean;
 };
 
 export type MediaWorkbenchResult = {

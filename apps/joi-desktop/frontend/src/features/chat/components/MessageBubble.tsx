@@ -8,6 +8,8 @@ export function MessageBubble({
   highlighted = false,
   item,
   onOpenThread,
+  onSpeak,
+  speaking = false,
   threadAnnotation,
   threadSelected = false,
 }: {
@@ -16,6 +18,8 @@ export function MessageBubble({
   highlighted?: boolean;
   item: ChatMessageRenderItem;
   onOpenThread?: (threadId: string) => void;
+  onSpeak?: (messageId: string, content: string) => void;
+  speaking?: boolean;
   threadAnnotation?: MessageThreadAnnotation;
   threadSelected?: boolean;
 }) {
@@ -41,7 +45,12 @@ export function MessageBubble({
             {attachments.length ? <MessageAttachmentGrid attachments={attachments} expandImages={isAssistant} /> : null}
             {!content && attachments.length === 0 ? <p className="message-skeleton">正在组织回复...</p> : null}
           </div>
-          <MessageBubbleActions content={content} createdAt={item.createdAt} />
+          <MessageBubbleActions
+            content={content}
+            createdAt={item.createdAt}
+            onSpeak={isAssistant ? () => onSpeak?.(item.id, content) : undefined}
+            speaking={speaking}
+          />
         </div>
         {showThreadMarker ? (
           <MessageThreadMarker
@@ -55,7 +64,17 @@ export function MessageBubble({
   );
 }
 
-export function MessageBubbleActions({ content, createdAt }: { content: string; createdAt?: string }) {
+export function MessageBubbleActions({
+  content,
+  createdAt,
+  onSpeak,
+  speaking = false,
+}: {
+  content: string;
+  createdAt?: string;
+  onSpeak?: () => void;
+  speaking?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
   const timestamp = formatMessageTimestamp(createdAt);
 
@@ -80,6 +99,7 @@ export function MessageBubbleActions({ content, createdAt }: { content: string; 
           {copied ? '已复制' : '复制'}
         </button>
       ) : null}
+      {content && onSpeak ? <button type="button" onClick={onSpeak}>{speaking ? '停止' : '朗读'}</button> : null}
     </div>
   );
 }

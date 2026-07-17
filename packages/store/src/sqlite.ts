@@ -173,6 +173,14 @@ import type { WorkspaceChangeSetDraft } from '../../runtime/src/workspace-exec.t
 type SQLiteValue = string | number | bigint | null;
 type SQLiteRow = Record<string, unknown>;
 
+// Keep this tombstone set until every production database has crossed the
+// retirement migration. These identifiers are migration guards, not callable
+// capabilities or historical UI compatibility.
+const RETIRED_CAPABILITY_IDS: ReadonlySet<string> = new Set([
+  'video_generate',
+  'video_analyze',
+]);
+
 type RoomRouteResolution = {
   room: MessengerRoom;
   speaker_persona_id?: string;
@@ -6466,15 +6474,16 @@ export class JoiSQLiteStore {
        FROM capabilities
        ORDER BY id ASC`,
     );
+    const capabilities = rows.map((row) => ({
+      id: String(row.id),
+      name: String(row.name),
+      description: optionalString(row.description) || '',
+      risk_level: optionalString(row.risk_level) || 'read_only',
+      enabled: Boolean(Number(row.enabled ?? 0)),
+      metadata: parseObject(row.metadata),
+    }));
     return {
-      capabilities: rows.map((row) => ({
-        id: String(row.id),
-        name: String(row.name),
-        description: optionalString(row.description) || '',
-        risk_level: optionalString(row.risk_level) || 'read_only',
-        enabled: Boolean(Number(row.enabled ?? 0)),
-        metadata: parseObject(row.metadata),
-      })),
+      capabilities: capabilities.filter((capability) => capability.metadata.retired !== true),
     };
   }
 
@@ -11369,6 +11378,10 @@ export class JoiSQLiteStore {
       wechat_claw_enabled: settings['entry.wechat_claw.enabled'] === 'true',
       wechat_claw_endpoint: settings['entry.wechat_claw.endpoint'] || '',
       wechat_claw_allowed_senders: parseStringSetting(settings['entry.wechat_claw.allowed_senders'], []),
+      speech_voice: settings['speech.voice'] || 'Ting-Ting',
+      speech_rate: Number(settings['speech.rate'] || 185),
+      speech_transcription_model: settings['speech.transcription_model'] || 'tiny',
+      speech_transcription_language: settings['speech.transcription_language'] || 'auto',
     });
   }
 
@@ -11400,6 +11413,10 @@ export class JoiSQLiteStore {
       'entry.wechat_claw.enabled': boolString(Boolean(settings.wechat_claw_enabled)),
       'entry.wechat_claw.endpoint': settings.wechat_claw_endpoint || '',
       'entry.wechat_claw.allowed_senders': json(settings.wechat_claw_allowed_senders || []),
+      'speech.voice': settings.speech_voice || 'Ting-Ting',
+      'speech.rate': String(settings.speech_rate || 185),
+      'speech.transcription_model': settings.speech_transcription_model || 'tiny',
+      'speech.transcription_language': settings.speech_transcription_language || 'auto',
     });
   }
 
@@ -12946,7 +12963,7 @@ export class JoiSQLiteStore {
       json({ desktop_default: true, electron_native: true }),
     );
     for (const agent of [
-      ['general_agent', 'General Agent', 'General purpose desktop agent.', ['memory_search', 'memory_write_candidate', 'session_search', 'session_summary', 'session_branch', 'session_compact', 'delegate_task', 'project_list', 'skills_list', 'skill_view', 'tool_search', 'task_list', 'task_view', 'task_update', 'workspace_search', 'file_read', 'file_analyze', 'image_generate', 'video_generate', 'text_to_speech', 'speech_transcribe', 'lsp_definition', 'lsp_references', 'lsp_diagnostics', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop', 'apply_patch', 'shell_command', 'test_command', 'shell_start', 'shell_write', 'shell_output', 'shell_kill', 'computer_observe', 'find_roots', 'observe_ui', 'search_ui', 'expand_ui', 'inspect_ui', 'read_text', 'wait_for', 'act_ui', 'browser_observe', 'browser_navigate', 'browser_click', 'browser_type', 'desktop_app_list', 'desktop_app_inspect', 'request_user_input', 'automation_update'], []],
+      ['general_agent', 'General Agent', 'General purpose desktop agent.', ['memory_search', 'memory_write_candidate', 'session_search', 'session_summary', 'session_branch', 'session_compact', 'delegate_task', 'project_list', 'skills_list', 'skill_view', 'tool_search', 'task_list', 'task_view', 'task_update', 'workspace_search', 'file_read', 'file_analyze', 'image_generate', 'text_to_speech', 'speech_transcribe', 'lsp_definition', 'lsp_references', 'lsp_diagnostics', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop', 'apply_patch', 'shell_command', 'test_command', 'shell_start', 'shell_write', 'shell_output', 'shell_kill', 'computer_observe', 'find_roots', 'observe_ui', 'search_ui', 'expand_ui', 'inspect_ui', 'read_text', 'wait_for', 'act_ui', 'browser_observe', 'browser_navigate', 'browser_click', 'browser_type', 'desktop_app_list', 'desktop_app_inspect', 'request_user_input', 'automation_update'], []],
       ['memory_agent', 'Memory Agent', 'Memory and preference assistant.', ['memory_search'], ['记忆', '记住', '偏好', 'memory']],
       ['devops_agent', 'DevOps Agent', 'Read-only diagnostics assistant.', ['system_health_check', 'server_diagnose'], ['joi 自检', 'health', 'server', 'docker', 'nginx', 'cloudflared', '服务状态', '部署']],
       ['research_agent', 'Research Agent', 'Read-only web research assistant.', ['web_research'], ['@research', 'https://', 'http://', '网页搜索', '上网搜索', '搜一下', '最新消息', '新闻', '天气', '泄露信息']],
@@ -12987,8 +13004,6 @@ export class JoiSQLiteStore {
       ['file_analyze', 'File Analyze', 'Analyze an authorized workspace file.', 'read_only'],
       ['image_generate', 'Image Generate', 'Generate and persist an image with Grok Build native image_gen.', 'read_only'],
       ['image_analyze', 'Image Analyze', 'Analyze a local image with macOS Vision OCR.', 'read_only'],
-      ['video_generate', 'Video Generate', 'Generate and persist an MP4 video with xAI.', 'read_only'],
-      ['video_analyze', 'Video Analyze', 'Analyze a local video with FFmpeg keyframes and macOS Vision OCR.', 'read_only'],
       ['text_to_speech', 'Text To Speech', 'Generate playable speech with the native macOS speech engine.', 'read_only'],
       ['speech_transcribe', 'Speech Transcribe', 'Transcribe local audio with Whisper.', 'read_only'],
       ['assistant_workspace', 'Assistant Workspace', 'Read the personal-assistant activity, calendar, plan, and channel workspace.', 'read_only'],
@@ -13049,7 +13064,7 @@ export class JoiSQLiteStore {
          version=excluded.version,
          metadata=excluded.metadata,
          updated_at=datetime('now')`,
-      json(['memory_search', 'memory_write_candidate', 'session_search', 'session_summary', 'session_branch', 'session_compact', 'delegate_task', 'project_list', 'skills_list', 'skill_view', 'tool_search', 'task_list', 'task_view', 'task_update', 'workspace_search', 'file_read', 'file_analyze', 'image_generate', 'video_generate', 'text_to_speech', 'speech_transcribe', 'lsp_definition', 'lsp_references', 'lsp_diagnostics', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop', 'apply_patch', 'shell_command', 'test_command', 'shell_start', 'shell_write', 'shell_output', 'shell_kill', 'computer_observe', 'find_roots', 'observe_ui', 'search_ui', 'expand_ui', 'inspect_ui', 'read_text', 'wait_for', 'act_ui', 'browser_observe', 'browser_navigate', 'browser_click', 'browser_type', 'desktop_app_list', 'desktop_app_inspect', 'request_user_input', 'automation_update']),
+      json(['memory_search', 'memory_write_candidate', 'session_search', 'session_summary', 'session_branch', 'session_compact', 'delegate_task', 'project_list', 'skills_list', 'skill_view', 'tool_search', 'task_list', 'task_view', 'task_update', 'workspace_search', 'file_read', 'file_analyze', 'image_generate', 'text_to_speech', 'speech_transcribe', 'lsp_definition', 'lsp_references', 'lsp_diagnostics', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop', 'apply_patch', 'shell_command', 'test_command', 'shell_start', 'shell_write', 'shell_output', 'shell_kill', 'computer_observe', 'find_roots', 'observe_ui', 'search_ui', 'expand_ui', 'inspect_ui', 'read_text', 'wait_for', 'act_ui', 'browser_observe', 'browser_navigate', 'browser_click', 'browser_type', 'desktop_app_list', 'desktop_app_inspect', 'request_user_input', 'automation_update']),
       this.options.version,
       json({ runtime: 'electron_ts_store', desktop_default: true }),
     );
@@ -13084,7 +13099,6 @@ export class JoiSQLiteStore {
       ['debugger_watchpoint', 'Debugger Watchpoint', 'Set an LLDB watchpoint.', 'browser_interaction'],
       ['debugger_memory', 'Debugger Memory', 'Read a bounded LLDB memory range.', 'browser_interaction'],
       ['image_analyze', 'Image Analyze', 'Analyze a local image with macOS Vision OCR.', 'read_only'],
-      ['video_analyze', 'Video Analyze', 'Analyze a local video with FFmpeg keyframes and macOS Vision OCR.', 'read_only'],
       ['assistant_workspace', 'Assistant Workspace', 'Read the personal-assistant workspace.', 'read_only'],
       ['assistant_action', 'Assistant Action', 'Operate activity capture, calendar, plans, and channels.', 'browser_interaction'],
     ] as const;
@@ -13103,8 +13117,16 @@ export class JoiSQLiteStore {
     }
     for (const target of [['agents', 'general_agent'], ['nodes', 'main-node']] as const) {
       const row = this.get(`SELECT capabilities FROM ${target[0]} WHERE id=?`, target[1]);
-      const capabilities = [...new Set([...parseStringArray(row?.capabilities), ...workbenchCapabilities.map((item) => item[0])])];
+      const capabilities = [...new Set([...parseStringArray(row?.capabilities), ...workbenchCapabilities.map((item) => item[0])])]
+        .filter((capability) => !RETIRED_CAPABILITY_IDS.has(capability));
       this.exec(`UPDATE ${target[0]} SET capabilities=?, updated_at=datetime('now') WHERE id=?`, json(capabilities), target[1]);
+    }
+    for (const retiredCapability of RETIRED_CAPABILITY_IDS) {
+      this.exec(
+        `UPDATE capabilities SET enabled=0, metadata=?, updated_at=datetime('now') WHERE id=?`,
+        json({ retired: true, reason: 'removed_from_joi_product_2026_07_17' }),
+        retiredCapability,
+      );
     }
     for (const workflow of [
       ['workflow_memory_search_v1', 'memory_search', 'memory_search_v1', [{ tool: 'memory_search', risk_level: 'read_only' }]],
@@ -18242,7 +18264,6 @@ function workflowNameForGateway(capabilityID: string): string {
     case 'shell_output':
     case 'shell_kill':
     case 'image_generate':
-    case 'video_generate':
     case 'text_to_speech':
     case 'speech_transcribe':
     case 'lsp_definition':
@@ -18816,8 +18837,6 @@ function titleForTaskCapability(capability: string): string {
       return '检索网页';
     case 'image_generate':
       return '生成图片';
-    case 'video_generate':
-      return '生成视频';
     case 'text_to_speech':
       return '生成语音';
     case 'speech_transcribe':
@@ -18894,7 +18913,7 @@ function summaryForToolOutput(output: Record<string, unknown>, fallback: string)
 type GeneratedMessageAttachment = {
   id: string;
   name: string;
-  kind: 'image' | 'video' | 'audio';
+  kind: 'image' | 'audio';
   mime_type: string;
   size: number;
   preview_url: string;
@@ -18903,7 +18922,7 @@ type GeneratedMessageAttachment = {
 function generatedAttachmentForToolOutput(output: Record<string, unknown>): GeneratedMessageAttachment[] {
   const mediaOutput = generatedMediaOutputForToolOutput(output);
   const status = (optionalString(mediaOutput.status) || '').toLowerCase();
-  if (status !== 'completed' || !['image_generate', 'video_generate', 'text_to_speech'].includes(optionalString(mediaOutput.capability) || '')) return [];
+  if (status !== 'completed' || !['image_generate', 'text_to_speech'].includes(optionalString(mediaOutput.capability) || '')) return [];
   const raw = mediaOutput.attachment && typeof mediaOutput.attachment === 'object' && !Array.isArray(mediaOutput.attachment)
     ? mediaOutput.attachment as Record<string, unknown>
     : {};
@@ -18911,7 +18930,7 @@ function generatedAttachmentForToolOutput(output: Record<string, unknown>): Gene
   const previewURL = optionalString(raw.preview_url) || optionalString(raw.previewUrl) || '';
   const size = Number(raw.size || 0);
   const rawKind = optionalString(raw.kind);
-  const kind: GeneratedMessageAttachment['kind'] = rawKind === 'video' || rawKind === 'audio' ? rawKind : 'image';
+  const kind: GeneratedMessageAttachment['kind'] = rawKind === 'audio' ? rawKind : 'image';
   if (!mimeType.startsWith(`${kind}/`) || !previewURL.startsWith('file:') || !Number.isFinite(size) || size <= 0) return [];
   return [{
     id: optionalString(raw.id) || `attachment_${newID()}`,
@@ -18934,7 +18953,7 @@ function generatedMediaOutputForToolOutput(output: Record<string, unknown>): Rec
     toolOutputRecord(rawResult.structuredContent),
   ];
   const structured = candidates.find((candidate) => (
-    ['image_generate', 'video_generate', 'text_to_speech'].includes(optionalString(candidate.capability) || '')
+    ['image_generate', 'text_to_speech'].includes(optionalString(candidate.capability) || '')
     && (optionalString(candidate.status) || '').toLowerCase() === 'completed'
   ));
   if (structured) return structured;
@@ -18942,7 +18961,7 @@ function generatedMediaOutputForToolOutput(output: Record<string, unknown>): Rec
   for (const item of content) {
     const parsedItem = toolOutputRecord(item);
     const parsedText = toolOutputRecord(parsedItem.text);
-    if (['image_generate', 'video_generate', 'text_to_speech'].includes(optionalString(parsedText.capability) || '')) {
+    if (['image_generate', 'text_to_speech'].includes(optionalString(parsedText.capability) || '')) {
       return parsedText;
     }
   }
@@ -19072,7 +19091,7 @@ function cacheHitRatioForUsage(inputTokens: number, cachedInputTokens: number): 
 }
 
 function sideEffectLevelForCapability(capability: string): string {
-  if (['apply_patch', 'memory_write_candidate', 'task_update', 'session_branch', 'session_compact', 'delegate_task', 'text_to_speech', 'video_generate'].includes(capability)) return 'write_local';
+  if (['apply_patch', 'memory_write_candidate', 'task_update', 'session_branch', 'session_compact', 'delegate_task', 'text_to_speech'].includes(capability)) return 'write_local';
   if (['browser_click', 'browser_type', 'act_ui', 'computer_use'].includes(capability)) return 'external_action';
   if (['shell_command', 'test_command', 'shell_start', 'shell_write', 'shell_kill', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop'].includes(capability)) return 'write_local';
   return 'read';
@@ -20236,6 +20255,12 @@ function normalizeWorkspaceSettings(input: WorkspaceSettings): WorkspaceSettings
     wechat_claw_enabled: Boolean(input.wechat_claw_enabled),
     wechat_claw_endpoint: (input.wechat_claw_endpoint || '').trim(),
     wechat_claw_allowed_senders: [...new Set((input.wechat_claw_allowed_senders || []).map((item) => item.trim()).filter(Boolean))],
+    speech_voice: (input.speech_voice || 'Ting-Ting').trim() || 'Ting-Ting',
+    speech_rate: Math.max(80, Math.min(450, Math.round(Number(input.speech_rate) || 185))),
+    speech_transcription_model: ['tiny', 'base', 'small'].includes(String(input.speech_transcription_model || ''))
+      ? String(input.speech_transcription_model)
+      : 'tiny',
+    speech_transcription_language: (input.speech_transcription_language || 'auto').trim() || 'auto',
   };
 }
 

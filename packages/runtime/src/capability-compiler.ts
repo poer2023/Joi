@@ -106,8 +106,6 @@ const capabilityToolDefinitions: CapabilityToolDefinition[] = [
   { name: 'image_analyze', description: 'Analyze an authorized local image with macOS Vision OCR and ffprobe metadata.', risk: 'read_only', fields: { path: 'string', image_path: 'string', question: 'string' }, backend: 'implemented' },
   { name: 'vision_analyze', description: 'Compatibility alias for local image analysis with macOS Vision OCR.', risk: 'read_only', fields: { path: 'string', image_path: 'string', question: 'string' }, backend: 'alias' },
   { name: 'image_generate', description: 'Generate a new image with the authenticated Grok Build native image_gen tool and persist it as a Joi attachment.', risk: 'read_only', fields: { prompt: 'string', aspect_ratio: 'string', size: 'string', style: 'string' }, backend: 'implemented' },
-  { name: 'video_generate', description: 'Generate a real video with the authenticated xAI video model, download it locally, and persist it as a Joi attachment.', risk: 'read_only', fields: { prompt: 'string', duration_seconds: 'number', aspect_ratio: 'string', resolution: 'string' }, backend: 'implemented' },
-  { name: 'video_analyze', description: 'Analyze an authorized local video with ffprobe, FFmpeg keyframes/contact sheet, and macOS Vision OCR.', risk: 'read_only', fields: { path: 'string', video_path: 'string', question: 'string', max_frames: 'number', transcribe: 'boolean', language: 'string', model: 'string' }, backend: 'implemented' },
   { name: 'text_to_speech', description: 'Generate a playable local speech artifact with the native macOS speech engine and FFmpeg. Set format explicitly to mp3, wav, or aiff when the user requests one; the default is mp3.', risk: 'read_only', fields: { text: 'string', voice: 'string', format: 'string', rate: 'number' }, backend: 'implemented' },
   { name: 'speech_transcribe', description: 'Transcribe an authorized local audio artifact with the local Whisper runtime. Pass the generated audio path as path; file_path is accepted as a compatibility alias.', risk: 'read_only', fields: { path: 'string', file_path: 'string', language: 'string', model: 'string' }, backend: 'implemented' },
   { name: 'assistant_workspace', description: 'Read the local personal-assistant workspace: activity capture, calendar drafts, evidence plans, and configured channels.', risk: 'read_only', fields: {}, backend: 'implemented' },
@@ -256,7 +254,7 @@ function toolSpec(definition: CapabilityToolDefinition): ToolSpec {
     name: definition.name,
     description: definition.description,
     execution_mode: definition.risk === 'read_only' ? 'parallel' : 'sequential',
-    timeout_seconds: ['image_generate', 'video_generate', 'image_analyze', 'video_analyze', 'speech_transcribe'].includes(definition.name)
+    timeout_seconds: ['image_generate', 'image_analyze', 'speech_transcribe'].includes(definition.name)
       ? 180
       : ['find_roots', 'observe_ui', 'search_ui', 'expand_ui', 'inspect_ui', 'read_text', 'wait_for', 'act_ui', 'computer_use'].includes(definition.name)
         ? 90
@@ -288,12 +286,9 @@ function requiredFieldsForCapability(capability: string): string[] {
     case 'web_extract':
       return ['url'];
     case 'image_generate':
-    case 'video_generate':
       return ['prompt'];
     case 'image_analyze':
     case 'vision_analyze':
-      return ['path'];
-    case 'video_analyze':
       return ['path'];
     case 'text_to_speech':
       return ['text'];

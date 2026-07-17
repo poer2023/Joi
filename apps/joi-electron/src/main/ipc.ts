@@ -87,7 +87,6 @@ import {
 } from '../../../../packages/runtime/src/capability-compiler';
 import { executeGrokBuildImageGeneration } from '../../../../packages/runtime/src/grok-build-image';
 import { executeLocalSpeechTranscription, executeLocalTextToSpeech } from '../../../../packages/runtime/src/local-speech.ts';
-import { executeXAIVideoGeneration } from '../../../../packages/runtime/src/xai-video.ts';
 import { discoverCodexSkills } from '../../../../packages/runtime/src/skills.ts';
 import { executeJoiPiComputerUse } from './pi-computer-use';
 import { TerminalSessionManager } from './terminal';
@@ -129,7 +128,7 @@ import { resolveACPBridgeGrant } from './acp-web-bridge';
 import { MCPRuntimeManager } from './mcp-runtime.ts';
 import { BrowserWorkbenchManager } from './browser-workbench.ts';
 import { executeCodeCapability } from './code-execution-capabilities.ts';
-import { analyzeImageFile, analyzeVideoFile, saveMediaDataURL } from './media-analysis.ts';
+import { analyzeImageFile, saveMediaDataURL } from './media-analysis.ts';
 import { AssistantRuntimeManager } from './assistant-runtime.ts';
 import { approvalResumeCapabilityInput, approvalResumeContinuationMessage } from './approval-resume.ts';
 
@@ -924,42 +923,6 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
       if (action === 'analyze_image') {
         if (!req.path) throw new Error('analyze_image path is required');
         return { action, output: await analyzeImageFile(req.path, join(mediaRoot, 'analysis')) };
-      }
-      if (action === 'analyze_video') {
-        if (!req.path) throw new Error('analyze_video path is required');
-        const output = await analyzeVideoFile(req.path, join(mediaRoot, 'analysis'));
-        if (req.transcribe) {
-          try {
-            output.transcription = await executeLocalSpeechTranscription({
-              path: req.path,
-              model: req.model || 'tiny',
-              language: req.language || 'auto',
-            }, { output_dir: join(mediaRoot, 'transcriptions'), timeout_seconds: 900 });
-          } catch (error) {
-            output.transcription_error = error instanceof Error ? error.message : String(error);
-          }
-        }
-        return { action, output };
-      }
-      if (action === 'generate_video') {
-        const credentials = await resolveXAIOAuthCredentials(
-          (name) => secrets.resolve(name),
-          (name, value) => secrets.save(name, value),
-        );
-        return {
-          action,
-          output: await executeXAIVideoGeneration({
-            prompt: req.prompt,
-            duration_seconds: req.duration_seconds,
-            aspect_ratio: req.aspect_ratio,
-            resolution: req.resolution,
-          }, {
-            api_key: credentials.apiKey,
-            base_url: credentials.baseURL,
-            output_dir: join(mediaRoot, 'generated-video'),
-            timeout_seconds: 900,
-          }),
-        };
       }
       throw new Error(`Unsupported media workbench action: ${action}`);
     },
@@ -3024,21 +2987,6 @@ async function executeElectronCapability(
           signal: options.signal,
         }),
       };
-    case 'video_generate': {
-      const credentials = await resolveXAIOAuthCredentials(
-        (name) => secrets.resolve(name),
-        (name, value) => secrets.save(name, value),
-      );
-      return {
-        output: await executeXAIVideoGeneration(inputs, {
-          api_key: credentials.apiKey,
-          base_url: credentials.baseURL,
-          output_dir: join(app.getPath('userData'), 'generated-videos'),
-          timeout_seconds: 600,
-          signal: options.signal,
-        }),
-      };
-    }
     case 'image_analyze':
     case 'vision_analyze': {
       const sourcePath = authorizedMediaPath(
@@ -3053,34 +3001,6 @@ async function executeElectronCapability(
           options.signal,
         ),
       };
-    }
-    case 'video_analyze': {
-      const sourcePath = authorizedMediaPath(
-        inputs.path ?? inputs.video_path,
-        workspaceSettings,
-        permissionProfile,
-      );
-      const output = await analyzeVideoFile(
-        sourcePath,
-        join(app.getPath('userData'), 'media-workbench', 'agent-analysis'),
-        { signal: options.signal, max_frames: Number(inputs.max_frames || 6) },
-      );
-      if (inputs.transcribe === true) {
-        try {
-          output.transcription = await executeLocalSpeechTranscription({
-            path: sourcePath,
-            model: inputs.model || 'tiny',
-            language: inputs.language || 'auto',
-          }, {
-            output_dir: join(app.getPath('userData'), 'media-workbench', 'agent-transcriptions'),
-            signal: options.signal,
-            timeout_seconds: 900,
-          });
-        } catch (error) {
-          output.transcription_error = error instanceof Error ? error.message : String(error);
-        }
-      }
-      return { output };
     }
     case 'text_to_speech':
       return {

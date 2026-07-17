@@ -5,7 +5,7 @@
 - Project: `/Users/hao/project/Joi`
 - Installed target: `/Applications/Joi.app`
 - Screens: existing Desktop chat transcript, tool execution disclosure, and Run Trace inspector
-- User job: let Joi perform session branching/compaction, bounded child-agent work, speech/TTS, native LSP/debugger operations, and video generation through real tool backends.
+- User job: let Joi perform session branching/compaction, bounded child-agent work, speech/TTS, and native LSP/debugger operations through real tool backends.
 
 ## References
 
@@ -32,11 +32,10 @@
 | Text to speech | Render supplied text into a real audio file and expose a playable artifact without claiming delivery. | File signature/duration check and installed-app artifact link. |
 | LSP | Start/use a real language server for diagnostics, definition, and references against workspace files; return normalized locations/diagnostics. | Fixture project with expected diagnostic/definition/reference results and installed-app calls. |
 | Debugger | Start a real LLDB/native debug session, set/run at least one breakpoint or equivalent stop, read structured output/status, then terminate cleanly. | Compiled fixture, debugger transcript/status assertions, and installed-app call sequence. |
-| Video | Produce a real playable video artifact from prompt or supplied media through a configured generation backend or deterministic local media pipeline; never return a placeholder URL. | `ffprobe` codec/duration validation, thumbnail evidence, and installed-app artifact link. |
 
 ## Interaction Rules
 
-- Tool execution summaries use concise Chinese verbs: 分支会话、压缩会话、委派子任务、转写语音、生成语音、查询代码、调试程序、生成视频.
+- Tool execution summaries use concise Chinese verbs: 分支会话、压缩会话、委派子任务、转写语音、生成语音、查询代码、调试程序.
 - Running, success, partial, cancelled, and failure states remain visible; one failed child/tool does not relabel an otherwise successful parent run as entirely failed.
 - Destructive host commands remain blocked even under `danger_full_access`.
 - Empty, missing-backend, timeout, invalid-path, and unsupported-language states return explicit errors and never simulated output.
@@ -57,7 +56,7 @@
 
 - [x] Every row in the capability contract has a real backend and deterministic automated proof.
 - [x] Every row is called from the freshly installed app and has matching Run Trace evidence.
-- [x] Audio and video artifacts pass format/duration inspection.
+- [x] Audio artifacts pass format/duration inspection.
 - [x] Session and child-agent provenance can be queried from SQLite.
 - [x] Existing chat, settings, window lifecycle, and previous 43-tool acceptance remain passing.
 - [x] Screenshots and a machine-readable comparison report are saved under `docs/specs/evidence/joi-advanced-agent-capabilities-2026-07-16/`.
@@ -74,6 +73,5 @@ The final installed bundle was built at `2026-07-15T17:55:59Z`, installed at `/A
 | Speech | `run_mrmdvgkq75ub1o` generated a 4.505-second WAV, transcribed the full sentence exactly, and persisted an `audio` message attachment plus `art_mrmdvywpxctnoi`. |
 | LSP | `run_mrmdqvhn7hrynm` used native `clangd` for a real definition and the `missing_native_symbol` diagnostic. |
 | Debugger | `run_mrmdrr8sg1voh2` used LLDB to break in `twice`, evaluate `value=21`, step, and dispose the session. |
-| Video | `run_mrmdwveexlqsmh` generated xAI request `ef7dd1b0-c512-939c-a00b-7f9987248a02`; the downloaded H.264/AAC MP4 is 480×480 and 1.041667 seconds. |
 
 Machine-readable proof: `docs/specs/evidence/joi-advanced-agent-capabilities-2026-07-16/installed-app/installed-app-comparison-report.json`.

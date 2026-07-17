@@ -160,7 +160,7 @@ type ComposerAttachment = {
   name: string;
   size: number;
   mime_type: string;
-  kind: 'image' | 'video' | 'file';
+  kind: 'image' | 'video' | 'audio' | 'file';
   preview_url?: string;
   last_modified?: number;
 };
@@ -978,6 +978,13 @@ export default function App() {
         preview_url: file.type.startsWith('image/') || file.type.startsWith('video/') ? URL.createObjectURL(file) : undefined,
         last_modified: file.lastModified,
       })),
+    ]);
+  }
+
+  function addComposerAttachment(attachment: ComposerAttachment) {
+    setComposerAttachments((current) => [
+      ...current.filter((item) => item.id !== attachment.id),
+      attachment,
     ]);
   }
 
@@ -2366,6 +2373,7 @@ export default function App() {
               roomRouteLock={roomRouteLock}
               setActiveTab={setActiveTab}
               addAttachments={addComposerAttachments}
+              addRecordedAttachment={addComposerAttachment}
               setMessage={setMessage}
               setQueuedMessageMode={setQueuedMessageMode}
               cancelQueuedRunMessage={cancelQueuedRunMessage}
@@ -3954,8 +3962,8 @@ function SettingsConsole({
   }
 
   function renderChatEntranceDetail() {
-    if (activeObject.id === 'voice-video') {
-      return <MediaWorkbenchPanel />;
+    if (activeObject.id === 'voice') {
+      return <VoiceSettingsPanel settings={workspaceSettings} onSave={(patch) => saveWorkspacePatch(patch, '语音设置已保存')} />;
     }
     if (activeObject.id === 'imessage') {
       const connected = imessageStatus?.connected ?? false;
@@ -4366,6 +4374,7 @@ function SettingsConsole({
     if (activeObject.id === 'token-usage') {
       return (
         <section className="settings-detail-panel">
+          <DetailHeader title="成本用量" description="查看模型用量、缓存命中和预估成本" />
           <CostsPanel calls={calls} health={health} usage={usage} />
         </section>
       );
@@ -5644,7 +5653,7 @@ function getSettingsObjects(category: SettingsCategory, nodes: NodeRecord[], aut
   }
   if (category === 'chatEntrances') {
     return [
-      { id: 'voice-video', label: '语音与视频', description: '录音、转写、朗读、视频生成与理解' },
+      { id: 'voice', label: '语音', description: '聊天录音、转写与回复朗读设置' },
       { id: 'telegram', label: 'Telegram', description: 'Telegram Bot 入口' },
       { id: 'imessage', label: 'iMessage', description: 'Photon 托管 iMessage 入口' },
       { id: 'desktop-notify', label: '桌面通知', description: '本机通知入口' },
@@ -5973,176 +5982,71 @@ function SettingsInlineTabs({
   );
 }
 
-function MediaWorkbenchPanel() {
-  const [tab, setTab] = useState<'voice' | 'video'>('voice');
-  const [recordingState, setRecordingState] = useState<'idle' | 'recording' | 'saving'>('idle');
-  const [speechText, setSpeechText] = useState('你好，我是 Joi。这是本机语音合成测试。');
-  const [speechVoice, setSpeechVoice] = useState('Ting-Ting');
-  const [speechRate, setSpeechRate] = useState('185');
-  const [videoPrompt, setVideoPrompt] = useState('一个清晰、克制的产品动效：蓝色光点沿白色网格移动，16:9。');
-  const [videoDuration, setVideoDuration] = useState('4');
-  const [videoAspect, setVideoAspect] = useState('16:9');
-  const [videoResolution, setVideoResolution] = useState('480p');
-  const [selectedMediaPath, setSelectedMediaPath] = useState('');
-  const [selectedMediaKind, setSelectedMediaKind] = useState<'image' | 'video'>('video');
-  const [transcribeVideo, setTranscribeVideo] = useState(false);
-  const [output, setOutput] = useState<Record<string, unknown> | null>(null);
-  const [busy, setBusy] = useState('');
-  const [status, setStatus] = useState('');
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const recordingChunksRef = useRef<Blob[]>([]);
-  const recordingStreamRef = useRef<MediaStream | null>(null);
-  const mediaInputRef = useRef<HTMLInputElement | null>(null);
+function VoiceSettingsPanel({
+  settings,
+  onSave,
+}: {
+  settings: WorkspaceSettings | null;
+  onSave: (patch: Partial<WorkspaceSettings>) => Promise<void>;
+}) {
+  const [voice, setVoice] = useState(settings?.speech_voice || 'Ting-Ting');
+  const [rate, setRate] = useState(String(settings?.speech_rate || 185));
+  const [model, setModel] = useState(settings?.speech_transcription_model || 'tiny');
+  const [language, setLanguage] = useState(settings?.speech_transcription_language || 'auto');
+  const [busy, setBusy] = useState(false);
 
-  useEffect(() => () => {
-    recorderRef.current?.stop();
-    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
-  }, []);
+  useEffect(() => {
+    setVoice(settings?.speech_voice || 'Ting-Ting');
+    setRate(String(settings?.speech_rate || 185));
+    setModel(settings?.speech_transcription_model || 'tiny');
+    setLanguage(settings?.speech_transcription_language || 'auto');
+  }, [settings?.speech_rate, settings?.speech_transcription_language, settings?.speech_transcription_model, settings?.speech_voice]);
 
-  async function runMedia(action: string, request: Record<string, unknown>) {
-    setBusy(action);
-    setStatus('');
+  async function save() {
+    setBusy(true);
     try {
-      const result = await desktopApi.executeMediaAction({ action, ...request });
-      setOutput(result.output);
-      setStatus(String(result.output.summary || `${action} 已完成`));
-      return result.output;
-    } catch (err) {
-      setStatus(err instanceof Error ? err.message : String(err));
-      return null;
+      await onSave({
+        speech_voice: voice.trim() || 'Ting-Ting',
+        speech_rate: Math.max(80, Math.min(450, Number(rate) || 185)),
+        speech_transcription_model: model,
+        speech_transcription_language: language.trim() || 'auto',
+      });
     } finally {
-      setBusy('');
+      setBusy(false);
     }
   }
-
-  async function startRecording() {
-    setStatus('');
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-      const candidates = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'];
-      const mimeType = candidates.find((candidate) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(candidate)) || '';
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      recordingChunksRef.current = [];
-      recordingStreamRef.current = stream;
-      recorderRef.current = recorder;
-      recorder.ondataavailable = (event) => { if (event.data.size) recordingChunksRef.current.push(event.data); };
-      recorder.onstop = () => {
-        void (async () => {
-          setRecordingState('saving');
-          try {
-            const blob = new Blob(recordingChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-            const dataURL = await blobToDataURL(blob);
-            const saved = await runMedia('save_recording', { data_url: dataURL, mime_type: blob.type });
-            if (saved) setStatus('录音已保存，可直接转写或播放。');
-          } finally {
-            recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
-            recordingStreamRef.current = null;
-            recorderRef.current = null;
-            setRecordingState('idle');
-          }
-        })();
-      };
-      recorder.start(250);
-      setRecordingState('recording');
-      setStatus('正在使用麦克风录音…');
-    } catch (err) {
-      setStatus(err instanceof Error ? err.message : String(err));
-      setRecordingState('idle');
-    }
-  }
-
-  function stopRecording() {
-    if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
-  }
-
-  async function transcribeCurrentAudio() {
-    const filePath = mediaOutputPath(output);
-    if (!filePath) {
-      setStatus('请先录音或选择可转写的音频。');
-      return;
-    }
-    const result = await runMedia('speech_transcribe', { path: filePath, model: 'tiny', language: 'auto' });
-    if (typeof result?.transcript === 'string') setSpeechText(result.transcript);
-  }
-
-  function chooseMedia(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.currentTarget.files?.[0] as (File & { path?: string }) | undefined;
-    event.currentTarget.value = '';
-    if (!file?.path) {
-      setStatus('请在 Joi Desktop 安装版中选择本地图片或视频。');
-      return;
-    }
-    setSelectedMediaPath(file.path);
-    setSelectedMediaKind(file.type.startsWith('image/') ? 'image' : 'video');
-    setStatus(`已选择：${file.name}`);
-  }
-
-  const previewURL = mediaOutputPreviewURL(output);
-  const outputKind = mediaOutputKind(output);
-  const contactSheetURL = typeof output?.contact_sheet_url === 'string' ? output.contact_sheet_url : '';
 
   return (
-    <section className="settings-detail-panel media-workbench-panel">
-      <DetailHeader title="语音与视频" description="录音、本地 Whisper 转写、macOS TTS、xAI 视频生成，以及基于 FFmpeg + Vision 的本地视频理解" />
-      <SettingsInlineTabs tabs={[['voice', '语音'], ['video', '视频']]} active={tab} onChange={(value) => setTab(value as typeof tab)} />
-      {tab === 'voice' ? (
-        <div className="workbench-pane media-voice-pane">
-          <section className="workbench-card">
-            <div className="workbench-card-heading"><div><strong>麦克风</strong><small>录音保存到 Joi 本地数据目录</small></div><span className={`live-dot ${recordingState === 'recording' ? 'on' : ''}`} /></div>
-            <div className="detail-actions">
-              {recordingState === 'recording'
-                ? <button className="danger-button" type="button" onClick={stopRecording}>停止并保存</button>
-                : <button type="button" disabled={recordingState === 'saving' || Boolean(busy)} onClick={() => void startRecording()}>{recordingState === 'saving' ? '保存中…' : '开始录音'}</button>}
-              <button className="secondary-button" type="button" disabled={Boolean(busy) || !mediaOutputPath(output)} onClick={() => void transcribeCurrentAudio()}>{busy === 'speech_transcribe' ? '转写中…' : '本地转写'}</button>
-            </div>
-          </section>
-          <section className="workbench-card">
-            <div className="workbench-card-heading"><div><strong>文字朗读</strong><small>本地 macOS 语音引擎，输出可播放音频</small></div></div>
-            <textarea rows={5} value={speechText} onChange={(event) => setSpeechText(event.target.value)} />
-            <div className="inline-field-grid">
-              <label><span>声音</span><input value={speechVoice} onChange={(event) => setSpeechVoice(event.target.value)} /></label>
-              <label><span>语速</span><input type="number" min="80" max="450" value={speechRate} onChange={(event) => setSpeechRate(event.target.value)} /></label>
-            </div>
-            <div className="detail-actions"><button type="button" disabled={Boolean(busy) || !speechText.trim()} onClick={() => void runMedia('text_to_speech', { text: speechText, voice: speechVoice, rate: Number(speechRate), format: 'mp3' })}>{busy === 'text_to_speech' ? '生成中…' : '生成朗读'}</button></div>
-          </section>
-        </div>
-      ) : null}
-      {tab === 'video' ? (
-        <div className="workbench-pane media-video-pane">
-          <section className="workbench-card">
-            <div className="workbench-card-heading"><div><strong>本地理解</strong><small>提取关键帧、媒体信息、画面文字和可选语音转写</small></div></div>
-            <input ref={mediaInputRef} className="visually-hidden" type="file" accept="image/*,video/*" onChange={chooseMedia} />
-            <div className="media-file-picker">
-              <button type="button" className="secondary-button" onClick={() => mediaInputRef.current?.click()}>选择图片或视频</button>
-              <span>{selectedMediaPath || '尚未选择'}</span>
-            </div>
-            {selectedMediaKind === 'video' ? <label className="compact-check"><input type="checkbox" checked={transcribeVideo} onChange={(event) => setTranscribeVideo(event.target.checked)} />同时用本地 Whisper 转写音轨</label> : null}
-            <div className="detail-actions"><button type="button" disabled={Boolean(busy) || !selectedMediaPath} onClick={() => void runMedia(selectedMediaKind === 'image' ? 'analyze_image' : 'analyze_video', { path: selectedMediaPath, transcribe: transcribeVideo, model: 'tiny', language: 'auto' })}>{busy.startsWith('analyze_') ? '分析中…' : '分析媒体'}</button></div>
-          </section>
-          <section className="workbench-card">
-            <div className="workbench-card-heading"><div><strong>生成视频</strong><small>xAI grok-imagine-video，完成后保存 MP4</small></div></div>
-            <textarea rows={5} value={videoPrompt} onChange={(event) => setVideoPrompt(event.target.value)} />
-            <div className="inline-field-grid three">
-              <label><span>时长</span><input type="number" min="1" max="15" value={videoDuration} onChange={(event) => setVideoDuration(event.target.value)} /></label>
-              <label><span>比例</span><select value={videoAspect} onChange={(event) => setVideoAspect(event.target.value)}><option>16:9</option><option>9:16</option><option>1:1</option><option>4:3</option><option>3:4</option></select></label>
-              <label><span>分辨率</span><select value={videoResolution} onChange={(event) => setVideoResolution(event.target.value)}><option>480p</option><option>720p</option></select></label>
-            </div>
-            <div className="detail-actions"><button type="button" disabled={Boolean(busy) || !videoPrompt.trim()} onClick={() => void runMedia('generate_video', { prompt: videoPrompt, duration_seconds: Number(videoDuration), aspect_ratio: videoAspect, resolution: videoResolution })}>{busy === 'generate_video' ? '生成与下载中…' : '生成视频'}</button></div>
-          </section>
-        </div>
-      ) : null}
-      {status ? <p className="settings-inline-status" role="status">{status}</p> : null}
-      {output ? (
-        <section className="media-output-card">
-          <div className="workbench-card-heading"><div><strong>最近结果</strong><small>{String(output.summary || output.mode || '')}</small></div></div>
-          {previewURL && outputKind === 'audio' ? <audio controls src={previewURL} /> : null}
-          {previewURL && outputKind === 'video' ? <video controls playsInline src={previewURL} /> : null}
-          {contactSheetURL ? <img src={contactSheetURL} alt="视频关键帧接触表" /> : null}
-          {typeof output.transcript === 'string' ? <pre>{output.transcript}</pre> : null}
-          {typeof output.recognized_text === 'string' && output.recognized_text ? <pre>{output.recognized_text}</pre> : null}
-          <CollapsedData label="查看媒体分析结果" value={output} />
-        </section>
-      ) : null}
+    <section className="settings-detail-panel voice-settings-panel">
+      <DetailHeader title="语音" description="配置聊天中的录音转写与回复朗读" />
+      <div className="settings-form">
+        <label className="field-row">
+          <span>朗读声音</span>
+          <input value={voice} placeholder="Ting-Ting" onChange={(event) => setVoice(event.target.value)} />
+        </label>
+        <label className="field-row">
+          <span>朗读语速</span>
+          <input type="number" min="80" max="450" value={rate} onChange={(event) => setRate(event.target.value)} />
+        </label>
+        <label className="field-row">
+          <span>Whisper 模型</span>
+          <select value={model} onChange={(event) => setModel(event.target.value)}>
+            <option value="tiny">Tiny（最快）</option>
+            <option value="base">Base（均衡）</option>
+            <option value="small">Small（更准确）</option>
+          </select>
+        </label>
+        <label className="field-row">
+          <span>转写语言</span>
+          <select value={language} onChange={(event) => setLanguage(event.target.value)}>
+            <option value="auto">自动识别</option>
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+        <p className="settings-field-hint">录音、转写和朗读入口位于聊天页；这里不执行语音操作。</p>
+        <div className="detail-actions"><button type="button" disabled={busy} onClick={() => void save()}>{busy ? '保存中…' : '保存语音设置'}</button></div>
+      </div>
     </section>
   );
 }
@@ -6720,6 +6624,7 @@ function readFileAsDataURL(file: File): Promise<string> {
 function attachmentKind(file: File): ComposerAttachment['kind'] {
   if (file.type.startsWith('image/')) return 'image';
   if (file.type.startsWith('video/')) return 'video';
+  if (file.type.startsWith('audio/')) return 'audio';
   const extension = file.name.split('.').pop()?.toLowerCase() || '';
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic', 'heif', 'svg'].includes(extension)) return 'image';
   if (['mp4', 'mov', 'webm', 'm4v', 'avi', 'mkv'].includes(extension)) return 'video';
@@ -6781,6 +6686,14 @@ function AttachmentKindIcon({ kind }: { kind: ComposerAttachment['kind'] }) {
       <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
         <path d="M5 7h10v10H5z" />
         <path d="m15 10 4-2v8l-4-2" />
+      </svg>
+    );
+  }
+  if (kind === 'audio') {
+    return (
+      <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+        <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z" />
+        <path d="M6 11v1a6 6 0 0 0 12 0v-1M12 18v3M9 21h6" />
       </svg>
     );
   }
@@ -7128,6 +7041,7 @@ function SidebarIcon({ name }: { name: 'plus' | 'search' | 'collapse' | 'expand'
 
 function ChatHome({
   addAttachments,
+  addRecordedAttachment,
   activePersona,
   activeProductTask,
   activeRoom,
@@ -7189,6 +7103,7 @@ function ChatHome({
   workspaceSettings,
 }: {
   addAttachments: (files: FileList | File[]) => void;
+  addRecordedAttachment: (attachment: ComposerAttachment) => void;
   activePersona: ProjectPersona | null;
   activeProductTask: ProductTaskDetail | null;
   activeRoom: MessengerRoom | null;
@@ -7278,6 +7193,119 @@ function ChatHome({
   );
   const [restoredThreadMessages, setRestoredThreadMessages] = useState<ConversationMessage[]>([]);
   const [threadRestoreStatus, setThreadRestoreStatus] = useState('');
+  const [voiceState, setVoiceState] = useState<'idle' | 'recording' | 'saving' | 'transcribing'>('idle');
+  const [voiceStatus, setVoiceStatus] = useState('');
+  const [speakingMessageID, setSpeakingMessageID] = useState('');
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const speechAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => () => {
+    recorderRef.current?.stop();
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    speechAudioRef.current?.pause();
+  }, []);
+
+  async function startVoiceRecording() {
+    setVoiceStatus('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      const candidates = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'];
+      const mimeType = candidates.find((candidate) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(candidate)) || '';
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recordingChunksRef.current = [];
+      recordingStreamRef.current = stream;
+      recorderRef.current = recorder;
+      recorder.ondataavailable = (event) => { if (event.data.size) recordingChunksRef.current.push(event.data); };
+      recorder.onstop = () => {
+        void (async () => {
+          setVoiceState('saving');
+          try {
+            const blob = new Blob(recordingChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+            const saved = await desktopApi.executeMediaAction({
+              action: 'save_recording',
+              data_url: await blobToDataURL(blob),
+              mime_type: blob.type,
+            });
+            const attachment = composerAttachmentFromMediaOutput(saved.output);
+            if (attachment) addRecordedAttachment(attachment);
+            const path = mediaOutputPath(saved.output);
+            if (!path) throw new Error('录音保存后没有返回本地路径');
+            setVoiceState('transcribing');
+            setVoiceStatus('正在本地转写…');
+            const transcription = await desktopApi.executeMediaAction({
+              action: 'speech_transcribe',
+              path,
+              model: workspaceSettings?.speech_transcription_model || 'tiny',
+              language: workspaceSettings?.speech_transcription_language || 'auto',
+            });
+            const transcript = typeof transcription.output.transcript === 'string' ? transcription.output.transcript.trim() : '';
+            if (transcript) setMessage([message.trim(), transcript].filter(Boolean).join('\n'));
+            setVoiceStatus(transcript ? '转写已放入输入框，确认后再发送。' : '录音已附加，但没有识别到文字。');
+          } catch (err) {
+            setVoiceStatus(err instanceof Error ? err.message : String(err));
+          } finally {
+            recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+            recordingStreamRef.current = null;
+            recorderRef.current = null;
+            setVoiceState('idle');
+          }
+        })();
+      };
+      recorder.start(250);
+      setVoiceState('recording');
+      setVoiceStatus('正在录音，再点一次停止。');
+    } catch (err) {
+      setVoiceStatus(err instanceof Error ? err.message : String(err));
+      setVoiceState('idle');
+    }
+  }
+
+  function stopVoiceRecording() {
+    if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
+  }
+
+  async function speakAssistantMessage(messageID: string, content: string) {
+    if (speakingMessageID === messageID) {
+      speechAudioRef.current?.pause();
+      speechAudioRef.current = null;
+      setSpeakingMessageID('');
+      return;
+    }
+    speechAudioRef.current?.pause();
+    speechAudioRef.current = null;
+    setSpeakingMessageID(messageID);
+    setVoiceStatus('正在生成本地朗读…');
+    try {
+      const result = await desktopApi.executeMediaAction({
+        action: 'text_to_speech',
+        text: content,
+        voice: workspaceSettings?.speech_voice || 'Ting-Ting',
+        rate: workspaceSettings?.speech_rate || 185,
+        format: 'mp3',
+      });
+      const previewURL = mediaOutputPreviewURL(result.output);
+      if (!previewURL) throw new Error('朗读完成后没有返回可播放音频');
+      const audio = new Audio(previewURL);
+      speechAudioRef.current = audio;
+      audio.onended = () => {
+        speechAudioRef.current = null;
+        setSpeakingMessageID('');
+        setVoiceStatus('');
+      };
+      audio.onerror = () => {
+        speechAudioRef.current = null;
+        setSpeakingMessageID('');
+        setVoiceStatus('朗读音频无法播放。');
+      };
+      await audio.play();
+      setVoiceStatus('');
+    } catch (err) {
+      setSpeakingMessageID('');
+      setVoiceStatus(err instanceof Error ? err.message : String(err));
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -7656,6 +7684,8 @@ function ChatHome({
                 onOpenThread={openThreadDetail}
                 onOpenTrace={(runID) => void openRunTrace(runID, 'stage')}
                 onResolveApproval={(approvalId, approve, scope) => void decideConfirmation(approvalId, approve, scope)}
+                onSpeak={(messageID, content) => void speakAssistantMessage(messageID, content)}
+                speakingMessageId={speakingMessageID}
                 selectedThreadId={selectedThreadID}
                 threadAnnotations={threadMessageAnnotations}
                 useMessageScrollerItems
@@ -7750,6 +7780,7 @@ function ChatHome({
               ))}
             </div>
           ) : null}
+          {voiceStatus ? <div className="composer-voice-status" role="status">{voiceStatus}</div> : null}
           <div className="composer-tools">
             <input
               ref={attachmentInputRef}
@@ -7766,6 +7797,16 @@ function ChatHome({
               onClick={() => attachmentInputRef.current?.click()}
             >
               <PaperclipIcon />
+            </button>
+            <button
+              aria-label={voiceState === 'recording' ? '停止录音并转写' : '开始语音输入'}
+              className={`composer-attachment-button composer-voice-button${voiceState === 'recording' ? ' active' : ''}`}
+              disabled={voiceState === 'saving' || voiceState === 'transcribing'}
+              title={voiceState === 'recording' ? '停止录音并转写' : voiceState === 'idle' ? '语音输入' : '正在处理语音'}
+              type="button"
+              onClick={() => voiceState === 'recording' ? stopVoiceRecording() : void startVoiceRecording()}
+            >
+              <MicrophoneIcon />
             </button>
             <span className="composer-tools-spacer" />
             {isSubmitting ? (
@@ -8154,6 +8195,15 @@ function PaperclipIcon() {
   return (
     <svg className="composer-attachment-button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
       <path d="m21.4 11.6-8.8 8.8a6 6 0 0 1-8.5-8.5l9.4-9.4a4 4 0 0 1 5.7 5.7l-9.4 9.4a2 2 0 1 1-2.8-2.8l8.8-8.8" />
+    </svg>
+  );
+}
+
+function MicrophoneIcon() {
+  return (
+    <svg className="composer-attachment-button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z" />
+      <path d="M6 11v1a6 6 0 0 0 12 0v-1M12 18v3M9 21h6" />
     </svg>
   );
 }
@@ -10542,14 +10592,10 @@ function CompanionLogsPanel({ runID }: { runID?: string }) {
   return (
     <section
       id="right-inspector-logs"
-      className="right-panel-section logs-inspector-panel"
+      className="logs-inspector-panel settings-logs-panel"
       role="tabpanel"
-      aria-labelledby="right-inspector-tab-logs"
+      aria-label="运行记录"
     >
-      <header>
-        <small>本机活动</small>
-        <h2>运行记录</h2>
-      </header>
       <div className="logs-filter-grid">
         <label className="field-row compact">
           <span>搜索</span>
@@ -10680,7 +10726,6 @@ function DiagnosticsLogCleanup({ onNotice }: { onNotice?: (message: string) => v
 
   return (
     <section className="diagnostics-log-cleanup">
-      <h3>清理运行记录</h3>
       <dl className="metrics">
         <KV label="范围" value="本机活动、运行事件、模型与能力使用记录" />
         <KV label="保留" value="对话、记忆、设置、密钥" />
@@ -12091,6 +12136,10 @@ function defaultWorkspaceSettings(): WorkspaceSettings {
     wechat_claw_enabled: false,
     wechat_claw_endpoint: '',
     wechat_claw_allowed_senders: [],
+    speech_voice: 'Ting-Ting',
+    speech_rate: 185,
+    speech_transcription_model: 'tiny',
+    speech_transcription_language: 'auto',
   };
 }
 
@@ -12629,8 +12678,7 @@ function NodesPanel({
 function CostsPanel({ usage, calls, health }: { usage: Record<string, unknown>[]; calls: ModelCall[]; health: SystemHealth | null }) {
   const today = health?.token_cost_today ?? {};
   return (
-    <section className="panel wide">
-      <h2>成本用量</h2>
+    <section className="settings-costs-panel">
       <dl className="metrics">
         <KV label="今日总令牌" value={formatTokenCount(today.total_tokens)} />
         <KV label="今日输入令牌" value={formatTokenCount(today.input_tokens)} />
@@ -13271,7 +13319,6 @@ function capabilityDisplayName(id: string, fallbackDescription = '') {
     session_compact: '压缩会话上下文',
     speech_transcribe: '转写语音',
     text_to_speech: '生成语音',
-    video_generate: '生成视频',
     lsp_definition: '查找代码定义',
     lsp_references: '查找代码引用',
     lsp_diagnostics: '检查代码诊断',
@@ -13452,6 +13499,22 @@ function blobToDataURL(blob: Blob): Promise<string> {
 
 function mediaOutputAttachment(output: Record<string, unknown> | null): Record<string, unknown> {
   return objectFromUnknown(output?.attachment);
+}
+
+function composerAttachmentFromMediaOutput(output: Record<string, unknown> | null): ComposerAttachment | null {
+  const attachment = mediaOutputAttachment(output);
+  const id = typeof attachment.id === 'string' ? attachment.id : '';
+  const name = typeof attachment.name === 'string' ? attachment.name : '';
+  const mimeType = typeof attachment.mime_type === 'string' ? attachment.mime_type : 'audio/webm';
+  if (!id || !name) return null;
+  return {
+    id,
+    name,
+    size: Number(attachment.size) || 0,
+    mime_type: mimeType,
+    kind: 'audio',
+    preview_url: typeof attachment.preview_url === 'string' ? attachment.preview_url : mediaOutputPreviewURL(output),
+  };
 }
 
 function mediaOutputPath(output: Record<string, unknown> | null): string {

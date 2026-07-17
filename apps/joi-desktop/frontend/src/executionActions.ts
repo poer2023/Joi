@@ -498,8 +498,6 @@ function descriptionForToolAction(title: string, status: ExecutionActionStatus, 
     if (title === '调用 MCP 工具') return '正在调用 MCP 工具...';
     if (title === '分析图片') return '正在分析图片...';
     if (title === '生成图片') return '正在生成图片...';
-    if (title === '生成视频') return '正在生成视频...';
-    if (title === '分析视频') return '正在分析视频...';
     if (title === '生成语音') return '正在生成语音...';
     if (title === '列出本机 App') return '正在列出本机 App...';
     if (title === '检查本机 App') return '正在检查本机 App...';
@@ -529,8 +527,6 @@ function descriptionForToolAction(title: string, status: ExecutionActionStatus, 
   if (title === '调用 MCP 工具') return '本轮执行了工具：已调用 MCP 工具';
   if (title === '分析图片') return '本轮执行了工具：已分析图片';
   if (title === '生成图片') return '本轮执行了工具：已生成图片';
-  if (title === '生成视频') return '本轮执行了工具：已生成视频';
-  if (title === '分析视频') return '本轮执行了工具：已分析视频';
   if (title === '生成语音') return '本轮执行了工具：已生成语音';
   if (title === '列出本机 App') return '本轮执行了工具：已列出本机 App';
   if (title === '检查本机 App') return '本轮执行了工具：已检查本机 App';
@@ -664,8 +660,6 @@ function titleForCapability(capability: string, workflow: string) {
   if (key.includes('web_research')) return '网页搜索';
   if (key.includes('vision_analyze')) return '分析图片';
   if (key.includes('image_generate')) return '生成图片';
-  if (key.includes('video_generate')) return '生成视频';
-  if (key.includes('video_analyze')) return '分析视频';
   if (key.includes('text_to_speech') || key.includes('tts')) return '生成语音';
   if (key.includes('speech_transcribe') || key.includes('transcri')) return '转写语音';
   if (key.includes('execute_code') || key.includes('code_execution')) return '执行代码';
@@ -722,8 +716,8 @@ function kindForCapability(capability: string, workflow: string, title: string):
   const key = `${capability} ${workflow} ${title}`.toLowerCase();
   if (key.includes('x_search') || title === '搜索 X') return 'web';
   if (key.includes('web_search') || key.includes('web_research') || key.includes('web_extract') || title === '网页搜索') return 'web';
-  if (key.includes('image_generate') || key.includes('video_generate') || title === '生成图片' || title === '生成视频') return 'artifact';
-  if (key.includes('vision_analyze') || key.includes('video_analyze') || title === '分析图片' || title === '分析视频') return 'observe';
+  if (key.includes('image_generate') || title === '生成图片') return 'artifact';
+  if (key.includes('vision_analyze') || title === '分析图片') return 'observe';
   if (key.includes('text_to_speech') || title === '生成语音') return 'artifact';
   if (key.includes('speech_transcribe') || title === '转写语音') return 'observe';
   if (key.includes('lsp_')) return key.includes('rename') || key.includes('format') ? 'file' : 'workspace';

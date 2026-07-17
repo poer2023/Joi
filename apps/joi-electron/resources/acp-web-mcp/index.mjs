@@ -172,7 +172,7 @@ async function callTool(id, params) {
         __joi_parent_conversation_id: String(process.env.JOI_PARENT_CONVERSATION_ID || ''),
         __joi_delegation_depth: Number(process.env.JOI_DELEGATION_DEPTH || 0),
       },
-    }, ['video_generate', 'speech_transcribe'].includes(name)
+    }, name === 'speech_transcribe'
       ? 660_000
       : name === 'delegate_task'
         ? 360_000

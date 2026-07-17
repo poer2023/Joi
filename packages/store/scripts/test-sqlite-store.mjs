@@ -404,10 +404,6 @@ try {
 
   for (const media of [
     {
-      capability: 'video_generate', kind: 'video', mime: 'video/mp4', name: 'joi-generated-video.mp4',
-      path: '/tmp/joi-generated-video.mp4', size: 60_165, mode: 'xai_async_video_v1', provider: 'xai', model: 'grok-imagine-video',
-    },
-    {
       capability: 'text_to_speech', kind: 'audio', mime: 'audio/wav', name: 'joi-generated-speech.wav',
       path: '/tmp/joi-generated-speech.wav', size: 42_000, mode: 'macos_say_ffmpeg_v1', provider: 'local_macos', model: '',
     },

@@ -49,7 +49,9 @@ export function MessageList({
   onOpenThread,
   onOpenTrace,
   onResolveApproval,
+  onSpeak,
   selectedThreadId,
+  speakingMessageId,
   threadAnnotations,
   useMessageScrollerItems = false,
 }: {
@@ -63,7 +65,9 @@ export function MessageList({
   onOpenThread?: (threadId: string) => void;
   onOpenTrace?: (runId: string) => void;
   onResolveApproval?: (approvalId: string, approve: boolean, scope?: 'one_call' | 'current_run') => void;
+  onSpeak?: (messageId: string, content: string) => void;
   selectedThreadId?: string;
+  speakingMessageId?: string;
   threadAnnotations?: Record<string, MessageThreadAnnotation>;
   useMessageScrollerItems?: boolean;
 }) {
@@ -85,6 +89,8 @@ export function MessageList({
               highlighted={highlightedMessageId === item.id}
               item={item}
               onOpenThread={onOpenThread}
+              onSpeak={onSpeak}
+              speaking={speakingMessageId === item.id}
               threadAnnotation={threadAnnotations?.[item.id]}
               threadSelected={Boolean(selectedThreadId && threadAnnotations?.[item.id]?.threadId === selectedThreadId)}
             />
@@ -99,7 +105,9 @@ export function MessageList({
               onOpenThread={onOpenThread}
               onOpenTrace={onOpenTrace}
               onResolveApproval={onResolveApproval}
+              onSpeak={onSpeak}
               selectedThreadId={selectedThreadId}
+              speakingMessageId={speakingMessageId}
               threadAnnotations={threadAnnotations}
             />
           );
@@ -249,7 +257,9 @@ function AssistantResponse({
   onOpenThread,
   onOpenTrace,
   onResolveApproval,
+  onSpeak,
   selectedThreadId,
+  speakingMessageId,
   threadAnnotations,
 }: {
   assistantAvatarSrc?: string;
@@ -259,7 +269,9 @@ function AssistantResponse({
   onOpenThread?: (threadId: string) => void;
   onOpenTrace?: (runId: string) => void;
   onResolveApproval?: (approvalId: string, approve: boolean, scope?: 'one_call' | 'current_run') => void;
+  onSpeak?: (messageId: string, content: string) => void;
   selectedThreadId?: string;
+  speakingMessageId?: string;
   threadAnnotations?: Record<string, MessageThreadAnnotation>;
 }) {
   const content = formatAssistantContent ? formatAssistantContent(item.message.content) : item.message.content;
@@ -282,7 +294,12 @@ function AssistantResponse({
             {attachments.length ? <MessageAttachmentGrid attachments={attachments} expandImages /> : null}
             {!content && attachments.length === 0 ? <p className="message-skeleton">正在组织回复...</p> : null}
           </div>
-          <MessageBubbleActions content={content} createdAt={item.message.createdAt} />
+          <MessageBubbleActions
+            content={content}
+            createdAt={item.message.createdAt}
+            onSpeak={onSpeak ? () => onSpeak(item.message.id, content) : undefined}
+            speaking={speakingMessageId === item.message.id}
+          />
         </div>
         {threadAnnotation ? (
           <MessageThreadMarker

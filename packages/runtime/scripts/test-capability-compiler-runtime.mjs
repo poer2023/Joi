@@ -28,7 +28,7 @@ function namesFor(permissionProfile, options) {
   assert(!names.includes('search_files'));
   assert(!names.includes('x_search'));
   assert(names.includes('image_generate'));
-  for (const name of ['video_generate', 'text_to_speech', 'speech_transcribe', 'lsp_definition', 'lsp_references', 'lsp_diagnostics']) {
+  for (const name of ['text_to_speech', 'speech_transcribe', 'lsp_definition', 'lsp_references', 'lsp_diagnostics']) {
     assert(names.includes(name));
   }
   assert(!names.includes('apply_patch'));
@@ -188,8 +188,11 @@ function namesFor(permissionProfile, options) {
   assert.ok(definitions.some((definition) => definition.name === 'session_search' && definition.backend === 'implemented'));
   assert.ok(definitions.some((definition) => definition.name === 'shell_start' && definition.backend === 'implemented'));
   assert.ok(definitions.some((definition) => definition.name === 'tool_search' && definition.backend === 'implemented'));
-  for (const name of ['delegate_task', 'session_branch', 'session_compact', 'video_generate', 'text_to_speech', 'speech_transcribe', 'lsp_definition', 'lsp_references', 'lsp_diagnostics', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop']) {
+  for (const name of ['delegate_task', 'session_branch', 'session_compact', 'text_to_speech', 'speech_transcribe', 'lsp_definition', 'lsp_references', 'lsp_diagnostics', 'debugger_attach', 'debugger_breakpoint', 'debugger_step', 'debugger_evaluate', 'debugger_stop']) {
     assert.ok(definitions.some((definition) => definition.name === name && definition.backend === 'implemented'), `${name} should be implemented`);
+  }
+  for (const retired of ['video_generate', 'video_analyze']) {
+    assert.equal(definitions.some((definition) => definition.name === retired), false, `${retired} must not be exposed`);
   }
 }
 
