@@ -180,6 +180,7 @@ export async function executeLocalSpeechTranscription(
   let parsed: Record<string, unknown>;
   let transcript = '';
   let segmentCount = 0;
+  let durationSeconds = 0;
 
   if (runtime.engine === 'whisper.cpp') {
     const normalizedPath = join(resultDir, 'input.wav');
@@ -188,6 +189,7 @@ export async function executeLocalSpeechTranscription(
       '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', normalizedPath,
     ], { signal: options.signal, timeout_seconds: Math.min(timeoutSeconds, 180) });
     if (converted.exit_code !== 0) throw new Error(`speech audio normalization failed: ${safeCommandError(converted)}`);
+    durationSeconds = await mediaDuration(normalizedPath, options, run);
     const outputPrefix = join(resultDir, 'transcript');
     const args = [
       '--model', String(runtime.model_path),
@@ -235,9 +237,9 @@ export async function executeLocalSpeechTranscription(
     parsed = JSON.parse(await readFile(jsonPath, 'utf8')) as Record<string, unknown>;
     transcript = stringValue(parsed.text);
     segmentCount = Array.isArray(parsed.segments) ? parsed.segments.length : 0;
+    durationSeconds = await mediaDuration(sourcePath, options, run);
   }
   if (!transcript) throw new Error('local Whisper returned an empty transcript');
-  const durationSeconds = await mediaDuration(sourcePath, options, run);
   return {
     status: 'completed',
     capability: 'speech_transcribe',

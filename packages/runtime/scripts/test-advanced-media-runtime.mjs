@@ -59,6 +59,8 @@ try {
   assert.ok(cppCommand.args.includes('--output-json'));
   assert.ok(cppCommand.args.includes('--language'));
   assert.ok(commands.some((command) => command.binary.includes('ffmpeg') && command.args.includes('16000')));
+  const durationCommand = commands.find((command) => command.binary.includes('ffprobe'));
+  assert.ok(durationCommand?.args.at(-1)?.endsWith('/input.wav'), 'whisper.cpp duration must use normalized WAV for MediaRecorder WebM compatibility');
 
   if (process.env.JOI_REAL_WHISPER_TEST === '1') {
     const chineseSpeech = await executeLocalTextToSpeech({
