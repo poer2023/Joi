@@ -87,7 +87,10 @@ function namesFor(permissionProfile, options) {
   assert.equal(electronCapabilityRequiresConfirmation('write_file'), true);
   assert.equal(electronCapabilityRequiresConfirmation('memory_write_candidate'), true);
   assert.equal(electronCapabilityRequiresConfirmation('task_update'), true);
-  assert.equal(electronCapabilityRequiresConfirmation('shell_write'), false);
+  assert.equal(electronCapabilityRequiresConfirmation('shell_start'), true);
+  assert.equal(electronCapabilityRequiresConfirmation('shell_write'), true);
+  assert.equal(electronCapabilityRequiresConfirmation('browser_evaluate'), true);
+  assert.equal(electronCapabilityRequiresConfirmation('execute_code'), true);
 }
 
 {

@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { compileElectronCapabilityTools } from '../../../packages/runtime/src/capability-compiler.ts';
 import {
   dispatchJoiCommand,
   startJoiCommandHost,
@@ -161,6 +162,30 @@ try {
   const readOnlyCapabilityConfig = JSON.parse(await readFile(readOnlyCapabilitySpec.args.at(-1), 'utf8'));
   assert.notEqual(readOnlyCapabilityConfig.token, capabilityConfig.token);
   assert.equal(resolveACPBridgeGrant(readOnlyCapabilityConfig.token).permission_profile, 'read_only');
+
+  const fullAgentSpec = createACPCapabilityMCPServer(
+    tempDir,
+    compileElectronCapabilityTools('danger_full_access', { allowed_capabilities: ['*'] }),
+    'danger_full_access',
+  );
+  assert(fullAgentSpec);
+  const fullAgentChild = spawn(fullAgentSpec.command, fullAgentSpec.args, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env },
+  });
+  children.push(fullAgentChild);
+  const fullAgentClient = mcpClient(fullAgentChild);
+  await fullAgentClient.call('initialize', {
+    protocolVersion: '2025-03-26',
+    capabilities: {},
+    clientInfo: { name: 'joi-full-agent-test', version: '1' },
+  });
+  fullAgentClient.notify('notifications/initialized');
+  const fullAgentInventory = await fullAgentClient.call('tools/list');
+  assert.equal(fullAgentInventory.tools.length, 89);
+  for (const capability of ['tool_search', 'shell_start', 'browser_tabs', 'browser_console', 'browser_network']) {
+    assert(fullAgentInventory.tools.some((tool) => tool.name === capability), `full MCP inventory is missing ${capability}`);
+  }
 
   const outOfGrant = await dispatchJoiCommand(
     { action: 'acp_web', token: capabilityConfig.token, capability: 'shell_command', payload: { cmd: ['id'] } },

@@ -234,8 +234,7 @@ export function electronCapabilityRisk(capability: string): CapabilityToolDefini
 }
 
 export function electronCapabilityRequiresConfirmation(capability: string): boolean {
-  return new Set(['apply_patch', 'browser_click', 'browser_type', 'act_ui', 'memory_write_candidate', 'task_update'])
-    .has(canonicalElectronCapabilityName(capability));
+  return electronCapabilityRisk(capability) !== 'read_only';
 }
 
 function riskAllowed(risk: CapabilityToolDefinition['risk'], maxRisk: CapabilityToolDefinition['risk']): boolean {

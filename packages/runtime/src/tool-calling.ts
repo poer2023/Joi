@@ -20,6 +20,7 @@ export type ToolCall = {
   arguments: Record<string, unknown>;
   raw_arguments?: unknown;
   argument_error?: string;
+  metadata?: Record<string, unknown>;
 };
 
 export type ToolResult = {

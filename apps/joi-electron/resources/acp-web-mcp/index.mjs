@@ -66,7 +66,7 @@ function loadBridgeConfig() {
 }
 
 function validTools(value) {
-  if (!Array.isArray(value) || value.length > 64) return [];
+  if (!Array.isArray(value) || value.length > 256) return [];
   const tools = [];
   const names = new Set();
   for (const item of value) {

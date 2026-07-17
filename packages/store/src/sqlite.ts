@@ -429,6 +429,7 @@ export type PersistedToolCallingResume = {
   model_name: string;
   final_message: string;
   tool_result: PersistedToolResult;
+  tool_results?: PersistedToolResult[];
   model_error?: string;
   usage?: {
     input_tokens?: number;
@@ -551,6 +552,7 @@ type ToolCallingCallbackToolCall = {
   id: string;
   name: string;
   arguments: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
 };
 
 type ToolCallingCallbackToolResult = {
@@ -2045,6 +2047,7 @@ export class JoiSQLiteStore {
   }
 
   createToolCallingEventCallbacks(started: StartedToolCallingChat, emit?: (event: RunEvent) => void): ToolCallingEventCallbacks {
+    const toolStartedAt = new Map<string, number>();
     const append = (input: Omit<RunEventV2Input, 'run_id'> & { run_id?: string }) => {
       const event = this.appendRunEventV2({
         ...input,
@@ -2117,6 +2120,8 @@ export class JoiSQLiteStore {
         });
       },
       onToolCallRequested: (event) => {
+        const capability = callbackToolCapability(event.call);
+        const risk = workflowRiskLevel(capability);
         append({
           event_type: 'tool.call_requested',
           item_type: 'tool_run',
@@ -2124,10 +2129,14 @@ export class JoiSQLiteStore {
           status: 'requested',
           source: 'model_provider',
           visibility: 'tool',
-          payload: { call_id: event.call.id, tool_name: event.call.name, input: event.call.arguments, step: event.step },
+          risk_level: risk,
+          payload: { call_id: event.call.id, capability, tool_name: event.call.name, input: event.call.arguments, step: event.step, risk, side_effect_level: sideEffectLevelForCapability(capability) },
         });
       },
       onToolStarted: (event) => {
+        if (!toolStartedAt.has(event.call.id)) toolStartedAt.set(event.call.id, Date.now());
+        const capability = callbackToolCapability(event.call);
+        const risk = workflowRiskLevel(capability);
         append({
           event_type: 'tool.started',
           item_type: 'tool_run',
@@ -2135,7 +2144,8 @@ export class JoiSQLiteStore {
           status: 'running',
           source: 'tool',
           visibility: 'tool',
-          payload: { call_id: event.call.id, tool_name: event.call.name, input: event.call.arguments, step: event.step },
+          risk_level: risk,
+          payload: { call_id: event.call.id, capability, tool_name: event.call.name, input: event.call.arguments, step: event.step, risk, side_effect_level: sideEffectLevelForCapability(capability) },
         });
       },
       onToolOutputDelta: (event) => {
@@ -2151,6 +2161,9 @@ export class JoiSQLiteStore {
         });
       },
       onToolCompleted: (event) => {
+        const capability = toolResultCapability(event.result);
+        const risk = toolResultRisk(event.result, capability);
+        const durationMs = toolResultDuration(event.result, toolStartedAt.get(event.call.id));
         append({
           event_type: 'tool.completed',
           item_type: 'tool_run',
@@ -2158,11 +2171,16 @@ export class JoiSQLiteStore {
           status: 'completed',
           source: 'tool',
           visibility: 'tool',
+          risk_level: risk,
+          duration_ms: durationMs,
           snapshot: event.result.output,
-          payload: { call_id: event.call.id, tool_name: event.call.name, step: event.step },
+          payload: { call_id: event.call.id, capability, tool_name: event.call.name, step: event.step, risk, side_effect_level: toolResultSideEffect(event.result, capability), duration_ms: durationMs },
         });
       },
       onToolFailed: (event) => {
+        const capability = event.result ? toolResultCapability(event.result) : callbackToolCapability(event.call);
+        const risk = event.result ? toolResultRisk(event.result, capability) : workflowRiskLevel(capability);
+        const durationMs = event.result ? toolResultDuration(event.result, toolStartedAt.get(event.call.id)) : elapsedToolDuration(toolStartedAt.get(event.call.id));
         append({
           event_type: 'tool.failed',
           item_type: 'tool_run',
@@ -2170,12 +2188,17 @@ export class JoiSQLiteStore {
           status: 'failed',
           source: 'tool',
           visibility: 'tool',
+          risk_level: risk,
+          duration_ms: durationMs,
           error: event.error || event.result?.output,
           snapshot: event.result?.output,
-          payload: { call_id: event.call.id, tool_name: event.call.name, step: event.step },
+          payload: { call_id: event.call.id, capability, tool_name: event.call.name, step: event.step, risk, side_effect_level: event.result ? toolResultSideEffect(event.result, capability) : sideEffectLevelForCapability(capability), duration_ms: durationMs },
         });
       },
       onApprovalRequired: (event) => {
+        const capability = toolResultCapability(event.result);
+        const risk = toolResultRisk(event.result, capability);
+        const durationMs = toolResultDuration(event.result, toolStartedAt.get(event.call.id));
         append({
           event_type: 'tool.approval_required',
           item_type: 'tool_run',
@@ -2183,8 +2206,10 @@ export class JoiSQLiteStore {
           status: 'waiting_confirmation',
           source: 'tool',
           visibility: 'approval',
+          risk_level: risk,
+          duration_ms: durationMs,
           snapshot: event.result.output,
-          payload: { call_id: event.call.id, tool_name: event.call.name, step: event.step },
+          payload: { call_id: event.call.id, capability, tool_name: event.call.name, step: event.step, risk, side_effect_level: toolResultSideEffect(event.result, capability), duration_ms: durationMs },
         });
       },
       onUsage: (event) => {
@@ -3625,7 +3650,7 @@ export class JoiSQLiteStore {
 
   finishToolCallingChat(started: StartedToolCallingChat, turn: PersistedToolCallingTurn): ChatResponse {
     const rawResponse = turn.final_message.trim() || '模型没有返回可展示内容。';
-    const toolResults = turn.tool_results || [];
+    const toolResults = (turn.tool_results || []).map(normalizePersistedToolResult);
     const assistantAttachments = toolResults.flatMap((result) => generatedAttachmentForToolOutput(result.output));
     const usage = turn.usage || {};
     const normalizedUsage = canonicalModelUsage(usage);
@@ -3654,11 +3679,11 @@ export class JoiSQLiteStore {
         ? this.get(`SELECT id FROM run_events WHERE run_id=? AND event_type=? AND item_id=? LIMIT 1`, started.run_id, eventType, itemID)
         : this.get(`SELECT id FROM run_events WHERE run_id=? AND event_type=? LIMIT 1`, started.run_id, eventType));
       for (const result of toolResults) {
-        const capability = canonicalCapabilityName(result.name);
+        const capability = toolResultCapability(result);
         const persistedCapabilityID = this.registeredCapabilityID(capability);
         const workflowName = workflowNameForGateway(capability);
         const args = result.arguments || {};
-        const risk = workflowRiskLevel(capability);
+        const risk = toolResultRisk(result, capability);
         const requestedAction = requestedActionForTool(capability, args, result.output);
         const resultWaiting = isWaitingConfirmationToolResult(result);
         const operationID = operationIDForTool(started.product_task_id, capability, args, result.call_id);
@@ -3767,7 +3792,7 @@ export class JoiSQLiteStore {
           `INSERT INTO tool_runs (id, run_id, turn_id, tool_call_id, capability_id, workflow_name, tool_name, purpose,
                                   node_id, assignment_reason, risk_level, side_effect_level, idempotency_key,
                                   status, input, output, output_summary, error_code, error_message, finished_at, completed_at, duration_ms)
-           VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, 'main-node', 'model_tool_call', ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), datetime('now'), datetime('now'), 0)`,
+           VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, 'main-node', 'model_tool_call', ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), datetime('now'), datetime('now'), ?)`,
           toolRunID,
           started.run_id,
           started.turn_id,
@@ -3777,14 +3802,15 @@ export class JoiSQLiteStore {
           result.name,
           requestedAction,
           risk,
-          sideEffectLevelForCapability(capability),
+          toolResultSideEffect(result, capability),
           operationID,
           toolStatus,
           json(args),
           json(result.output),
           toolSummary,
-          toolStatus === 'failed' || toolStatus === 'policy_blocked' ? toolStatus : '',
-          optionalString(result.output?.error) || '',
+          toolResultErrorCode(result, toolStatus),
+          toolResultErrorMessage(result, toolStatus),
+          toolResultDuration(result),
         );
         this.insertRunStep(started.run_id, 'tool_finished', 'Tool runtime finished', { workflow_name: workflowName, tool_run_id: toolRunID, call_id: result.call_id }, result.output);
         const toolTerminalEventType = toolStatus === 'failed' ? 'tool.failed' : toolStatus === 'policy_blocked' ? 'tool.policy_blocked' : 'tool.completed';
@@ -4094,7 +4120,7 @@ export class JoiSQLiteStore {
     const prefixHash = prompt.prefix_hash;
     const dynamicTailHash = prompt.dynamic_tail_hash;
     const promptCacheKey = prompt.prompt_cache_key;
-    const toolResults = turn.tool_results || [];
+    const toolResults = (turn.tool_results || []).map(normalizePersistedToolResult);
     const usage = turn.usage || {};
     const normalizedUsage = canonicalModelUsage(usage);
     const usageStatus = turn.usage_status || usageStatusForUsage(normalizedUsage);
@@ -4288,11 +4314,11 @@ export class JoiSQLiteStore {
       this.insertTurnItem(runID, turnID, itemSeq++, 'message', 'user', '', '', {}, message, {}, 'completed', { source: 'desktop_user' });
 
       for (const result of toolResults) {
-        const capability = canonicalCapabilityName(result.name);
+        const capability = toolResultCapability(result);
         const persistedCapabilityID = this.registeredCapabilityID(capability);
         const workflowName = workflowNameForGateway(capability);
         const args = result.arguments || {};
-        const risk = workflowRiskLevel(capability);
+        const risk = toolResultRisk(result, capability);
         const requestedAction = requestedActionForTool(capability, args, result.output);
         const resultWaiting = isWaitingConfirmationToolResult(result);
         const operationID = operationIDForTool(productTask?.id, capability, args, result.call_id);
@@ -4395,7 +4421,7 @@ export class JoiSQLiteStore {
           `INSERT INTO tool_runs (id, run_id, turn_id, tool_call_id, capability_id, workflow_name, tool_name, purpose,
                                   node_id, assignment_reason, risk_level, side_effect_level, idempotency_key,
                                   status, input, output, output_summary, error_code, error_message, finished_at, completed_at, duration_ms)
-           VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, 'main-node', 'model_tool_call', ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), datetime('now'), datetime('now'), 0)`,
+           VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, 'main-node', 'model_tool_call', ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), datetime('now'), datetime('now'), ?)`,
           toolRunID,
           runID,
           turnID,
@@ -4405,14 +4431,15 @@ export class JoiSQLiteStore {
           result.name,
           requestedAction,
           risk,
-          sideEffectLevelForCapability(capability),
+          toolResultSideEffect(result, capability),
           operationID,
           toolStatus,
           json(args),
           json(result.output),
           toolSummary,
-          toolStatus === 'failed' || toolStatus === 'policy_blocked' ? toolStatus : '',
-          optionalString(result.output?.error) || '',
+          toolResultErrorCode(result, toolStatus),
+          toolResultErrorMessage(result, toolStatus),
+          toolResultDuration(result),
         );
         this.insertRunStep(runID, 'tool_finished', 'Tool runtime finished', { workflow_name: workflowName, tool_run_id: toolRunID, call_id: result.call_id }, result.output);
         this.insertRunEvent(runID, turnID, this.nextRunEventSeq(runID), toolStatus === 'failed' ? 'tool.failed' : toolStatus === 'policy_blocked' ? 'tool.policy_blocked' : 'tool.completed', {
@@ -8790,8 +8817,8 @@ export class JoiSQLiteStore {
               cr.risk_level, cr.input, COALESCE(r.conversation_id, '') AS conversation_id,
               COALESCE(r.user_message_id, '') AS user_message_id, COALESCE(m.content, '') AS user_message,
               COALESCE(r.selected_agent_id, '') AS agent_id, COALESCE(r.selected_model_id, '') AS model_id,
-              COALESCE(models.model_name, r.selected_model_id, '') AS model_name,
-              COALESCE(models.provider, 'openai_compatible') AS provider
+              COALESCE(NULLIF(json_extract(r.route_result, '$.model'), ''), models.model_name, r.selected_model_id, '') AS model_name,
+              COALESCE(NULLIF(json_extract(r.route_result, '$.provider'), ''), models.provider, 'openai_compatible') AS provider
        FROM confirmation_requests cr
        JOIN runs r ON r.id=cr.run_id
        LEFT JOIN messages m ON m.id=r.user_message_id
@@ -8827,10 +8854,20 @@ export class JoiSQLiteStore {
     const modelError = resume.model_error?.trim() || '';
     const responseBase = sanitizeAssistantConversationText(request.user_message, baseResponse);
     const response = modelError ? `${responseBase}\n\n最终模型回复失败：${modelError}` : responseBase;
-    const toolResult = resume.tool_result;
+    const toolResult = normalizePersistedToolResult(resume.tool_result);
+    const continuationToolResults = (resume.tool_results || [])
+      .map(normalizePersistedToolResult)
+      .filter((result, index, results) => (
+        Boolean(result.call_id)
+        && result.call_id !== toolResult.call_id
+        && results.findIndex((candidate) => candidate.call_id === result.call_id) === index
+      ));
+    const allToolResults = [toolResult, ...continuationToolResults];
+    const toolArgs = toolResult.arguments || {};
     const capability = canonicalCapabilityName(request.capability_id || toolResult.name);
     const workflowName = workflowNameForGateway(capability);
     const toolRunID = `toolrun_${newID()}`;
+    const resumedToolRunIDs = [toolRunID];
     const modelCallID = `mcall_${newID()}`;
     const assistantMessageID = `msg_${newID()}`;
     const usage = resume.usage || {};
@@ -8841,7 +8878,7 @@ export class JoiSQLiteStore {
     const costEstimate = this.estimateModelUsageCost(resumeProvider, resumeModelName, normalizedUsage);
     const runMetadata = parseObject(this.get(`SELECT metadata FROM runs WHERE id=?`, request.run_id)?.metadata);
     const productTaskID = optionalString(runMetadata.product_task_id);
-    const operationID = optionalString(request.input.operation_id) || operationIDForTool(productTaskID, capability, request.input, request.call_id);
+    const operationID = optionalString(request.input.operation_id) || operationIDForTool(productTaskID, capability, toolArgs, request.call_id);
     const toolStatus = toolRunStatusForOutput(toolResult.output);
     const toolSummary = summaryForToolOutput(toolResult.output, toolStatus);
     let productTask: ProductTask | undefined;
@@ -8862,7 +8899,7 @@ export class JoiSQLiteStore {
                                 idempotency_key, status, input, output, output_summary, error_code, error_message,
                                 finished_at, completed_at, duration_ms)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'main-node', 'confirmation_resume', ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''),
-                 datetime('now'), datetime('now'), 0)`,
+                 datetime('now'), datetime('now'), ?)`,
         toolRunID,
         request.run_id,
         request.turn_id,
@@ -8872,15 +8909,16 @@ export class JoiSQLiteStore {
         capability,
         request.requested_action || `Execute ${capability}`,
         request.confirmation_id,
-        workflowRiskLevel(capability),
-        sideEffectLevelForCapability(capability),
+        toolResultRisk(toolResult, capability),
+        toolResultSideEffect(toolResult, capability),
         operationID,
         toolStatus,
-        json(request.input),
+        json(toolArgs),
         json(toolResult.output),
         toolSummary,
-        toolStatus === 'failed' || toolStatus === 'policy_blocked' ? toolStatus : '',
-        optionalString(toolResult.output?.error) || '',
+        toolResultErrorCode(toolResult, toolStatus),
+        toolResultErrorMessage(toolResult, toolStatus),
+        toolResultDuration(toolResult),
       );
       this.exec(
         `UPDATE turn_items
@@ -8945,15 +8983,79 @@ export class JoiSQLiteStore {
         run_id: request.run_id,
         capability,
         requested_action: request.requested_action || `Execute ${capability}`,
-        input: request.input,
+        input: toolArgs,
         output: { ...toolResult.output, resumed: true },
         status: toolStatus === 'failed' || toolStatus === 'policy_blocked' ? 'failed' : 'done',
         tool_run_id: toolRunID,
         operation_id: operationID,
       });
+      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.output_delta', { item_type: 'tool_run', item_id: request.call_id, tool_run_id: toolRunID, call_id: request.call_id, tool_name: capability, status: toolStatus, output: toolResult.output, visibility: 'tool', source: 'tool', resumed: true });
+      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), toolStatus === 'failed' ? 'tool.failed' : toolStatus === 'policy_blocked' ? 'tool.policy_blocked' : 'tool.completed', { item_type: 'tool_run', item_id: request.call_id, tool_run_id: toolRunID, call_id: request.call_id, tool_name: capability, status: toolStatus, summary: toolSummary, output: toolResult.output, visibility: 'tool', source: 'tool', resumed: true });
+      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.finished', { call_id: request.call_id, tool_name: capability, status: toolStatus, output: toolResult.output, visibility: 'trace_only', resumed: true });
+
+      for (const result of continuationToolResults) {
+        const continuationCapability = toolResultCapability(result);
+        const persistedCapabilityID = this.registeredCapabilityID(continuationCapability);
+        const continuationWorkflowName = workflowNameForGateway(continuationCapability);
+        const continuationArgs = result.arguments || {};
+        const continuationStatus = toolRunStatusForOutput(result.output);
+        const continuationSummary = summaryForToolOutput(result.output, continuationStatus);
+        const continuationRisk = toolResultRisk(result, continuationCapability);
+        const continuationSideEffect = toolResultSideEffect(result, continuationCapability);
+        const continuationRequestedAction = requestedActionForTool(continuationCapability, continuationArgs, result.output);
+        const continuationOperationID = operationIDForTool(productTaskID, continuationCapability, continuationArgs, result.call_id);
+        const continuationToolRunID = `toolrun_${newID()}`;
+        resumedToolRunIDs.push(continuationToolRunID);
+        this.insertRunStep(request.run_id, 'capability_requested', 'Approval continuation requested read-only capability', { agent_id: request.agent_id, call_id: result.call_id, tool_name: result.name, resumed: true }, { capability: continuationCapability, inputs: continuationArgs, risk: continuationRisk, operation_id: continuationOperationID });
+        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.call_requested', { item_type: 'tool_run', item_id: result.call_id, call_id: result.call_id, tool_name: result.name, capability: continuationCapability, status: 'requested', visibility: 'tool', source: 'model_provider', input: continuationArgs, risk: continuationRisk, resumed: true });
+        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.started', { item_type: 'tool_run', item_id: result.call_id, tool_run_id: continuationToolRunID, call_id: result.call_id, tool_name: result.name, capability: continuationCapability, status: 'running', visibility: 'tool', source: 'tool', resumed: true });
+        this.exec(
+          `INSERT INTO tool_runs (id, run_id, turn_id, tool_call_id, capability_id, workflow_name, tool_name, purpose,
+                                  approval_request_id, node_id, assignment_reason, risk_level, side_effect_level,
+                                  idempotency_key, status, input, output, output_summary, error_code, error_message,
+                                  finished_at, completed_at, duration_ms)
+           VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, 'main-node', 'approval_resume_continuation', ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''),
+                   datetime('now'), datetime('now'), ?)`,
+          continuationToolRunID,
+          request.run_id,
+          request.turn_id,
+          result.call_id,
+          persistedCapabilityID,
+          continuationWorkflowName,
+          result.name,
+          continuationRequestedAction,
+          request.confirmation_id,
+          continuationRisk,
+          continuationSideEffect,
+          continuationOperationID,
+          continuationStatus,
+          json(continuationArgs),
+          json(result.output),
+          continuationSummary,
+          toolResultErrorCode(result, continuationStatus),
+          toolResultErrorMessage(result, continuationStatus),
+          toolResultDuration(result),
+        );
+        this.insertRunStep(request.run_id, 'tool_finished', 'Approval continuation tool finished', { workflow_name: continuationWorkflowName, tool_run_id: continuationToolRunID, call_id: result.call_id, resumed: true }, result.output);
+        this.insertTurnItem(request.run_id, request.turn_id, this.nextTurnItemSeq(request.run_id), 'tool_call', 'assistant', result.call_id, result.name, continuationArgs, '', {}, 'completed', { capability: continuationCapability, resumed_from_confirmation_id: request.confirmation_id });
+        this.insertTurnItem(request.run_id, request.turn_id, this.nextTurnItemSeq(request.run_id), 'tool_output', 'tool', result.call_id, result.name, {}, JSON.stringify(result.output), result.output, continuationStatus === 'failed' || continuationStatus === 'policy_blocked' ? 'failed' : 'completed', { tool_run_id: continuationToolRunID, capability: continuationCapability, resumed_from_confirmation_id: request.confirmation_id });
+        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.output_delta', { item_type: 'tool_run', item_id: result.call_id, tool_run_id: continuationToolRunID, call_id: result.call_id, tool_name: result.name, capability: continuationCapability, status: continuationStatus, output: result.output, visibility: 'tool', source: 'tool', resumed: true });
+        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), continuationStatus === 'failed' ? 'tool.failed' : continuationStatus === 'policy_blocked' ? 'tool.policy_blocked' : 'tool.completed', { item_type: 'tool_run', item_id: result.call_id, tool_run_id: continuationToolRunID, call_id: result.call_id, tool_name: result.name, capability: continuationCapability, status: continuationStatus, summary: continuationSummary, output: result.output, visibility: 'tool', source: 'tool', resumed: true });
+        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.finished', { call_id: result.call_id, tool_name: result.name, capability: continuationCapability, status: continuationStatus, output: result.output, visibility: 'trace_only', resumed: true });
+        this.recordProductTaskToolCheckpoint(productTaskID, {
+          run_id: request.run_id,
+          capability: continuationCapability,
+          requested_action: continuationRequestedAction,
+          input: continuationArgs,
+          output: { ...result.output, resumed: true },
+          status: continuationStatus === 'failed' || continuationStatus === 'policy_blocked' ? 'failed' : 'done',
+          tool_run_id: continuationToolRunID,
+          operation_id: continuationOperationID,
+        });
+      }
       const persistedToolRunCount = this.persistedToolRunCountForRun(request.run_id);
       if (modelError) {
-        this.insertRunStep(request.run_id, 'model_call_failed', 'Model call failed after approval resume', { agent_id: request.agent_id, model_id: resumeModelName, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resumeProvider, model: resumeModelName, resumed: true, error: modelError, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_ids: [toolRunID], tool_run_count: persistedToolRunCount }, 'failed');
+        this.insertRunStep(request.run_id, 'model_call_failed', 'Model call failed after approval resume', { agent_id: request.agent_id, model_id: resumeModelName, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resumeProvider, model: resumeModelName, resumed: true, error: modelError, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_ids: resumedToolRunIDs, tool_run_count: persistedToolRunCount }, 'failed');
 	        this.exec(
 	          `INSERT INTO model_calls (id, run_id, agent_id, model_id, prompt_assembly_id, provider, model_name,
                                       prompt_cache_key, prefix_hash, dynamic_tail_hash, input_tokens, output_tokens,
@@ -8983,7 +9085,7 @@ export class JoiSQLiteStore {
 	          modelError,
 	          json({ responses: resume.model_responses || [], error: modelError }),
 	          json({ status: 'failed', error: modelError, usage_status: 'failed' }),
-	          json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, tool_run_count: persistedToolRunCount, error: modelError, estimated_cost: roundCost(costEstimate) }),
+	          json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, tool_run_ids: resumedToolRunIDs, tool_run_count: persistedToolRunCount, error: modelError, estimated_cost: roundCost(costEstimate) }),
 	        );
         this.exec(
           `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
@@ -9010,9 +9112,6 @@ export class JoiSQLiteStore {
 	          request.turn_id,
 	        );
 	        this.markProductTaskFailed(productTaskID, request.run_id, new Error(modelError), 'failed');
-	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.output_delta', { item_type: 'tool_run', item_id: request.call_id, tool_run_id: toolRunID, call_id: request.call_id, tool_name: capability, status: toolStatus, output: toolResult.output, visibility: 'tool', source: 'tool', resumed: true });
-	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), toolStatus === 'failed' ? 'tool.failed' : toolStatus === 'policy_blocked' ? 'tool.policy_blocked' : 'tool.completed', { item_type: 'tool_run', item_id: request.call_id, tool_run_id: toolRunID, call_id: request.call_id, tool_name: capability, status: toolStatus, summary: toolSummary, output: toolResult.output, visibility: 'tool', source: 'tool', resumed: true });
-	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.finished', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, visibility: 'trace_only', resumed: true });
 	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'assistant.completed', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response }, status: 'failed', visibility: 'chat', source: 'store', resumed: true, error: modelError });
 	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'message.delta', { run_id: request.run_id, turn_id: request.turn_id, delta: response, status: 'failed', visibility: 'trace_only', resumed: true, error: modelError });
 	        this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'run.failed', { run_id: request.run_id, turn_id: request.turn_id, status: 'failed', terminal: true, error: 'approval_resume_model_failed', message: modelError, resumed: true });
@@ -9021,7 +9120,7 @@ export class JoiSQLiteStore {
         }
         return;
       }
-      this.insertRunStep(request.run_id, 'model_call_finished', 'Model call finished', { agent_id: request.agent_id, model_id: resumeModelName, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resumeProvider, model: resumeModelName, real_model: resumeProvider !== 'mock_provider', resumed: true, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_ids: [toolRunID], tool_run_count: persistedToolRunCount });
+      this.insertRunStep(request.run_id, 'model_call_finished', 'Model call finished', { agent_id: request.agent_id, model_id: resumeModelName, prompt_assembly_id: optionalString(promptAssembly?.id) || '' }, { model_call_id: modelCallID, provider: resumeProvider, model: resumeModelName, real_model: resumeProvider !== 'mock_provider', resumed: true, ...normalizedUsage, estimated_cost: roundCost(costEstimate), tool_run_ids: resumedToolRunIDs, tool_run_count: persistedToolRunCount });
       this.insertRunStep(request.run_id, 'agent_output_parsed', 'Agent output parsed', { turn: 1, resumed: true }, { repaired: false, output_type: 'final_answer' });
       this.insertRunStep(request.run_id, 'response_generated', 'Response generated', {}, { response, resumed: true });
 	      this.exec(
@@ -9052,7 +9151,7 @@ export class JoiSQLiteStore {
 	        usageStatus,
 	        json({ responses: resume.model_responses || [] }),
 	        json({ status: 'completed', usage_status: usageStatus }),
-	        json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, tool_run_count: persistedToolRunCount, usage_status: usageStatus, estimated_cost: roundCost(costEstimate) }),
+	        json({ source: 'electron_ts_tool_calling_resume', resumed_from_confirmation_id: request.confirmation_id, tool_run_id: toolRunID, tool_run_ids: resumedToolRunIDs, tool_run_count: persistedToolRunCount, usage_status: usageStatus, estimated_cost: roundCost(costEstimate) }),
 	      );
       this.exec(
         `INSERT INTO messages (id, conversation_id, role, content, attachments, metadata, created_at)
@@ -9077,9 +9176,6 @@ export class JoiSQLiteStore {
 	         WHERE id=?`,
 	        request.turn_id,
 	      );
-	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.output_delta', { item_type: 'tool_run', item_id: request.call_id, tool_run_id: toolRunID, call_id: request.call_id, tool_name: capability, status: toolStatus, output: toolResult.output, visibility: 'tool', source: 'tool', resumed: true });
-	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), toolStatus === 'failed' ? 'tool.failed' : toolStatus === 'policy_blocked' ? 'tool.policy_blocked' : 'tool.completed', { item_type: 'tool_run', item_id: request.call_id, tool_run_id: toolRunID, call_id: request.call_id, tool_name: capability, status: toolStatus, summary: toolSummary, output: toolResult.output, visibility: 'tool', source: 'tool', resumed: true });
-	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'tool.finished', { call_id: request.call_id, tool_name: capability, status: 'completed', output: toolResult.output, visibility: 'trace_only', resumed: true });
 	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'assistant.delta', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response, stream_source: 'resume_final_chunk' }, status: 'completed', visibility: 'chat', source: 'store', resumed: true });
 	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'assistant.completed', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'assistant_message', item_id: assistantMessageID, delta: { text: response }, status: 'completed', visibility: 'chat', source: 'store', resumed: true, terminal: true });
 	      this.insertRunEvent(request.run_id, request.turn_id, this.nextRunEventSeq(request.run_id), 'usage.recorded', { run_id: request.run_id, turn_id: request.turn_id, item_type: 'model', item_id: modelCallID, status: usageStatus, visibility: 'trace_only', source: 'store', usage: normalizedUsage, usage_status: usageStatus, estimated_cost: roundCost(costEstimate), resumed: true });
@@ -9092,7 +9188,7 @@ export class JoiSQLiteStore {
         message_id: assistantMessageID,
         response,
         waiting_confirmation: false,
-        tool_results: [toolResult],
+        tool_results: allToolResults,
         runtime_status: 'completed',
       });
       if (productTaskID) {
@@ -15234,14 +15330,19 @@ export class JoiSQLiteStore {
          description=excluded.description,
          system_prompt=excluded.system_prompt,
          capabilities=excluded.capabilities,
+         metadata=json_patch(COALESCE(agents.metadata, '{}'), excluded.metadata),
          enabled=1,
          updated_at=datetime('now')`,
       personaID,
       name,
       description,
       systemPrompt,
-      json(normalizeAgentCapabilityList(capabilities)),
-      json({ source: 'persona_messenger', ai_identity_label: '项目人格' }),
+      json(personaAgentExecutionCapabilities(personaID, capabilities)),
+      json({
+        source: 'persona_messenger',
+        ai_identity_label: '项目人格',
+        capability_policy: personaID === 'per_joi_desktop' ? 'all_registered' : 'persona_scoped',
+      }),
     );
   }
 
@@ -15451,9 +15552,11 @@ export class JoiSQLiteStore {
   private ensureApprovalActorAllowed(approvalID: string, runID: string, riskLevel: string, actorID: string): void {
     if (!isHighRiskApproval(riskLevel)) return;
     const roomRow = this.get(
-      `SELECT r.id AS room_id
+      `SELECT COALESCE(direct_room.id, metadata_room.id) AS room_id
        FROM runs rn
-       LEFT JOIN rooms r ON r.conversation_id=rn.conversation_id
+       LEFT JOIN conversations c ON c.id=rn.conversation_id
+       LEFT JOIN rooms direct_room ON direct_room.conversation_id=rn.conversation_id
+       LEFT JOIN rooms metadata_room ON metadata_room.id=json_extract(COALESCE(c.metadata, '{}'), '$.room_id')
        WHERE rn.id=?
        LIMIT 1`,
       runID,
@@ -18266,8 +18369,84 @@ function memoryProfileVersionFor(results: MemorySearchResult[]): string {
   return `electron_profile_${hashText(`${results.length}:${source}`).slice(0, 12)}`;
 }
 
+function normalizePersistedToolResult(result: PersistedToolResult): PersistedToolResult {
+  const embedded = embeddedPersistedToolOutput(result.output);
+  if (Object.keys(embedded).length === 0) return result;
+  return {
+    ...result,
+    output: {
+      ...result.output,
+      ...embedded,
+      raw_output: result.output.raw_output ?? embedded.raw_output,
+    },
+  };
+}
+
+function embeddedPersistedToolOutput(output: Record<string, unknown>): Record<string, unknown> {
+  const rawOutput = toolOutputRecord(output.raw_output);
+  const rawResult = toolOutputRecord(rawOutput.result);
+  for (const candidate of [output.structuredContent, rawOutput.structuredContent, rawResult.structuredContent]) {
+    const record = toolOutputRecord(candidate);
+    if (optionalString(record.status) || optionalString(record.capability)) return record;
+  }
+  const content = Array.isArray(rawResult.content) ? rawResult.content : Array.isArray(rawOutput.content) ? rawOutput.content : [];
+  for (const item of content) {
+    const record = toolOutputRecord(item);
+    if (typeof record.text !== 'string') continue;
+    const parsed = toolOutputRecord(record.text);
+    if (optionalString(parsed.status) || optionalString(parsed.capability)) return parsed;
+  }
+  return {};
+}
+
 function isWaitingConfirmationToolResult(result: PersistedToolResult): boolean {
-  return result.output?.status === 'waiting_confirmation';
+  const normalized = normalizePersistedToolResult(result);
+  return normalized.output?.status === 'waiting_confirmation';
+}
+
+function callbackToolCapability(call: ToolCallingCallbackToolCall): string {
+  const declared = optionalString(call.metadata?.capability) || call.name;
+  return canonicalCapabilityName(declared);
+}
+
+function toolResultCapability(result: ToolCallingCallbackToolResult): string {
+  const normalized = normalizePersistedToolResult(result as PersistedToolResult);
+  return canonicalCapabilityName(optionalString(normalized.output.capability) || normalized.name);
+}
+
+function toolResultRisk(result: ToolCallingCallbackToolResult, capability: string): string {
+  const normalized = normalizePersistedToolResult(result as PersistedToolResult);
+  const explicit = optionalString(normalized.output.risk_level) || optionalString(normalized.output.risk);
+  return explicit ? normalizeLogRiskLevel(explicit) : workflowRiskLevel(capability);
+}
+
+function toolResultSideEffect(result: ToolCallingCallbackToolResult, capability: string): string {
+  const normalized = normalizePersistedToolResult(result as PersistedToolResult);
+  return optionalString(normalized.output.side_effect_level) || sideEffectLevelForCapability(capability);
+}
+
+function elapsedToolDuration(startedAt?: number): number {
+  return startedAt === undefined ? 0 : Math.max(1, Date.now() - startedAt);
+}
+
+function toolResultDuration(result: ToolCallingCallbackToolResult, startedAt?: number): number {
+  const normalized = normalizePersistedToolResult(result as PersistedToolResult);
+  const explicit = optionalNumber(normalized.output.duration_ms);
+  return explicit === undefined ? elapsedToolDuration(startedAt) : Math.max(0, Math.round(explicit));
+}
+
+function toolResultErrorCode(result: PersistedToolResult, status: string): string {
+  if (status !== 'failed' && status !== 'policy_blocked') return '';
+  return optionalString(result.output.code) || optionalString(result.output.error_code) || status;
+}
+
+function toolResultErrorMessage(result: PersistedToolResult, status: string): string {
+  if (status !== 'failed' && status !== 'policy_blocked') return '';
+  return optionalString(result.output.error)
+    || optionalString(result.output.error_message)
+    || optionalString(result.output.policy_reason)
+    || optionalString(result.output.summary)
+    || `${result.name} ${status}`;
 }
 
 function confirmationMessageForToolResult(result: PersistedToolResult): string {
@@ -18984,69 +19163,6 @@ function resolveToolMemoryCandidateScope(
   return { scope_type: 'global', scope_id: '' };
 }
 
-const defaultPersonaAgentCapabilities = [
-  'memory_recall',
-  'memory_write_candidate',
-  'session_search',
-  'session_summary',
-  'session_branch',
-  'session_compact',
-  'delegate_task',
-  'project_list',
-  'skills_list',
-  'skill_view',
-  'tool_search',
-  'task_list',
-  'task_view',
-  'task_update',
-  'workspace_search',
-  'file_read',
-  'file_analyze',
-  'image_generate',
-  'image_analyze',
-  'video_generate',
-  'video_analyze',
-  'text_to_speech',
-  'speech_transcribe',
-  'assistant_workspace',
-  'assistant_action',
-  'lsp_definition',
-  'lsp_references',
-  'lsp_diagnostics',
-  'debugger_attach',
-  'debugger_breakpoint',
-  'debugger_step',
-  'debugger_evaluate',
-  'debugger_stop',
-  'web_research',
-  'shell_command',
-  'test_command',
-  'shell_start',
-  'shell_write',
-  'shell_output',
-  'shell_kill',
-  'computer_observe',
-  'find_roots',
-  'observe_ui',
-  'search_ui',
-  'expand_ui',
-  'inspect_ui',
-  'read_text',
-  'wait_for',
-  'browser_observe',
-  'browser_navigate',
-  'desktop_app_list',
-  'desktop_app_inspect',
-  'system_health_check',
-  'server_diagnose',
-  'apply_patch',
-  'browser_click',
-  'browser_type',
-  'act_ui',
-  'request_user_input',
-  'automation_update',
-];
-
 const personaUiOnlyCapabilities = new Set([
   'chat',
   'runs',
@@ -19058,17 +19174,28 @@ const personaUiOnlyCapabilities = new Set([
 
 function normalizeAgentCapabilityList(values: string[]): string[] {
   const normalized = values.map((value) => value.trim()).filter(Boolean);
-  if (normalized.includes('*')) return ['*'];
-  const toolRequest = normalized.includes('tool_request');
+  if (normalized.includes('*') || normalized.includes('tool_request')) return ['*'];
   const capabilities = normalized
     .filter((value) => value !== 'tool_request' && !personaUiOnlyCapabilities.has(value))
     .map((value) => value === 'memory' ? 'memory_recall' : value);
-  if (toolRequest) capabilities.push(...defaultPersonaAgentCapabilities);
   return [...new Set(capabilities)];
+}
+
+function personaAgentExecutionCapabilities(personaID: string, personaCapabilities: string[]): string[] {
+  // The authored Joi persona describes identity and product affordances. It is
+  // deliberately not an execution allowlist: the default Joi Agent can request
+  // every registered tool, while the compiler and permission profile still
+  // decide what is exposed and executable for the current run.
+  if (personaID.trim() === 'per_joi_desktop') return ['*'];
+  return normalizeAgentCapabilityList(personaCapabilities);
 }
 
 function canonicalCapabilityName(capabilityID: string): string {
   const normalized = capabilityID.trim();
+  const delegatedMCP = normalized.match(/^(?:mcp[._])?joi_capabilities[._]([A-Za-z0-9_.-]+)$/i);
+  if (delegatedMCP?.[1]) return canonicalCapabilityName(delegatedMCP[1]);
+  const delegatedWebMCP = normalized.match(/^(?:mcp[._])?joi_web[._](web_search|web_extract)$/i);
+  if (delegatedWebMCP?.[1]) return 'web_research';
   switch (normalized) {
     case 'server_diagnose_v1':
     case 'server_diagnose_self':

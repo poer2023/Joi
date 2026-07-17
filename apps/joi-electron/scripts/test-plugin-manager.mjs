@@ -61,6 +61,20 @@ try {
   assert(scopedRuntime.capability_allowlist.some((item) => item.capability_id === 'mcp.joi_capabilities.browser_click'));
   assert(!scopedRuntime.capability_allowlist.some((item) => item.capability_id === 'mcp.joi_capabilities.x_search'));
 
+  const fullAgentRuntime = providerRuntimeConfig(
+    provider,
+    process.cwd(),
+    [process.cwd()],
+    'danger_full_access',
+    userDataDir,
+    ['*'],
+  );
+  for (const capability of ['tool_search', 'file_read', 'workspace_search', 'shell_start', 'browser_tabs', 'browser_console', 'browser_network']) {
+    assert(fullAgentRuntime.joi_capability_tools.includes(capability), `full agent bridge is missing ${capability}`);
+    assert(fullAgentRuntime.capability_allowlist.some((item) => item.capability_id === `mcp.joi_capabilities.${capability}`));
+  }
+  assert(!fullAgentRuntime.joi_capability_tools.includes('x_search'), 'planned tools must not be exposed as executable');
+
   const workspaceWriteRuntime = providerRuntimeConfig(provider, process.cwd(), [process.cwd()], 'workspace_write', userDataDir);
   assert(workspaceWriteRuntime.capability_allowlist.some((item) => item.operation === 'workspace_write'));
   assert(workspaceWriteRuntime.capability_allowlist.some((item) => item.command_policy === 'workspace_test'));

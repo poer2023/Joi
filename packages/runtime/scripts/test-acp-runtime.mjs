@@ -135,22 +135,26 @@ assert.equal(result.tool_results[0]?.output.raw_output?.prompt_has_tool_search_f
 assert.equal(result.tool_results[0]?.output.raw_output?.prompt_has_joi_capability_names, true);
 assert.equal(result.tool_results[0]?.output.raw_output?.prompt_has_joi_capability_discovery, true);
 assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-joi-web')?.output.status, 'succeeded');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-unknown-mcp')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-spoofed-web-title')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-web-bad-args')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-workspace-write')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-outside-write')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-delete-diff')?.output.status, 'failed');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-unknown-mcp')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-spoofed-web-title')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-web-bad-args')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-workspace-write')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-outside-write')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-delete-diff')?.output.status, 'policy_blocked');
 assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-safe-command')?.output.status, 'succeeded');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-sensitive-workspace-read')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-test-command')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-dangerous-command')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-wrapped-dangerous-command')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-test-command-smuggle')?.output.status, 'failed');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-sensitive-workspace-read')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-test-command')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-dangerous-command')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-wrapped-dangerous-command')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-test-command-smuggle')?.output.status, 'policy_blocked');
 assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-permission-read')?.output.status, 'succeeded');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-permission-outside-write')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-permission-network')?.output.status, 'failed');
-assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-no-reject-option')?.output.status, 'failed');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-permission-outside-write')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-permission-network')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-no-reject-option')?.output.status, 'policy_blocked');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-read')?.output.capability, 'file_read');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-read')?.output.policy_allowed, true);
+assert(Number(result.tool_results.find((tool) => tool.call_id === 'fake-read')?.output.duration_ms) >= 1);
+assert.match(String(result.tool_results.find((tool) => tool.call_id === 'fake-dangerous-command')?.output.error), /command_/);
 assert.equal(result.model_responses[0]?.requested_model, 'fake-model[medium]');
 assert.equal(result.model_responses[0]?.effective_model, 'fake-model[medium]');
 assert(events.some(([type, model]) => type === 'model' && model === 'fake-model[medium]'));
@@ -205,15 +209,15 @@ const workspaceWriteResult = await runACPChatTurn({
   messages: [{ role: 'user', content: 'Exercise workspace-write permission policy.' }],
 });
 assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-workspace-write')?.output.status, 'succeeded');
-assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-outside-write')?.output.status, 'failed');
-assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-delete-diff')?.output.status, 'failed');
+assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-outside-write')?.output.status, 'policy_blocked');
+assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-delete-diff')?.output.status, 'policy_blocked');
 assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-test-command')?.output.status, 'succeeded');
-assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-dangerous-command')?.output.status, 'failed');
-assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-wrapped-dangerous-command')?.output.status, 'failed');
-assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-test-command-smuggle')?.output.status, 'failed');
+assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-dangerous-command')?.output.status, 'policy_blocked');
+assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-wrapped-dangerous-command')?.output.status, 'policy_blocked');
+assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-test-command-smuggle')?.output.status, 'policy_blocked');
 assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-permission-read')?.output.status, 'succeeded');
-assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-permission-outside-write')?.output.status, 'failed');
-assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-permission-network')?.output.status, 'failed');
+assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-permission-outside-write')?.output.status, 'policy_blocked');
+assert.equal(workspaceWriteResult.tool_results.find((tool) => tool.call_id === 'fake-permission-network')?.output.status, 'policy_blocked');
 
 const fullAccessEvents = [];
 const fullAccessResult = await runACPChatTurn({
@@ -236,8 +240,9 @@ assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake
 assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-delete-diff')?.output.status, 'succeeded');
 assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-safe-command')?.output.status, 'succeeded');
 assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-test-command')?.output.status, 'succeeded');
-assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-dangerous-command')?.output.status, 'failed');
-assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-wrapped-dangerous-command')?.output.status, 'failed');
+assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-dangerous-command')?.output.status, 'policy_blocked');
+assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-wrapped-dangerous-command')?.output.status, 'policy_blocked');
+assert.match(String(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-dangerous-command')?.output.error), /command_blacklisted_by_full_access_blacklist_v1/);
 assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-permission-read')?.output.status, 'succeeded');
 assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-permission-outside-write')?.output.status, 'succeeded');
 assert.equal(fullAccessResult.tool_results.find((tool) => tool.call_id === 'fake-permission-network')?.output.status, 'succeeded');
@@ -280,7 +285,7 @@ try {
     system_message: 'Keep output exact.',
     messages: [{ role: 'user', content: 'Exercise symlink boundary policy.' }],
   });
-  assert.equal(symlinkResult.tool_results.find((tool) => tool.call_id === 'fake-symlink-escape-write')?.output.status, 'failed');
+  assert.equal(symlinkResult.tool_results.find((tool) => tool.call_id === 'fake-symlink-escape-write')?.output.status, 'policy_blocked');
 } finally {
   await rm(symlinkRoot, { recursive: true, force: true });
 }
