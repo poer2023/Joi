@@ -694,6 +694,35 @@ try {
      VALUES ('art_checkpoint_prd', 'document', 'Apollo PRD', 'checkpoint artifact smoke', 'run_checkpoint_done', ?, 'active', datetime('now', '-35 minutes'), datetime('now', '-35 minutes'))`,
     created.room.conversation_id,
   );
+  store['exec'](
+    `INSERT INTO runs (id, conversation_id, status, selected_agent_id, route_result, terminal_reason, created_at, started_at, metadata)
+     VALUES ('run_checkpoint_recovery', ?, 'needs_recovery', ?, '{}', 'desktop restarted during task', datetime('now', '-30 minutes'), datetime('now', '-30 minutes'), '{}')`,
+    created.room.conversation_id,
+    rolledBack.id,
+  );
+  store.appendRunEventV2({
+    id: 'evt_checkpoint_recovery_required',
+    run_id: 'run_checkpoint_recovery',
+    event_type: 'run.recovery_required',
+    status: 'needs_recovery',
+    source: 'startup_recovery',
+    visibility: 'inline_status',
+    payload: { recovery_status: 'recoverable', reason: 'desktop restarted during task' },
+  });
+  store['exec'](
+    `INSERT INTO product_tasks (id, title, description, status, latest_run_id, source_conversation_id, source_run_id, progress_percent, metadata)
+     VALUES ('ptask_checkpoint_active', '继续 Apollo 验收', 'Today active task fixture', 'running', 'run_checkpoint_recovery', ?, 'run_checkpoint_recovery', 60, '{}')`,
+    created.room.conversation_id,
+  );
+  store['exec'](
+    `INSERT INTO open_loops (id, topic, description, source_conversation_id, source_run_id, source_product_task_id, suggested_followup, priority)
+     VALUES ('oloop_checkpoint_today', '确认 Apollo 回归结果', 'Today open-loop fixture', ?, 'run_checkpoint_recovery', 'ptask_checkpoint_active', '打开任务并核对剩余验收项', 'high')`,
+    created.room.conversation_id,
+  );
+  store['exec'](
+    `INSERT INTO proactive_messages (id, type, title, body, reason, source_open_loop_id, source_product_task_id, score, status)
+     VALUES ('pmsg_checkpoint_today', 'followup', '继续 Apollo 验收', '还有一个中断任务等待恢复。', 'open_loop', 'oloop_checkpoint_today', 'ptask_checkpoint_active', 0.9, 'draft')`,
+  );
 
   const checkpointBefore = store.listPersonaMessenger().checkpoint;
   assert.ok(checkpointBefore.completed_count >= 1);
@@ -702,6 +731,14 @@ try {
   assert.ok(checkpointBefore.new_artifact_count >= 1);
   assert.ok(checkpointBefore.external_unhandled_count >= 1);
   assert.ok(checkpointBefore.no_progress_project_count >= 1);
+  assert.ok(checkpointBefore.recoverable_count >= 1);
+  assert.ok(checkpointBefore.active_task_count >= 1);
+  assert.ok(checkpointBefore.open_loop_count >= 1);
+  assert.ok(checkpointBefore.proactive_message_count >= 1);
+  assert.ok(checkpointBefore.items.some((item) => item.kind === 'recovery_required' && item.run_id === 'run_checkpoint_recovery'));
+  assert.ok(checkpointBefore.items.some((item) => item.kind === 'active_task' && item.product_task_id === 'ptask_checkpoint_active'));
+  assert.ok(checkpointBefore.items.some((item) => item.kind === 'open_loop' && item.open_loop_id === 'oloop_checkpoint_today'));
+  assert.ok(checkpointBefore.items.some((item) => item.kind === 'proactive_message' && item.proactive_message_id === 'pmsg_checkpoint_today'));
   assert.ok(checkpointBefore.items.some((item) => item.kind === 'completed'));
   assert.ok(checkpointBefore.items.some((item) => item.kind === 'failed'));
   assert.ok(checkpointBefore.items.some((item) => item.kind === 'approval_required'));

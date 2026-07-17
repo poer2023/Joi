@@ -1,0 +1,398 @@
+{
+  "diagnostics": {
+    "status": "completed",
+    "capability": "lsp_diagnostics",
+    "mode": "native_lsp_stdio_v1",
+    "backend": "clangd",
+    "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-diagnostics-fixture.c",
+    "diagnostic_count": 1,
+    "diagnostics": [
+      {
+        "severity": 1,
+        "code": "undeclared_var_use",
+        "source": "clang",
+        "message": "Use of undeclared identifier 'missing_native_symbol'",
+        "range": {
+          "start": {
+            "line": 2,
+            "character": 9
+          },
+          "end": {
+            "line": 2,
+            "character": 30
+          }
+        }
+      }
+    ],
+    "summary": "Native clangd returned 1 diagnostic."
+  },
+  "definition": {
+    "status": "completed",
+    "capability": "lsp_definition",
+    "mode": "native_lsp_stdio_v1",
+    "backend": "clangd",
+    "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+    "position": {
+      "line": 6,
+      "character": 10
+    },
+    "location_count": 1,
+    "locations": [
+      {
+        "uri": "file:///Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 4
+          },
+          "end": {
+            "line": 1,
+            "character": 9
+          }
+        }
+      }
+    ],
+    "summary": "Native clangd resolved 1 definition location."
+  },
+  "references": {
+    "status": "completed",
+    "capability": "lsp_references",
+    "mode": "native_lsp_stdio_v1",
+    "backend": "clangd",
+    "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+    "position": {
+      "line": 1,
+      "character": 5
+    },
+    "location_count": 2,
+    "locations": [
+      {
+        "uri": "file:///Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 4
+          },
+          "end": {
+            "line": 1,
+            "character": 9
+          }
+        }
+      },
+      {
+        "uri": "file:///Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "range": {
+          "start": {
+            "line": 6,
+            "character": 9
+          },
+          "end": {
+            "line": 6,
+            "character": 14
+          }
+        }
+      }
+    ],
+    "summary": "Native clangd resolved 2 reference locations."
+  },
+  "lsp_deep": {
+    "hover": {
+      "status": "completed",
+      "capability": "lsp_hover",
+      "mode": "native_lsp_stdio_v2",
+      "backend": "clangd",
+      "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+      "position": {
+        "line": 6,
+        "character": 10
+      },
+      "hover": {
+        "text": "### function `twice`  \n\n---\n→ `int`  \nParameters:  \n- `int value`\n\n---\n```cpp\nint twice(int value)\n```",
+        "range": {
+          "start": {
+            "line": 6,
+            "character": 9
+          },
+          "end": {
+            "line": 6,
+            "character": 14
+          }
+        }
+      },
+      "summary": "Native clangd returned hover information."
+    },
+    "symbols": {
+      "status": "completed",
+      "capability": "lsp_symbols",
+      "mode": "native_lsp_stdio_v2",
+      "backend": "clangd",
+      "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+      "symbol_count": 2,
+      "symbols": [
+        {
+          "name": "twice",
+          "detail": "int (int)",
+          "kind": 12,
+          "range": {
+            "start": {
+              "line": 1,
+              "character": 0
+            },
+            "end": {
+              "line": 3,
+              "character": 1
+            }
+          },
+          "selection_range": {
+            "start": {
+              "line": 1,
+              "character": 4
+            },
+            "end": {
+              "line": 1,
+              "character": 9
+            }
+          },
+          "uri": "",
+          "children": []
+        },
+        {
+          "name": "main",
+          "detail": "int (void)",
+          "kind": 12,
+          "range": {
+            "start": {
+              "line": 5,
+              "character": 0
+            },
+            "end": {
+              "line": 7,
+              "character": 1
+            }
+          },
+          "selection_range": {
+            "start": {
+              "line": 5,
+              "character": 4
+            },
+            "end": {
+              "line": 5,
+              "character": 8
+            }
+          },
+          "uri": "",
+          "children": []
+        }
+      ],
+      "summary": "Native clangd returned 2 document symbols."
+    },
+    "codeActions": {
+      "status": "completed",
+      "capability": "lsp_code_actions",
+      "mode": "native_lsp_stdio_v2",
+      "backend": "clangd",
+      "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-diagnostics-fixture.c",
+      "action_count": 0,
+      "actions": [],
+      "summary": "Native clangd returned 0 code actions."
+    },
+    "renamed": {
+      "status": "completed",
+      "capability": "lsp_rename",
+      "mode": "native_lsp_stdio_v2",
+      "backend": "clangd",
+      "path": "/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy/rename-fixture.c",
+      "new_name": "twice_renamed",
+      "changed_files": [
+        "/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy/rename-fixture.c"
+      ],
+      "summary": "Native clangd renamed the symbol across 1 file."
+    },
+    "formatted": {
+      "status": "completed",
+      "capability": "lsp_format",
+      "mode": "native_lsp_stdio_v2",
+      "backend": "clangd",
+      "path": "/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy/format-fixture.c",
+      "edit_count": 7,
+      "changed_files": [
+        "/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy/format-fixture.c"
+      ],
+      "summary": "Native clangd applied 7 formatting edits."
+    }
+  },
+  "code_execution": {
+    "codeJavaScript": {
+      "status": "completed",
+      "capability": "execute_code",
+      "mode": "ephemeral_code_kernel_v1",
+      "language": "javascript",
+      "command": "node",
+      "exit_code": 0,
+      "stdout": "{\"answer\":42}\n",
+      "stderr": "",
+      "duration_ms": 21,
+      "summary": "javascript code completed in 21ms."
+    },
+    "codeTypeScript": {
+      "status": "completed",
+      "capability": "execute_code",
+      "mode": "ephemeral_code_kernel_v1",
+      "language": "typescript",
+      "command": "typescript/node",
+      "exit_code": 0,
+      "stdout": "42\n",
+      "stderr": "",
+      "duration_ms": 23,
+      "summary": "typescript code completed in 23ms."
+    },
+    "codePython": {
+      "status": "completed",
+      "capability": "execute_code",
+      "mode": "ephemeral_code_kernel_v1",
+      "language": "python",
+      "command": "python3",
+      "exit_code": 0,
+      "stdout": "42\n",
+      "stderr": "",
+      "duration_ms": 24,
+      "summary": "python code completed in 24ms."
+    },
+    "codeSwift": {
+      "status": "completed",
+      "capability": "execute_code",
+      "mode": "ephemeral_code_kernel_v1",
+      "language": "swift",
+      "command": "swift",
+      "exit_code": 0,
+      "stdout": "42\n",
+      "stderr": "",
+      "duration_ms": 127,
+      "summary": "swift code completed in 127ms."
+    },
+    "sandbox": {
+      "status": "completed",
+      "capability": "sandbox_run",
+      "mode": "macos_sandbox_exec_v1",
+      "cwd": "/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy",
+      "argv": [
+        "/usr/bin/printf",
+        "sandbox-ok"
+      ],
+      "network_allowed": false,
+      "exit_code": 0,
+      "stdout": "sandbox-ok",
+      "stderr": "",
+      "duration_ms": 7,
+      "summary": "Sandboxed command completed."
+    }
+  },
+  "debugger": {
+    "attached": {
+      "status": "completed",
+      "capability": "debugger_attach",
+      "mode": "native_lldb_pty_v1",
+      "session": {
+        "id": "debug_70d757ffc3d245e6",
+        "target": "/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy/native-debugger-fixture",
+        "cwd": "/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy",
+        "status": "ready",
+        "pid": 75292,
+        "started_at": "2026-07-15T20:00:34.879Z",
+        "backend": "lldb"
+      },
+      "output": "(lldb) target create \"/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy/native-debugger-fixture\"\nCurrent executable set to '/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy/native-debugger-fixture' (arm64).\n(lldb) ",
+      "summary": "Native LLDB session debug_70d757ffc3d245e6 is ready for /private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy/native-debugger-fixture."
+    },
+    "breakpoint": {
+      "status": "completed",
+      "capability": "debugger_breakpoint",
+      "mode": "native_lldb_pty_v1",
+      "session_id": "debug_70d757ffc3d245e6",
+      "output": "breakpoint set --name twice\nBreakpoint 1: where = native-debugger-fixture`twice + 8 at native-debugger-fixture.c:2:16, address = 0x0000000100000330\n(lldb)",
+      "summary": "Set an LLDB breakpoint in session debug_70d757ffc3d245e6."
+    },
+    "run": {
+      "status": "completed",
+      "capability": "debugger_step",
+      "mode": "native_lldb_pty_v1",
+      "session_id": "debug_70d757ffc3d245e6",
+      "action": "run",
+      "output": "run\nProcess 75294 launched: '/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-gmKKNy/native-debugger-fixture' (arm64)\nProcess 75294 stopped\n* thread #1, queue = 'com.apple.main-thread', stop reason = breakpoint 1.1\n    frame #0: 0x0000000100000330 native-debugger-fixture`twice(value=21) at native-debugger-fixture.c:2:16\n   1   \tint twice(int value) {\n-> 2   \t  int result = value * 2;\n    \t               ^\n   3   \t  return result;\n   4   \t}\n   5   \t\n   6   \tint main(void) {\n   7   \t  return twice(21) == 42 ? 0 : 1;\nTarget 0: (native-debugger-fixture) stopped.\n(lldb)",
+      "process_state": "stopped",
+      "summary": "LLDB run completed in session debug_70d757ffc3d245e6."
+    },
+    "evaluated": {
+      "status": "completed",
+      "capability": "debugger_evaluate",
+      "mode": "native_lldb_pty_v1",
+      "session_id": "debug_70d757ffc3d245e6",
+      "expression": "value",
+      "output": "expression -- value\n(int) $0 = 21\n(lldb)",
+      "summary": "Evaluated a native expression in LLDB session debug_70d757ffc3d245e6."
+    },
+    "threads": {
+      "status": "completed",
+      "capability": "debugger_threads",
+      "mode": "native_lldb_pty_v2",
+      "session_id": "debug_70d757ffc3d245e6",
+      "output": "thread list\nProcess 75294 stopped\n* thread #1: tid = 0x106fe2, 0x0000000100000330 native-debugger-fixture`twice(value=21) at native-debugger-fixture.c:2:16, queue = 'com.apple.main-thread', stop reason = breakpoint 1.1\n(lldb)",
+      "summary": "Read threads from LLDB session debug_70d757ffc3d245e6."
+    },
+    "stack": {
+      "status": "completed",
+      "capability": "debugger_stack",
+      "mode": "native_lldb_pty_v2",
+      "session_id": "debug_70d757ffc3d245e6",
+      "output": "thread backtrace\n* thread #1, queue = 'com.apple.main-thread', stop reason = breakpoint 1.1\n  * frame #0: 0x0000000100000330 native-debugger-fixture`twice(value=21) at native-debugger-fixture.c:2:16\n    frame #1: 0x0000000100000360 native-debugger-fixture`main at native-debugger-fixture.c:7:10\n    frame #2: 0x0000000191f1fbec dyld`start + 6688\n(lldb)",
+      "summary": "Read stack from LLDB session debug_70d757ffc3d245e6."
+    },
+    "locals": {
+      "status": "completed",
+      "capability": "debugger_locals",
+      "mode": "native_lldb_pty_v2",
+      "session_id": "debug_70d757ffc3d245e6",
+      "output": "frame variable\n(int) value = 21\n(int) result = 1\n(lldb)",
+      "summary": "Read locals from LLDB session debug_70d757ffc3d245e6."
+    },
+    "memory": {
+      "status": "completed",
+      "capability": "debugger_memory",
+      "mode": "native_lldb_pty_v2",
+      "session_id": "debug_70d757ffc3d245e6",
+      "address": "$sp",
+      "count": 4,
+      "output": "memory read --count 4 --format x $sp\n0x16fdfdaa0: 0xf1c86bf0 0x00000001 0x00000001 0x00000015\n(lldb)",
+      "summary": "Read 4 memory item(s) in LLDB session debug_70d757ffc3d245e6."
+    },
+    "watchpoint": {
+      "status": "completed",
+      "capability": "debugger_watchpoint",
+      "mode": "native_lldb_pty_v2",
+      "session_id": "debug_70d757ffc3d245e6",
+      "output": "watchpoint set variable value\nWatchpoint created: Watchpoint 1: addr = 0x16fdfdaac size = 4 state = enabled type = m\n    declare @ '/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-debugger-fixture.c:1'\n    watchpoint spec = 'value'\n    watchpoint resources:\n       #0: addr = 0x16fdfdaac size = 4\nWatchpoint 1 hit:\n    \nnew value: 21\n(lldb)",
+      "summary": "Set a watchpoint in LLDB session debug_70d757ffc3d245e6."
+    },
+    "stepped": {
+      "status": "completed",
+      "capability": "debugger_step",
+      "mode": "native_lldb_pty_v1",
+      "session_id": "debug_70d757ffc3d245e6",
+      "action": "next",
+      "output": "next\nProcess 75294 stopped\n* thread #1, queue = 'com.apple.main-thread', stop reason = step over\n    frame #0: 0x000000010000033c native-debugger-fixture`twice(value=21) at native-debugger-fixture.c:3:10\n   1   \tint twice(int value) {\n   2   \t  int result = value * 2;\n-> 3   \t  return result;\n    \t         ^\n   4   \t}\n   5   \t\n   6   \tint main(void) {\n   7   \t  return twice(21) == 42 ? 0 : 1;\nTarget 0: (native-debugger-fixture) stopped.\n(lldb)",
+      "process_state": "stopped",
+      "summary": "LLDB next completed in session debug_70d757ffc3d245e6."
+    },
+    "stopped": {
+      "status": "completed",
+      "capability": "debugger_stop",
+      "mode": "native_lldb_pty_v1",
+      "session_id": "debug_70d757ffc3d245e6",
+      "disposed": true,
+      "summary": "Disposed native LLDB session debug_70d757ffc3d245e6."
+    }
+  }
+}

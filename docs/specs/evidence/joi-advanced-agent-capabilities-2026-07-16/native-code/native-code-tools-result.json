@@ -1,0 +1,164 @@
+{
+  "diagnostics": {
+    "status": "completed",
+    "capability": "lsp_diagnostics",
+    "mode": "native_lsp_stdio_v1",
+    "backend": "clangd",
+    "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-diagnostics-fixture.c",
+    "diagnostic_count": 1,
+    "diagnostics": [
+      {
+        "severity": 1,
+        "code": "undeclared_var_use",
+        "source": "clang",
+        "message": "Use of undeclared identifier 'missing_native_symbol'",
+        "range": {
+          "start": {
+            "line": 2,
+            "character": 9
+          },
+          "end": {
+            "line": 2,
+            "character": 30
+          }
+        }
+      }
+    ],
+    "summary": "Native clangd returned 1 diagnostic."
+  },
+  "definition": {
+    "status": "completed",
+    "capability": "lsp_definition",
+    "mode": "native_lsp_stdio_v1",
+    "backend": "clangd",
+    "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+    "position": {
+      "line": 6,
+      "character": 10
+    },
+    "location_count": 1,
+    "locations": [
+      {
+        "uri": "file:///Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 4
+          },
+          "end": {
+            "line": 1,
+            "character": 9
+          }
+        }
+      }
+    ],
+    "summary": "Native clangd resolved 1 definition location."
+  },
+  "references": {
+    "status": "completed",
+    "capability": "lsp_references",
+    "mode": "native_lsp_stdio_v1",
+    "backend": "clangd",
+    "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+    "position": {
+      "line": 1,
+      "character": 5
+    },
+    "location_count": 2,
+    "locations": [
+      {
+        "uri": "file:///Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 4
+          },
+          "end": {
+            "line": 1,
+            "character": 9
+          }
+        }
+      },
+      {
+        "uri": "file:///Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "path": "/Users/hao/project/Joi/apps/joi-electron/scripts/fixtures/native-lsp-fixture.c",
+        "range": {
+          "start": {
+            "line": 6,
+            "character": 9
+          },
+          "end": {
+            "line": 6,
+            "character": 14
+          }
+        }
+      }
+    ],
+    "summary": "Native clangd resolved 2 reference locations."
+  },
+  "debugger": {
+    "attached": {
+      "status": "completed",
+      "capability": "debugger_attach",
+      "mode": "native_lldb_pty_v1",
+      "session": {
+        "id": "debug_7716a06daceb4def",
+        "target": "/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-cTucjH/native-debugger-fixture",
+        "cwd": "/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-cTucjH",
+        "status": "ready",
+        "pid": 4166,
+        "started_at": "2026-07-15T17:37:19.568Z",
+        "backend": "lldb"
+      },
+      "output": "(lldb) target create \"/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-cTucjH/native-debugger-fixture\"\nCurrent executable set to '/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-cTucjH/native-debugger-fixture' (arm64).\n(lldb) ",
+      "summary": "Native LLDB session debug_7716a06daceb4def is ready for /private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-cTucjH/native-debugger-fixture."
+    },
+    "breakpoint": {
+      "status": "completed",
+      "capability": "debugger_breakpoint",
+      "mode": "native_lldb_pty_v1",
+      "session_id": "debug_7716a06daceb4def",
+      "output": "breakpoint set --name twice\nBreakpoint 1: where = native-debugger-fixture`twice + 8 at native-debugger-fixture.c:2:16, address = 0x0000000100000330\n(lldb)",
+      "summary": "Set an LLDB breakpoint in session debug_7716a06daceb4def."
+    },
+    "run": {
+      "status": "completed",
+      "capability": "debugger_step",
+      "mode": "native_lldb_pty_v1",
+      "session_id": "debug_7716a06daceb4def",
+      "action": "run",
+      "output": "run\nProcess 4216 launched: '/private/var/folders/l0/csgxpbrj3l515hg8d0g4jv740000gn/T/joi-native-code-tools-cTucjH/native-debugger-fixture' (arm64)\nProcess 4216 stopped\n* thread #1, queue = 'com.apple.main-thread', stop reason = breakpoint 1.1\n    frame #0: 0x0000000100000330 native-debugger-fixture`twice(value=21) at native-debugger-fixture.c:2:16\n   1   \tint twice(int value) {\n-> 2   \t  int result = value * 2;\n    \t               ^\n   3   \t  return result;\n   4   \t}\n   5   \t\n   6   \tint main(void) {\n   7   \t  return twice(21) == 42 ? 0 : 1;\nTarget 0: (native-debugger-fixture) stopped.\n(lldb)",
+      "process_state": "stopped",
+      "summary": "LLDB run completed in session debug_7716a06daceb4def."
+    },
+    "evaluated": {
+      "status": "completed",
+      "capability": "debugger_evaluate",
+      "mode": "native_lldb_pty_v1",
+      "session_id": "debug_7716a06daceb4def",
+      "expression": "value",
+      "output": "expression -- value\n(int) $0 = 21\n(lldb)",
+      "summary": "Evaluated a native expression in LLDB session debug_7716a06daceb4def."
+    },
+    "stepped": {
+      "status": "completed",
+      "capability": "debugger_step",
+      "mode": "native_lldb_pty_v1",
+      "session_id": "debug_7716a06daceb4def",
+      "action": "next",
+      "output": "next\nProcess 4216 stopped\n* thread #1, queue = 'com.apple.main-thread', stop reason = step over\n    frame #0: 0x000000010000033c native-debugger-fixture`twice(value=21) at native-debugger-fixture.c:3:10\n   1   \tint twice(int value) {\n   2   \t  int result = value * 2;\n-> 3   \t  return result;\n    \t         ^\n   4   \t}\n   5   \t\n   6   \tint main(void) {\n   7   \t  return twice(21) == 42 ? 0 : 1;\nTarget 0: (native-debugger-fixture) stopped.\n(lldb)",
+      "process_state": "stopped",
+      "summary": "LLDB next completed in session debug_7716a06daceb4def."
+    },
+    "stopped": {
+      "status": "completed",
+      "capability": "debugger_stop",
+      "mode": "native_lldb_pty_v1",
+      "session_id": "debug_7716a06daceb4def",
+      "disposed": true,
+      "summary": "Disposed native LLDB session debug_7716a06daceb4def."
+    }
+  }
+}

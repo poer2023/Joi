@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { resolveAutomationModelRuntimeRoute } from '../src/main/automation-runtime-route.ts';
+import { resolveAutomationModelRuntimeRoute, resolveAutomationModelSettings } from '../src/main/automation-runtime-route.ts';
 import {
   TelegramOutboundService,
   isProactiveTelegramDeliveryRequested,
@@ -261,6 +261,47 @@ assert.equal(acpRoute.ready, true);
 assert.equal(acpRoute.model_selection_policy, 'settings_preferred');
 assert.equal(resolvedAPIKey, false, 'ACP automation routing must not require an API key');
 assert.equal(readinessACPFlag, true, 'ACP automation readiness must use the configured-provider flag');
+
+const activeACPSettings = {
+  model_provider: 'acp_codex_cli',
+  model_name: 'gpt-5.6-luna[medium]',
+  model_base_url: '',
+  model_reasoning_effort: 'medium',
+};
+const duplicateDeepSeekModels = [
+  {
+    provider: 'acp_codex_cli',
+    id: 'deepseek-v4-flash',
+    supports_tool_calling: true,
+    metadata: { observed_from_request: true },
+  },
+  {
+    provider: 'openai_compatible',
+    base_url: 'https://api.deepseek.com/v1',
+    id: 'deepseek-v4-flash',
+    metadata: { source: 'provider_model_list' },
+    config: { enabled: true, temperature: 0.7, timeout_seconds: 75, max_retries: 2, supports_json_mode: false, supports_tool_calling: false, supports_reasoning: false },
+  },
+];
+const inferredDeepSeekSettings = resolveAutomationModelSettings({
+  settings: activeACPSettings,
+  request: { message: 'scheduled deepseek task', model_name: 'deepseek-v4-flash', reasoning_effort: 'low' },
+  availableModels: duplicateDeepSeekModels,
+});
+assert.equal(inferredDeepSeekSettings.model_provider, 'openai_compatible');
+assert.equal(inferredDeepSeekSettings.model_base_url, 'https://api.deepseek.com/v1');
+assert.equal(inferredDeepSeekSettings.model_name, 'deepseek-v4-flash');
+assert.equal(inferredDeepSeekSettings.model_reasoning_effort, 'low');
+assert.equal(inferredDeepSeekSettings.model_timeout_seconds, 75);
+assert.equal(inferredDeepSeekSettings.model_max_retries, 2);
+
+const explicitACPDeepSeekSettings = resolveAutomationModelSettings({
+  settings: activeACPSettings,
+  request: { message: 'explicit ACP task', model_name: 'deepseek-v4-flash', model_provider: 'acp_codex_cli' },
+  availableModels: duplicateDeepSeekModels,
+});
+assert.equal(explicitACPDeepSeekSettings.model_provider, 'acp_codex_cli');
+assert.equal(explicitACPDeepSeekSettings.model_base_url, '');
 
 const automationSource = await readFile(new URL('../src/main/automation.ts', import.meta.url), 'utf8');
 assert.match(

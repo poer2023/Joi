@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -19,6 +20,25 @@ try {
   });
 
   const initialWorkspaceSettings = store.getWorkspaceSettings();
+  const authoredMemorySystem = store.getMemorySystem();
+  assert.equal(authoredMemorySystem.constitution?.id, 'constitution_joi_v2');
+  assert.equal(authoredMemorySystem.constitution?.version, 2);
+  assert.equal(authoredMemorySystem.constitution?.status, 'active');
+  assert.match(authoredMemorySystem.constitution?.identity || '', /我叫 Joi，24 岁/);
+  assert.match(authoredMemorySystem.constitution?.compiled_prompt || '', /Default User:\n- Age: 30\n- Gender: 男性/);
+  assert.equal(authoredMemorySystem.metrics.layer_counts?.persona, 1);
+  const authoredPrompt = store.assembleToolCallingPrompt({
+    message: '你是谁，我们是什么关系？',
+    runtime_mode: 'tool_calling',
+    memory_controls: { use_memories: false, generate_memories: false, disable_on_external_context: true },
+  }, 'general_agent', 'real-tool-model');
+  assert.match(authoredPrompt.cacheable_prefix, /Persona Constitution — user-authored hard memory/);
+  assert.match(authoredPrompt.cacheable_prefix, /我叫 Joi，24 岁/);
+  assert.match(authoredPrompt.cacheable_prefix, /Default User:\n- Age: 30\n- Gender: 男性/);
+  assert.equal(authoredPrompt.memory_results.length, 0, 'persona hard memory stays outside learned-memory retrieval');
+  assert.equal(store.resolveAgentIDForTool('Research Agent'), 'research_agent');
+  assert.equal(store.resolveAgentIDForTool('research'), 'research_agent');
+  assert.equal(store.resolveAgentIDForTool(''), 'research_agent');
   store.saveWorkspaceSettings({ ...initialWorkspaceSettings, allowed_roots: [...initialWorkspaceSettings.allowed_roots, tempDir] });
   const enhancedDiagnosticsPath = store.exportDiagnostics().path;
   const enhancedDiagnosticsManifest = JSON.parse(execFileSync('unzip', ['-p', enhancedDiagnosticsPath, 'manifest.json'], { encoding: 'utf8' }));
@@ -78,14 +98,134 @@ try {
 
   assert.equal(response.response, 'Electron SQLite deterministic response: store test ping');
 
+  const changeSetPath = join(tempDir, 'changeset-target.txt');
+  const beforeChangeSetContent = Buffer.from('before change set\n');
+  const afterChangeSetContent = Buffer.from('after change set\n');
+  writeFileSync(changeSetPath, beforeChangeSetContent);
+  const changeSetDraft = {
+    id: 'changeset_store_roundtrip',
+    patch: '*** Begin Patch\n*** Update File: changeset-target.txt\n*** End Patch',
+    permission_profile: 'workspace_write',
+    files: [{
+      operation: 'update',
+      path: changeSetPath,
+      mode: 0o644,
+      before_exists: true,
+      before_content_base64: beforeChangeSetContent.toString('base64'),
+      after_content_base64: afterChangeSetContent.toString('base64'),
+      before_hash: createHash('sha256').update(beforeChangeSetContent).digest('hex'),
+      after_hash: createHash('sha256').update(afterChangeSetContent).digest('hex'),
+      bytes: afterChangeSetContent.length,
+      lines: 1,
+    }],
+  };
+  store.recordWorkspaceChangeSetPrepared(changeSetDraft);
+  writeFileSync(changeSetPath, afterChangeSetContent);
+  const appliedChangeSet = store.markWorkspaceChangeSetApplied(changeSetDraft.id);
+  assert.equal(appliedChangeSet.status, 'applied');
+  assert.equal(appliedChangeSet.run_id, undefined);
+  assert.equal(store.listWorkspaceChangeSets().change_sets[0].id, changeSetDraft.id);
+  const revertedChangeSet = store.revertWorkspaceChangeSet(changeSetDraft.id, 'store roundtrip test');
+  assert.equal(revertedChangeSet.status, 'reverted');
+  assert.equal(readFileSync(changeSetPath, 'utf8'), beforeChangeSetContent.toString('utf8'));
+
+  const conflictingDraft = {
+    ...changeSetDraft,
+    id: 'changeset_store_conflict',
+  };
+  store.recordWorkspaceChangeSetPrepared(conflictingDraft);
+  writeFileSync(changeSetPath, afterChangeSetContent);
+  store.markWorkspaceChangeSetApplied(conflictingDraft.id);
+  writeFileSync(changeSetPath, 'changed again after apply\n');
+  assert.throws(
+    () => store.revertWorkspaceChangeSet(conflictingDraft.id),
+    /changed after ChangeSet/,
+    'safe revert must refuse to overwrite later user changes',
+  );
+
   const conversations = store.listConversations({ view: 'active', limit: 10 }).conversations;
   assert.equal(conversations[0].title, 'store test ping');
   assert.equal(conversations[0].latest_run_id, response.run_id);
   assert.equal(conversations[0].message_count, 2);
+  assert.equal(store.listConversations({ view: 'all', query: 'store test ping', limit: 10 }).conversations[0].id, response.conversation_id);
+  assert.equal(store.listConversations({ view: 'all', query: 'no-such-session-token', limit: 10 }).conversations.length, 0);
+  const initialMessenger = store.listPersonaMessenger();
+  const joiPersona = initialMessenger.personas.find((persona) => persona.id === 'per_joi_desktop');
+  assert.equal(joiPersona?.tagline, '24 岁产品运营白领 · 你的亲密朋友');
+  assert.match(joiPersona?.self_intro || '', /我们不是恋人/);
+  assert.match(String(store['get'](`SELECT system_prompt FROM agents WHERE id='per_joi_desktop'`)?.system_prompt || ''), /我叫 Joi，今年 24 岁/);
+  assert.deepEqual(store.getAgentCapabilities('per_joi_desktop'), ['*']);
+  assert.equal(JSON.parse(String(store['get'](`SELECT metadata FROM agents WHERE id='per_joi_desktop'`)?.metadata || '{}')).capability_policy, 'all_registered');
+  const authoredConstitution = String(store['get'](`SELECT compiled_prompt FROM persona_constitutions WHERE status='active' ORDER BY version DESC LIMIT 1`)?.compiled_prompt || '');
+  assert.match(authoredConstitution, /24 岁/);
+  store['exec'](`UPDATE personas SET capabilities='["chat","runs","threads","assets","memory"]' WHERE id='per_joi_desktop'`);
+  store['exec'](`UPDATE agents SET capabilities='["memory_recall"]' WHERE id='per_joi_desktop'`);
+  store.listPersonaMessenger();
+  assert.deepEqual(JSON.parse(String(store['get'](`SELECT capabilities FROM personas WHERE id='per_joi_desktop'`)?.capabilities || '[]')), ['chat', 'runs', 'threads', 'assets', 'memory']);
+  assert.deepEqual(store.getAgentCapabilities('per_joi_desktop'), ['*'], 'legacy persona capability rows must not narrow the default Joi Agent');
+  const defaultPersonaPrompt = store.assembleToolCallingPrompt({
+    message: 'Verify persona and agent compatibility',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, 'per_joi_desktop', 'real-tool-model');
+  assert.deepEqual(defaultPersonaPrompt.agent_capabilities, ['*']);
+  assert.match(defaultPersonaPrompt.system_message, /Persona Constitution — user-authored hard memory/);
+  assert.match(defaultPersonaPrompt.system_message, /24 岁/);
 
   const detail = store.getConversation(response.conversation_id);
   assert.deepEqual(detail.messages.map((message) => message.role), ['user', 'assistant']);
   assert.equal(detail.messages[1].content, response.response);
+
+  for (let index = 1; index <= 4; index += 1) {
+    store.recordToolCallingChat({
+      conversation_id: response.conversation_id,
+      message: `branch and compaction history ${index}`,
+      model_name: 'deepseek-v4-flash',
+      runtime_mode: 'tool_calling',
+      permission_profile: 'danger_full_access',
+    }, {
+      provider: 'openai_compatible',
+      model_name: 'deepseek-v4-flash',
+      selected_agent_id: 'general_agent',
+      final_message: `history response ${index}`,
+      tool_results: [],
+      usage: {},
+      usage_status: 'provider_missing',
+      finish_reason: 'stop',
+      model_responses: [],
+    });
+  }
+  const sourceBeforeBranch = store.getConversation(response.conversation_id);
+  const branch = store.branchConversationForTool({
+    source_conversation_id: response.conversation_id,
+    from_message_id: sourceBeforeBranch.messages[3].id,
+    title: 'Persistent branch fixture',
+    source_run_id: response.run_id,
+  });
+  assert.equal(branch.copied_message_count, 4);
+  assert.equal(branch.source_unchanged, true);
+  assert.equal(store.getConversation(branch.child_conversation_id).messages.length, 4);
+  assert.equal(store.getConversation(response.conversation_id).messages.length, sourceBeforeBranch.messages.length);
+  assert.equal(store.getConversation(branch.child_conversation_id).conversation.metadata?.branch?.parent_conversation_id, response.conversation_id);
+
+  const compaction = store.compactConversationForTool({
+    conversation_id: response.conversation_id,
+    summary: 'Persistent checkpoint: the fixture established branch and compaction provenance.',
+    keep_recent_messages: 2,
+    reason: 'contract_test',
+    source_run_id: response.run_id,
+  });
+  assert.equal(compaction.transcript_preserved, true);
+  assert.equal(compaction.covered_message_count, sourceBeforeBranch.messages.length - 2);
+  assert.equal(store.getConversation(response.conversation_id).messages.length, sourceBeforeBranch.messages.length);
+  const compactedPrompt = store.assembleToolCallingPrompt({
+    conversation_id: response.conversation_id,
+    message: 'continue after checkpoint',
+    runtime_mode: 'tool_calling',
+  }, 'general_agent', 'deepseek-v4-flash');
+  assert.match(compactedPrompt.dynamic_tail, /Persistent Conversation Checkpoint/);
+  assert.match(compactedPrompt.dynamic_tail, /Persistent checkpoint: the fixture established branch/);
+  assert.equal(compactedPrompt.conversation_messages.length, 2);
 
   const trace = store.getRunTrace(response.run_id);
   assert.equal(trace.status, 'completed');
@@ -262,6 +402,77 @@ try {
   const imageTrace = store.getRunTrace(imageResponse.run_id);
   assert.ok(imageTrace.events.some((event) => event.event_type === 'artifact.created' && event.payload?.native_tool === 'image_gen'));
 
+  for (const media of [
+    {
+      capability: 'video_generate', kind: 'video', mime: 'video/mp4', name: 'joi-generated-video.mp4',
+      path: '/tmp/joi-generated-video.mp4', size: 60_165, mode: 'xai_async_video_v1', provider: 'xai', model: 'grok-imagine-video',
+    },
+    {
+      capability: 'text_to_speech', kind: 'audio', mime: 'audio/wav', name: 'joi-generated-speech.wav',
+      path: '/tmp/joi-generated-speech.wav', size: 42_000, mode: 'macos_say_ffmpeg_v1', provider: 'local_macos', model: '',
+    },
+  ]) {
+    const started = store.beginToolCallingChat({
+      message: `test ${media.capability}`,
+      runtime_mode: 'tool_calling',
+      model_name: 'fixture-model',
+    }, { provider: 'openai_compatible', model_name: 'fixture-model', selected_agent_id: 'general_agent' });
+    const responseWithMedia = store.finishToolCallingChat(started, {
+      status: 'completed', provider: 'openai_compatible', model_name: 'fixture-model', selected_agent_id: 'general_agent',
+      final_message: `${media.capability} completed`,
+      tool_results: [{
+        call_id: `call_${media.capability}`,
+        name: media.capability,
+        arguments: {},
+        output: {
+          status: 'completed', capability: media.capability, mode: media.mode, provider: media.provider, model: media.model,
+          duration_seconds: 1.04, file_path: media.path, summary: `${media.capability} completed`,
+          attachment: {
+            id: `attachment_${media.kind}_fixture`, name: media.name, kind: media.kind,
+            mime_type: media.mime, size: media.size, preview_url: `file://${media.path}`,
+          },
+        },
+      }],
+      usage: {}, usage_status: 'provider_missing', finish_reason: 'stop', model_responses: [],
+    });
+    const messageAttachment = store.getConversation(responseWithMedia.conversation_id).messages.at(-1)?.attachments?.[0];
+    assert.equal(messageAttachment?.kind, media.kind);
+    assert.equal(messageAttachment?.mime_type, media.mime);
+    const artifact = store.listArtifacts({ type: media.kind, limit: 10 }).artifacts.find((item) => item.source_run_id === responseWithMedia.run_id);
+    assert.equal(artifact?.type, media.kind);
+    assert.equal(artifact?.metadata?.generation_mode, media.mode);
+  }
+
+  const acpMediaStarted = store.beginToolCallingChat({
+    message: 'test ACP wrapped speech attachment', runtime_mode: 'tool_calling', model_name: 'fixture-model',
+  }, { provider: 'acp_codex_cli', model_name: 'fixture-model', selected_agent_id: 'general_agent' });
+  const acpMediaPayload = {
+    status: 'completed', capability: 'text_to_speech', mode: 'macos_say_ffmpeg_v1', provider: 'local_macos',
+    duration_seconds: 4.5, file_path: '/tmp/joi-acp-speech.wav',
+    attachment: {
+      id: 'attachment_acp_audio_fixture', name: 'joi-acp-speech.wav', kind: 'audio',
+      mime_type: 'audio/wav', size: 84_000, preview_url: 'file:///tmp/joi-acp-speech.wav',
+    },
+  };
+  const acpMediaResponse = store.finishToolCallingChat(acpMediaStarted, {
+    status: 'completed', provider: 'acp_codex_cli', model_name: 'fixture-model', selected_agent_id: 'general_agent',
+    final_message: 'ACP speech completed',
+    tool_results: [{
+      call_id: 'call_acp_text_to_speech', name: 'mcp.joi_capabilities.text_to_speech', arguments: {},
+      output: {
+        status: 'succeeded', protocol: 'acp', kind: 'other',
+        raw_output: { result: { content: [{ type: 'text', text: JSON.stringify(acpMediaPayload) }], structuredContent: acpMediaPayload }, error: null },
+      },
+    }],
+    usage: {}, usage_status: 'provider_missing', finish_reason: 'stop', model_responses: [],
+  });
+  const acpMediaAttachment = store.getConversation(acpMediaResponse.conversation_id).messages.at(-1)?.attachments?.[0];
+  assert.equal(acpMediaAttachment?.kind, 'audio');
+  assert.equal(acpMediaAttachment?.preview_url, 'file:///tmp/joi-acp-speech.wav');
+  const acpMediaArtifact = store.listArtifacts({ type: 'audio', limit: 20 }).artifacts.find((item) => item.source_run_id === acpMediaResponse.run_id);
+  assert.equal(acpMediaArtifact?.metadata?.generation_mode, 'macos_say_ffmpeg_v1');
+  assert.equal(acpMediaArtifact?.metadata?.file_path, '/tmp/joi-acp-speech.wav');
+
   const chatOnlyResponse = await store.sendDeterministicChat({
     message: '今天只做一个纯聊天检查：用一句话回复我，不要创建任务。',
     input_mode: 'auto',
@@ -319,20 +530,49 @@ try {
 
   const capabilities = store.listCapabilities().capabilities.map((capability) => capability.id);
   assert.ok(capabilities.includes('memory_search'));
+  assert.ok(capabilities.includes('memory_recall'));
+  assert.ok(capabilities.includes('session_search'));
+  assert.ok(capabilities.includes('tool_search'));
+  assert.ok(capabilities.includes('shell_start'));
+  assert.ok(capabilities.includes('task_update'));
   assert.ok(capabilities.includes('apply_patch'));
+  assert.ok(capabilities.includes('request_user_input'));
+  assert.ok(capabilities.includes('automation_update'));
 
   const workflows = store.listToolWorkflows().workflows.map((workflow) => workflow.name);
   assert.ok(workflows.includes('memory_search_v1'));
+  assert.ok(workflows.includes('memory_recall_v1'));
+  assert.ok(workflows.includes('session_search_v1'));
+  assert.ok(workflows.includes('shell_start_v1'));
 
   const automation = store.saveAutomation({
     kind: 'schedule',
+    execution_kind: 'cron',
     name: 'Store automation interval',
     trigger_config: { type: 'interval', every_minutes: 15 },
     prompt_template: 'Run store automation for {{payload.subject}}',
+    rrule: 'FREQ=MINUTELY;INTERVAL=15',
+    model: 'deepseek-v4-flash',
+    model_provider: 'openai_compatible',
+    model_base_url: 'https://api.deepseek.com/v1',
+    reasoning_effort: 'medium',
+    cwds: ['/tmp/joi-automation'],
+    execution_environment: 'local',
+    target: { kind: 'new_task' },
   });
   assert.equal(automation.kind, 'schedule');
+  assert.equal(automation.execution_kind, 'cron');
+  assert.equal(automation.status, 'ACTIVE');
   assert.equal(automation.enabled, true);
   assert.equal(automation.permission_profile, 'read_only');
+  assert.equal(automation.rrule, 'FREQ=MINUTELY;INTERVAL=15');
+  assert.equal(automation.model, 'deepseek-v4-flash');
+  assert.equal(automation.model_provider, 'openai_compatible');
+  assert.equal(automation.model_base_url, 'https://api.deepseek.com/v1');
+  assert.equal(automation.reasoning_effort, 'medium');
+  assert.deepEqual(automation.cwds, ['/tmp/joi-automation']);
+  assert.equal(automation.execution_environment, 'local');
+  assert.deepEqual(automation.target, { kind: 'new_task' });
   assert.equal(store.listAutomations({ kind: 'schedule' }).automations.some((item) => item.id === automation.id), true);
   const triggerInsert = store.enqueueAutomationTrigger({
     automation_id: automation.id,
@@ -366,18 +606,76 @@ try {
     trigger_id: claimed.trigger.id,
     run_id: automationResponse.run_id,
     product_task_id: automationResponse.product_task?.id,
+    conversation_id: automationResponse.conversation_id,
+    source_cwd: automation.cwds[0],
+    automation_name: automation.name,
   });
   store.recordAutomationRunCompleted({
     automation_run_id: automationRun.id,
     run_id: automationResponse.run_id,
     output_summary: 'store automation completed',
   });
-  assert.equal(store.listAutomationRuns({ automation_id: automation.id }).runs[0].status, 'succeeded');
+  const completedAutomationRun = store.listAutomationRuns({ automation_id: automation.id }).runs[0];
+  assert.equal(completedAutomationRun.status, 'succeeded');
+  assert.equal(completedAutomationRun.conversation_id, automationResponse.conversation_id);
+  assert.equal(completedAutomationRun.source_cwd, '/tmp/joi-automation');
+  assert.equal(completedAutomationRun.automation_name, automation.name);
+  assert.equal(completedAutomationRun.read_at, undefined);
+  assert.equal(completedAutomationRun.archived_at, undefined);
+  assert.ok(store.setAutomationRunRead({ id: completedAutomationRun.id, read: true }).read_at);
+  assert.equal(store.setAutomationRunRead({ id: completedAutomationRun.id, read: false }).read_at, undefined);
+  assert.equal(store.markAllAutomationRunsRead({ automation_id: automation.id }).updated, 1);
+  assert.ok(store.listAutomationRuns({ automation_id: automation.id }).runs[0].read_at);
+  assert.ok(store.setAutomationRunArchived({ id: completedAutomationRun.id, archived: true }).archived_at);
+  assert.equal(store.setAutomationRunArchived({ id: completedAutomationRun.id, archived: false }).archived_at, undefined);
+  assert.deepEqual(store.archiveAllAutomationRuns({ automation_id: automation.id }), { succeeded_count: 1, failed_count: 0 });
+  assert.ok(store.listAutomationRuns({ automation_id: automation.id }).runs[0].archived_at);
   assert.equal(store.listAutomationTriggers({ automation_id: automation.id }).triggers[0].status, 'succeeded');
   const automationCompletedEvent = store.getRunTrace(automationResponse.run_id).events.find((event) => event.event_type === 'automation.run_completed');
   assert.equal(automationCompletedEvent?.status, 'completed');
   assert.equal(automationCompletedEvent?.terminal, true);
   assert.equal(automationCompletedEvent?.visibility, 'trace_only');
+
+  const concurrencyTriggerOne = store.enqueueAutomationTrigger({
+    automation_id: automation.id,
+    trigger_type: 'schedule',
+    dedup_key: 'schedule:store:concurrency:1',
+    payload: { concurrency: 1 },
+    fire_at: new Date(Date.now() - 1000).toISOString(),
+  }).trigger;
+  const concurrencyTriggerTwo = store.enqueueAutomationTrigger({
+    automation_id: automation.id,
+    trigger_type: 'schedule',
+    dedup_key: 'schedule:store:concurrency:2',
+    payload: { concurrency: 2 },
+    fire_at: new Date(Date.now() - 1000).toISOString(),
+  }).trigger;
+  const firstConcurrencyClaim = store.claimDueAutomationTrigger(new Date().toISOString());
+  assert.equal(firstConcurrencyClaim?.trigger.id, concurrencyTriggerOne.id);
+  assert.equal(store.claimDueAutomationTrigger(new Date().toISOString()), undefined);
+  store.recordAutomationTriggerFailed({
+    trigger_id: concurrencyTriggerOne.id,
+    error_code: 'TEST_COMPLETE',
+    error_message: 'release concurrency slot',
+  });
+  const secondConcurrencyClaim = store.claimDueAutomationTrigger(new Date().toISOString());
+  assert.equal(secondConcurrencyClaim?.trigger.id, concurrencyTriggerTwo.id);
+  store.recordAutomationTriggerFailed({
+    trigger_id: concurrencyTriggerTwo.id,
+    error_code: 'TEST_COMPLETE',
+    error_message: 'release concurrency slot',
+  });
+
+  store.setAutomationEnabled({ id: automation.id, enabled: false });
+  const pausedManualTrigger = store.triggerAutomationNow({ id: automation.id, payload: { paused_manual: true } }).trigger;
+  const pausedManualClaim = store.claimDueAutomationTrigger(new Date().toISOString());
+  assert.equal(pausedManualClaim?.trigger.id, pausedManualTrigger.id);
+  store.recordAutomationTriggerFailed({
+    trigger_id: pausedManualTrigger.id,
+    error_code: 'TEST_COMPLETE',
+    error_message: 'paused manual run was claimable',
+  });
+  store.setAutomationEnabled({ id: automation.id, enabled: true });
 
   const retryAutomation = store.saveAutomation({
     kind: 'webhook',
@@ -610,6 +908,35 @@ try {
   assert.ok(projectScopedPrompt.memory_results.some((result) => result.memory.id === 'mem_scope_project_a'));
   assert.ok(!projectScopedPrompt.memory_results.some((result) => result.memory.id === 'mem_scope_project_b'));
   assert.deepEqual(projectScopedPrompt.memory_scope.project_ids, ['prj_memory_scope_a']);
+  const toolScopedRecall = store.recallMemoriesForTool({
+    conversation_id: 'conv_memory_scope',
+    room_id: 'room_memory_scope',
+    user_id: 'desktop_user',
+    message: 'Scope cipher',
+    runtime_mode: 'tool_calling',
+  }, 'Scope cipher', 8);
+  assert.ok(toolScopedRecall.memories.some((result) => result.memory.id === 'mem_scope_project_a'));
+  assert.ok(!toolScopedRecall.memories.some((result) => result.memory.id === 'mem_scope_project_b'));
+  assert.deepEqual(toolScopedRecall.scope.project_ids, ['prj_memory_scope_a']);
+  const toolCandidateRequest = {
+    conversation_id: 'conv_memory_scope',
+    room_id: 'room_memory_scope',
+    user_id: 'desktop_user',
+    message: 'Remember a scoped tool candidate',
+    runtime_mode: 'tool_calling',
+  };
+  const toolCandidate = store.createMemoryCandidateForTool(toolCandidateRequest, {
+    content: 'Tool candidate stays inside project alpha.',
+    summary: 'Scoped tool candidate',
+    scope: 'current_project',
+  });
+  assert.equal(toolCandidate.candidate.scope_type, 'project');
+  assert.equal(toolCandidate.candidate.scope_id, 'prj_memory_scope_a');
+  assert.equal(toolCandidate.candidate.status, 'pending');
+  assert.equal(store.createMemoryCandidateForTool(toolCandidateRequest, {
+    content: 'Tool candidate stays inside project alpha.',
+    scope: 'current_project',
+  }).deduped, true);
   const crossProjectPrompt = store.assembleToolCallingPrompt({
     conversation_id: 'conv_memory_scope',
     room_id: 'room_memory_scope',
@@ -747,6 +1074,178 @@ try {
   assert.ok(memoryMetrics.injected_count >= 1);
   assert.ok(memoryMetrics.scope_counts.project >= 1);
 
+  const globalMemorySettings = store.getMemorySettings();
+  assert.equal(globalMemorySettings.pipeline_version, 'memory_os_v4_hygiene');
+  assert.equal(store.saveMemorySettings({ use_memories: false, generate_memories: false }).use_memories, false);
+  const globallyDisabledPrompt = store.assembleToolCallingPrompt({
+    message: 'Scope priority exact',
+    runtime_mode: 'tool_calling',
+  }, 'general_agent', 'real-tool-model');
+  assert.equal(globallyDisabledPrompt.memory_results.length, 0);
+  assert.equal(globallyDisabledPrompt.memory_controls.generate_memories, false);
+  assert.match(globallyDisabledPrompt.cacheable_prefix, /Joi Persona Constitution v2/);
+  store.saveMemorySettings(globalMemorySettings);
+
+  const taskDisabledPrompt = store.assembleToolCallingPrompt({
+    message: 'Scope priority exact',
+    runtime_mode: 'tool_calling',
+    memory_controls: { use_memories: false, generate_memories: true, disable_on_external_context: true },
+  }, 'general_agent', 'real-tool-model');
+  assert.equal(taskDisabledPrompt.memory_results.length, 0);
+  assert.equal(taskDisabledPrompt.memory_controls.use_memories, false);
+
+  const memoryChatResult = (message, suffix, request = {}, toolResults = [], finalMessage = '已记录当前结果。') => store.recordToolCallingChat({
+    message,
+    input_mode: 'chat_assist',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+    principal_id: 'principal_local_owner',
+    ...request,
+  }, {
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: finalMessage,
+    tool_results: toolResults,
+    usage: { input_tokens: 4, output_tokens: 4, cached_input_tokens: 0 },
+    model_responses: [{ id: `chatcmpl_memory_${suffix}` }],
+  });
+
+  const explicitMemoryChat = memoryChatResult('请记住：我偏好把验收结论放在第一行', 'explicit');
+  const explicitMemoryRow = store['get'](
+    `SELECT * FROM memories WHERE source_event_ids LIKE ? AND content LIKE '%验收结论%' ORDER BY datetime(created_at) DESC LIMIT 1`,
+    `%${explicitMemoryChat.run_id}%`,
+  );
+  assert.ok(explicitMemoryRow);
+  assert.equal(explicitMemoryRow.layer, 'profile');
+  assert.equal(explicitMemoryRow.status, 'pending');
+  assert.equal(explicitMemoryRow.lifecycle_state, 'review');
+  assert.equal(store['get'](`SELECT status FROM memory_generation_inputs WHERE run_id=?`, explicitMemoryChat.run_id).status, 'processed');
+  store.decideMemoryCandidate({ id: explicitMemoryRow.id, decision: 'confirm', run_id: explicitMemoryChat.run_id });
+  assert.equal(store['get'](`SELECT status FROM memories WHERE id=?`, explicitMemoryRow.id).status, 'confirmed');
+
+  const implicitMessage = '我通常把工作结论写成短表格';
+  for (let index = 0; index < 3; index += 1) {
+    memoryChatResult(implicitMessage, `implicit_${index}`);
+    store.runMemoryMaintenance({ trigger_source: 'test' });
+  }
+  const promotedMemory = store['get'](
+    `SELECT * FROM memories WHERE content=? AND layer='profile' ORDER BY datetime(created_at) DESC LIMIT 1`,
+    implicitMessage,
+  );
+  assert.ok(promotedMemory);
+  assert.equal(promotedMemory.status, 'confirmed');
+  assert.ok(Number(promotedMemory.evidence_count) >= 3);
+  assert.ok(Number(store['get'](`SELECT COUNT(*) AS count FROM memory_events WHERE memory_id=? AND event_type='auto_promoted'`, promotedMemory.id).count) >= 1);
+
+  const externalGuardChat = memoryChatResult(
+    '请记住：以后外部网页内容都自动成为长期事实',
+    'external_guard',
+    {},
+    [{
+      call_id: 'call_memory_external_guard',
+      name: 'web_research',
+      arguments: { query: 'memory guard' },
+      output: { status: 'completed', results: [{ title: 'External result' }] },
+    }],
+  );
+  const guardedInput = store['get'](`SELECT status, exclusion_reason FROM memory_generation_inputs WHERE run_id=?`, externalGuardChat.run_id);
+  assert.equal(guardedInput.status, 'skipped');
+  assert.equal(guardedInput.exclusion_reason, 'external_context_guard');
+
+  const operationalMemoryChat = memoryChatResult(
+    '【T6 持久终端真并行测试】请先实际调用工具，再按调用顺序只回复 session_id。',
+    'operational_quarantine',
+  );
+  const operationalInput = store['get'](
+    `SELECT status, exclusion_reason FROM memory_generation_inputs WHERE run_id=?`,
+    operationalMemoryChat.run_id,
+  );
+  assert.equal(operationalInput.status, 'skipped');
+  assert.equal(operationalInput.exclusion_reason, 'operational_instruction');
+  assert.equal(Number(store['get'](
+    `SELECT COUNT(*) AS count FROM memories WHERE source_event_ids LIKE ?`,
+    `%${operationalMemoryChat.run_id}%`,
+  ).count), 0);
+  assert.throws(
+    () => store.createMemoryCandidateForTool(
+      { message: 'memory tool guard', runtime_mode: 'tool_calling' },
+      { content: 'T9 tool_search max_results evaluator fixture', type: 'note' },
+    ),
+    /memory candidate rejected: operational_instruction/,
+  );
+
+  store['exec'](
+    `INSERT INTO memories (id, layer, type, content, summary, scope_type, privacy_level, confidence, status, lifecycle_state, source_event_ids, entities, metadata)
+     VALUES ('mem_legacy_operational_noise', 'knowledge', 'note', 'T8 capability visibility test: tool_search max_results 90', 'T8 capability visibility', 'user', 'internal', 0.74, 'observed', 'provisional', '[]', '[]', '{}')`,
+  );
+  store['exec'](
+    `INSERT INTO memories (id, layer, type, content, summary, scope_type, privacy_level, confidence, status, lifecycle_state, source_event_ids, entities, metadata)
+     VALUES ('mem_confirmed_operational_phrase', 'knowledge', 'note', 'T3 failure recovery is a consciously confirmed reference.', 'Confirmed T3 reference', 'user', 'internal', 0.95, 'confirmed', 'active', '[]', '[]', '{}')`,
+  );
+
+  const seriousMemoryChat = memoryChatResult(
+    '实现本地索引并验证旧数据兼容',
+    'serious_episode',
+    { input_mode: 'serious_task' },
+    [{
+      call_id: 'call_serious_memory_patch',
+      name: 'apply_patch',
+      arguments: { patch: 'fixture' },
+      output: { status: 'completed', changed_file_count: 1, summary: 'Local index patch applied.' },
+    }, {
+      call_id: 'call_serious_memory_test',
+      name: 'test_command',
+      arguments: { cmd: ['pnpm', 'test'] },
+      output: { status: 'completed', test_status: 'succeeded', exit_code: 0, summary: 'Compatibility tests passed.' },
+    }],
+    '本地索引已完成，旧数据兼容检查通过。',
+  );
+  const maintenanceResult = store.runMemoryMaintenance({ trigger_source: 'test' }).run;
+  assert.equal(maintenanceResult.status, 'completed');
+  assert.ok((maintenanceResult.quarantined_count || 0) >= 1);
+  assert.equal(store['get'](`SELECT status FROM memories WHERE id='mem_legacy_operational_noise'`).status, 'quarantined');
+  assert.equal(store['get'](`SELECT lifecycle_state FROM memories WHERE id='mem_legacy_operational_noise'`).lifecycle_state, 'quarantined');
+  assert.equal(store['get'](`SELECT status FROM memories WHERE id='mem_confirmed_operational_phrase'`).status, 'confirmed');
+  const episodeMemory = store['get'](
+    `SELECT * FROM memories WHERE layer='episode' AND source_event_ids LIKE ? ORDER BY datetime(created_at) DESC LIMIT 1`,
+    `%${seriousMemoryChat.run_id}%`,
+  );
+  assert.ok(episodeMemory);
+  assert.equal(episodeMemory.status, 'confirmed');
+  assert.ok(episodeMemory.valid_until);
+
+  const influenceChat = memoryChatResult(
+    '我应该怎样呈现验收结论？',
+    'influence',
+    {},
+    [],
+    '把验收结论放在第一行，然后再补充证据。',
+  );
+  const influenceUsage = store['get'](
+    `SELECT * FROM memory_usage_logs WHERE run_id=? AND memory_id=?`,
+    influenceChat.run_id,
+    explicitMemoryRow.id,
+  );
+  assert.ok(influenceUsage, JSON.stringify({
+    explicit_memory: store['get'](`SELECT id, layer, status, lifecycle_state, scope_type, scope_id, privacy_level FROM memories WHERE id=?`, explicitMemoryRow.id),
+    used_memories: influenceChat.used_memories.map((item) => ({ id: item.memory.id, source: item.retrieval_source })),
+  }));
+  assert.equal(influenceUsage.pipeline_version, 'memory_os_v4_hygiene');
+  assert.equal(influenceUsage.influence_state, 'inferred_used');
+
+  const abstainedChat = memoryChatResult('量子斑马第七号的随机校验值是什么？', 'retrieval_abstention');
+  const abstainedPack = store['get'](`SELECT dynamic_retrieval FROM memory_context_packs WHERE run_id=?`, abstainedChat.run_id);
+  assert.deepEqual(JSON.parse(abstainedPack.dynamic_retrieval), []);
+  assert.ok(store.getRunTrace(abstainedChat.run_id).events.some((event) => event.event_type === 'memory.retrieval.abstained'));
+  const memorySystem = store.getMemorySystem();
+  assert.equal(memorySystem.settings.pipeline_version, 'memory_os_v4_hygiene');
+  assert.ok((memorySystem.metrics.quarantined_count || 0) >= 1);
+  assert.equal(memorySystem.constitution?.version, 2);
+  assert.equal(memorySystem.metrics.layer_counts?.persona, 1);
+  assert.ok((memorySystem.metrics.layer_counts?.profile || 0) >= 2);
+  assert.ok((memorySystem.metrics.layer_counts?.episode || 0) >= 1);
+
   assert.ok(ttlPrompt.agent_capabilities.includes('workspace_search'));
   assert.ok(ttlPrompt.agent_capabilities.includes('apply_patch'));
   const researchPrompt = store.assembleToolCallingPrompt({
@@ -815,6 +1314,44 @@ try {
   assert.equal(store.listConfirmations().items[0].id, 'confirm_test');
   store.decideConfirmation({ id: 'confirm_test', approve: true, actor: 'test' });
   assert.equal(store.listConfirmations().items[0].status, 'approved');
+
+  store['exec'](
+    `INSERT INTO room_members (id, room_id, member_type, member_id, display_name, role, visibility_scope, metadata)
+     VALUES ('rmem_child_approval_human', 'room_joi_dm', 'human', 'human_child_approver', 'Child approver', 'collaborator', 'room_members', '{"can_approve_high_risk":true}')`,
+  );
+  store['exec'](
+    `INSERT INTO conversations (id, channel, user_id, title, active_agent_id, active_project_id, metadata)
+     VALUES ('conv_child_room_approval', 'desktop', 'desktop_user', 'Child room approval', 'per_joi_desktop', 'prj_joi_desktop', '{"room_id":"room_joi_dm","room_type":"joi_private_thread"}')`,
+  );
+  store['exec'](
+    `INSERT INTO runs (id, conversation_id, status, selected_agent_id, entry_channel, terminal_status, finished_at)
+     VALUES ('run_child_room_approval', 'conv_child_room_approval', 'completed', 'per_joi_desktop', 'desktop', 'completed', datetime('now'))`,
+  );
+  store['insertRunEvent']('run_child_room_approval', '', 1, 'run.completed', {
+    run_id: 'run_child_room_approval',
+    status: 'succeeded',
+    terminal: true,
+  });
+  store['exec'](
+    `INSERT INTO confirmation_requests (id, run_id, capability_id, requested_action, risk_level, status, input)
+     VALUES ('confirm_child_room_member', 'run_child_room_approval', 'apply_patch', 'Apply child patch', 'workspace_write', 'pending', '{}')`,
+  );
+  store.decideConfirmation({ id: 'confirm_child_room_member', approve: true, actor: 'human_child_approver' });
+  assert.equal(store.listConfirmations().items.find((item) => item.id === 'confirm_child_room_member').status, 'approved');
+  store['exec'](
+    `INSERT INTO confirmation_requests (id, run_id, capability_id, requested_action, risk_level, status, input)
+     VALUES ('confirm_child_room_owner', 'run_child_room_approval', 'apply_patch', 'Apply owner patch', 'workspace_write', 'pending', '{}')`,
+  );
+  store.decideConfirmation({ id: 'confirm_child_room_owner', approve: true, actor: 'desktop_user' });
+  assert.equal(store.listConfirmations().items.find((item) => item.id === 'confirm_child_room_owner').approved_by, 'desktop_user');
+  store['exec'](
+    `INSERT INTO confirmation_requests (id, run_id, capability_id, requested_action, risk_level, status, input)
+     VALUES ('confirm_child_room_guest', 'run_child_room_approval', 'apply_patch', 'Apply guest patch', 'workspace_write', 'pending', '{}')`,
+  );
+  assert.throws(
+    () => store.decideConfirmation({ id: 'confirm_child_room_guest', approve: true, actor: 'untrusted_guest' }),
+    /requires a permitted approver/,
+  );
 
   store.interruptRun({ run_id: response.run_id, reason: 'test interrupt' });
   store.interruptRun({ run_id: response.run_id, reason: 'duplicate interrupt' });
@@ -957,10 +1494,11 @@ try {
   assert.ok(promptRow.cacheable_prefix.includes('Earlier turn-specific wording, exact-output formats'));
   assert.ok(promptRow.cacheable_prefix.includes('Never continue a previous fixed answer such as RESULT=4'));
   assert.ok(promptRow.cacheable_prefix.includes('Do not proactively add emoji'));
-  assert.ok(promptRow.dynamic_tail.includes('Prefer direct status updates.'));
-  const memoryPackRow = store['get'](`SELECT dynamic_retrieval FROM memory_context_packs WHERE run_id=?`, toolCallingChat.run_id);
+  assert.ok(promptRow.cacheable_prefix.includes('Prefer direct status updates.'));
+  const memoryPackRow = store['get'](`SELECT profile, dynamic_retrieval FROM memory_context_packs WHERE run_id=?`, toolCallingChat.run_id);
+  const stableMemoryIDs = JSON.parse(memoryPackRow.profile).map((result) => result.memory.id);
   const dynamicMemoryIDs = JSON.parse(memoryPackRow.dynamic_retrieval).map((result) => result.memory.id);
-  assert.ok(dynamicMemoryIDs.includes(correctedMemory.id));
+  assert.ok(stableMemoryIDs.includes(correctedMemory.id));
   assert.ok(!dynamicMemoryIDs.includes('mem_test'));
 
   const emojiSanitizedChat = store.recordToolCallingChat({
@@ -1010,6 +1548,144 @@ try {
   assert.equal(seriousTaskModeEvent?.payload?.contract_mode, 'execution');
   assert.ok(seriousTaskTrace.steps.some((step) => step.step_type === 'artifact_created'));
   assert.ok(seriousTaskTrace.steps.some((step) => step.step_type === 'task_verification_finished'));
+
+  const maxStepsTaskChat = store.recordToolCallingChat({
+    message: '帮我完成一份不能假完成的验证报告',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'max_steps_exceeded',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'I reached the step limit before verification.',
+    tool_results: [],
+    usage: { input_tokens: 3, output_tokens: 2 },
+    model_responses: [{ id: 'chatcmpl_max_steps_task' }],
+  });
+  assert.equal(maxStepsTaskChat.product_task.status, 'blocked');
+  assert.equal(maxStepsTaskChat.product_task.verification.status, 'failed');
+  assert.equal(maxStepsTaskChat.product_task.verification.checks.find((check) => check.name === 'runtime_reached_safe_terminal_state')?.status, 'failed');
+
+  const untestedPatchTaskChat = store.recordToolCallingChat({
+    message: '实现并测试 Joi 的任务验收修复',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'The patch was applied but tests were not run.',
+    tool_results: [{
+      call_id: 'call_untested_patch',
+      name: 'apply_patch',
+      arguments: { patch: 'fixture' },
+      output: { status: 'completed', changed_file_count: 1, summary: 'Patch applied.' },
+    }],
+    usage: { input_tokens: 3, output_tokens: 2 },
+    model_responses: [{ id: 'chatcmpl_untested_patch' }],
+  });
+  assert.equal(untestedPatchTaskChat.product_task.status, 'blocked');
+  assert.equal(untestedPatchTaskChat.product_task.verification.checks.find((check) => check.name === 'task_contract_requirements')?.status, 'failed');
+
+  const verifiedPatchTaskChat = store.recordToolCallingChat({
+    message: '实现并测试 Joi 的交付闭环',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'The patch and its tests passed.',
+    tool_results: [{
+      call_id: 'call_verified_patch',
+      name: 'apply_patch',
+      arguments: { patch: 'fixture' },
+      output: { status: 'completed', changed_file_count: 1, summary: 'Patch applied.' },
+    }, {
+      call_id: 'call_verified_test',
+      name: 'test_command',
+      arguments: { cmd: ['pnpm', 'test'] },
+      output: { status: 'completed', test_status: 'succeeded', exit_code: 0, summary: 'Tests passed.' },
+    }],
+    usage: { input_tokens: 3, output_tokens: 2 },
+    model_responses: [{ id: 'chatcmpl_verified_patch' }],
+  });
+  assert.equal(verifiedPatchTaskChat.product_task.status, 'completed');
+  assert.equal(verifiedPatchTaskChat.product_task.verification.status, 'passed');
+
+  const disclosedWebFailureChat = store.recordToolCallingChat({
+    message: '生成一份只保留已核验来源的免费游戏报告',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'Epic 免费游戏页返回 403，无法完成正文核验，因此本期不列具体游戏。',
+    tool_results: [{
+      call_id: 'call_disclosed_web_failure',
+      name: 'mcp.joi_web.web_extract',
+      arguments: { url: 'https://store.epicgames.com/en-US/free-games' },
+      output: {
+        status: 'failed',
+        fetch_status: 'http_error',
+        status_code: 403,
+        failure_class: 'origin_access_restricted',
+        summary: 'Source could not be verified: HTTP 403.',
+      },
+    }],
+    usage: { input_tokens: 4, output_tokens: 4 },
+    model_responses: [{ id: 'chatcmpl_disclosed_web_failure' }],
+  });
+  assert.equal(disclosedWebFailureChat.product_task.status, 'completed');
+  assert.equal(disclosedWebFailureChat.product_task.verification.status, 'passed');
+  assert.match(disclosedWebFailureChat.product_task.verification.summary, /disclosed read-only source limitations/);
+  const disclosedFailureCheck = disclosedWebFailureChat.product_task.verification.checks.find((check) => check.name === 'tool_failures_not_hidden');
+  assert.equal(disclosedFailureCheck.status, 'passed');
+  assert.equal(disclosedFailureCheck.evidence.failed_tool_count, 1);
+  assert.equal(disclosedFailureCheck.evidence.disclosed_failure_count, 1);
+  const disclosedWebFailureTrace = store.getRunTrace(disclosedWebFailureChat.run_id);
+  assert.ok(disclosedWebFailureTrace.events.some((event) => event.event_type === 'tool.failed'));
+  assert.ok(disclosedWebFailureTrace.events.some((event) => event.event_type === 'task.completed'));
+  assert.ok(!disclosedWebFailureTrace.events.some((event) => event.event_type === 'task.blocked'));
+
+  const hiddenWebFailureChat = store.recordToolCallingChat({
+    message: '生成一份确认所有来源都成功的免费游戏报告',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'Epic 免费游戏页已经完整核验，一切正常。',
+    tool_results: [{
+      call_id: 'call_hidden_web_failure',
+      name: 'mcp.joi_web.web_extract',
+      arguments: { url: 'https://store.epicgames.com/en-US/free-games' },
+      output: {
+        status: 'failed',
+        fetch_status: 'http_error',
+        status_code: 403,
+        failure_class: 'origin_access_restricted',
+      },
+    }],
+    usage: { input_tokens: 4, output_tokens: 4 },
+    model_responses: [{ id: 'chatcmpl_hidden_web_failure' }],
+  });
+  assert.equal(hiddenWebFailureChat.product_task.status, 'blocked');
+  assert.equal(hiddenWebFailureChat.product_task.verification.status, 'failed');
+  const hiddenWebFailureTrace = store.getRunTrace(hiddenWebFailureChat.run_id);
+  assert.ok(hiddenWebFailureTrace.events.some((event) => event.event_type === 'task.blocked'));
 
   const telegramTaskChat = store.recordToolCallingChat({
     conversation_id: 'conv_tg_handoff_test',
@@ -1292,6 +1968,83 @@ try {
   assert.equal(store.listConfirmations().items.find((item) => item.id === waitingConfirmation.id).status, 'rejected');
   assert.equal(store.getProductTask(waitingToolCallingChat.product_task.id).task.status, 'blocked');
 
+  const acpNestedWaiting = store.recordToolCallingChat({
+    message: 'Start a persistent shell through the Joi ACP bridge',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    provider: 'acp_codex_cli',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'per_joi_desktop',
+    final_message: 'The Joi bridge requested confirmation.',
+    tool_results: [{
+      call_id: 'call_acp_shell_start_waiting',
+      name: 'mcp.joi_capabilities.shell_start',
+      arguments: { cwd: tempDir },
+      output: {
+        status: 'succeeded',
+        protocol: 'acp',
+        raw_output: {
+          result: {
+            structuredContent: {
+              status: 'waiting_confirmation',
+              capability: 'shell_start',
+              risk: 'browser_interaction',
+              requested_action: 'Start persistent shell',
+              message: '这个交互能力需要你确认后才会执行。',
+              duration_ms: 17,
+            },
+          },
+        },
+      },
+    }],
+    usage: {},
+    usage_status: 'provider_missing',
+    model_responses: [],
+  });
+  assert.equal(acpNestedWaiting.ui.requires_user_input, true, 'nested MCP confirmation state must reach the Joi approval flow');
+  const acpNestedConfirmation = store.listConfirmations().items.find((item) => item.run_id === acpNestedWaiting.run_id);
+  assert.ok(acpNestedConfirmation);
+  assert.equal(acpNestedConfirmation.capability_id, 'shell_start');
+  assert.equal(acpNestedConfirmation.risk_level, 'browser_interaction');
+  store.decideConfirmation({ id: acpNestedConfirmation.id, approve: false, actor: 'test', reason: 'nested ACP confirmation regression test' });
+
+  const acpPolicyTrace = store.recordToolCallingChat({
+    message: 'Attempt one policy-blocked ACP workspace edit and report the rejection',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    provider: 'acp_codex_cli',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'per_joi_desktop',
+    final_message: '工作区修改已被策略阻止，未执行。',
+    tool_results: [{
+      call_id: 'call_acp_policy_edit',
+      name: 'Editing files',
+      arguments: { path: 'README.md' },
+      output: {
+        status: 'policy_blocked',
+        protocol: 'acp',
+        capability: 'apply_patch',
+        policy_reason: 'workspace_write_profile_required',
+        error: 'workspace_write_profile_required',
+        duration_ms: 29,
+      },
+    }],
+    usage: {},
+    usage_status: 'provider_missing',
+    model_responses: [],
+  });
+  const acpPolicyToolRun = store['get'](`SELECT capability_id, risk_level, side_effect_level, status, duration_ms, error_message FROM tool_runs WHERE run_id=?`, acpPolicyTrace.run_id);
+  assert.equal(acpPolicyToolRun.capability_id, 'apply_patch');
+  assert.equal(acpPolicyToolRun.risk_level, 'workspace_write');
+  assert.equal(acpPolicyToolRun.side_effect_level, 'write_local');
+  assert.equal(acpPolicyToolRun.status, 'policy_blocked');
+  assert.equal(acpPolicyToolRun.duration_ms, 29);
+  assert.equal(acpPolicyToolRun.error_message, 'workspace_write_profile_required');
+
   const resumableChat = store.recordToolCallingChat({
     message: 'Use another model-generated patch that will be approved',
     input_mode: 'serious_task',
@@ -1330,10 +2083,18 @@ try {
   });
   assert.equal(store.listConfirmations().items.find((item) => item.id === resumableConfirmation.id).approved_by, 'test');
   assert.equal(store.listConfirmations().items.find((item) => item.id === resumableConfirmation.id).decided_at, '2026-06-22T00:00:00Z');
+  store['exec'](
+    `UPDATE runs
+     SET route_result=json_set(COALESCE(route_result, '{}'), '$.provider', 'acp_codex_cli', '$.model', 'gpt-5.6-luna[medium]')
+     WHERE id=?`,
+    resumableChat.run_id,
+  );
   const resumeRequest = store.loadApprovedToolCallingResume(resumableConfirmation.id);
   assert.equal(resumeRequest.call_id, 'call_apply_patch_resume');
   assert.equal(resumeRequest.input.reason, 'edited resume approval');
   assert.equal(resumeRequest.input.dry_run, true);
+  assert.equal(resumeRequest.provider, 'acp_codex_cli', 'approval resume must preserve the provider selected in the original run route');
+  assert.equal(resumeRequest.model_name, 'gpt-5.6-luna[medium]', 'approval resume must preserve the model selected in the original run route');
   const resumed = store.completeApprovedToolCallingResume(resumableConfirmation.id, {
     provider: 'openai_compatible',
     model_name: 'real-tool-model',
@@ -1342,8 +2103,21 @@ try {
       call_id: 'call_apply_patch_resume',
       name: 'apply_patch',
       arguments: resumeRequest.input,
-      output: { status: 'completed', summary: 'patch applied by approval resume' },
+      output: { status: 'completed', summary: 'patch applied by approval resume', duration_ms: 17 },
     },
+    tool_results: [{
+      call_id: 'call_resume_verify_read',
+      name: 'file_read',
+      arguments: { path: 'README.md' },
+      output: {
+        status: 'completed',
+        capability: 'file_read',
+        risk: 'read_only',
+        side_effect_level: 'read',
+        summary: 'verified patch after approval resume',
+        duration_ms: 9,
+      },
+    }],
     usage: { input_tokens: 11, output_tokens: 4, cached_input_tokens: 1 },
     model_responses: [{ id: 'chatcmpl_resume_final', choices: [{ message: { content: 'Patch resumed final answer.' } }] }],
   });
@@ -1360,7 +2134,22 @@ try {
   assert.ok(resumedTrace.events.some((event) => event.event_type === 'tool.finished'));
   assert.ok(resumedTrace.events.some((event) => event.event_type === 'run.completed'));
   assert.equal(store.getConversation(resumableChat.conversation_id).messages.at(-1).content, 'Patch resumed final answer.');
-  assert.equal(JSON.parse(store['get'](`SELECT output FROM tool_runs WHERE run_id=?`, resumableChat.run_id).output).summary, 'patch applied by approval resume');
+  const resumedToolRuns = store['all'](
+    `SELECT tool_call_id, capability_id, assignment_reason, risk_level, side_effect_level, input, output, duration_ms
+     FROM tool_runs WHERE run_id=? ORDER BY CASE assignment_reason WHEN 'confirmation_resume' THEN 0 ELSE 1 END, created_at, id`,
+    resumableChat.run_id,
+  );
+  assert.equal(resumedToolRuns.length, 2);
+  assert.equal(resumedToolRuns[0].tool_call_id, 'call_apply_patch_resume');
+  assert.equal(resumedToolRuns[0].capability_id, 'apply_patch');
+  assert.equal(resumedToolRuns[0].duration_ms, 17);
+  assert.equal(JSON.parse(resumedToolRuns[0].output).summary, 'patch applied by approval resume');
+  assert.equal(resumedToolRuns[1].tool_call_id, 'call_resume_verify_read');
+  assert.equal(resumedToolRuns[1].capability_id, 'file_read');
+  assert.equal(resumedToolRuns[1].assignment_reason, 'approval_resume_continuation');
+  assert.equal(resumedToolRuns[1].risk_level, 'read_only');
+  assert.equal(resumedToolRuns[1].side_effect_level, 'read');
+  assert.equal(resumedToolRuns[1].duration_ms, 9);
   assert.ok(store.listConfirmations().items.find((item) => item.id === resumableConfirmation.id).resumed_at);
   const duplicateResume = store.completeApprovedToolCallingResume(resumableConfirmation.id, {
     provider: 'openai_compatible',
@@ -1385,7 +2174,8 @@ try {
     resumableChat.run_id,
     resumableConfirmation.id,
   ).metadata);
-  assert.equal(resumedModelMetadata.tool_run_count, 1);
+  assert.equal(resumedModelMetadata.tool_run_count, 2);
+  assert.equal(resumedModelMetadata.tool_run_ids.length, 2);
   assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM messages WHERE json_extract(metadata, '$.run_id')=? AND role='assistant'`, resumableChat.run_id).count), 1);
   assert.equal(Number(store['get'](`SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND role='assistant' AND content LIKE 'confirmation_required:%'`, resumableChat.conversation_id).count), 0);
 
@@ -1672,6 +2462,17 @@ try {
     usage: { input_tokens: 9, output_tokens: 4, cached_input_tokens: 2 },
     usage_status: 'recorded',
   });
+  streamCallbacks.onEvent({
+    type: 'work_summary.updated',
+    step: 0,
+    status: 'completed',
+    detail: {
+      phase: 'prepared',
+      summary: '已准备 3 项 Joi 能力',
+      user_visible: true,
+      capability_count: 3,
+    },
+  });
   streamCallbacks.onAssistantDelta({ step: 1, text: `${committedStreamAnswer}\n\n`, index: 0 });
   streamCallbacks.onAssistantCompleted({ step: 1, text: `${committedStreamAnswer}\n\n`, finish_reason: 'stop', usage_status: 'recorded' });
   streamCallbacks.onModelCompleted({ step: 1, finish_reason: 'stop', usage_status: 'recorded' });
@@ -1690,6 +2491,7 @@ try {
   assert.equal(streamFinished.response, committedStreamAnswer);
   assert.ok(emittedEventTypes.includes('assistant.delta'));
   assert.ok(emittedEventTypes.includes('tool.completed'));
+  assert.ok(emittedEventTypes.includes('work_summary.updated'));
   assert.ok(emittedEvents.every((event) => event.run_id === streamStarted.run_id && event.seq > 0));
   const streamTrace = store.getRunTrace(streamStarted.run_id);
   const streamEventTypes = streamTrace.events.map((event) => event.event_type);
@@ -1710,6 +2512,11 @@ try {
   assert.equal(streamTrace.events.filter((event) => event.event_type === 'tool.started' && event.item_id === streamToolCall.id).length, 1);
   assert.equal(streamTrace.events.filter((event) => event.event_type === 'tool.completed' && event.item_id === streamToolCall.id).length, 1);
   assert.equal(streamTrace.events.filter((event) => event.event_type === 'usage.recorded' && event.item_id === streamStarted.model_call_id).length, 1);
+  const preparedStage = streamTrace.events.find((event) => event.event_type === 'work_summary.updated');
+  assert.equal(preparedStage?.visibility, 'transcript');
+  assert.equal(preparedStage?.item_type, 'work_summary');
+  assert.equal(preparedStage?.phase, 'prepared');
+  assert.equal(preparedStage?.payload?.user_visible, true);
   assert.equal(streamTrace.model_calls[0].input_tokens, 9);
   assert.equal(streamTrace.model_calls[0].cached_input_tokens, 2);
   const streamModelCallRow = store['get'](
@@ -1902,16 +2709,26 @@ try {
       version: 'test',
     });
     const staleTrace = reopenedRecoveryStore.getRunTrace(staleRun.run_id);
-    assert.equal(staleTrace.status, 'failed');
-    assert.equal(staleTrace.terminal_reason, 'runtime state was lost after app restart');
+    assert.equal(staleTrace.status, 'needs_recovery');
+    assert.equal(staleTrace.terminal_status, undefined);
+    assert.equal(staleTrace.terminal_reason, 'App restarted before this run reached a safe terminal state');
     assert.ok(staleTrace.events.some((event) => event.event_type === 'run.recovery_required'));
-    assert.ok(staleTrace.events.some((event) => event.event_type === 'run.failed'));
+    assert.equal(staleTrace.events.some((event) => event.event_type === 'run.failed'), false);
     const waitingRecoveryTrace = reopenedRecoveryStore.getRunTrace(waitingRecovery.run_id);
     assert.equal(waitingRecoveryTrace.status, 'waiting_confirmation');
     assert.ok(waitingRecoveryTrace.events.some((event) => event.event_type === 'run.recovery_required'));
     const recoverableRuns = reopenedRecoveryStore.listRecoverableRuns({ limit: 10 }).runs;
-    assert.ok(recoverableRuns.some((item) => item.run_id === staleRun.run_id && item.recovery_status === 'runtime_lost'));
+    assert.ok(recoverableRuns.some((item) => item.run_id === staleRun.run_id && item.recovery_status === 'recoverable' && item.safe_to_retry === true));
     assert.ok(recoverableRuns.some((item) => item.run_id === waitingRecovery.run_id && item.recovery_status === 'needs_user_decision'));
+    const retryContext = reopenedRecoveryStore.beginRecoverableRunRetry(staleRun.run_id);
+    assert.equal(retryContext.original_message, 'This live run will be orphaned by restart');
+    assert.equal(retryContext.completed_effects.length, 0);
+    assert.equal(reopenedRecoveryStore.getRunTrace(staleRun.run_id).status, 'resuming');
+    reopenedRecoveryStore.failRecoverableRunRetry(staleRun.run_id, 'fixture retry failed');
+    assert.equal(reopenedRecoveryStore.getRunTrace(staleRun.run_id).status, 'needs_recovery');
+    const abandonedTrace = reopenedRecoveryStore.abandonRecoverableRun(staleRun.run_id, 'fixture abandoned');
+    assert.equal(abandonedTrace.status, 'cancelled');
+    assert.equal(reopenedRecoveryStore.listRecoverableRuns({ limit: 10 }).runs.some((item) => item.run_id === staleRun.run_id), false);
     reopenedRecoveryStore.close();
   }
 
@@ -2087,6 +2904,7 @@ try {
   assert.equal(appLog.payload.nested.password, '[REDACTED]');
   assert.equal(String(appLog.payload.note).includes('log-token-value'), false);
   assert.equal(String(appLog.payload.long_note).includes(longLogBody), true);
+  assert.equal(appLog.error, undefined);
   assert.match(appLog.created_at, /^\d{4}-\d{2}-\d{2}/);
   const defaultTimestampEvent = store.appendRunEventV2({
     run_id: response.run_id,
@@ -2110,6 +2928,39 @@ try {
   assert.equal(JSON.stringify(secretShapeLog.payload).includes('plain-local-secret-12345'), false);
   const logDetail = store.getLogEntry(appLog.id);
   assert.equal(logDetail?.feature_key, 'store.test.app_log');
+  assert.equal(logDetail?.error, undefined);
+  const ipcStartedLog = store.recordAppLog({
+    level: 'debug',
+    risk_level: 'read_only',
+    category: 'ipc',
+    feature_key: 'ipc.GetSystemHealth.started',
+    source: 'electron_ipc',
+    message: 'IPC GetSystemHealth started',
+  });
+  const ipcSucceededLog = store.recordAppLog({
+    level: 'debug',
+    risk_level: 'read_only',
+    category: 'ipc',
+    feature_key: 'ipc.GetSystemHealth.succeeded',
+    source: 'electron_ipc',
+    message: 'IPC GetSystemHealth succeeded',
+  });
+  const ipcFailedLog = store.recordAppLog({
+    level: 'error',
+    risk_level: 'read_only',
+    category: 'ipc',
+    feature_key: 'ipc.GetSystemHealth.failed',
+    source: 'electron_ipc',
+    message: 'IPC GetSystemHealth failed',
+    error: new Error('fixture IPC failure'),
+  });
+  const defaultIPCLogs = store.listLogs({ sources: ['electron_ipc'], limit: 100 }).logs;
+  assert.ok(!defaultIPCLogs.some((log) => log.id === ipcStartedLog.id));
+  assert.ok(!defaultIPCLogs.some((log) => log.id === ipcSucceededLog.id));
+  assert.ok(defaultIPCLogs.some((log) => log.id === ipcFailedLog.id && log.error?.message === 'fixture IPC failure'));
+  const explicitDebugIPCLogs = store.listLogs({ sources: ['electron_ipc'], levels: ['debug'], limit: 100 }).logs;
+  assert.ok(explicitDebugIPCLogs.some((log) => log.id === ipcStartedLog.id));
+  assert.ok(explicitDebugIPCLogs.some((log) => log.id === ipcSucceededLog.id));
   const unifiedLogs = store.listLogs({ query: 'store.test.app_log', include_trace: true, include_worker_heartbeat: true, limit: 100 }).logs;
   assert.ok(unifiedLogs.some((log) => log.id === appLog.id && log.source_table === 'app_logs'));
   const runLogs = store.listLogs({ run_id: response.run_id, include_trace: true, include_worker_heartbeat: true, limit: 100 }).logs;

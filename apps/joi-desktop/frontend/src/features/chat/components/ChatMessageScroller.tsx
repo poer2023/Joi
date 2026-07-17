@@ -1,7 +1,9 @@
 import { MessageScroller } from '@shadcn/react/message-scroller';
 import type { ReactNode } from 'react';
+import { useReducedMotionPreference } from '../../../components/useLayerLifecycle';
 
 export function ChatMessageScroller({ children }: { children: ReactNode }) {
+  const reducedMotion = useReducedMotionPreference();
   return (
     <MessageScroller.Provider
       autoScroll
@@ -24,7 +26,7 @@ export function ChatMessageScroller({ children }: { children: ReactNode }) {
         </MessageScroller.Viewport>
         <MessageScroller.Button
           aria-label="跳到最新消息"
-          behavior="smooth"
+          behavior={reducedMotion ? 'auto' : 'smooth'}
           className="chat-message-scroller-button"
           direction="end"
           title="跳到最新消息"

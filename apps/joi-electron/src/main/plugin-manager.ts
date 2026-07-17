@@ -13,8 +13,12 @@ import {
   inspectACPProvider,
   type ACPProviderRuntimeConfig,
 } from '../../../../packages/runtime/src/acp.ts';
+import {
+  canonicalElectronCapabilityName,
+  compileElectronCapabilityTools,
+} from '../../../../packages/runtime/src/capability-compiler.ts';
 import { resolveACPEphemeralLauncherScript } from './acp-ephemeral-launcher.ts';
-import { createACPWebMCPServer } from './acp-web-bridge.ts';
+import { createACPCapabilityMCPServer, createACPWebMCPServer } from './acp-web-bridge.ts';
 
 export type GitHubPluginSource = {
   owner: string;
@@ -118,11 +122,22 @@ export class JoiPluginManager {
     return inspection;
   }
 
-  resolveProvider(providerID: string, permissionProfile: ACPProviderRuntimeConfig['permission_profile']): ACPProviderRuntimeConfig | undefined {
+  resolveProvider(
+    providerID: string,
+    permissionProfile: NonNullable<ACPProviderRuntimeConfig['permission_profile']>,
+    allowedCapabilities?: Iterable<string>,
+  ): ACPProviderRuntimeConfig | undefined {
     const provider = this.store.getEnabledPluginProvider(providerID);
     if (!provider) return undefined;
     const workspace = this.store.getWorkspaceSettings();
-    return providerRuntimeConfig(provider, workspace.default_root, workspace.allowed_roots, permissionProfile, this.userDataDir);
+    return providerRuntimeConfig(
+      provider,
+      workspace.default_root,
+      workspace.allowed_roots,
+      permissionProfile,
+      this.userDataDir,
+      allowedCapabilities,
+    );
   }
 }
 
@@ -173,18 +188,38 @@ export function providerRuntimeConfig(
   provider: PluginProviderConfig,
   cwd: string,
   allowedRoots: string[],
-  permissionProfile: ACPProviderRuntimeConfig['permission_profile'],
+  permissionProfile: NonNullable<ACPProviderRuntimeConfig['permission_profile']>,
   userDataDir: string,
+  allowedCapabilities?: Iterable<string>,
 ): ACPProviderRuntimeConfig {
   if (provider.protocol !== 'acp') throw new Error(`unsupported plugin provider protocol: ${provider.protocol}`);
-  const mcpServers = [createACPWebMCPServer(userDataDir)];
+  const allowedCapabilityNames = allowedCapabilities === undefined
+    ? undefined
+    : [...allowedCapabilities].map((capability) => canonicalElectronCapabilityName(String(capability))).filter(Boolean);
+  const allowedCapabilitySet = allowedCapabilityNames === undefined ? undefined : new Set(allowedCapabilityNames);
+  const exposeWeb = allowedCapabilitySet === undefined
+    || allowedCapabilitySet.has('*')
+    || allowedCapabilitySet.has('web_research');
+  const delegatedTools = allowedCapabilityNames === undefined
+    ? []
+    : compileElectronCapabilityTools(permissionProfile, { allowed_capabilities: allowedCapabilityNames })
+      .filter((tool) => tool.name !== 'web_research');
+  const delegatedServer = createACPCapabilityMCPServer(userDataDir, delegatedTools, permissionProfile);
+  const mcpServers = [
+    ...(exposeWeb ? [createACPWebMCPServer(userDataDir)] : []),
+    ...(delegatedServer ? [delegatedServer] : []),
+  ];
+  const trustedMCPTools = [
+    ...(exposeWeb ? [
+      { server: 'joi_web', tool: 'web_search' },
+      { server: 'joi_web', tool: 'web_extract' },
+    ] : []),
+    ...delegatedTools.map((tool) => ({ server: 'joi_capabilities', tool: tool.name })),
+  ];
   const capabilityAllowlist = compileACPProviderCapabilityAllowlist({
     permission_profile: permissionProfile,
     allowed_roots: allowedRoots.length > 0 ? allowedRoots : [cwd],
-    trusted_mcp_tools: [
-      { server: 'joi_web', tool: 'web_search' },
-      { server: 'joi_web', tool: 'web_extract' },
-    ],
+    trusted_mcp_tools: trustedMCPTools,
   });
   if (provider.runtime === 'node') {
     const useCodexEphemeralLauncher = provider.id === 'acp_codex_cli';
@@ -208,6 +243,7 @@ export function providerRuntimeConfig(
       timeout_seconds: 300,
       mcp_servers: mcpServers,
       capability_allowlist: capabilityAllowlist,
+      joi_capability_tools: delegatedTools.map((tool) => tool.name),
       ephemeral_session: true,
     };
   }
@@ -223,6 +259,7 @@ export function providerRuntimeConfig(
     timeout_seconds: 300,
     mcp_servers: mcpServers,
     capability_allowlist: capabilityAllowlist,
+    joi_capability_tools: delegatedTools.map((tool) => tool.name),
     ephemeral_session: true,
   };
 }

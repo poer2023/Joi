@@ -1,0 +1,18 @@
+{
+  "status": "completed",
+  "capability": "video_generate",
+  "mode": "xai_async_video_v1",
+  "provider": "xai",
+  "model": "grok-imagine-video",
+  "request_id": "b28b2d01-5e67-9d7f-bb77-c596c6d9f563",
+  "aspect_ratio": "16:9",
+  "resolution": "480p",
+  "duration_seconds": 1,
+  "file_path": "/Users/hao/project/Joi/docs/specs/evidence/joi-agent-workbench-parity-2026-07-16/video-live/joi-xai-video-1784145682528-d1acb1b3.mp4",
+  "size": 65072,
+  "ffprobe": {
+    "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+    "duration": "1.041667",
+    "size": "65072"
+  }
+}

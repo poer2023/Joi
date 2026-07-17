@@ -33,6 +33,7 @@ export type NormalizedStatus =
 export type NormalizedRunEvent = {
   id: string;
   runId: string;
+  conversationId?: string;
   seq: number;
   type: string;
   schemaVersion: number;
@@ -82,7 +83,7 @@ export type MessageThreadAnnotation = {
 export type ChatMessageAttachment = {
   id: string;
   name: string;
-  kind: 'image' | 'video' | 'file';
+  kind: 'image' | 'video' | 'audio' | 'file';
   mimeType: string;
   size: number;
   previewUrl?: string;
@@ -102,6 +103,7 @@ export type TranscriptLineRenderItem = {
   id: string;
   runId: string;
   status: 'pending' | 'running' | 'completed' | 'failed' | 'waiting_approval';
+  runOutcome?: NormalizedStatus;
   kind: TranscriptLineKind;
   label: string;
   detail?: string;
@@ -225,6 +227,7 @@ export type HandoffRenderItem = {
 
 export type BuildConversationRenderItemsInput = {
   messages: ConversationMessage[];
+  conversationId?: string;
   streamingAssistant?: StreamingAssistantMessage | null;
   pendingUserMessage?: ConversationMessage | null;
   runEventsByRunId: Record<string, NormalizedRunEvent[]>;

@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const root = process.cwd();
 const outDir = mkdtempSync(join(tmpdir(), 'joi-execution-actions-'));
+const esbuildBin = [
+  join(root, '..', '..', '..', 'node_modules', '.pnpm', 'node_modules', '.bin', 'esbuild'),
+  join(root, 'node_modules', '.bin', 'esbuild'),
+].find((candidate) => existsSync(candidate)) || 'node_modules/.bin/esbuild';
 
 try {
   const entry = join(outDir, 'entry.ts');
@@ -16,7 +20,7 @@ try {
     export { permissionProfileForPrompt } from '${root}/src/permissionProfile.ts';
     export { capabilityBackend, capabilityBackendLabel, capabilityStatusLabel } from '${root}/src/features/capabilities/capabilityPresentation.ts';
   `);
-  execFileSync('node_modules/.bin/esbuild', [
+  execFileSync(esbuildBin, [
     entry,
     '--bundle',
     '--format=esm',
@@ -121,12 +125,14 @@ try {
         step_type: 'tool_finished',
         title: 'Tool runtime finished',
         status: 'succeeded',
+        error: {},
         output: { status: 'succeeded', source_url: 'https://example.com', summary: 'Example Domain' },
       },
     ]));
     assert.equal(actions.length, 1);
     assert.equal(actions[0].title, '读取网页');
     assert.equal(actions[0].kind, 'web');
+    assert.equal(actions[0].status, 'completed');
     assert.equal(actions[0].description, '本轮执行了工具：已读取网页并提取正文');
     assert.equal(actions[0].sourceLabel, 'example.com');
     assert.equal(actions[0].completedLabel, '已读取网页 · example.com');
@@ -198,6 +204,23 @@ try {
     assert.equal(actions[0].kind, 'command');
     assert.equal(actions[0].title, '运行命令');
     assert(actions[0].details.some((detail) => detail.label === 'COMMAND' && Array.isArray(detail.value)));
+  }
+
+  for (const [capability, expectedTitle] of [
+    ['tool_search', '查找工具'],
+    ['session_search', '搜索会话'],
+    ['memory_recall', '检索记忆'],
+    ['memory_write_candidate', '创建记忆建议'],
+    ['task_list', '查看任务'],
+    ['task_view', '查看任务详情'],
+    ['task_update', '更新任务'],
+  ]) {
+    const actions = projectRunTraceToActions(baseTrace([
+      { id: `step_${capability}_1`, step_type: 'capability_requested', title: 'Agent requested capability', status: 'succeeded', output: { capability, inputs: {} } },
+      { id: `step_${capability}_2`, step_type: 'workflow_compiled', title: 'Workflow compiled', status: 'succeeded', output: { workflow: { workflow_name: `${capability}_v1` } } },
+      { id: `step_${capability}_3`, step_type: 'tool_finished', title: 'Tool runtime finished', status: 'succeeded', output: { status: 'completed' } },
+    ]));
+    assert.equal(actions[0].title, expectedTitle);
   }
 
   {

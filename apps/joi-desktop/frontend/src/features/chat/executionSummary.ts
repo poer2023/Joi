@@ -148,6 +148,18 @@ function toolNameFromEvent(event: NormalizedRunEvent): string {
 }
 
 function inferToolLabels(toolName: string) {
+  if (toolName.includes('tool_search')) {
+    return { running: '正在查找工具', completed: '已查找工具', failed: '工具查找失败' };
+  }
+  if (toolName.includes('session_search')) {
+    return { running: '正在搜索会话', completed: '已搜索会话', failed: '会话搜索失败' };
+  }
+  if (toolName.includes('session_summary')) {
+    return { running: '正在读取会话上下文', completed: '已读取会话上下文', failed: '会话读取失败' };
+  }
+  if (toolName.includes('shell_')) {
+    return { running: '正在操作终端', completed: '已操作终端', failed: '终端操作失败' };
+  }
   if (toolName.includes('web') || toolName.includes('browser')) {
     return { running: '正在读取网页', completed: '已读取网页', failed: '网页处理失败' };
   }

@@ -56,6 +56,7 @@ export type ACPProviderRuntimeConfig = {
   permission_profile?: PermissionProfile;
   mcp_servers?: McpServer[];
   capability_allowlist?: readonly ACPCompiledCapability[];
+  joi_capability_tools?: string[];
   ephemeral_session?: boolean;
 };
 
@@ -78,6 +79,8 @@ export type ACPChatTurnRequest = ACPProviderRuntimeConfig & {
   messages: Array<{ role: string; content: string }>;
   signal?: AbortSignal;
   callbacks?: ToolCallingCallbacks;
+  getSteeringMessages?: () => Promise<Array<Record<string, unknown>>> | Array<Record<string, unknown>>;
+  getFollowUpMessages?: () => Promise<Array<Record<string, unknown>>> | Array<Record<string, unknown>>;
 };
 
 type ACPConnectionHandle = {
@@ -232,6 +235,8 @@ export async function runACPChatTurn(req: ACPChatTurnRequest): Promise<ToolCalli
   const callbacks = committedAnswerCallbacks(req.callbacks);
   const toolCalls = new Map<string, ToolCall>();
   const toolResults: ToolResult[] = [];
+  const toolStartedAt = new Map<string, number>();
+  const toolPermissions = new Map<string, ACPToolPermissionTrace>();
   const usage = emptyUsage();
   let responseText = '';
   let deltaIndex = 0;
@@ -271,12 +276,13 @@ export async function runACPChatTurn(req: ACPChatTurnRequest): Promise<ToolCalli
       if (update.sessionUpdate === 'tool_call') {
         const call = acpToolCall(update);
         toolCalls.set(call.id, call);
+        if (!toolStartedAt.has(call.id)) toolStartedAt.set(call.id, Date.now());
         callbacks?.onToolCallRequested?.({ step: 1, call });
         if (update.status === 'in_progress' || update.status === 'pending' || !update.status) {
           callbacks?.onToolStarted?.({ step: 1, call });
         }
         if (update.status === 'completed' || update.status === 'failed') {
-          finishACPTool(update, call, toolResults, callbacks);
+          finishACPTool(update, call, toolResults, callbacks, toolStartedAt.get(call.id), toolPermissions.get(call.id));
         }
         return;
       }
@@ -284,14 +290,20 @@ export async function runACPChatTurn(req: ACPChatTurnRequest): Promise<ToolCalli
         const existing = toolCalls.get(update.toolCallId) || acpToolCall(update);
         const call = mergeACPToolCall(existing, update);
         toolCalls.set(call.id, call);
+        if (!toolStartedAt.has(call.id)) toolStartedAt.set(call.id, Date.now());
         if (update.rawOutput !== undefined) {
           callbacks?.onToolOutputDelta?.({ step: 1, call, output: acpOutput(update.rawOutput) });
         }
         if (update.status === 'completed' || update.status === 'failed') {
-          finishACPTool(update, call, toolResults, callbacks);
+          finishACPTool(update, call, toolResults, callbacks, toolStartedAt.get(call.id), toolPermissions.get(call.id));
         }
       }
     }, (permission, outcome, decision) => {
+      toolPermissions.set(permission.toolCall.toolCallId, {
+        allowed: decision.allow,
+        policy_capability: decision.capability_id || '',
+        policy_reason: decision.reason,
+      });
       callbacks?.onModelDelta?.({
         step: 1,
         payload: {
@@ -335,7 +347,22 @@ export async function runACPChatTurn(req: ACPChatTurnRequest): Promise<ToolCalli
       }
       effectiveModel = await setACPModel(handle, requestedModel);
     }
-    callbacks?.onModelStarted?.({ step: 1, model: effectiveModel, streaming: true });
+    const effectiveJoiTools = effectiveJoiMCPToolNames(req.mcp_servers, req.joi_capability_tools);
+    await callbacks?.onEvent?.({
+      type: 'work_summary.updated',
+      step: 0,
+      status: 'completed',
+      detail: {
+        phase: 'prepared',
+        summary: effectiveJoiTools.length > 0
+          ? `已准备 ${effectiveJoiTools.length} 项 Joi 能力`
+          : '已准备 ACP 执行环境',
+        user_visible: true,
+        capability_count: effectiveJoiTools.length,
+        capability_names: effectiveJoiTools,
+        provider_id: req.provider_id,
+      },
+    });
     callbacks?.onModelDelta?.({
       step: 1,
       payload: {
@@ -346,18 +373,47 @@ export async function runACPChatTurn(req: ACPChatTurnRequest): Promise<ToolCalli
         },
       },
     });
-    const promptText = assembleACPPrompt(req.system_message, req.messages, req.mcp_servers);
-    const promptResponse = await withACPTimeout(
-      handle.connection.prompt({
-        sessionId: handle.session.sessionId,
-        prompt: [{ type: 'text', text: promptText }],
-      }),
-      req.timeout_seconds || 300,
-      req.signal,
-      async () => {
-        await handle?.connection.cancel({ sessionId: handle?.session.sessionId || '' }).catch(() => undefined);
-      },
+    const promptText = assembleACPPrompt(
+      req.system_message,
+      req.messages,
+      req.mcp_servers,
+      req.joi_capability_tools,
     );
+    let nextPrompt = promptText;
+    let finalStopReason = '';
+    let promptTurn = 0;
+    for (; promptTurn < 12; promptTurn += 1) {
+      const step = promptTurn + 1;
+      callbacks?.onModelStarted?.({ step, model: effectiveModel, streaming: true });
+      const promptResponse = await withACPTimeout(
+        handle.connection.prompt({
+          sessionId: handle.session.sessionId,
+          prompt: [{ type: 'text', text: nextPrompt }],
+        }),
+        req.timeout_seconds || 300,
+        req.signal,
+        async () => {
+          await handle?.connection.cancel({ sessionId: handle?.session.sessionId || '' }).catch(() => undefined);
+        },
+      );
+      if (promptResponse.usage) mergeUsage(usage, promptResponse.usage);
+      finalStopReason = promptResponse.stopReason;
+      const queued = await drainACPQueuedMessages(req);
+      if (queued.length === 0) break;
+      const queuedText = queued.map((message) => typeof message.content === 'string' ? message.content.trim() : '').filter(Boolean).join('\n\n');
+      if (!queuedText) break;
+      if (responseText.trim()) {
+        responseText += '\n\n';
+        callbacks?.onAssistantDelta?.({ step, text: '\n\n', index: deltaIndex++ });
+      }
+      await callbacks?.onEvent?.({
+        type: 'run.message_queue_drained',
+        step,
+        status: 'completed',
+        detail: { count: queued.length, next_prompt: true, protocol: 'acp' },
+      });
+      nextPrompt = queuedText;
+    }
     if (!leadingTextResolved && leadingTextBuffer) {
       const decision = filterACPLeadingSystemNotice(leadingTextBuffer, true);
       if (decision.notice) callbacks?.onModelDelta?.({ step: 1, payload: { protocol: 'acp', system_notice: decision.notice } });
@@ -368,25 +424,46 @@ export async function runACPChatTurn(req: ACPChatTurnRequest): Promise<ToolCalli
       leadingTextResolved = true;
       leadingTextBuffer = '';
     }
-    if (promptResponse.usage) mergeUsage(usage, promptResponse.usage);
     const usageStatus = usage.total_tokens > 0 ? 'recorded' : 'provider_missing';
     callbacks?.onUsage?.({ step: 1, usage, usage_status: usageStatus });
-    callbacks?.onAssistantCompleted?.({ step: 1, text: responseText, finish_reason: promptResponse.stopReason, usage_status: usageStatus });
-    callbacks?.onModelCompleted?.({ step: 1, finish_reason: promptResponse.stopReason, usage_status: usageStatus });
+    callbacks?.onAssistantCompleted?.({ step: promptTurn + 1, text: responseText, finish_reason: finalStopReason, usage_status: usageStatus });
+    callbacks?.onModelCompleted?.({ step: promptTurn + 1, finish_reason: finalStopReason, usage_status: usageStatus });
+    const distinctToolResults = [...new Map(toolResults.map((result) => [result.call_id, result])).values()];
+    const waitingToolCount = distinctToolResults.filter((result) => String(result.output.status || '').toLowerCase() === 'waiting_confirmation').length;
+    const waitingForConfirmation = waitingToolCount > 0;
+    const failedToolCount = distinctToolResults.filter((result) => ['failed', 'policy_blocked', 'blocked', 'denied'].includes(String(result.output.status || '').toLowerCase())).length;
+    const succeededToolCount = distinctToolResults.length - failedToolCount - waitingToolCount;
+    await callbacks?.onEvent?.({
+      type: 'work_summary.updated',
+      step: 1,
+      status: waitingForConfirmation ? 'waiting_confirmation' : 'completed',
+      detail: {
+        phase: 'verified',
+        summary: distinctToolResults.length === 0
+          ? '执行完成 · 未调用工具'
+          : failedToolCount > 0
+            ? `执行完成 · ${succeededToolCount} 项成功，${failedToolCount} 项失败`
+            : `执行完成 · ${succeededToolCount} 项成功`,
+        user_visible: true,
+        succeeded_tool_count: succeededToolCount,
+        failed_tool_count: failedToolCount,
+        tool_count: distinctToolResults.length,
+      },
+    });
     return {
       status: 'completed',
       final_message: responseText.trim(),
       tool_results: toolResults,
       usage,
       usage_status: usageStatus,
-      finish_reason: promptResponse.stopReason,
+      finish_reason: finalStopReason,
       model_responses: [{
         protocol: 'acp',
         provider_id: req.provider_id,
         session_id: handle.session.sessionId,
         requested_model: requestedModel || 'default',
         effective_model: effectiveModel,
-        stop_reason: promptResponse.stopReason,
+        stop_reason: finalStopReason,
         agent: handle.initialize.agentInfo,
       }],
     };
@@ -669,6 +746,13 @@ function validateTrustedMCPArguments(server: string, tool: string, value: unknow
   return false;
 }
 
+async function drainACPQueuedMessages(req: ACPChatTurnRequest): Promise<Array<Record<string, unknown>>> {
+  const steering = req.getSteeringMessages ? await req.getSteeringMessages() : [];
+  if (Array.isArray(steering) && steering.length > 0) return steering;
+  const followUp = req.getFollowUpMessages ? await req.getFollowUpMessages() : [];
+  return Array.isArray(followUp) ? followUp : [];
+}
+
 function evaluateACPCommandPermission(
   rawInput: Record<string, unknown>,
   profile: PermissionProfile,
@@ -903,7 +987,7 @@ function parseACPCommand(value: unknown): string[] | undefined {
 
 function safeACPCommandArgument(value: string): boolean {
   const text = value.trim();
-  if (!text || value.includes('\0') || text.startsWith('~') || hasParentTraversal(text) || blockedACPPath(text)) return false;
+  if (!text || value.includes('\0') || text.startsWith('~') || hasParentTraversal(text)) return false;
   if (text.includes('=/') || text.includes(':/')) return false;
   return true;
 }
@@ -915,12 +999,16 @@ function pathLikeCommandArgument(value: string): boolean {
 
 function pathAllowedByCapability(input: string, capability: ACPCompiledCapability): boolean {
   if (!input || input.includes('\0') || input.trim().startsWith('~')) return false;
-  if (!capability.host_access && blockedACPPath(input)) return false;
   const roots = capability.allowed_roots || [];
   const candidates = isAbsolute(input) ? [input] : roots.map((root) => resolve(root, input));
   return candidates.some((inputPath) => {
     const candidate = canonicalBoundaryPath(inputPath);
-    return roots.some((root) => pathWithinRoot(candidate, canonicalBoundaryPath(root)));
+    return roots.some((root) => {
+      const canonicalRoot = canonicalBoundaryPath(root);
+      if (!pathWithinRoot(candidate, canonicalRoot)) return false;
+      const relativePath = relative(canonicalRoot, candidate);
+      return capability.host_access || !blockedACPPath(relativePath);
+    });
   });
 }
 
@@ -1004,40 +1092,154 @@ function safeCapabilitySegment(value: string): boolean {
   return /^[A-Za-z0-9._-]+$/.test(value);
 }
 
+type ACPToolPermissionTrace = {
+  allowed: boolean;
+  policy_capability: string;
+  policy_reason: string;
+};
+
 function acpToolCall(update: ToolCallUpdate): ToolCall {
+  const capability = inferACPToolCapability(update);
   return {
     id: update.toolCallId,
     name: update.title || update.toolCallId,
     arguments: isRecord(update.rawInput) ? update.rawInput : update.rawInput === undefined ? {} : { value: update.rawInput },
     raw_arguments: update.rawInput,
+    metadata: {
+      protocol: 'acp',
+      kind: update.kind || 'other',
+      title: update.title || '',
+      ...(capability ? { capability } : {}),
+    },
   };
 }
 
 function mergeACPToolCall(call: ToolCall, update: ToolCallUpdate): ToolCall {
+  const capability = inferACPToolCapability(update) || String(call.metadata?.capability || '').trim();
   return {
     ...call,
     name: update.title || call.name,
     arguments: update.rawInput === undefined ? call.arguments : isRecord(update.rawInput) ? update.rawInput : { value: update.rawInput },
     raw_arguments: update.rawInput === undefined ? call.raw_arguments : update.rawInput,
+    metadata: {
+      ...(call.metadata || {}),
+      protocol: 'acp',
+      kind: update.kind || call.metadata?.kind || 'other',
+      title: update.title || call.metadata?.title || call.name,
+      ...(capability ? { capability } : {}),
+    },
   };
 }
 
-function finishACPTool(update: ToolCallUpdate, call: ToolCall, results: ToolResult[], callbacks?: ToolCallingCallbacks) {
+function finishACPTool(
+  update: ToolCallUpdate,
+  call: ToolCall,
+  results: ToolResult[],
+  callbacks?: ToolCallingCallbacks,
+  startedAt?: number,
+  permission?: ACPToolPermissionTrace,
+) {
   if (results.some((result) => result.call_id === call.id)) return;
+  const output = normalizeACPToolOutput(update, call, startedAt, permission);
   const result: ToolResult = {
     call_id: call.id,
     name: call.name,
     arguments: call.arguments,
-    output: {
-      status: update.status === 'failed' ? 'failed' : 'succeeded',
-      protocol: 'acp',
-      kind: update.kind || 'other',
-      raw_output: update.rawOutput ?? update.content ?? null,
-    },
+    output,
   };
   results.push(result);
-  if (update.status === 'failed') callbacks?.onToolFailed?.({ step: 1, call, result, error: new Error(`${call.name} failed`) });
+  if (output.status === 'waiting_confirmation') callbacks?.onApprovalRequired?.({ step: 1, call, result });
+  else if (['failed', 'policy_blocked', 'blocked', 'denied'].includes(String(output.status || '').toLowerCase())) {
+    callbacks?.onToolFailed?.({ step: 1, call, result, error: new Error(String(output.error || `${call.name} failed`)) });
+  }
   else callbacks?.onToolCompleted?.({ step: 1, call, result });
+}
+
+function normalizeACPToolOutput(
+  update: ToolCallUpdate,
+  call: ToolCall,
+  startedAt?: number,
+  permission?: ACPToolPermissionTrace,
+): Record<string, unknown> {
+  const rawOutput = update.rawOutput ?? update.content ?? null;
+  const embedded = embeddedACPToolOutput(rawOutput);
+  const capability = String(embedded.capability || call.metadata?.capability || inferACPToolCapability(update) || '').trim();
+  const denied = permission?.allowed === false;
+  const status = denied
+    ? 'policy_blocked'
+    : String(embedded.status || (update.status === 'failed' ? 'failed' : 'succeeded')).trim().toLowerCase();
+  const durationMs = Math.max(1, Date.now() - (startedAt || Date.now()));
+  const error = denied
+    ? permission?.policy_reason || 'ACP permission denied'
+    : firstACPToolError(embedded, rawOutput, status, call.name);
+  return {
+    ...embedded,
+    status,
+    protocol: 'acp',
+    kind: update.kind || call.metadata?.kind || 'other',
+    ...(capability ? { capability } : {}),
+    duration_ms: durationMs,
+    ...(permission ? {
+      policy_allowed: permission.allowed,
+      policy_capability: permission.policy_capability || null,
+      policy_reason: permission.policy_reason,
+    } : {}),
+    ...(error ? { error } : {}),
+    raw_output: rawOutput,
+  };
+}
+
+function embeddedACPToolOutput(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) return {};
+  const result = isRecord(value.result) ? value.result : {};
+  for (const candidate of [value.structuredContent, result.structuredContent]) {
+    if (isRecord(candidate)) return candidate;
+  }
+  const content = Array.isArray(result.content) ? result.content : Array.isArray(value.content) ? value.content : [];
+  for (const item of content) {
+    if (!isRecord(item) || typeof item.text !== 'string') continue;
+    try {
+      const parsed = JSON.parse(item.text);
+      if (isRecord(parsed)) return parsed;
+    } catch {
+      // Non-JSON MCP text is ordinary raw tool output.
+    }
+  }
+  return {};
+}
+
+function firstACPToolError(embedded: Record<string, unknown>, rawOutput: unknown, status: string, toolName: string): string {
+  if (!['failed', 'policy_blocked', 'blocked', 'denied'].includes(status)) return '';
+  for (const value of [embedded.error, embedded.error_message, embedded.summary, embedded.message]) {
+    if (typeof value === 'string' && value.trim()) return redactACPErrorText(value.trim()).slice(0, 4_096);
+  }
+  if (isRecord(rawOutput) && typeof rawOutput.formatted_output === 'string' && rawOutput.formatted_output.trim()) {
+    return redactACPErrorText(rawOutput.formatted_output.trim()).slice(0, 4_096);
+  }
+  return `${toolName} failed`;
+}
+
+function inferACPToolCapability(update: ToolCallUpdate): string {
+  const mcpIdentity = trustedMCPIdentity(update);
+  if (mcpIdentity) {
+    if (mcpIdentity.server === 'joi_capabilities' || mcpIdentity.server === 'joi_web') return mcpIdentity.tool;
+    return 'mcp_tool_call';
+  }
+  const rawInput = isRecord(update.rawInput) ? update.rawInput : {};
+  if (typeof rawInput.command === 'string' || Array.isArray(rawInput.command)) return 'shell_command';
+  if (typeof rawInput.server === 'string' && typeof rawInput.tool === 'string') return 'mcp_tool_call';
+  if (String(rawInput.type || '').toLowerCase() === 'websearch' || isRecord(rawInput.action)) return 'web_research';
+  const kind = String(update.kind || '').toLowerCase();
+  if (['edit', 'move', 'delete'].includes(kind)) return 'apply_patch';
+  if (kind === 'read') return 'file_read';
+  if (kind === 'search') return 'workspace_search';
+  if (kind === 'fetch') return 'web_research';
+  const title = String(update.title || '').toLowerCase();
+  if (title.startsWith('read file ')) return 'file_read';
+  if (title.startsWith('list files ') || title.startsWith('search files ')) return 'workspace_search';
+  if (title === 'editing files' || title.startsWith('edit file ')) return 'apply_patch';
+  if (title.startsWith('web search:') || title.startsWith('open page:')) return 'web_research';
+  return '';
 }
 
 function acpOutput(value: unknown): Record<string, unknown> {
@@ -1048,9 +1250,11 @@ function assembleACPPrompt(
   systemMessage: string,
   messages: Array<{ role: string; content: string }>,
   mcpServers: McpServer[] | undefined,
+  joiCapabilityTools: string[] | undefined,
 ): string {
   const transcript = messages.map((message) => `${message.role.toUpperCase()}: ${message.content}`).join('\n\n');
   const joiWebAvailable = (mcpServers || []).some((server) => server.name === 'joi_web');
+  const delegatedToolNames = [...new Set((joiCapabilityTools || []).map((name) => name.trim()).filter(Boolean))].sort();
   return [
     'You are running as a delegated ACP coding agent inside Joi Desktop.',
     'Follow the host policy and the current user request. Do not claim a tool action succeeded unless the tool actually completed.',
@@ -1061,6 +1265,13 @@ function assembleACPPrompt(
           'Do not claim the Joi web tools are unavailable unless that discovery attempt returned no match. Do not substitute the Codex in-app Browser when these tools satisfy the request.',
         ].join(' ')
       : '',
+    delegatedToolNames.length > 0
+      ? [
+          `The selected Joi Agent also grants these policy-controlled delegated tools: ${delegatedToolNames.map((name) => `mcp__joi_capabilities__${name}`).join(', ')}.`,
+          `Use only the granted tools that fit the task. If a full tool name is not visible, call tool_search for "joi_capabilities ${delegatedToolNames.join(' ')}" before concluding it is unavailable.`,
+          'These tools still execute through Joi policy, workspace-root, capability-enable, and audit checks.',
+        ].join(' ')
+      : '',
     '<JOI_SYSTEM_CONTEXT>',
     systemMessage,
     '</JOI_SYSTEM_CONTEXT>',
@@ -1068,6 +1279,19 @@ function assembleACPPrompt(
     transcript,
     '</CONVERSATION>',
   ].filter(Boolean).join('\n\n');
+}
+
+function effectiveJoiMCPToolNames(mcpServers: McpServer[] | undefined, delegatedTools: string[] | undefined): string[] {
+  const names = new Set<string>();
+  if ((mcpServers || []).some((server) => server.name === 'joi_web')) {
+    names.add('web_search');
+    names.add('web_extract');
+  }
+  for (const name of delegatedTools || []) {
+    const normalized = name.trim();
+    if (normalized) names.add(normalized);
+  }
+  return [...names].sort();
 }
 
 function filterACPLeadingSystemNotice(value: string, force = false): { ready: boolean; text: string; notice?: string } {
@@ -1147,6 +1371,9 @@ const ACP_PROVIDER_ENV_ALLOWLIST = [
   'DISABLE_MCP_CONFIG_FILTERING',
   'ELECTRON_RUN_AS_NODE',
   'JOI_ACP_EPHEMERAL',
+  'JOI_PARENT_RUN_ID',
+  'JOI_PARENT_CONVERSATION_ID',
+  'JOI_DELEGATION_DEPTH',
 ] as const;
 
 function safeACPEnvironmentValue(key: string, value: unknown): value is string {

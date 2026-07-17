@@ -4,7 +4,7 @@
   "version": "0.1.1",
   "type": "module",
   "scripts": {
-    "test": "node --experimental-strip-types scripts/test-sqlite-store.mjs && node --experimental-strip-types scripts/test-persona-messenger-store.mjs && node --experimental-strip-types scripts/test-notification-delivery-store.mjs && node --experimental-strip-types scripts/test-telegram-inbound-store.mjs"
+    "test": "node --experimental-strip-types scripts/test-sqlite-store.mjs && node --experimental-strip-types scripts/test-agent-workbench-store.mjs && node --experimental-strip-types scripts/test-skill-store.mjs && node --experimental-strip-types scripts/test-persona-messenger-store.mjs && node --experimental-strip-types scripts/test-notification-delivery-store.mjs && node --experimental-strip-types scripts/test-telegram-inbound-store.mjs"
   },
   "exports": {
     ".": "./src/index.ts"

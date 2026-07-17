@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, dialog, type MessageBoxSyncOptions } from 'electron';
 import { mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -65,6 +65,7 @@ let automationWebhookServer: AutomationWebhookServer | null = null;
 let pluginManager: JoiPluginManager | null = null;
 let telegramOutbound: TelegramOutboundService | null = null;
 let isQuitting = false;
+let quitConfirmed = false;
 const secrets = new KeychainSecretStore();
 
 function ensureStore() {
@@ -103,6 +104,7 @@ function showMainWindow(window: BrowserWindow | null = mainWindow) {
 }
 
 function ensureMainWindow() {
+  if (!app.isReady()) return;
   if (!mainWindow || mainWindow.isDestroyed()) {
     createMainWindow();
     return;
@@ -111,6 +113,11 @@ function ensureMainWindow() {
 }
 
 function createMainWindow() {
+  if (!app.isReady()) return;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    showMainWindow(mainWindow);
+    return;
+  }
   const preloadPath = join(mainDir, '../preload/index.mjs');
   const sqliteStore = ensureStore();
   const managedPlugins = ensurePluginManager(sqliteStore);
@@ -124,7 +131,9 @@ function createMainWindow() {
     minWidth: 560,
     minHeight: 720,
     title: 'Joi',
-    titleBarStyle: 'hiddenInset',
+    // Use a full-size content view so the renderer's 36px titlebar shares the
+    // same physical row as the native traffic lights instead of starting below it.
+    titleBarStyle: 'hidden',
     trafficLightPosition: { x: 14, y: 14 },
     show: false,
     webPreferences: {
@@ -278,7 +287,7 @@ if (!hasSingleInstanceLock) {
     if (!isDesktopE2E() && !envFlag('JOI_DISABLE_SECRET_LOAD')) {
       await secrets.loadIntoEnv();
     }
-    createMainWindow();
+    ensureMainWindow();
   });
 
   app.on('activate', () => {
@@ -293,7 +302,31 @@ if (!hasSingleInstanceLock) {
     if (process.platform !== 'darwin') app.quit();
   });
 
-  app.on('before-quit', () => {
+  app.on('before-quit', (event) => {
+    if (!isDesktopE2E() && !quitConfirmed) {
+      const activeSchedules = store?.listAutomations({ kind: 'schedule', enabled: true, limit: 1 }).automations ?? [];
+      if (activeSchedules.length > 0) {
+        event.preventDefault();
+        const quitOptions: MessageBoxSyncOptions = {
+          type: 'warning',
+          title: '退出 Joi？',
+          message: 'Joi 关闭后，已安排的任务不会运行。',
+          detail: '保持 Joi 运行可继续执行定时任务和持续监控。',
+          buttons: ['保持运行', '退出 Joi'],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        };
+        const choice = mainWindow && !mainWindow.isDestroyed()
+          ? dialog.showMessageBoxSync(mainWindow, quitOptions)
+          : dialog.showMessageBoxSync(quitOptions);
+        if (choice === 1) {
+          quitConfirmed = true;
+          setImmediate(() => app.quit());
+        }
+        return;
+      }
+    }
     isQuitting = true;
     telegramInbound?.stop();
     telegramInbound = null;

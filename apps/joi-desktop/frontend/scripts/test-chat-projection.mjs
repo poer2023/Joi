@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 
 const root = process.cwd();
 const outDir = mkdtempSync(join(tmpdir(), 'joi-chat-projection-'));
+const messageListSource = readFileSync(join(root, 'src/features/chat/components/MessageList.tsx'), 'utf8');
 const esbuildBin = [
   join(root, '..', '..', '..', 'node_modules', '.pnpm', 'esbuild@0.27.7', 'node_modules', '@esbuild', 'darwin-arm64', 'bin', 'esbuild'),
   join(root, '..', '..', '..', 'node_modules', '.pnpm', 'node_modules', '.bin', 'esbuild'),
@@ -21,6 +22,13 @@ try {
     export { getEventVisibility } from '${root}/src/features/chat/eventVisibility.ts';
     export { buildConversationRenderItems } from '${root}/src/features/chat/conversationProjector.ts';
     export { messagesForConversationHydration, shouldRestoreThreadMessages } from '${root}/src/features/chat/conversationHydration.ts';
+    export {
+      NEW_CONVERSATION_SUBMISSION_KEY,
+      executionEventIsVisible,
+      shouldQueueConversationSubmission,
+      submissionKeyForConversation,
+      withSubmissionActive,
+    } from '${root}/src/features/chat/submissionRegistry.ts';
     import React from '${root}/node_modules/react/index.js';
     import { renderToStaticMarkup } from '${root}/node_modules/react-dom/server.node.js';
     import { MarkdownContent } from '${root}/src/features/chat/components/MarkdownContent.tsx';
@@ -49,9 +57,38 @@ try {
     buildConversationRenderItems,
     messagesForConversationHydration,
     shouldRestoreThreadMessages,
+    NEW_CONVERSATION_SUBMISSION_KEY,
+    executionEventIsVisible,
+    shouldQueueConversationSubmission,
+    submissionKeyForConversation,
+    withSubmissionActive,
     renderMarkdownContent,
     renderMessageList,
   } = await import(pathToFileURL(bundle).href);
+
+  {
+    let active = new Set();
+    active = withSubmissionActive(active, submissionKeyForConversation('conv_a'), true);
+    assert.equal(shouldQueueConversationSubmission(active, 'conv_a'), true);
+    assert.equal(shouldQueueConversationSubmission(active, 'conv_b'), false);
+    assert.equal(executionEventIsVisible({
+      eventConversationID: 'conv_a',
+      currentConversationID: 'conv_b',
+      activeSubmissionKeys: active,
+    }), false);
+
+    active = withSubmissionActive(active, NEW_CONVERSATION_SUBMISSION_KEY, true);
+    assert.equal(executionEventIsVisible({
+      eventConversationID: 'conv_a',
+      currentConversationID: '',
+      activeSubmissionKeys: active,
+    }), false);
+    assert.equal(executionEventIsVisible({
+      eventConversationID: 'conv_new',
+      currentConversationID: '',
+      activeSubmissionKeys: active,
+    }), true);
+  }
 
   const event = (event_type, payload = {}, extra = {}) => normalizeRunEvent({
     id: `${event_type}-${payload.seq || payload.call_id || payload.item_id || payload.task_id || Math.random()}`,
@@ -83,6 +120,8 @@ try {
   assert.equal(normalizeStatus('delivered'), 'completed');
   assert.equal(normalizeStatus('suppressed'), 'skipped');
   assert.equal(normalizeStatus('rejected'), 'failed');
+  assert.doesNotMatch(messageListSource, /:stack:\$\{groups\.length\}/);
+  assert.doesNotMatch(messageListSource, /:group:\$\{lines\.length\}/);
 
   {
     const shortMarkup = renderMarkdownContent('```ts\nconst ok = true;\n```');
@@ -105,13 +144,42 @@ try {
     const normalized = normalizeRunEvent({
       event_type: 'assistant.delta',
       run_id: 'run_1',
+      conversation_id: 'conv_1',
       seq: 2,
       payload: { item_type: 'assistant_message', delta: { text: 'hello', stream_source: 'fallback_final_chunk' } },
     });
     assert.equal(normalized.type, 'assistant.delta');
+    assert.equal(normalized.conversationId, 'conv_1');
     assert.equal(normalized.delta.text, 'hello');
     assert.equal(normalized.delta.stream_source, 'fallback_final_chunk');
     assert.equal(getEventVisibility(normalized, 'auto'), 'chat');
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [{ id: 'msg_current_user', conversation_id: 'conv_current', role: 'user', content: 'current thread' }],
+      conversationId: 'conv_current',
+      activeRunId: 'run_foreign',
+      runEventsByRunId: {
+        run_foreign: [
+          event('assistant.completed', { text: 'foreign answer', status: 'completed', seq: 1 }, {
+            run_id: 'run_foreign',
+            conversation_id: 'conv_foreign',
+            item_type: 'assistant_message',
+            item_id: 'msg_foreign_assistant',
+            visibility: 'chat',
+          }),
+          event('run.completed', { status: 'succeeded', seq: 2 }, {
+            run_id: 'run_foreign',
+            conversation_id: 'conv_foreign',
+            visibility: 'trace_only',
+          }),
+        ],
+      },
+      mode: 'auto',
+    });
+    assert.deepEqual(result.items.map((item) => item.id), ['msg_current_user']);
+    assert.equal(result.activeRunStatusByRunId.run_foreign, undefined);
   }
 
   assert.equal(getEventVisibility(event('item.completed', { item_type: 'reflection', status: 'completed' }), 'auto'), 'trace_only');
@@ -123,6 +191,22 @@ try {
   assert.equal(getEventVisibility(event('model.started', { item_type: 'model_call', item_id: 'model_1', visibility: 'transcript', status: 'running', step: 0 }), 'auto'), 'transcript');
   assert.equal(getEventVisibility(event('worker.started', { task_id: 'task_1', status: 'running' }), 'background_task'), 'trace_only');
   assert.equal(getEventVisibility(event('run.completed', { status: 'succeeded' }), 'auto'), 'hidden');
+  assert.equal(getEventVisibility(event('run.message_steering_queued', {
+    status: 'pending',
+    queue_message_id: 'queue_steer_1',
+  }, { item_type: 'run', visibility: 'inline_status' }), 'auto'), 'trace_only');
+  assert.equal(getEventVisibility(event('run.message_steering_delivered', {
+    status: 'completed',
+    queue_message_id: 'queue_steer_1',
+  }, { item_type: 'run', visibility: 'inline_status' }), 'auto'), 'trace_only');
+  assert.equal(getEventVisibility(event('run.message_follow_up_queued', {
+    status: 'pending',
+    queue_message_id: 'queue_follow_1',
+  }, { item_type: 'run', visibility: 'inline_status' }), 'auto'), 'trace_only');
+  assert.equal(getEventVisibility(event('run.message_queue_drained', {
+    status: 'completed',
+    count: 2,
+  }, { item_type: 'run', visibility: 'inline_status' }), 'auto'), 'trace_only');
   assert.equal(getEventVisibility(event('automation.run_started', { status: 'running', summary: '自动化开始执行' }, { item_type: 'automation', visibility: 'inline_status' }), 'background_task'), 'trace_only');
 
   {
@@ -196,6 +280,26 @@ try {
     const markup = renderMessageList(withProcess.items);
     assert.match(markup, /message-attachment-expanded-image/);
     assert.match(markup, /src="file:\/\/\/tmp\/joi-grok-image\.jpg"/);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [{
+        id: 'msg_generated_media', conversation_id: 'conv_media', role: 'assistant', content: '媒体已生成。',
+        attachments: [
+          { id: 'audio_1', name: 'speech.wav', kind: 'audio', mime_type: 'audio/wav', size: 42000, preview_url: 'file:///tmp/speech.wav' },
+          { id: 'video_1', name: 'motion.mp4', kind: 'video', mime_type: 'video/mp4', size: 60165, preview_url: 'file:///tmp/motion.mp4' },
+        ],
+        metadata: { run_id: 'run_generated_media' },
+      }],
+      runEventsByRunId: {},
+      mode: 'auto',
+    });
+    const generated = result.items.find((item) => item.type === 'message');
+    assert.deepEqual(generated.attachments.map((item) => item.kind), ['audio', 'video']);
+    const markup = renderMessageList(result.items);
+    assert.match(markup, /<audio[^>]*src="file:\/\/\/tmp\/speech\.wav"[^>]*controls=""/);
+    assert.match(markup, /<video[^>]*src="file:\/\/\/tmp\/motion\.mp4"[^>]*controls=""/);
   }
 
   {
@@ -585,6 +689,22 @@ try {
   }
 
   {
+    const toolNames = ['tool_search', 'session_search', 'memory_recall', 'shell_start', 'shell_write', 'shell_output', 'shell_kill'];
+    const expectedLabels = ['查找工具', '搜索会话', '记忆检索', '操作终端', '操作终端', '操作终端', '操作终端'];
+    const runEvents = toolNames.flatMap((toolName, index) => [
+      event('tool.call_requested', { item_type: 'tool_run', item_id: `call_new_${index}`, call_id: `call_new_${index}`, tool_name: toolName, visibility: 'tool', status: 'requested', seq: index * 2 + 1 }),
+      event('tool.completed', { item_type: 'tool_run', item_id: `call_new_${index}`, call_id: `call_new_${index}`, tool_name: toolName, visibility: 'tool', status: 'completed', seq: index * 2 + 2 }),
+    ]);
+    const result = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: { run_1: runEvents },
+      mode: 'auto',
+    });
+    const transcriptLines = result.items.filter((item) => item.type === 'transcript_line');
+    assert.deepEqual(transcriptLines.map((item) => item.label), expectedLabels);
+  }
+
+  {
     const result = buildConversationRenderItems({
       messages: [message],
       runEventsByRunId: {
@@ -674,7 +794,11 @@ try {
             item_id: 'call_weather',
             call_id: 'call_weather',
             tool_name: 'web_research',
-            input: { url: 'https://wttr.in/Shanghai?format=3', api_key: 'secret-value' },
+            input: {
+              url: 'https://wttr.in/Shanghai?format=3',
+              api_key: 'secret-value',
+              command: 'curl -H "Authorization: Bearer header-secret" "https://weather.example/?token=query-secret"',
+            },
             visibility: 'tool',
             status: 'requested',
             seq: 1,
@@ -698,15 +822,227 @@ try {
     assert.equal(transcriptLines[0].kind, 'tool');
     assert.equal(transcriptLines[0].label, '网页搜索');
     assert.equal(transcriptLines[0].detail, undefined);
-    assert.deepEqual(transcriptLines[0].detailRows.map((row) => row.label), ['Input', 'Output']);
+    assert.deepEqual(transcriptLines[0].detailRows.map((row) => row.label), ['Input', 'Output', 'Raw']);
     assert.ok(transcriptLines[0].detailRows.some((row) => row.label === 'Input' && row.value.includes('https://wttr.in/Shanghai?format=3')));
     assert.ok(transcriptLines[0].detailRows.some((row) => row.label === 'Output' && row.value.includes('Shanghai: rain')));
     assert.equal(JSON.stringify(transcriptLines[0].detailRows).includes('secret-value'), false);
     assert.equal(JSON.stringify(transcriptLines[0].detailRows).includes('call_weather'), false);
     const completedMarkup = renderMessageList(result.items);
-    assert.match(completedMarkup, /<details class="process-stack process-stack-completed">/);
-    assert.doesNotMatch(completedMarkup, /process-stack process-stack-completed" open/);
+    assert.match(completedMarkup, /<section class="process-stack process-stack-completed" data-expanded="false">/);
+    assert.match(completedMarkup, /<button aria-expanded="false" class="process-stack-summary disclosure-trigger"/);
+    assert.doesNotMatch(completedMarkup, /<dt>输入<\/dt>/);
+    assert.match(completedMarkup, /wttr\.in\/Shanghai\?format=3/);
+    assert.match(completedMarkup, /<dt>输出<\/dt>/);
+    assert.match(completedMarkup, /Shanghai: rain/);
+    assert.match(completedMarkup, /查看原始调用/);
+    assert.match(completedMarkup, /class="scroll-area scroll-area-axes-both scroll-area-tracks-always transcript-detail-scroll-area"/);
+    assert.match(completedMarkup, /aria-label="输出内容" class="scroll-area-viewport" tabindex="0"/);
+    assert.match(completedMarkup, /scroll-area-hover-zone scroll-area-hover-zone-horizontal/);
+    assert.doesNotMatch(completedMarkup, /已完成处理/);
+    assert.doesNotMatch(completedMarkup, /secret-value/);
+    assert.doesNotMatch(completedMarkup, /header-secret/);
+    assert.doesNotMatch(completedMarkup, /query-secret/);
+    assert.match(completedMarkup, /\[redacted\]/);
     assert.match(completedMarkup, /<div class="message-bubble-frame">[\s\S]*?完成了/);
+    const styles = readFileSync(join(root, 'src', 'styles.css'), 'utf8');
+    assert.match(styles, /\.scroll-area-viewport::-webkit-scrollbar\s*{[\s\S]*?width: 0;[\s\S]*?height: 0;/);
+    assert.match(styles, /\.scroll-area-tracks-always\.scroll-area-can-scroll \.scroll-area-track\s*{[\s\S]*?opacity: 1;/);
+    assert.match(styles, /\.scroll-area-tracks-always \.scroll-area-thumb\s*{[\s\S]*?width: 4px;[\s\S]*?rgba\(68, 71, 77, 0\.38\)/);
+    assert.match(styles, /\.transcript-detail-scroll-area > \.scroll-area-viewport\s*{[\s\S]*?max-height: 192px;/);
+    assert.match(styles, /\.transcript-detail-scroll-area > \.scroll-area-viewport > \.transcript-detail-scroll-content\s*{[\s\S]*?margin: 0;[\s\S]*?padding: 0;/);
+    assert.match(styles, /\.transcript-detail-scroll-area pre\s*{[\s\S]*?overflow: visible;/);
+    assert.match(styles, /\.chat-thread > \.scroll-area-viewport > \.scroll-area-content\s*{/);
+    assert.doesNotMatch(styles, /(^|\n)\.chat-thread \.scroll-area-content\s*{/);
+    assert.match(styles, /\[data-expanded="true"\] > \.disclosure-trigger > \.disclosure-chevron\s*{[\s\S]*?rotate\(90deg\)/);
+    assert.doesNotMatch(styles, /\.process-stack:not\(\[open\]\) \.process-stack-summary::after/);
+    assert.match(messageListSource, /<path d="m6\.5 5\.5 2\.5 2\.5-2\.5 2\.5"/);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('tool.call_requested', {
+            item_type: 'tool_run',
+            item_id: 'call_recommended',
+            call_id: 'call_recommended',
+            tool_name: 'mcp.opencli.everia_recommended',
+            input: { command: 'opencli everia recommended --format json' },
+            visibility: 'tool',
+            status: 'requested',
+            seq: 1,
+          }),
+          event('tool.completed', {
+            item_type: 'tool_run',
+            item_id: 'call_recommended',
+            call_id: 'call_recommended',
+            tool_name: 'mcp.opencli.everia_recommended',
+            snapshot: {
+              status: 'completed',
+              output: {
+                count: 2,
+                items: [
+                  { title: 'First work', image_url: 'https://images.example/1.webp' },
+                  { title: 'Second work', image_url: 'https://images.example/2.webp' },
+                ],
+              },
+            },
+            visibility: 'tool',
+            status: 'completed',
+            seq: 2,
+          }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const markup = renderMessageList(result.items);
+    assert.match(markup, /opencli everia recommended --format json/);
+    assert.match(markup, /First work/);
+    assert.match(markup, /Second work/);
+    assert.match(markup, /images\.example\/2\.webp/);
+    assert.doesNotMatch(markup, /2 项/);
+    assert.doesNotMatch(markup, /已完成处理/);
+  }
+
+  {
+    const formattedOutput = JSON.stringify([
+      { rank: 1, title: 'First recommendation', url: 'https://images.example/1.webp?token=formatted-secret' },
+      { rank: 2, title: 'Second recommendation' },
+    ], null, 2);
+    const result = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('tool.call_requested', {
+            item_type: 'tool_run',
+            item_id: 'call_shell_json',
+            call_id: 'call_shell_json',
+            tool_name: 'shell_command',
+            input: { command: 'opencli everia recommended --format json' },
+            visibility: 'tool',
+            status: 'requested',
+            seq: 1,
+          }),
+          event('tool.output_delta', {
+            item_type: 'tool_run',
+            item_id: 'call_shell_json',
+            call_id: 'call_shell_json',
+            tool_name: 'shell_command',
+            delta: { formatted_output: formattedOutput, exit_code: 0 },
+            visibility: 'tool',
+            status: 'completed',
+            seq: 2,
+          }),
+          event('tool.completed', {
+            item_type: 'tool_run',
+            item_id: 'call_shell_json',
+            call_id: 'call_shell_json',
+            tool_name: 'shell_command',
+            snapshot: { status: 'completed' },
+            visibility: 'tool',
+            status: 'completed',
+            seq: 3,
+          }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const line = result.items.find((item) => item.type === 'transcript_line' && item.kind === 'tool');
+    const output = line.detailRows.find((row) => row.label === 'Output');
+    assert.equal(output.value, formattedOutput.replace('formatted-secret', '[redacted]'));
+    const markup = renderMessageList(result.items);
+    assert.match(markup, /First recommendation/);
+    assert.match(markup, /\[redacted\]/);
+    assert.doesNotMatch(markup, /formatted-secret/);
+    assert.match(markup, /查看原始调用/);
+  }
+
+  {
+    const extracted = {
+      status: 'completed',
+      url: 'https://example.com/changelog',
+      fetch_status: 'succeeded',
+      readable_text: 'A concise extracted page body.',
+    };
+    const mcpEnvelope = {
+      content: [{ type: 'text', text: JSON.stringify(extracted) }],
+      structuredContent: extracted,
+      isError: false,
+    };
+    const result = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('tool.call_requested', {
+            item_type: 'tool_run',
+            item_id: 'call_mcp_extract',
+            call_id: 'call_mcp_extract',
+            tool_name: 'mcp.joi_web.web_extract',
+            input: { server: 'joi_web', tool: 'web_extract', arguments: { url: extracted.url } },
+            visibility: 'tool',
+            status: 'requested',
+            seq: 1,
+          }),
+          event('tool.completed', {
+            item_type: 'tool_run',
+            item_id: 'call_mcp_extract',
+            call_id: 'call_mcp_extract',
+            tool_name: 'mcp.joi_web.web_extract',
+            snapshot: { status: 'completed', output: mcpEnvelope },
+            visibility: 'tool',
+            status: 'completed',
+            seq: 2,
+          }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const line = result.items.find((item) => item.type === 'transcript_line' && item.kind === 'tool');
+    const output = line.detailRows.find((row) => row.label === 'Output');
+    const raw = line.detailRows.find((row) => row.label === 'Raw');
+    assert.match(output.value, /"readable_text": "A concise extracted page body\."/);
+    assert.doesNotMatch(output.value, /"content"/);
+    assert.doesNotMatch(output.value, /\\"status\\"/);
+    assert.match(raw.value, /"structuredContent"/);
+    const markup = renderMessageList(result.items);
+    assert.match(markup, /读取了网页/);
+    assert.match(markup, /查看原始调用/);
+    assert.match(markup, /aria-expanded="false"/);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('tool.call_requested', {
+            item_type: 'tool_run',
+            item_id: 'call_empty',
+            call_id: 'call_empty',
+            tool_name: 'workspace_write',
+            input: { path: '/tmp/empty-result.txt' },
+            visibility: 'tool',
+            status: 'requested',
+            seq: 1,
+          }),
+          event('tool.completed', {
+            item_type: 'tool_run',
+            item_id: 'call_empty',
+            call_id: 'call_empty',
+            tool_name: 'workspace_write',
+            snapshot: { status: 'completed' },
+            visibility: 'tool',
+            status: 'completed',
+            seq: 2,
+          }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const line = result.items.find((item) => item.type === 'transcript_line' && item.kind === 'tool');
+    assert.ok(line.detailRows.some((row) => row.label === 'Output' && row.value === '无返回内容'));
+    assert.match(renderMessageList(result.items), /<dt>输出<\/dt><dd><span class="transcript-detail-value">无返回内容<\/span>/);
   }
 
   {
@@ -752,9 +1088,172 @@ try {
     assert.match(markup, /process-tool-cluster-title">读取网页<\/span><span class="process-tool-cluster-count">× 8/);
     assert.match(markup, /1 · pi query 1/);
     assert.match(markup, /1 · https:\/\/example\.com\/1/);
-    assert.match(markup, /<details class="process-stack process-stack-failed">/);
-    assert.doesNotMatch(markup, /process-stack process-stack-failed" open/);
-    assert.doesNotMatch(markup, /process-tool-cluster process-tool-cluster-[^"]+" open/);
+    assert.match(markup, /<section class="process-stack process-stack-completed" data-expanded="false">/);
+    assert.doesNotMatch(markup, /process-stack-failed/);
+    assert.match(markup, /class="process-stack-failure-count">1 项失败<\/span>/);
+    assert.match(markup, /process-tool-cluster process-tool-cluster-completed/);
+    assert.match(markup, /class="process-tool-cluster-failure-count">1 失败<\/span>/);
+    assert.match(markup, /tool-activity-icon tool-activity-icon-failed/);
+    assert.doesNotMatch(markup, /process-tool-cluster[^>]+data-expanded="true"/);
+    assert.doesNotMatch(markup, /transcript-line-expanded/);
+  }
+
+  {
+    const mixedResult = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('tool.failed', {
+            item_type: 'tool_run',
+            item_id: 'extract_failed',
+            call_id: 'extract_failed',
+            tool_name: 'mcp.joi_web.web_extract',
+            status: 'failed',
+            seq: 1,
+          }),
+          event('assistant.completed', { status: 'completed', seq: 2 }),
+          event('run.completed', { status: 'succeeded', seq: 3 }),
+          event('verification.failed', { status: 'failed', summary: 'One source could not be read', seq: 4 }),
+        ],
+      },
+      mode: 'auto',
+    });
+    assert.equal(mixedResult.activeRunStatusByRunId.run_1, 'completed');
+    const mixedMarkup = renderMessageList(mixedResult.items);
+    assert.match(mixedMarkup, /process-stack-completed/);
+    assert.match(mixedMarkup, /class="process-stack-failure-count">1 项失败<\/span>/);
+    assert.doesNotMatch(mixedMarkup, /process-stack-failed/);
+  }
+
+  {
+    const failedResult = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('tool.completed', { item_type: 'tool_run', item_id: 'read_ok', tool_name: 'file_read', status: 'completed', seq: 1 }),
+          event('assistant.completed', { status: 'completed', seq: 2 }),
+          event('run.failed', { status: 'failed', summary: 'Runtime stopped', seq: 3 }),
+        ],
+      },
+      mode: 'auto',
+    });
+    assert.equal(failedResult.activeRunStatusByRunId.run_1, 'failed');
+  }
+
+  {
+    const semanticResult = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('work_summary.updated', {
+            item_type: 'work_summary',
+            item_id: 'run_1:prepared',
+            phase: 'prepared',
+            summary: '已准备 14 项 Joi 能力',
+            user_visible: true,
+            status: 'completed',
+            step: 0,
+            seq: 1,
+          }, { visibility: 'transcript' }),
+          event('work_summary.updated', {
+            item_type: 'work_summary',
+            item_id: 'run_1:verified',
+            phase: 'verified',
+            summary: '执行完成 · 5 项成功，1 项失败',
+            user_visible: true,
+            status: 'completed',
+            step: 1,
+            seq: 2,
+          }, { visibility: 'transcript' }),
+          event('assistant.completed', { status: 'completed', seq: 3 }),
+          event('run.completed', { status: 'completed', seq: 4 }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const semanticLines = semanticResult.items.filter((item) => item.type === 'transcript_line');
+    assert.deepEqual(semanticLines, []);
+    const semanticMarkup = renderMessageList(semanticResult.items);
+    assert.doesNotMatch(semanticMarkup, /能力已就绪|结果已核对|已思考/);
+  }
+
+  {
+    const toolResult = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('work_summary.updated', {
+            item_type: 'work_summary',
+            item_id: 'run_1:prepared',
+            phase: 'prepared',
+            summary: '已准备 14 项 Joi 能力',
+            user_visible: true,
+            status: 'completed',
+            step: 0,
+            seq: 1,
+          }, { visibility: 'transcript' }),
+          event('tool.completed', {
+            item_type: 'tool_run',
+            item_id: 'read_ok',
+            tool_name: 'file_read',
+            status: 'completed',
+            seq: 2,
+          }, { visibility: 'transcript' }),
+          event('work_summary.updated', {
+            item_type: 'work_summary',
+            item_id: 'run_1:verified',
+            phase: 'verified',
+            summary: '执行完成 · 1 项成功',
+            user_visible: true,
+            status: 'completed',
+            step: 1,
+            seq: 3,
+          }, { visibility: 'transcript' }),
+          event('assistant.completed', { status: 'completed', seq: 4 }),
+          event('run.completed', { status: 'completed', seq: 5 }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const toolLines = toolResult.items.filter((item) => item.type === 'transcript_line');
+    assert.equal(toolLines.length, 1);
+    assert.equal(toolLines[0].kind, 'tool');
+    const toolMarkup = renderMessageList(toolResult.items);
+    assert.match(toolMarkup, /读取了文件|读取文件/);
+    assert.doesNotMatch(toolMarkup, /能力已就绪|结果已核对/);
+  }
+
+  {
+    const boundaryResult = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('work_summary.updated', {
+            item_type: 'work_summary',
+            item_id: 'failed_summary',
+            phase: 'verified',
+            summary: '文件校验失败',
+            user_visible: true,
+            status: 'failed',
+            seq: 1,
+          }, { visibility: 'transcript' }),
+          event('plan.updated', {
+            item_type: 'plan',
+            item_id: 'completed_plan',
+            summary: '迁移计划已更新',
+            user_visible: true,
+            status: 'completed',
+            seq: 2,
+          }, { visibility: 'transcript' }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const boundaryLines = boundaryResult.items.filter((item) => item.type === 'transcript_line');
+    assert.equal(boundaryLines.length, 2);
+    assert.equal(boundaryLines[0].status, 'failed');
+    assert.equal(boundaryLines[0].detail, '文件校验失败');
+    assert.equal(boundaryLines[1].detail, '迁移计划已更新');
   }
 
   {
@@ -793,8 +1292,8 @@ try {
     assert.deepEqual(transcriptLines.map((item) => item.kind), ['tool', 'tool']);
     assert.equal(result.items.some((item) => item.type === 'compact_run_card'), false);
     const runningMarkup = renderMessageList(result.items);
-    assert.match(runningMarkup, /<details class="process-stack process-stack-running">/);
-    assert.doesNotMatch(runningMarkup, /process-stack process-stack-running" open/);
+    assert.match(runningMarkup, /<section class="process-stack process-stack-running" data-expanded="true">/);
+    assert.match(runningMarkup, /<button aria-expanded="true" class="process-stack-summary disclosure-trigger"/);
     assert.match(runningMarkup, /<div class="message-bubble-frame">[\s\S]*?完成了/);
   }
 
@@ -916,10 +1415,104 @@ try {
     assert.equal(result.items.some((item) => item.type === 'transcript_line' && item.label.includes('Use direct status updates')), false);
     assert.equal(result.items.some((item) => item.type === 'transcript_line' && item.label.includes('External entry linked')), false);
     assert.ok(result.items.some((item) => item.type === 'transcript_line' && item.status === 'running' && item.label === '已恢复执行'));
-    assert.ok(result.items.some((item) => item.type === 'transcript_line' && item.status === 'running' && item.label.includes('User requested cancel')));
+    assert.equal(result.items.some((item) => item.type === 'transcript_line' && item.status === 'running' && item.label.includes('User requested cancel')), false);
     assert.ok(result.items.some((item) => item.type === 'transcript_line' && item.status === 'failed' && item.label.includes('User cancelled')));
     assert.ok(result.items.some((item) => item.type === 'transcript_line' && item.status === 'failed' && item.label.includes('User changed direction')));
     assert.equal(result.activeRunStatusByRunId.run_1, 'cancelled');
+  }
+
+  {
+    const cancelledResult = buildConversationRenderItems({
+      messages: [
+        { id: 'msg_cancel_user', conversation_id: 'conv_cancel', role: 'user', content: 'cancel this run' },
+        { id: 'msg_cancel_assistant', conversation_id: 'conv_cancel', role: 'assistant', content: '运行已取消。', metadata: { run_id: 'run_cancel' } },
+      ],
+      conversationId: 'conv_cancel',
+      activeRunId: 'run_cancel',
+      runEventsByRunId: {
+        run_cancel: [
+          event('run.started', { status: 'running', seq: 1 }, {
+            run_id: 'run_cancel', conversation_id: 'conv_cancel', visibility: 'trace_only', created_at: '2026-07-15 20:25:36',
+          }),
+          event('work_summary.updated', { status: 'completed', summary: '已准备 61 项 Joi 能力', user_visible: true, seq: 2 }, {
+            run_id: 'run_cancel', conversation_id: 'conv_cancel', item_type: 'work_summary', item_id: 'summary_prepared', visibility: 'transcript', created_at: '2026-07-15 20:25:40',
+          }),
+          event('tool.started', { status: 'running', tool_name: 'shell_command', call_id: 'call_sleep', seq: 3 }, {
+            run_id: 'run_cancel', conversation_id: 'conv_cancel', item_type: 'tool_run', item_id: 'call_sleep', visibility: 'tool', created_at: '2026-07-15 20:25:52',
+          }),
+          event('run.cancel_requested', { status: 'running', reason: 'cancelled_in_desktop', seq: 4 }, {
+            run_id: 'run_cancel', conversation_id: 'conv_cancel', item_type: 'run', item_id: 'run_cancel', visibility: 'inline_status', created_at: '2026-07-15 20:25:56',
+          }),
+          event('run.cancelled', { status: 'cancelled', reason: 'cancelled_in_desktop', seq: 5 }, {
+            run_id: 'run_cancel', conversation_id: 'conv_cancel', item_type: 'run', item_id: 'run_cancel', visibility: 'inline_status', created_at: '2026-07-15 20:25:56',
+          }),
+          event('assistant.completed', { text: '运行已取消。', status: 'cancelled', seq: 6 }, {
+            run_id: 'run_cancel', conversation_id: 'conv_cancel', item_type: 'assistant_message', item_id: 'msg_cancel_assistant', visibility: 'chat', created_at: '2026-07-15 20:25:56',
+          }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const cancelledMarkup = renderMessageList(cancelledResult.items);
+    assert.equal(cancelledResult.activeRunStatusByRunId.run_cancel, 'cancelled');
+    assert.match(cancelledMarkup, />已取消</);
+    assert.match(cancelledMarkup, />· 20s</);
+    assert.doesNotMatch(cancelledMarkup, /正在处理/);
+    assert.doesNotMatch(cancelledMarkup, /项失败/);
+    assert.equal((cancelledMarkup.match(/class="process-stack-title">已取消<\/span>/g) || []).length, 1);
+  }
+
+  {
+    const completedResult = buildConversationRenderItems({
+      messages: [
+        { id: 'msg_auto_user', conversation_id: 'conv_auto', role: 'user', content: 'run the digest' },
+        { id: 'msg_auto_assistant', conversation_id: 'conv_auto', role: 'assistant', content: '日报已完成。', metadata: { run_id: 'run_auto_terminal' } },
+      ],
+      conversationId: 'conv_auto',
+      activeRunId: 'run_auto_terminal',
+      runEventsByRunId: {
+        run_auto_terminal: [
+          event('run.started', { status: 'running', seq: 1 }, {
+            run_id: 'run_auto_terminal', conversation_id: 'conv_auto', visibility: 'trace_only', created_at: '2026-07-16 01:00:18',
+          }),
+          event('tool.started', { status: 'running', tool_name: 'web_search', call_id: 'call_digest_search', seq: 2 }, {
+            run_id: 'run_auto_terminal', conversation_id: 'conv_auto', item_type: 'tool_run', item_id: 'call_digest_search', visibility: 'tool', created_at: '2026-07-16 01:00:19',
+          }),
+          event('assistant.completed', { text: '日报已完成。', status: 'completed', seq: 3 }, {
+            run_id: 'run_auto_terminal', conversation_id: 'conv_auto', item_type: 'assistant_message', item_id: 'msg_auto_assistant', visibility: 'chat', created_at: '2026-07-16 01:01:14',
+          }),
+          event('run.completed', { status: 'succeeded', seq: 4 }, {
+            run_id: 'run_auto_terminal', conversation_id: 'conv_auto', visibility: 'trace_only', created_at: '2026-07-16 01:01:14',
+          }),
+          event('automation.run_started', { status: 'running', summary: '个人关注日报', seq: 5 }, {
+            run_id: 'run_auto_terminal', conversation_id: 'conv_auto', item_type: 'automation', item_id: 'automation_digest', visibility: 'trace_only', created_at: '2026-07-16 01:01:14',
+          }),
+          event('automation.run_completed', { status: 'running', summary: '个人关注日报完成', seq: 6 }, {
+            run_id: 'run_auto_terminal', conversation_id: 'conv_auto', item_type: 'automation', item_id: 'automation_digest', visibility: 'trace_only', created_at: '2026-07-16 01:01:14',
+          }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const completedMarkup = renderMessageList(completedResult.items);
+    assert.equal(completedResult.activeRunStatusByRunId.run_auto_terminal, 'completed');
+    assert.match(completedMarkup, />· 56s</);
+    assert.doesNotMatch(completedMarkup, /正在处理/);
+  }
+
+  {
+    const boundaryMarkup = renderMessageList([
+      {
+        type: 'transcript_line', id: 'run_a:tool', runId: 'run_a', status: 'completed', runOutcome: 'completed', kind: 'tool', label: '网页搜索',
+        runStartedAt: '2026-07-16 01:00:00', runCompletedAt: '2026-07-16 01:00:01',
+      },
+      {
+        type: 'transcript_line', id: 'run_b:tool', runId: 'run_b', status: 'completed', runOutcome: 'completed', kind: 'tool', label: '操作终端',
+        runStartedAt: '2026-07-16 01:01:00', runCompletedAt: '2026-07-16 01:01:02',
+      },
+      { type: 'message', id: 'msg_run_b', role: 'assistant', content: 'run b done', runId: 'run_b' },
+    ]);
+    assert.equal((boundaryMarkup.match(/class="process-stack process-stack-/g) || []).length, 2);
   }
 
   {
@@ -957,10 +1550,51 @@ try {
     assert.equal(approvalLine.approval.requestedAction, '写入文件');
     assert.equal(result.activeRunStatusByRunId.run_confirm, 'waiting_approval');
     const waitingMarkup = renderMessageList(result.items);
-    assert.match(waitingMarkup, /<details class="process-stack process-stack-waiting_approval">/);
-    assert.doesNotMatch(waitingMarkup, /process-stack process-stack-waiting_approval" open/);
+    assert.match(waitingMarkup, /<section class="process-stack process-stack-waiting_approval" data-expanded="true">/);
     assert.match(waitingMarkup, />等待确认</);
     assert.match(waitingMarkup, />允许一次</);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [
+        { id: 'msg_approved_user', conversation_id: 'conv_approved', role: 'user', content: '帮我写入文件' },
+        { id: 'msg_approved_assistant', conversation_id: 'conv_approved', role: 'assistant', content: '写入并核验完成。', metadata: { run_id: 'run_approved' } },
+      ],
+      activeRunId: '',
+      runEventsByRunId: {
+        run_approved: [
+          event('approval.requested', {
+            confirmation_id: 'confirm_approved',
+            call_id: 'call_approved',
+            capability: 'apply_patch',
+            target_path: '/Users/hao/project/Joi/config.json',
+            risk: 'workspace_write',
+            status: 'waiting_confirmation',
+            seq: 1,
+          }, { run_id: 'run_approved', item_id: 'call_approved', visibility: 'approval' }),
+          event('approval.resolved', {
+            confirmation_id: 'confirm_approved',
+            call_id: 'call_approved',
+            capability: 'apply_patch',
+            risk: 'workspace_write',
+            status: 'approved',
+            decision: 'approved',
+            approved: true,
+            seq: 2,
+          }, { run_id: 'run_approved', item_id: 'call_approved', visibility: 'approval' }),
+          event('run.completed', { status: 'succeeded', seq: 3 }, { run_id: 'run_approved', visibility: 'trace_only', terminal: true }),
+        ],
+      },
+      mode: 'serious_task',
+    });
+    const approvalLine = result.items.find((item) => item.type === 'transcript_line' && item.kind === 'approval');
+    assert.equal(approvalLine.status, 'completed');
+    assert.match(approvalLine.label, /^已批准 · 写入文件/);
+    const approvedMarkup = renderMessageList(result.items);
+    assert.match(approvedMarkup, />已批准</);
+    assert.doesNotMatch(approvedMarkup, />允许一次</);
+    assert.doesNotMatch(approvedMarkup, />等待确认</);
   }
 } finally {
   rmSync(outDir, { recursive: true, force: true });

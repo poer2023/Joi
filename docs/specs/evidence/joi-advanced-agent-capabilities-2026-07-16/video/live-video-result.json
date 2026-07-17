@@ -1,0 +1,18 @@
+{
+  "status": "completed",
+  "capability": "video_generate",
+  "mode": "xai_async_video_v1",
+  "provider": "xai",
+  "model": "grok-imagine-video",
+  "request_id": "54bfe015-28db-97a8-84da-dc3ab5a9a94c",
+  "aspect_ratio": "16:9",
+  "resolution": "480p",
+  "duration_seconds": 1,
+  "file_path": "/Users/hao/project/Joi/docs/specs/evidence/joi-advanced-capabilities-2026-07-16/video/joi-xai-video-1784136784479-91c6c41b.mp4",
+  "size": 60165,
+  "ffprobe": {
+    "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+    "duration": "1.041667",
+    "size": "60165"
+  }
+}

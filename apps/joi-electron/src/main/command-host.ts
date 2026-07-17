@@ -70,11 +70,16 @@ export type JoiCommandHostOptions = {
   };
   replayRunEvents?: (runID: string, afterSeq: number) => unknown[] | Promise<unknown[]>;
   acpWeb?: {
-    token: string;
+    token?: string;
+    authorize?: (token: string) => {
+      permission_profile: string;
+      capabilities: Iterable<string>;
+    } | undefined;
     execute: (request: {
-      capability: 'web_search' | 'web_extract';
+      capability: string;
       payload: Record<string, unknown>;
       request_id: string;
+      permission_profile: string;
     }) => unknown | Promise<unknown>;
   };
   logger?: Pick<Console, 'info' | 'warn' | 'error'>;
@@ -217,19 +222,27 @@ async function dispatchACPWebCommand(
   traceID: string,
 ): Promise<JoiCommandEnvelope> {
   const bridge = options.acpWeb;
-  if (!bridge) return errorEnvelope(traceID, 'ACP_WEB_UNAVAILABLE', 'Joi ACP web bridge is unavailable');
-  if (!secureTokenEqual(String(request.token || ''), bridge.token)) {
-    return errorEnvelope(traceID, 'ACP_WEB_UNAUTHORIZED', 'Joi ACP web bridge token is invalid');
-  }
+  if (!bridge) return errorEnvelope(traceID, 'ACP_WEB_UNAVAILABLE', 'Joi ACP capability bridge is unavailable');
+  const candidateToken = String(request.token || '');
+  const grant = bridge.authorize?.(candidateToken)
+    || (bridge.token && secureTokenEqual(candidateToken, bridge.token)
+      ? { permission_profile: 'read_only', capabilities: ['web_search', 'web_extract'] }
+      : undefined);
+  if (!grant) return errorEnvelope(traceID, 'ACP_WEB_UNAUTHORIZED', 'Joi ACP capability bridge token is invalid');
   const capability = String(request.capability || '').trim();
-  if (capability !== 'web_search' && capability !== 'web_extract') {
-    return errorEnvelope(traceID, 'ACP_WEB_CAPABILITY_DENIED', `Joi ACP web bridge does not expose ${capability || '(empty)'}`, { capability });
+  if (!new Set(grant.capabilities).has(capability)) {
+    return errorEnvelope(traceID, 'ACP_WEB_CAPABILITY_DENIED', `Joi ACP capability bridge does not expose ${capability || '(empty)'}`, { capability });
   }
   const payload = request.payload && typeof request.payload === 'object' && !Array.isArray(request.payload)
     ? request.payload as Record<string, unknown>
     : {};
   try {
-    return successEnvelope(traceID, await bridge.execute({ capability, payload, request_id: traceID }));
+    return successEnvelope(traceID, await bridge.execute({
+      capability,
+      payload,
+      request_id: traceID,
+      permission_profile: grant.permission_profile,
+    }));
   } catch (error) {
     return errorEnvelope(traceID, 'ACP_WEB_FAILED', error instanceof Error ? error.message : String(error), { capability });
   }

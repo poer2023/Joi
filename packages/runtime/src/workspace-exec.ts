@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -73,6 +73,32 @@ type WorkspacePatchChange = {
   lines: number;
   mode: number;
   content: Buffer;
+  beforeExists: boolean;
+  beforeContent: Buffer;
+};
+
+export type WorkspaceChangeSetDraft = {
+  id: string;
+  patch: string;
+  permission_profile: PermissionProfile;
+  files: Array<{
+    operation: 'add' | 'update';
+    path: string;
+    mode: number;
+    before_exists: boolean;
+    before_content_base64: string;
+    after_content_base64: string;
+    before_hash: string;
+    after_hash: string;
+    bytes: number;
+    lines: number;
+  }>;
+};
+
+type ApplyPatchExecutionOptions = {
+  onPrepared?: (changeSet: WorkspaceChangeSetDraft) => void;
+  onApplied?: (changeSet: WorkspaceChangeSetDraft) => void;
+  onFailed?: (changeSet: WorkspaceChangeSetDraft, error: Error) => void;
 };
 
 const defaultShellCommandTimeoutSeconds = 30;
@@ -151,7 +177,7 @@ export async function executeTestCommand(req: TestCommandRequest, settings: Work
   };
 }
 
-export function executeApplyPatch(req: ApplyPatchRequest, settings: WorkspaceSettings): CapabilityResult {
+export function executeApplyPatch(req: ApplyPatchRequest, settings: WorkspaceSettings, options: ApplyPatchExecutionOptions = {}): CapabilityResult {
   const profile = normalizedPermissionProfile(req.permission_profile);
   if (!permissionProfileAllowsWorkspaceWrite(profile)) throw policyDenied('apply_patch requires workspace_write permission profile');
   const patch = req.patch?.trimEnd() || '';
@@ -159,19 +185,52 @@ export function executeApplyPatch(req: ApplyPatchRequest, settings: WorkspaceSet
   const normalized = normalizeWorkspaceSettings(settings);
   const ops = parseWorkspaceApplyPatch(patch);
   const changes = prepareWorkspacePatchChanges(ops, normalized);
-  for (const change of changes) {
-    writeWorkspaceFileAtomic(change.path, change.content, change.mode);
+  const changeSet: WorkspaceChangeSetDraft = {
+    id: `changeset_${randomUUID()}`,
+    patch,
+    permission_profile: profile,
+    files: changes.map((change) => ({
+      operation: change.operation,
+      path: change.path,
+      mode: change.mode,
+      before_exists: change.beforeExists,
+      before_content_base64: change.beforeContent.toString('base64'),
+      after_content_base64: change.content.toString('base64'),
+      before_hash: hashWorkspaceContent(change.beforeContent),
+      after_hash: hashWorkspaceContent(change.content),
+      bytes: change.bytes,
+      lines: change.lines,
+    })),
+  };
+  options.onPrepared?.(changeSet);
+  const applied: WorkspacePatchChange[] = [];
+  try {
+    for (const change of changes) {
+      writeWorkspaceFileAtomic(change.path, change.content, change.mode);
+      applied.push(change);
+    }
+    options.onApplied?.(changeSet);
+  } catch (error) {
+    for (const change of [...applied].reverse()) restoreWorkspacePatchChange(change);
+    const failure = error instanceof Error ? error : new Error(String(error));
+    options.onFailed?.(changeSet, failure);
+    throw failure;
   }
   const changedFiles = changes.map((change) => ({
     operation: change.operation,
     path: change.path,
     bytes: change.bytes,
     lines: change.lines,
+    before_hash: hashWorkspaceContent(change.beforeContent),
+    after_hash: hashWorkspaceContent(change.content),
   }));
   return {
     status: 'completed',
     changed_files: changedFiles,
     changed_file_count: changedFiles.length,
+    change_set_id: changeSet.id,
+    reversible: true,
+    review_patch: patch,
     permission_profile: profile,
     summary: `Applied workspace patch to ${changedFiles.length} file(s).`,
     mode: 'apply_patch_v1_workspace',
@@ -788,7 +847,7 @@ function prepareWorkspacePatchChanges(ops: WorkspacePatchOp[], settings: Workspa
   const seen = new Set<string>();
   for (const op of ops) {
     const path = resolveWorkspaceTargetPath(op.path, settings, op.kind === 'update');
-    if (forbiddenWorkspaceWritePath(path)) throw new Error('path is blocked by workspace write policy');
+    if (forbiddenWorkspaceWritePath(path, settings)) throw new Error('path is blocked by workspace write policy');
     if (seen.has(path)) throw new Error(`patch touches the same file more than once: ${path}`);
     seen.add(path);
     if (op.kind === 'add') {
@@ -801,14 +860,33 @@ function prepareWorkspacePatchChanges(ops: WorkspacePatchOp[], settings: Workspa
       }
       if (fileExists) throw new Error(`add file already exists: ${path}`);
       const content = contentForAddPatch(op.lines);
-      changes.push({ operation: 'add', path, bytes: content.length, lines: countLines(content.toString('utf8')), mode: 0o644, content });
+      changes.push({
+        operation: 'add',
+        path,
+        bytes: content.length,
+        lines: countLines(content.toString('utf8')),
+        mode: 0o644,
+        content,
+        beforeExists: false,
+        beforeContent: Buffer.alloc(0),
+      });
       continue;
     }
     const info = statSync(path);
     if (info.isDirectory()) throw new Error('apply_patch update path must be a file');
-    const next = contentForUpdatePatch(readFileSync(path, 'utf8'), op.lines);
+    const beforeContent = readFileSync(path);
+    const next = contentForUpdatePatch(beforeContent.toString('utf8'), op.lines);
     const content = Buffer.from(next, 'utf8');
-    changes.push({ operation: 'update', path, bytes: content.length, lines: countLines(next), mode: info.mode & 0o777, content });
+    changes.push({
+      operation: 'update',
+      path,
+      bytes: content.length,
+      lines: countLines(next),
+      mode: info.mode & 0o777,
+      content,
+      beforeExists: true,
+      beforeContent,
+    });
   }
   return changes;
 }
@@ -893,21 +971,48 @@ function writeWorkspaceFileAtomic(path: string, content: Buffer, mode: number): 
   }
 }
 
+function restoreWorkspacePatchChange(change: WorkspacePatchChange): void {
+  if (!change.beforeExists) {
+    rmSync(change.path, { force: true });
+    return;
+  }
+  writeWorkspaceFileAtomic(change.path, change.beforeContent, change.mode);
+}
+
+function hashWorkspaceContent(content: Buffer): string {
+  return createHash('sha256').update(content).digest('hex');
+}
+
 function resolveWorkspaceTargetPath(pathInput: string, settings: WorkspaceSettings, mustExist: boolean): string {
   const normalized = normalizeWorkspaceSettings(settings);
+  const allowedRoots = realAndLogicalWorkspaceRoots(normalized.allowed_roots);
   const raw = pathInput.trim();
   if (!raw) throw new Error('workspace path is required');
   const candidate = isAbsolute(raw) ? resolve(raw) : resolve(normalized.default_root, raw);
   if (mustExist) {
     const real = realpathSync(candidate);
-    if (!normalized.allowed_roots.some((root) => pathWithinRoot(real, root))) throw new Error('workspace path is outside allowed roots');
+    if (!allowedRoots.some((root) => pathWithinRoot(real, root))) throw new Error('workspace path is outside allowed roots');
     return real;
   }
   const parent = existingParent(candidate);
   const parentReal = realpathSync(parent);
   const resolved = resolve(parentReal, relative(parent, candidate));
-  if (!normalized.allowed_roots.some((root) => pathWithinRoot(resolved, root))) throw new Error('workspace path is outside allowed roots');
+  if (!allowedRoots.some((root) => pathWithinRoot(resolved, root))) throw new Error('workspace path is outside allowed roots');
   return resolved;
+}
+
+function realAndLogicalWorkspaceRoots(roots: string[]): string[] {
+  const resolvedRoots = new Set<string>();
+  for (const root of roots) {
+    const logicalRoot = resolve(root);
+    resolvedRoots.add(logicalRoot);
+    try {
+      resolvedRoots.add(realpathSync(logicalRoot));
+    } catch {
+      // The normalized logical root still provides the boundary for a not-yet-created root.
+    }
+  }
+  return [...resolvedRoots];
 }
 
 function existingParent(path: string): string {
@@ -924,9 +1029,15 @@ function existingParent(path: string): string {
   }
 }
 
-function forbiddenWorkspaceWritePath(path: string): boolean {
-  if (shellArgReferencesBlockedPath(path)) return true;
-  for (const part of path.split(/[\\/]+/)) {
+function forbiddenWorkspaceWritePath(path: string, settings: WorkspaceSettings): boolean {
+  const roots = realAndLogicalWorkspaceRoots(normalizeWorkspaceSettings(settings).allowed_roots);
+  const containingRoot = roots
+    .filter((root) => pathWithinRoot(path, root))
+    .sort((left, right) => right.length - left.length)[0];
+  const relativePath = containingRoot ? relative(containingRoot, path) : path;
+  const scopedPath = `/${relativePath.replaceAll('\\', '/')}`;
+  if (shellArgReferencesBlockedPath(scopedPath)) return true;
+  for (const part of relativePath.split(/[\\/]+/)) {
     if (['.git', '.codex', 'node_modules'].includes(part.toLowerCase())) return true;
   }
   return false;

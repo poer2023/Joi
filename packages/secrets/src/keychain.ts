@@ -101,6 +101,7 @@ export class KeychainSecretStore {
 
 export function assertAllowedSecret(name: string): asserts name is DesktopSecretName {
   if (name.startsWith('JOI_AUTOMATION_WEBHOOK_SECRET_')) return;
+  if (/^ASSISTANT_(DISCORD|FEISHU)_WEBHOOK$/.test(name)) return;
   if (!desktopSecretNames.includes(name as DesktopSecretName)) {
     throw new Error('unsupported secret name');
   }

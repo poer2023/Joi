@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { compileElectronCapabilityTools } from '../../../packages/runtime/src/capability-compiler.ts';
 import {
   dispatchJoiCommand,
   startJoiCommandHost,
@@ -11,14 +12,16 @@ import {
 import {
   acpWebBridgeConfigPath,
   acpWebBridgeToken,
+  createACPCapabilityMCPServer,
   createACPWebMCPServer,
+  resolveACPBridgeGrant,
   resolveACPWebMCPScript,
 } from '../src/main/acp-web-bridge.ts';
 
 const token = acpWebBridgeToken();
 const executed = [];
 const acpWeb = {
-  token,
+  authorize: resolveACPBridgeGrant,
   execute(request) {
     executed.push(request);
     return {
@@ -46,7 +49,7 @@ assert.equal(denied.error?.code, 'ACP_WEB_CAPABILITY_DENIED');
 
 const tempDir = await mkdtemp(join(tmpdir(), 'joi-acp-web-'));
 const socketPath = join(tempDir, 'joi-cli.sock');
-let child;
+const children = [];
 try {
   const spec = createACPWebMCPServer(tempDir);
   assert.equal(spec.name, 'joi_web');
@@ -68,12 +71,13 @@ try {
     acpWeb,
     logger: { info() {}, warn() {}, error() {} },
   });
-  child = spawn(spec.command, spec.args, {
+  const child = spawn(spec.command, spec.args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     // Codex ACP 1.1.2 drops McpServer.env. The launch spec must work with no
     // per-server environment entries at all.
     env: { ...process.env },
   });
+  children.push(child);
   const client = mcpClient(child);
   const initialized = await client.call('initialize', {
     protocolVersion: '2025-03-26',
@@ -92,9 +96,105 @@ try {
   assert.equal(output.query, 'Joi ACP');
   assert.equal(executed.at(-1)?.capability, 'web_search');
   assert.equal(executed.at(-1)?.payload.query, 'Joi ACP');
-  await assert.rejects(client.call('tools/call', { name: 'shell_command', arguments: {} }), /Unsupported Joi web tool/);
+  await assert.rejects(client.call('tools/call', { name: 'shell_command', arguments: {} }), /Unsupported Joi capability tool/);
+
+  const capabilitySpec = createACPCapabilityMCPServer(tempDir, [
+    {
+      name: 'workspace_search',
+      description: 'Search an authorized workspace.',
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string' } },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'file_read',
+      description: 'Read an authorized workspace file.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+  ], 'danger_full_access');
+  assert(capabilitySpec);
+  assert.equal(capabilitySpec.name, 'joi_capabilities');
+  const capabilityConfigPath = capabilitySpec.args.at(-1);
+  const capabilityConfigInfo = await stat(capabilityConfigPath);
+  assert.equal(capabilityConfigInfo.mode & 0o077, 0);
+  const capabilityConfig = JSON.parse(await readFile(capabilityConfigPath, 'utf8'));
+  assert.equal(capabilityConfig.server_name, 'joi_capabilities');
+  assert.deepEqual(capabilityConfig.tools.map((tool) => tool.name), ['file_read', 'workspace_search']);
+  assert.deepEqual([...resolveACPBridgeGrant(capabilityConfig.token).capabilities].sort(), ['file_read', 'workspace_search']);
+  assert.equal(resolveACPBridgeGrant(capabilityConfig.token).permission_profile, 'danger_full_access');
+
+  const capabilityChild = spawn(capabilitySpec.command, capabilitySpec.args, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env },
+  });
+  children.push(capabilityChild);
+  const capabilityClient = mcpClient(capabilityChild);
+  const capabilityInitialized = await capabilityClient.call('initialize', {
+    protocolVersion: '2025-03-26',
+    capabilities: {},
+    clientInfo: { name: 'joi-capability-test', version: '1' },
+  });
+  assert.equal(capabilityInitialized.protocolVersion, '2025-03-26');
+  capabilityClient.notify('notifications/initialized');
+  const capabilityInventory = await capabilityClient.call('tools/list');
+  assert.deepEqual(capabilityInventory.tools.map((tool) => tool.name), ['file_read', 'workspace_search']);
+  const searched = await capabilityClient.call('tools/call', { name: 'workspace_search', arguments: { query: 'bridge scope' } });
+  assert.equal(searched.isError, false);
+  assert.equal(executed.at(-1)?.capability, 'workspace_search');
+  assert.equal(executed.at(-1)?.permission_profile, 'danger_full_access');
+
+  const readOnlyCapabilitySpec = createACPCapabilityMCPServer(tempDir, [
+    {
+      name: 'workspace_search',
+      description: 'Search an authorized workspace.',
+      parameters: { type: 'object', properties: { query: { type: 'string' } } },
+    },
+  ], 'read_only');
+  assert(readOnlyCapabilitySpec);
+  const readOnlyCapabilityConfig = JSON.parse(await readFile(readOnlyCapabilitySpec.args.at(-1), 'utf8'));
+  assert.notEqual(readOnlyCapabilityConfig.token, capabilityConfig.token);
+  assert.equal(resolveACPBridgeGrant(readOnlyCapabilityConfig.token).permission_profile, 'read_only');
+
+  const fullAgentSpec = createACPCapabilityMCPServer(
+    tempDir,
+    compileElectronCapabilityTools('danger_full_access', { allowed_capabilities: ['*'] }),
+    'danger_full_access',
+  );
+  assert(fullAgentSpec);
+  const fullAgentChild = spawn(fullAgentSpec.command, fullAgentSpec.args, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env },
+  });
+  children.push(fullAgentChild);
+  const fullAgentClient = mcpClient(fullAgentChild);
+  await fullAgentClient.call('initialize', {
+    protocolVersion: '2025-03-26',
+    capabilities: {},
+    clientInfo: { name: 'joi-full-agent-test', version: '1' },
+  });
+  fullAgentClient.notify('notifications/initialized');
+  const fullAgentInventory = await fullAgentClient.call('tools/list');
+  assert.equal(fullAgentInventory.tools.length, 89);
+  for (const capability of ['tool_search', 'shell_start', 'browser_tabs', 'browser_console', 'browser_network']) {
+    assert(fullAgentInventory.tools.some((tool) => tool.name === capability), `full MCP inventory is missing ${capability}`);
+  }
+
+  const outOfGrant = await dispatchJoiCommand(
+    { action: 'acp_web', token: capabilityConfig.token, capability: 'shell_command', payload: { cmd: ['id'] } },
+    { handlers: {}, acpWeb },
+  );
+  assert.equal(outOfGrant.ok, false);
+  assert.equal(outOfGrant.error?.code, 'ACP_WEB_CAPABILITY_DENIED');
 } finally {
-  child?.kill('SIGTERM');
+  for (const child of children) child.kill('SIGTERM');
   await stopJoiCommandHost(socketPath);
   await rm(tempDir, { recursive: true, force: true });
 }

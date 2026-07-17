@@ -1,0 +1,48 @@
+{
+  "verified_at": "2026-07-16T04:26:22+08:00",
+  "application": "/Applications/Joi.app",
+  "package": "/Users/hao/project/Joi/dist/desktop/Joi-0.1.1-macos-arm64.zip",
+  "codesign_deep_strict": "passed",
+  "installed_bundle_renderer": "file:///Applications/Joi.app/Contents/Resources/app.asar/dist/renderer/index.html",
+  "user_data_preserved": "/Users/hao/Library/Application Support/Joi",
+  "running_message_control": {
+    "steering": {
+      "run_id": "run_mrmis4gzbcj2uk",
+      "queue_message_id": "rqm_mrmisifvo4b2b6",
+      "queue_status": "delivered",
+      "run_status": "completed",
+      "result": "RUN_QUEUE_READY STEER_OK"
+    },
+    "follow_up": {
+      "run_id": "run_mrmj1mtvvcrcom",
+      "queue_message_id": "rqm_mrmj273jqavui7",
+      "queue_status": "delivered",
+      "run_status": "completed",
+      "result": "FIRST_DONE FOLLOW_UP_DONE"
+    },
+    "interrupt": {
+      "run_id": "run_mrmj516bmfbhzf",
+      "run_status": "cancelled",
+      "terminal_events": [
+        "run.cancel_requested",
+        "run.cancelled",
+        "run.interrupted"
+      ]
+    }
+  },
+  "installed_browser": {
+    "url": "https://example.com",
+    "title": "Example Domain",
+    "result": "passed"
+  },
+  "installed_assistant_activity": {
+    "start": "passed",
+    "capture_with_local_ocr": "passed",
+    "stop_and_summary": "passed"
+  },
+  "window_lifecycle": {
+    "close_kept_process_alive": true,
+    "reopen_restored_window": true,
+    "reopen_restored_conversation": true
+  }
+}

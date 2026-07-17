@@ -47,6 +47,9 @@ const joiApi: JoiPreloadApi = {
     openExternal(url: string): Promise<void> {
       return ipcRenderer.invoke('joi:app:openExternal', url) as Promise<void>;
     },
+    setWindowButtonVisibility(visible: boolean): Promise<void> {
+      return ipcRenderer.invoke('joi:app:setWindowButtonVisibility', visible) as Promise<void>;
+    },
   },
 };
 

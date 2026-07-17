@@ -221,6 +221,11 @@ try {
   assert.equal(missingPrivate.status, 'failed');
   assert.equal(missingPrivate.fetch_status, 'http_error');
   assert.equal(missingPrivate.status_code, 404);
+  assert.equal(missingPrivate.failure_class, 'origin_not_found');
+  assert.equal(missingPrivate.source_verified, false);
+  assert.equal(missingPrivate.retryable, false);
+  assert.equal(missingPrivate.readable_text, '');
+  assert.match(missingPrivate.summary, /Source could not be verified: HTTP 404/);
 
   const blockedScheme = await executeWebResearch({ url: 'file:///etc/passwd' }, settings);
   assert.equal(blockedScheme.status, 'policy_blocked');

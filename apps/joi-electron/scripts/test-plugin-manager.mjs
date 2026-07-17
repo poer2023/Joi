@@ -45,6 +45,36 @@ try {
   assert(readOnlyRuntime.capability_allowlist.some((item) => item.capability_id === 'mcp.joi_web.web_extract'));
   assert(!readOnlyRuntime.capability_allowlist.some((item) => item.operation === 'workspace_write'));
 
+  const scopedRuntime = providerRuntimeConfig(
+    provider,
+    process.cwd(),
+    [process.cwd()],
+    'danger_full_access',
+    userDataDir,
+    ['workspace_search_v1', 'file_read_v1', 'web_research_v2', 'apply_patch_v1', 'browser_click', 'x_search'],
+  );
+  assert.deepEqual(scopedRuntime.mcp_servers.map((server) => server.name), ['joi_web', 'joi_capabilities']);
+  assert.deepEqual(scopedRuntime.joi_capability_tools, ['workspace_search', 'file_read', 'apply_patch', 'browser_click']);
+  assert(scopedRuntime.capability_allowlist.some((item) => item.capability_id === 'mcp.joi_capabilities.workspace_search'));
+  assert(scopedRuntime.capability_allowlist.some((item) => item.capability_id === 'mcp.joi_capabilities.file_read'));
+  assert(scopedRuntime.capability_allowlist.some((item) => item.capability_id === 'mcp.joi_capabilities.apply_patch'));
+  assert(scopedRuntime.capability_allowlist.some((item) => item.capability_id === 'mcp.joi_capabilities.browser_click'));
+  assert(!scopedRuntime.capability_allowlist.some((item) => item.capability_id === 'mcp.joi_capabilities.x_search'));
+
+  const fullAgentRuntime = providerRuntimeConfig(
+    provider,
+    process.cwd(),
+    [process.cwd()],
+    'danger_full_access',
+    userDataDir,
+    ['*'],
+  );
+  for (const capability of ['tool_search', 'file_read', 'workspace_search', 'shell_start', 'browser_tabs', 'browser_console', 'browser_network']) {
+    assert(fullAgentRuntime.joi_capability_tools.includes(capability), `full agent bridge is missing ${capability}`);
+    assert(fullAgentRuntime.capability_allowlist.some((item) => item.capability_id === `mcp.joi_capabilities.${capability}`));
+  }
+  assert(!fullAgentRuntime.joi_capability_tools.includes('x_search'), 'planned tools must not be exposed as executable');
+
   const workspaceWriteRuntime = providerRuntimeConfig(provider, process.cwd(), [process.cwd()], 'workspace_write', userDataDir);
   assert(workspaceWriteRuntime.capability_allowlist.some((item) => item.operation === 'workspace_write'));
   assert(workspaceWriteRuntime.capability_allowlist.some((item) => item.command_policy === 'workspace_test'));
