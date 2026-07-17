@@ -131,7 +131,9 @@ function createMainWindow() {
     minWidth: 560,
     minHeight: 720,
     title: 'Joi',
-    titleBarStyle: 'hiddenInset',
+    // Use a full-size content view so the renderer's 36px titlebar shares the
+    // same physical row as the native traffic lights instead of starting below it.
+    titleBarStyle: 'hidden',
     trafficLightPosition: { x: 14, y: 14 },
     show: false,
     webPreferences: {

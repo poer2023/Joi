@@ -814,7 +814,11 @@ function processGroupSummary(group: ProcessGroupItem): string {
     const label = transcriptLabel(group.header.label);
     return group.header.detail ? `${label} · ${transcriptDetail(group.header.detail)}` : label;
   }
-  if (group.header.kind === 'approval') return '等待确认';
+  if (group.header.kind === 'approval') {
+    if (group.header.status === 'completed') return '已批准';
+    if (group.header.status === 'failed') return '已拒绝';
+    return '等待确认';
+  }
   if (group.header.kind === 'tool') return '使用能力';
   return '处理过程';
 }

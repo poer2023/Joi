@@ -45,6 +45,7 @@ import type {
   RecordExternalConnectorFailureRequest,
   RecordExternalConnectorInboundRequest,
   RecordExternalConnectorOutboundRequest,
+  RecoverableRunActionRequest,
   RedirectRunRequest,
   RetryExternalConnectorEventRequest,
   RollbackProjectPersonaRequest,
@@ -759,6 +760,64 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
     ListRecoverableRuns(payload) {
       return store.listRecoverableRuns(payload as { limit?: number });
     },
+    async ResolveRecoverableRun(payload) {
+      const req = payload as RecoverableRunActionRequest;
+      const runID = req.run_id?.trim() || '';
+      if (!runID) throw new Error('run_id is required');
+      if (req.action === 'abandon') {
+        const trace = store.abandonRecoverableRun(runID, req.reason?.trim() || 'abandoned by user');
+        emitRunEvents(window, trace);
+        return { action: 'abandon', original_run_id: runID, trace };
+      }
+      if (req.action !== 'retry') throw new Error(`Unsupported recovery action: ${req.action}`);
+      const recovery = store.beginRecoverableRunRetry(runID);
+      emitRunEvents(window, store.getRunTrace(runID));
+      const settings = store.getSettings();
+      const completedEffects = recovery.completed_effects
+        .map((effect, index) => `${index + 1}. ${String(effect.capability || 'operation')}: ${String(effect.summary || effect.purpose || 'completed')}`)
+        .join('\n');
+      const recoveryMessage = [
+        '继续上次因 Joi 重启而中断的任务。',
+        `原始目标：${recovery.original_message}`,
+        completedEffects
+          ? `已经完成的副作用如下，必须先核对当前状态且不得重复执行：\n${completedEffects}`
+          : '上次运行没有记录到已完成的副作用，可以从安全检查点重新开始。',
+        '完成后请按原始目标给出可核对的交付物和验证证据。',
+      ].join('\n\n');
+      try {
+        const result = await runLiveElectronToolCallingChat({
+          conversation_id: recovery.conversation_id,
+          message: recoveryMessage,
+          input_mode: recovery.requested_mode,
+          product_task_id: recovery.product_task_id,
+          parent_run_id: runID,
+          runtime_mode: 'tool_calling',
+          permission_profile: recovery.permission_profile,
+        }, settings, secrets, store, activeToolCallingRuns, emitNewRunEvents, pluginManager);
+        const newTrace = store.getRunTrace(result.run_id);
+        if (['failed', 'cancelled'].includes(String(newTrace.terminal_status || newTrace.status))) {
+          const trace = store.failRecoverableRunRetry(runID, newTrace.terminal_reason || `Recovery run ${result.run_id} failed`);
+          emitRunEvents(window, trace);
+          return { action: 'retry', original_run_id: runID, new_run: result, trace };
+        }
+        const trace = store.completeRecoverableRunRetry(runID, result.run_id);
+        emitRunEvents(window, trace);
+        return { action: 'retry', original_run_id: runID, new_run: result, trace };
+      } catch (error) {
+        const trace = store.failRecoverableRunRetry(runID, error instanceof Error ? error.message : String(error));
+        emitRunEvents(window, trace);
+        throw error;
+      }
+    },
+    ListWorkspaceChangeSets(payload) {
+      return store.listWorkspaceChangeSets((payload || {}) as { run_id?: string; product_task_id?: string; limit?: number });
+    },
+    RevertWorkspaceChangeSet(payload) {
+      const req = (payload || {}) as { id?: string; reason?: string };
+      const changeSet = store.revertWorkspaceChangeSet(req.id?.trim() || '', req.reason?.trim() || 'reverted by user');
+      if (changeSet.run_id) emitRunEvents(window, store.getRunTrace(changeSet.run_id));
+      return changeSet;
+    },
     ListBackups() {
       return store.listBackups();
     },
@@ -1342,6 +1401,14 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
   ipcMain.handle('joi:app:openExternal', async (_event, rawUrl: unknown) => {
     const url = externalUrlSchema.parse(rawUrl);
     await shell.openExternal(url);
+  });
+
+  ipcMain.removeHandler('joi:app:setWindowButtonVisibility');
+  ipcMain.handle('joi:app:setWindowButtonVisibility', (_event, rawVisible: unknown) => {
+    const visible = z.boolean().parse(rawVisible);
+    if (process.platform === 'darwin' && !window.isDestroyed()) {
+      window.setWindowButtonVisibility(visible);
+    }
   });
 
   ipcMain.removeHandler('joi:terminal:start');
@@ -2417,7 +2484,9 @@ async function resumeElectronToolCallingRun(
   }
   let toolResult: PersistedToolResult;
   try {
-    const executed = await executeElectronCapability(resume.capability_id, resume.input, resumeReq, store, secrets);
+    const executed = await executeElectronCapability(resume.capability_id, resume.input, resumeReq, store, secrets, {
+      parentRunID: resume.run_id,
+    });
     toolResult = {
       call_id: resume.call_id,
       name: resume.capability_id,
@@ -2774,6 +2843,22 @@ async function executeElectronCapability(
     permission_profile: permissionProfile,
   };
   const workspaceSettings = store.getWorkspaceSettings();
+  const executeTrackedWorkspacePatch = (
+    patchInputs: Record<string, unknown> & { permission_profile: string },
+  ) => executeApplyPatch(patchInputs, workspaceSettings, {
+    onPrepared: (draft) => {
+      store.recordWorkspaceChangeSetPrepared(draft, {
+        run_id: options.parentRunID,
+        product_task_id: req.product_task_id,
+      });
+    },
+    onApplied: (draft) => {
+      store.markWorkspaceChangeSetApplied(draft.id);
+    },
+    onFailed: (draft, error) => {
+      store.markWorkspaceChangeSetFailed(draft.id, error.message);
+    },
+  });
   const browserDisabled = () => ({
     output: {
       status: 'blocked',
@@ -2939,7 +3024,7 @@ async function executeElectronCapability(
       };
     case 'apply_patch':
       if (!['workspace_write', 'danger_full_access'].includes(String(req.permission_profile || ''))) return undefined;
-      return { output: executeApplyPatch(inputsWithPermission, store.getWorkspaceSettings()) };
+      return { output: executeTrackedWorkspacePatch(inputsWithPermission) };
     case 'patch':
     case 'edit_file':
     case 'edit':
@@ -2948,7 +3033,7 @@ async function executeElectronCapability(
       if (!['workspace_write', 'danger_full_access'].includes(String(req.permission_profile || ''))) return undefined;
       const patchInputs = patchAliasInputs(capability, inputsWithPermission);
       if (!patchInputs) return { output: executeUnsupportedCapability(capability, inputsWithPermission, 'patch_required') };
-      return { output: executeApplyPatch(patchInputs, store.getWorkspaceSettings()) };
+      return { output: executeTrackedWorkspacePatch(patchInputs as Record<string, unknown> & { permission_profile: string }) };
     }
     case 'computer_observe':
       return { output: await executeComputerObserve(inputs) };

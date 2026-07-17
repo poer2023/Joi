@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -96,6 +97,51 @@ try {
   });
 
   assert.equal(response.response, 'Electron SQLite deterministic response: store test ping');
+
+  const changeSetPath = join(tempDir, 'changeset-target.txt');
+  const beforeChangeSetContent = Buffer.from('before change set\n');
+  const afterChangeSetContent = Buffer.from('after change set\n');
+  writeFileSync(changeSetPath, beforeChangeSetContent);
+  const changeSetDraft = {
+    id: 'changeset_store_roundtrip',
+    patch: '*** Begin Patch\n*** Update File: changeset-target.txt\n*** End Patch',
+    permission_profile: 'workspace_write',
+    files: [{
+      operation: 'update',
+      path: changeSetPath,
+      mode: 0o644,
+      before_exists: true,
+      before_content_base64: beforeChangeSetContent.toString('base64'),
+      after_content_base64: afterChangeSetContent.toString('base64'),
+      before_hash: createHash('sha256').update(beforeChangeSetContent).digest('hex'),
+      after_hash: createHash('sha256').update(afterChangeSetContent).digest('hex'),
+      bytes: afterChangeSetContent.length,
+      lines: 1,
+    }],
+  };
+  store.recordWorkspaceChangeSetPrepared(changeSetDraft);
+  writeFileSync(changeSetPath, afterChangeSetContent);
+  const appliedChangeSet = store.markWorkspaceChangeSetApplied(changeSetDraft.id);
+  assert.equal(appliedChangeSet.status, 'applied');
+  assert.equal(appliedChangeSet.run_id, undefined);
+  assert.equal(store.listWorkspaceChangeSets().change_sets[0].id, changeSetDraft.id);
+  const revertedChangeSet = store.revertWorkspaceChangeSet(changeSetDraft.id, 'store roundtrip test');
+  assert.equal(revertedChangeSet.status, 'reverted');
+  assert.equal(readFileSync(changeSetPath, 'utf8'), beforeChangeSetContent.toString('utf8'));
+
+  const conflictingDraft = {
+    ...changeSetDraft,
+    id: 'changeset_store_conflict',
+  };
+  store.recordWorkspaceChangeSetPrepared(conflictingDraft);
+  writeFileSync(changeSetPath, afterChangeSetContent);
+  store.markWorkspaceChangeSetApplied(conflictingDraft.id);
+  writeFileSync(changeSetPath, 'changed again after apply\n');
+  assert.throws(
+    () => store.revertWorkspaceChangeSet(conflictingDraft.id),
+    /changed after ChangeSet/,
+    'safe revert must refuse to overwrite later user changes',
+  );
 
   const conversations = store.listConversations({ view: 'active', limit: 10 }).conversations;
   assert.equal(conversations[0].title, 'store test ping');
@@ -1012,7 +1058,7 @@ try {
   assert.ok(memoryMetrics.scope_counts.project >= 1);
 
   const globalMemorySettings = store.getMemorySettings();
-  assert.equal(globalMemorySettings.pipeline_version, 'memory_os_v3_codex_alma');
+  assert.equal(globalMemorySettings.pipeline_version, 'memory_os_v4_hygiene');
   assert.equal(store.saveMemorySettings({ use_memories: false, generate_memories: false }).use_memories, false);
   const globallyDisabledPrompt = store.assembleToolCallingPrompt({
     message: 'Scope priority exact',
@@ -1090,15 +1136,60 @@ try {
   assert.equal(guardedInput.status, 'skipped');
   assert.equal(guardedInput.exclusion_reason, 'external_context_guard');
 
+  const operationalMemoryChat = memoryChatResult(
+    '【T6 持久终端真并行测试】请先实际调用工具，再按调用顺序只回复 session_id。',
+    'operational_quarantine',
+  );
+  const operationalInput = store['get'](
+    `SELECT status, exclusion_reason FROM memory_generation_inputs WHERE run_id=?`,
+    operationalMemoryChat.run_id,
+  );
+  assert.equal(operationalInput.status, 'skipped');
+  assert.equal(operationalInput.exclusion_reason, 'operational_instruction');
+  assert.equal(Number(store['get'](
+    `SELECT COUNT(*) AS count FROM memories WHERE source_event_ids LIKE ?`,
+    `%${operationalMemoryChat.run_id}%`,
+  ).count), 0);
+  assert.throws(
+    () => store.createMemoryCandidateForTool(
+      { message: 'memory tool guard', runtime_mode: 'tool_calling' },
+      { content: 'T9 tool_search max_results evaluator fixture', type: 'note' },
+    ),
+    /memory candidate rejected: operational_instruction/,
+  );
+
+  store['exec'](
+    `INSERT INTO memories (id, layer, type, content, summary, scope_type, privacy_level, confidence, status, lifecycle_state, source_event_ids, entities, metadata)
+     VALUES ('mem_legacy_operational_noise', 'knowledge', 'note', 'T8 capability visibility test: tool_search max_results 90', 'T8 capability visibility', 'user', 'internal', 0.74, 'observed', 'provisional', '[]', '[]', '{}')`,
+  );
+  store['exec'](
+    `INSERT INTO memories (id, layer, type, content, summary, scope_type, privacy_level, confidence, status, lifecycle_state, source_event_ids, entities, metadata)
+     VALUES ('mem_confirmed_operational_phrase', 'knowledge', 'note', 'T3 failure recovery is a consciously confirmed reference.', 'Confirmed T3 reference', 'user', 'internal', 0.95, 'confirmed', 'active', '[]', '[]', '{}')`,
+  );
+
   const seriousMemoryChat = memoryChatResult(
     '实现本地索引并验证旧数据兼容',
     'serious_episode',
     { input_mode: 'serious_task' },
-    [],
+    [{
+      call_id: 'call_serious_memory_patch',
+      name: 'apply_patch',
+      arguments: { patch: 'fixture' },
+      output: { status: 'completed', changed_file_count: 1, summary: 'Local index patch applied.' },
+    }, {
+      call_id: 'call_serious_memory_test',
+      name: 'test_command',
+      arguments: { cmd: ['pnpm', 'test'] },
+      output: { status: 'completed', test_status: 'succeeded', exit_code: 0, summary: 'Compatibility tests passed.' },
+    }],
     '本地索引已完成，旧数据兼容检查通过。',
   );
   const maintenanceResult = store.runMemoryMaintenance({ trigger_source: 'test' }).run;
   assert.equal(maintenanceResult.status, 'completed');
+  assert.ok((maintenanceResult.quarantined_count || 0) >= 1);
+  assert.equal(store['get'](`SELECT status FROM memories WHERE id='mem_legacy_operational_noise'`).status, 'quarantined');
+  assert.equal(store['get'](`SELECT lifecycle_state FROM memories WHERE id='mem_legacy_operational_noise'`).lifecycle_state, 'quarantined');
+  assert.equal(store['get'](`SELECT status FROM memories WHERE id='mem_confirmed_operational_phrase'`).status, 'confirmed');
   const episodeMemory = store['get'](
     `SELECT * FROM memories WHERE layer='episode' AND source_event_ids LIKE ? ORDER BY datetime(created_at) DESC LIMIT 1`,
     `%${seriousMemoryChat.run_id}%`,
@@ -1123,7 +1214,7 @@ try {
     explicit_memory: store['get'](`SELECT id, layer, status, lifecycle_state, scope_type, scope_id, privacy_level FROM memories WHERE id=?`, explicitMemoryRow.id),
     used_memories: influenceChat.used_memories.map((item) => ({ id: item.memory.id, source: item.retrieval_source })),
   }));
-  assert.equal(influenceUsage.pipeline_version, 'memory_os_v3_codex_alma');
+  assert.equal(influenceUsage.pipeline_version, 'memory_os_v4_hygiene');
   assert.equal(influenceUsage.influence_state, 'inferred_used');
 
   const abstainedChat = memoryChatResult('量子斑马第七号的随机校验值是什么？', 'retrieval_abstention');
@@ -1131,7 +1222,8 @@ try {
   assert.deepEqual(JSON.parse(abstainedPack.dynamic_retrieval), []);
   assert.ok(store.getRunTrace(abstainedChat.run_id).events.some((event) => event.event_type === 'memory.retrieval.abstained'));
   const memorySystem = store.getMemorySystem();
-  assert.equal(memorySystem.settings.pipeline_version, 'memory_os_v3_codex_alma');
+  assert.equal(memorySystem.settings.pipeline_version, 'memory_os_v4_hygiene');
+  assert.ok((memorySystem.metrics.quarantined_count || 0) >= 1);
   assert.equal(memorySystem.constitution?.version, 2);
   assert.equal(memorySystem.metrics.layer_counts?.persona, 1);
   assert.ok((memorySystem.metrics.layer_counts?.profile || 0) >= 2);
@@ -1401,6 +1493,76 @@ try {
   assert.equal(seriousTaskModeEvent?.payload?.contract_mode, 'execution');
   assert.ok(seriousTaskTrace.steps.some((step) => step.step_type === 'artifact_created'));
   assert.ok(seriousTaskTrace.steps.some((step) => step.step_type === 'task_verification_finished'));
+
+  const maxStepsTaskChat = store.recordToolCallingChat({
+    message: '帮我完成一份不能假完成的验证报告',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'max_steps_exceeded',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'I reached the step limit before verification.',
+    tool_results: [],
+    usage: { input_tokens: 3, output_tokens: 2 },
+    model_responses: [{ id: 'chatcmpl_max_steps_task' }],
+  });
+  assert.equal(maxStepsTaskChat.product_task.status, 'blocked');
+  assert.equal(maxStepsTaskChat.product_task.verification.status, 'failed');
+  assert.equal(maxStepsTaskChat.product_task.verification.checks.find((check) => check.name === 'runtime_reached_safe_terminal_state')?.status, 'failed');
+
+  const untestedPatchTaskChat = store.recordToolCallingChat({
+    message: '实现并测试 Joi 的任务验收修复',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'The patch was applied but tests were not run.',
+    tool_results: [{
+      call_id: 'call_untested_patch',
+      name: 'apply_patch',
+      arguments: { patch: 'fixture' },
+      output: { status: 'completed', changed_file_count: 1, summary: 'Patch applied.' },
+    }],
+    usage: { input_tokens: 3, output_tokens: 2 },
+    model_responses: [{ id: 'chatcmpl_untested_patch' }],
+  });
+  assert.equal(untestedPatchTaskChat.product_task.status, 'blocked');
+  assert.equal(untestedPatchTaskChat.product_task.verification.checks.find((check) => check.name === 'task_contract_requirements')?.status, 'failed');
+
+  const verifiedPatchTaskChat = store.recordToolCallingChat({
+    message: '实现并测试 Joi 的交付闭环',
+    input_mode: 'serious_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: 'The patch and its tests passed.',
+    tool_results: [{
+      call_id: 'call_verified_patch',
+      name: 'apply_patch',
+      arguments: { patch: 'fixture' },
+      output: { status: 'completed', changed_file_count: 1, summary: 'Patch applied.' },
+    }, {
+      call_id: 'call_verified_test',
+      name: 'test_command',
+      arguments: { cmd: ['pnpm', 'test'] },
+      output: { status: 'completed', test_status: 'succeeded', exit_code: 0, summary: 'Tests passed.' },
+    }],
+    usage: { input_tokens: 3, output_tokens: 2 },
+    model_responses: [{ id: 'chatcmpl_verified_patch' }],
+  });
+  assert.equal(verifiedPatchTaskChat.product_task.status, 'completed');
+  assert.equal(verifiedPatchTaskChat.product_task.verification.status, 'passed');
 
   const disclosedWebFailureChat = store.recordToolCallingChat({
     message: '生成一份只保留已核验来源的免费游戏报告',
@@ -2378,16 +2540,26 @@ try {
       version: 'test',
     });
     const staleTrace = reopenedRecoveryStore.getRunTrace(staleRun.run_id);
-    assert.equal(staleTrace.status, 'failed');
-    assert.equal(staleTrace.terminal_reason, 'runtime state was lost after app restart');
+    assert.equal(staleTrace.status, 'needs_recovery');
+    assert.equal(staleTrace.terminal_status, undefined);
+    assert.equal(staleTrace.terminal_reason, 'App restarted before this run reached a safe terminal state');
     assert.ok(staleTrace.events.some((event) => event.event_type === 'run.recovery_required'));
-    assert.ok(staleTrace.events.some((event) => event.event_type === 'run.failed'));
+    assert.equal(staleTrace.events.some((event) => event.event_type === 'run.failed'), false);
     const waitingRecoveryTrace = reopenedRecoveryStore.getRunTrace(waitingRecovery.run_id);
     assert.equal(waitingRecoveryTrace.status, 'waiting_confirmation');
     assert.ok(waitingRecoveryTrace.events.some((event) => event.event_type === 'run.recovery_required'));
     const recoverableRuns = reopenedRecoveryStore.listRecoverableRuns({ limit: 10 }).runs;
-    assert.ok(recoverableRuns.some((item) => item.run_id === staleRun.run_id && item.recovery_status === 'runtime_lost'));
+    assert.ok(recoverableRuns.some((item) => item.run_id === staleRun.run_id && item.recovery_status === 'recoverable' && item.safe_to_retry === true));
     assert.ok(recoverableRuns.some((item) => item.run_id === waitingRecovery.run_id && item.recovery_status === 'needs_user_decision'));
+    const retryContext = reopenedRecoveryStore.beginRecoverableRunRetry(staleRun.run_id);
+    assert.equal(retryContext.original_message, 'This live run will be orphaned by restart');
+    assert.equal(retryContext.completed_effects.length, 0);
+    assert.equal(reopenedRecoveryStore.getRunTrace(staleRun.run_id).status, 'resuming');
+    reopenedRecoveryStore.failRecoverableRunRetry(staleRun.run_id, 'fixture retry failed');
+    assert.equal(reopenedRecoveryStore.getRunTrace(staleRun.run_id).status, 'needs_recovery');
+    const abandonedTrace = reopenedRecoveryStore.abandonRecoverableRun(staleRun.run_id, 'fixture abandoned');
+    assert.equal(abandonedTrace.status, 'cancelled');
+    assert.equal(reopenedRecoveryStore.listRecoverableRuns({ limit: 10 }).runs.some((item) => item.run_id === staleRun.run_id), false);
     reopenedRecoveryStore.close();
   }
 

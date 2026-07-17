@@ -249,6 +249,10 @@ export type CheckpointSummary = {
   completed_count: number;
   failed_count: number;
   pending_approval_count: number;
+  recoverable_count: number;
+  active_task_count: number;
+  open_loop_count: number;
+  proactive_message_count: number;
   waiting_user_count: number;
   new_artifact_count: number;
   no_progress_project_count: number;
@@ -263,6 +267,12 @@ export type CheckpointSummary = {
     room_id?: string;
     project_id?: string;
     run_id?: string;
+    approval_id?: string;
+    product_task_id?: string;
+    artifact_id?: string;
+    open_loop_id?: string;
+    proactive_message_id?: string;
+    safe_to_retry?: boolean;
   }>;
 };
 
@@ -851,8 +861,49 @@ export type RecoverableRunRecord = {
   status: string;
   recovery_status: 'needs_user_decision' | 'runtime_lost' | 'recoverable' | string;
   reason: string;
+  safe_to_retry?: boolean;
+  completed_side_effect_count?: number;
+  product_task_id?: string;
   latest_event?: RunEvent;
   trace?: RunTrace;
+};
+
+export type RecoverableRunActionRequest = {
+  run_id: string;
+  action: 'retry' | 'abandon';
+  reason?: string;
+};
+
+export type RecoverableRunActionResponse = {
+  action: 'retry' | 'abandon';
+  original_run_id: string;
+  new_run?: ChatResponse;
+  trace: RunTrace;
+};
+
+export type WorkspaceChangeSetFile = {
+  id: string;
+  operation: 'add' | 'update' | string;
+  path: string;
+  before_hash: string;
+  after_hash: string;
+  bytes: number;
+  lines: number;
+};
+
+export type WorkspaceChangeSet = {
+  id: string;
+  run_id?: string;
+  product_task_id?: string;
+  status: 'prepared' | 'applied' | 'failed' | 'reverted' | string;
+  permission_profile: PermissionProfile | string;
+  patch: string;
+  reversible: boolean;
+  error?: string;
+  files: WorkspaceChangeSetFile[];
+  created_at?: string;
+  applied_at?: string;
+  reverted_at?: string;
 };
 
 export type RunClosureReportItem = {
@@ -1642,6 +1693,7 @@ export type MemoryQualityMetrics = {
   inferred_used_count?: number;
   abstention_count?: number;
   archived_count?: number;
+  quarantined_count?: number;
   observed_count?: number;
   embedding_count?: number;
   generation_queue_count?: number;
@@ -1665,6 +1717,7 @@ export type MemoryMaintenanceRun = {
   expired_count: number;
   merged_count: number;
   embedding_count: number;
+  quarantined_count?: number;
   error_summary?: string;
   metadata?: Record<string, unknown>;
   started_at?: string;
@@ -2521,6 +2574,9 @@ export type DesktopBindings = {
   ListRunMessages(req: { run_id: string; status?: string }): Promise<{ messages: RunQueuedMessage[] }>;
   CancelRunMessage(req: CancelRunMessageRequest): Promise<RunQueuedMessage>;
   ListRecoverableRuns(req?: { limit?: number }): Promise<{ runs: RecoverableRunRecord[] }>;
+  ResolveRecoverableRun(req: RecoverableRunActionRequest): Promise<RecoverableRunActionResponse>;
+  ListWorkspaceChangeSets(req?: { run_id?: string; product_task_id?: string; limit?: number }): Promise<{ change_sets: WorkspaceChangeSet[] }>;
+  RevertWorkspaceChangeSet(req: { id: string; reason?: string }): Promise<WorkspaceChangeSet>;
   GetRecentRunClosureReport(req?: { limit?: number }): Promise<RunClosureReport>;
   GetExternalHandoffAudit(): Promise<ExternalHandoffAudit>;
   ListBackups(): Promise<{ backups: BackupRecord[] }>;
@@ -2579,6 +2635,7 @@ export type JoiPreloadApi = {
   app: {
     getVersion(): Promise<string>;
     openExternal(url: string): Promise<void>;
+    setWindowButtonVisibility(visible: boolean): Promise<void>;
   };
 };
 
@@ -2639,6 +2696,9 @@ export const desktopBindingMethods: Array<keyof DesktopBindings> = [
   'InvokeMCPTool',
   'EnqueueRunMessage',
   'ListRecoverableRuns',
+  'ResolveRecoverableRun',
+  'ListWorkspaceChangeSets',
+  'RevertWorkspaceChangeSet',
   'ListRunMessages',
   'ListRunTraceSpans',
   'ListPersonaMessenger',

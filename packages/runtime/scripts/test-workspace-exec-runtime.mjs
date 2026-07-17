@@ -127,6 +127,8 @@ try {
     ].join('\n'),
   }, settings), /policy_denied/);
 
+  let preparedChangeSet;
+  let appliedChangeSet;
   const patchResult = executeApplyPatch({
     permission_profile: 'workspace_write',
     patch: [
@@ -138,9 +140,24 @@ try {
       ' keep',
       '*** End Patch',
     ].join('\n'),
-  }, settings);
+  }, settings, {
+    onPrepared(changeSet) {
+      preparedChangeSet = changeSet;
+      assert.equal(readFileSync(join(root, 'target.txt'), 'utf8'), 'old\nkeep\n');
+    },
+    onApplied(changeSet) {
+      appliedChangeSet = changeSet;
+    },
+  });
   assert.equal(patchResult.mode, 'apply_patch_v1_workspace');
   assert.equal(patchResult.changed_file_count, 1);
+  assert.match(String(patchResult.change_set_id), /^changeset_/);
+  assert.equal(patchResult.reversible, true);
+  assert.equal(patchResult.review_patch.includes('*** Update File: target.txt'), true);
+  assert.equal(preparedChangeSet.id, patchResult.change_set_id);
+  assert.equal(appliedChangeSet.id, patchResult.change_set_id);
+  assert.equal(preparedChangeSet.files[0].before_exists, true);
+  assert.notEqual(preparedChangeSet.files[0].before_hash, preparedChangeSet.files[0].after_hash);
   assert.equal(readFileSync(join(root, 'target.txt'), 'utf8'), 'new\nkeep\n');
 
   const addResult = executeApplyPatch({

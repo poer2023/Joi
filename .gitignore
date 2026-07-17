@@ -7,6 +7,8 @@ release-*/
 coverage/
 backups/
 logs/
+!apps/joi-desktop/frontend/src/features/logs/
+!apps/joi-desktop/frontend/src/features/logs/logPresentation.ts
 reports/
 soak-results-*.jsonl
 output/

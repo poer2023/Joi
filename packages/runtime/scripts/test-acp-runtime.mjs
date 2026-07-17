@@ -142,6 +142,7 @@ assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-workspace
 assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-outside-write')?.output.status, 'failed');
 assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-delete-diff')?.output.status, 'failed');
 assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-safe-command')?.output.status, 'succeeded');
+assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-sensitive-workspace-read')?.output.status, 'failed');
 assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-test-command')?.output.status, 'failed');
 assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-dangerous-command')?.output.status, 'failed');
 assert.equal(result.tool_results.find((tool) => tool.call_id === 'fake-wrapped-dangerous-command')?.output.status, 'failed');

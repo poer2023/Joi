@@ -72,12 +72,14 @@ import {
   type UpdateMessengerRoomRequest,
   type UpdateProjectPersonaRequest,
   type WorkerGatewayAuditRecord,
+  type WorkspaceChangeSet,
   type WorkspaceSettings,
 } from './api/desktop';
 import { eventsOn, windowSetMinSize } from './api/runtime';
 import { permissionProfileForPrompt } from './permissionProfile';
 import joiAvatar from './assets/joi-avatar-circle.png';
 import { ScrollArea } from './components/ScrollArea';
+import { useLayerLifecycle, useReducedMotionPreference } from './components/useLayerLifecycle';
 import { buildConversationRenderItems, deriveRunStatus, getMessageRunId, sortBySeq } from './features/chat/conversationProjector';
 import {
   buildAutomationTelegramNotificationPolicy,
@@ -95,6 +97,12 @@ import { TraceDrawer } from './features/chat/components/TraceDrawer';
 import { normalizeRunEvent, normalizeRunEvents } from './features/chat/runEventNormalizer';
 import { mergeAssistantTextChunk } from './features/chat/streamingText';
 import { messagesForConversationHydration, shouldRestoreThreadMessages } from './features/chat/conversationHydration';
+import {
+  executionEventIsVisible,
+  shouldQueueConversationSubmission,
+  submissionKeyForConversation,
+  withSubmissionActive,
+} from './features/chat/submissionRegistry';
 import type { MessageThreadAnnotation, NormalizedRunEvent } from './features/chat/types';
 import {
   conversationChannelLabel,
@@ -132,11 +140,19 @@ import {
 } from './executionActions';
 import '@xterm/xterm/css/xterm.css';
 
-type Tab = 'chat' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
-type SettingsTab = Exclude<Tab, 'chat'>;
+type Tab = 'chat' | 'today' | 'trace' | 'system' | 'memory' | 'nodes' | 'costs' | 'confirmations' | 'settings' | 'backups';
+type SettingsTab = Exclude<Tab, 'chat' | 'today'>;
 type SettingsCategory = 'models' | 'chatEntrances' | 'automations' | 'observability' | 'dataMemory' | 'capabilities' | 'nodesExecution' | 'privacySecurity' | 'advanced';
-type SelectSettingsObject = (category: SettingsCategory, objectID?: string) => void;
-type RightInspectorTab = 'overview' | 'runs' | 'assets' | 'memory' | 'member';
+type SelectSettingsObjectOptions = {
+  preserveSidebar?: boolean;
+};
+
+type SelectSettingsObject = (
+  category: SettingsCategory,
+  objectID?: string,
+  options?: SelectSettingsObjectOptions,
+) => void;
+type RightInspectorTab = 'overview' | 'conversation' | 'runs' | 'assets' | 'memory' | 'member';
 type MessengerRoomMember = NonNullable<MessengerRoom['members']>[number];
 type MessengerThread = PersonaMessengerSnapshot['threads'][number];
 type ComposerAttachment = {
@@ -283,6 +299,21 @@ function mergeRunEvents(
   };
 }
 
+function mergeConversationMessages(
+  current: ConversationMessage[],
+  incoming: ConversationMessage[],
+): ConversationMessage[] {
+  if (incoming.length === 0) return current;
+  const incomingByID = new Map(incoming.map((message) => [message.id, message]));
+  const currentIDs = new Set(current.map((message) => message.id));
+  return [
+    ...current.map((message) => incomingByID.has(message.id)
+      ? { ...message, ...incomingByID.get(message.id)! }
+      : message),
+    ...incoming.filter((message) => !currentIDs.has(message.id)),
+  ];
+}
+
 function pickRunEvents(
   eventsByRunId: Record<string, NormalizedRunEvent[]>,
   runIds: Iterable<string | undefined>,
@@ -320,6 +351,10 @@ function latestActiveRunId(
     }
   }
   return latest;
+}
+
+function runMessageQueuesEqual(current: RunQueuedMessage[], next: RunQueuedMessage[]): boolean {
+  return current.length === next.length && JSON.stringify(current) === JSON.stringify(next);
 }
 
 function runEventsBelongToConversation(events: NormalizedRunEvent[], conversationID: string): boolean {
@@ -432,6 +467,7 @@ class RenderCrashBoundary extends Component<RenderCrashBoundaryProps, RenderCras
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('chat');
+  const [immersiveMode, setImmersiveMode] = useState(false);
   const [message, setMessage] = useState('');
   const [lastPrompt, setLastPrompt] = useState('');
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
@@ -439,7 +475,7 @@ export default function App() {
   const [streamingAssistantMessage, setStreamingAssistantMessage] = useState<StreamingAssistantMessage | null>(null);
   const [activeExecutionActions, setActiveExecutionActions] = useState<ExecutionAction[]>([]);
   const [activeExecutionStatus, setActiveExecutionStatus] = useState<ExecutionRunStatus>('pending');
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [activeSubmissionKeys, setActiveSubmissionKeys] = useState<Set<string>>(() => new Set());
   const [queuedMessageMode, setQueuedMessageMode] = useState<'steering' | 'follow_up'>('steering');
   const [pendingRunMessages, setPendingRunMessages] = useState<RunQueuedMessage[]>([]);
   const [inputMode, setInputMode] = useState<InputMode>('auto');
@@ -463,6 +499,8 @@ export default function App() {
   const [archivedConversations, setArchivedConversations] = useState<ConversationSummary[]>([]);
   const [trashedConversations, setTrashedConversations] = useState<ConversationSummary[]>([]);
   const [currentConversationID, setCurrentConversationID] = useState('');
+  const isSubmitting = activeSubmissionKeys.has(submissionKeyForConversation(currentConversationID));
+  const [loadingConversationID, setLoadingConversationID] = useState('');
   const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([]);
   const [messenger, setMessenger] = useState<PersonaMessengerSnapshot | null>(null);
   const [currentRoomID, setCurrentRoomID] = useState('room_private_hub');
@@ -472,7 +510,6 @@ export default function App() {
   const [personaCandidates, setPersonaCandidates] = useState<PersonaCandidate[]>([]);
   const [selectedPersonaCandidateID, setSelectedPersonaCandidateID] = useState('');
   const [projectCreatorBusy, setProjectCreatorBusy] = useState(false);
-  const [todayPanelOpen, setTodayPanelOpen] = useState(false);
   const [checkpointBusy, setCheckpointBusy] = useState(false);
   const [capabilities, setCapabilities] = useState<CapabilityRecord[]>([]);
   const [workflows, setWorkflows] = useState<ToolWorkflowRecord[]>([]);
@@ -535,14 +572,34 @@ export default function App() {
   const liveProcessEventQueueRef = useRef<NormalizedRunEvent[]>([]);
   const liveProcessEventTimerRef = useRef<number | null>(null);
   const loadConversationRequestRef = useRef(0);
+  const activeSubmissionKeysRef = useRef<Set<string>>(new Set());
+  const latestSubmissionByKeyRef = useRef<Map<string, string>>(new Map());
+  const runConversationIDsRef = useRef<Map<string, string>>(new Map());
+  const currentConversationIDRef = useRef(currentConversationID);
+  currentConversationIDRef.current = currentConversationID;
   const initialConversationSelectionRef = useRef(false);
   const newThreadRequestedRef = useRef(false);
 
+  function setCurrentConversationView(conversationID: string) {
+    currentConversationIDRef.current = conversationID;
+    setCurrentConversationID(conversationID);
+  }
+
+  function markSubmissionActive(submissionKey: string, active: boolean) {
+    const next = withSubmissionActive(activeSubmissionKeysRef.current, submissionKey, active);
+    activeSubmissionKeysRef.current = next;
+    setActiveSubmissionKeys(next);
+  }
+
   const stepCount = useMemo(() => trace?.steps?.length ?? 0, [trace]);
   const firstModelCall = trace?.model_calls?.[0] ?? chat?.model_calls?.[0];
-  const inSettingsArea = activeTab !== 'chat' && activeTab !== 'trace';
+  const activeRunID = useMemo(() => (
+    isSubmitting ? latestActiveRunId(runEventsByRunId, currentConversationID) || chat?.run_id || trace?.id || '' : ''
+  ), [chat?.run_id, currentConversationID, isSubmitting, runEventsByRunId, trace?.id]);
+  const inSettingsArea = activeTab !== 'chat' && activeTab !== 'today' && activeTab !== 'trace';
   const autoSidebarCollapsed = sidebarPreference === 'auto' && windowWidth < sidebarWidth + CHAT_MAIN_MIN_WIDTH;
   const sidebarCollapsed = sidebarPreference === 'collapsed' || autoSidebarCollapsed;
+  const visibleSidebarCollapsed = immersiveMode || sidebarCollapsed;
   const activeSidebarWidth = sidebarCollapsed ? 0 : sidebarWidth;
   const maxRightPanelWidth = Math.max(
     RIGHT_PANEL_MIN_WIDTH,
@@ -616,20 +673,27 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const runID = isSubmitting
-      ? latestActiveRunId(runEventsByRunId) || chat?.run_id || trace?.id || ''
-      : '';
-    if (!runID) {
-      if (!isSubmitting) setPendingRunMessages([]);
+    if (!activeRunID) {
+      if (!isSubmitting) {
+        setPendingRunMessages((current) => current.length > 0 ? [] : current);
+      }
       return undefined;
     }
     let cancelled = false;
+    let refreshing = false;
     const refreshQueue = async () => {
+      if (refreshing) return;
+      refreshing = true;
       try {
-        const result = await desktopApi.listRunMessages({ run_id: runID, status: 'pending' });
-        if (!cancelled) setPendingRunMessages(result.messages ?? []);
+        const result = await desktopApi.listRunMessages({ run_id: activeRunID, status: 'pending' });
+        if (!cancelled) {
+          const nextMessages = result.messages ?? [];
+          setPendingRunMessages((current) => runMessageQueuesEqual(current, nextMessages) ? current : nextMessages);
+        }
       } catch {
         // The run event stream remains authoritative if queue inspection briefly races startup.
+      } finally {
+        refreshing = false;
       }
     };
     void refreshQueue();
@@ -638,7 +702,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [chat?.run_id, isSubmitting, runEventsByRunId, trace?.id]);
+  }, [activeRunID, isSubmitting]);
 
   useEffect(() => {
     let animationFrame = 0;
@@ -682,6 +746,48 @@ export default function App() {
   }, [notice, noticeKey]);
 
   useEffect(() => {
+    if (!immersiveMode) return;
+    if (activeTab !== 'chat' || onboarding?.required || artifactViewer) {
+      setImmersiveMode(false);
+    }
+  }, [activeTab, artifactViewer, immersiveMode, onboarding?.required]);
+
+  useEffect(() => {
+    const setWindowButtonVisibility = window.joi?.app.setWindowButtonVisibility;
+    if (!setWindowButtonVisibility) return undefined;
+    void setWindowButtonVisibility(!immersiveMode).catch(() => undefined);
+    return () => {
+      if (immersiveMode) {
+        void setWindowButtonVisibility(true).catch(() => undefined);
+      }
+    };
+  }, [immersiveMode]);
+
+  useEffect(() => {
+    function handleImmersiveShortcut(event: KeyboardEvent) {
+      const toggleShortcut = event.metaKey
+        && event.shiftKey
+        && !event.altKey
+        && event.key.toLowerCase() === 'f';
+      if (toggleShortcut) {
+        if (activeTab !== 'chat' || onboarding?.required || artifactViewer) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setImmersiveMode((current) => !current);
+        return;
+      }
+      if (immersiveMode && event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        setImmersiveMode(false);
+      }
+    }
+
+    window.addEventListener('keydown', handleImmersiveShortcut, true);
+    return () => window.removeEventListener('keydown', handleImmersiveShortcut, true);
+  }, [activeTab, artifactViewer, immersiveMode, onboarding?.required]);
+
+  useEffect(() => {
     if (activeTab === 'memory') {
       selectSettingsObject('dataMemory', 'memory-search');
     } else if (activeTab === 'nodes') {
@@ -697,13 +803,17 @@ export default function App() {
     }
   }, [activeTab]);
 
-  function selectSettingsObject(category: SettingsCategory, objectID?: string) {
+  function selectSettingsObject(
+    category: SettingsCategory,
+    objectID?: string,
+    options?: SelectSettingsObjectOptions,
+  ) {
     setSettingsCategory(category);
     setSettingsObjectByCategory((current) => ({
       ...current,
       [category]: objectID ?? current[category] ?? defaultSettingsObjectByCategory[category],
     }));
-    if (objectID) {
+    if (objectID && !options?.preserveSidebar) {
       setSidebarPreference('collapsed');
     }
   }
@@ -1003,18 +1113,6 @@ export default function App() {
     streamingAssistantCompletionRef.current = null;
   }
 
-  async function waitForStreamingAssistantIdle(timeoutMs = 30000) {
-    const startedAt = Date.now();
-    while (
-      streamingAssistantTimerRef.current !== null
-      || streamingAssistantQueueRef.current.length > 0
-      || streamingAssistantCompletionRef.current !== null
-    ) {
-      if (Date.now() - startedAt > timeoutMs) break;
-      await sleep(50);
-    }
-  }
-
   function resetLiveProcessEventQueue() {
     if (liveProcessEventTimerRef.current !== null) {
       window.clearTimeout(liveProcessEventTimerRef.current);
@@ -1044,26 +1142,28 @@ export default function App() {
     }, liveProcessEventDelay(nextEvent));
   }
 
-  async function waitForLiveProcessEventQueueIdle(timeoutMs = 15000) {
-    const startedAt = Date.now();
-    while (liveProcessEventTimerRef.current !== null || liveProcessEventQueueRef.current.length > 0) {
-      if (Date.now() - startedAt > timeoutMs) break;
-      await sleep(50);
-    }
-  }
-
   function dispatchExecutionEvent(event: ExecutionEvent) {
     const normalized = normalizeRunEvent(event);
     const eventType = normalized.type || event.type || event.event || '';
+    if (normalized.runId && normalized.conversationId) {
+      runConversationIDsRef.current.set(normalized.runId, normalized.conversationId);
+    }
+    const eventConversationID = normalized.conversationId
+      || (normalized.runId ? runConversationIDsRef.current.get(normalized.runId) || '' : '');
+    const eventIsVisible = executionEventIsVisible({
+      eventConversationID,
+      currentConversationID: currentConversationIDRef.current,
+      activeSubmissionKeys: activeSubmissionKeysRef.current,
+    });
     if (normalized.runId && eventType !== 'assistant.delta' && eventType !== 'model.delta') {
-      if (shouldRevealLiveProcessEvent(normalized)) {
+      if (eventIsVisible && eventType !== 'run.started' && shouldRevealLiveProcessEvent(normalized)) {
         enqueueLiveProcessEvent(normalized);
       } else {
         mergeRunEventForProjection(normalized);
       }
     }
 
-    if (!eventType) return;
+    if (!eventType || !eventIsVisible) return;
 
     if (eventType === 'run.started') {
       setActiveExecutionStatus('running');
@@ -1114,7 +1214,9 @@ export default function App() {
     if (eventType === 'approval.requested') {
       setActiveExecutionStatus('waiting_approval');
       setActiveExecutionActions((current) => upsertExecutionAction(current, approvalEventToExecutionAction(event), 'waiting_approval'));
-      void refreshAll();
+      void desktopApi.listConfirmations()
+        .then((result) => setConfirmations(result.items ?? []))
+        .catch(() => undefined);
       return;
     }
 
@@ -1152,7 +1254,7 @@ export default function App() {
       if (!text) return;
       const runID = normalized.runId || event.run_id || event.runID || '';
       const messageID = String(normalized.itemId || normalized.metadata.message_id || normalized.snapshot.assistant_message_id || event.message_id || pendingAssistantIDRef.current || `streaming-${runID || Date.now()}`);
-      const conversationID = pendingConversationIDRef.current || currentConversationID || 'pending-conversation';
+      const conversationID = eventConversationID || pendingConversationIDRef.current || currentConversationIDRef.current || 'pending-conversation';
       receivedAssistantDeltaRef.current = true;
       receivedAssistantDeltaRunIDRef.current = runID;
       const streamSource = String(normalized.delta.stream_source || '');
@@ -1348,6 +1450,16 @@ export default function App() {
     }
   }
 
+  async function refreshChatIndex() {
+    const [messengerSnapshot, conversationList] = await Promise.all([
+      desktopApi.listPersonaMessenger(),
+      desktopApi.listConversations({ view: 'active', limit: 100 }),
+    ]);
+    setMessenger(messengerSnapshot);
+    setCurrentRoomID(selectPrimaryJoiRoom(messengerSnapshot)?.id ?? '');
+    setConversations(conversationList.conversations ?? []);
+  }
+
   async function syncMCPServer(serverID: string) {
     setError('');
     try {
@@ -1394,14 +1506,19 @@ export default function App() {
     const attachments = composerAttachments;
     const requestMessage = prompt || attachmentOnlyPrompt(attachments);
     if (!requestMessage && attachments.length === 0) return;
-    const currentActiveRunID = latestActiveRunId(runEventsByRunId) || chat?.run_id || trace?.id || '';
-    if (isSubmitting && currentActiveRunID) {
+    const submissionConversationID = currentConversationIDRef.current;
+    const submissionKey = submissionKeyForConversation(submissionConversationID);
+    const currentlySubmitting = shouldQueueConversationSubmission(activeSubmissionKeysRef.current, submissionConversationID);
+    const currentActiveRunID = latestActiveRunId(runEventsByRunId, submissionConversationID)
+      || (currentlySubmitting ? chat?.run_id || trace?.id || '' : '');
+    if (currentlySubmitting) {
+      if (!currentActiveRunID) return;
       setMessage('');
       clearComposerAttachments();
       try {
         const queued = await desktopApi.enqueueRunMessage({
           run_id: currentActiveRunID,
-          conversation_id: currentConversationID || undefined,
+          conversation_id: submissionConversationID || undefined,
           kind: queuedMessageMode,
           content: requestMessage,
           attachments: attachments.map(attachmentForRequest),
@@ -1417,6 +1534,12 @@ export default function App() {
       }
       return;
     }
+
+    const submissionToken = `submission-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const previousChat = chat;
+    const previousTrace = trace;
+    latestSubmissionByKeyRef.current.set(submissionKey, submissionToken);
+    markSubmissionActive(submissionKey, true);
     setChat(null);
     setTrace(null);
     resetStreamingAssistantQueue();
@@ -1424,14 +1547,12 @@ export default function App() {
     setStreamingAssistantMessage(null);
     setActiveExecutionActions([]);
     setActiveExecutionStatus('pending');
-    if (isSubmitting) return;
     const optimisticActions = createOptimisticExecutionActions(requestMessage);
     const pendingConversationID = currentConversationID || 'pending-conversation';
     pendingConversationIDRef.current = pendingConversationID;
     pendingAssistantIDRef.current = '';
     receivedAssistantDeltaRef.current = false;
     receivedAssistantDeltaRunIDRef.current = '';
-    Object.keys(runCompletedFallbackTimersRef.current).forEach(clearRunCompletedFallback);
     setLastPrompt(requestMessage);
     setPendingUserMessage({
       id: `pending-${Date.now()}`,
@@ -1444,17 +1565,18 @@ export default function App() {
     clearComposerAttachments();
     setActiveExecutionActions(optimisticActions);
     setActiveExecutionStatus(optimisticActions.length > 0 ? 'running' : 'pending');
-    setIsSubmitting(true);
     const routing = executionRoutingForSettings(workspaceSettings);
     const personaModelName = activeRoom?.type === 'project_dm' ? configuredPersonaModelName(activePersona?.model_strategy) : '';
     const modelName = personaModelName || selectedModelName || settings?.model_name || 'deepseek-v4-flash';
+
+    let result: ChatResponse;
     try {
       await Promise.race([
         new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())),
         sleep(120),
       ]);
-      const result = await desktopApi.sendChat({
-        conversation_id: currentConversationID || undefined,
+      result = await desktopApi.sendChat({
+        conversation_id: submissionConversationID || undefined,
         room_id: activeRoom?.id,
         channel: 'desktop',
         user_id: 'desktop_user',
@@ -1471,100 +1593,157 @@ export default function App() {
         runtime_mode: 'tool_calling',
         permission_profile: permissionProfileForPrompt(inputMode, requestMessage),
       });
-      setChat(result);
-      pendingAssistantIDRef.current = result.assistant_message_id;
-      pendingConversationIDRef.current = result.conversation_id;
-      newThreadRequestedRef.current = false;
-      setCurrentConversationID(result.conversation_id);
-      if (result.product_task?.id) {
-        setActiveProductTaskID(result.product_task.id);
-        setActiveProductTaskDetail(await desktopApi.getProductTask(result.product_task.id));
-      }
-      if (result.artifacts?.[0]?.id) {
-        setArtifacts((current) => [result.artifacts![0], ...current.filter((item) => item.id !== result.artifacts![0].id)]);
-      }
-      setMessage('');
-      const runTrace = await desktopApi.getRunTrace(result.run_id);
-      await waitForLiveProcessEventQueueIdle();
-      setTrace(runTrace);
-      setRunEventsByRunId((current) => mergeRunEvents(current, result.run_id, normalizeTraceEvents(runTrace)));
-      const visibleActions = visibleExecutionActions(projectRunTraceToActions(runTrace));
-      setActiveExecutionActions(visibleActions);
-      setActiveExecutionStatus(normalizeRunExecutionStatus(runTrace.status));
-      if (receivedAssistantDeltaRef.current && (!receivedAssistantDeltaRunIDRef.current || receivedAssistantDeltaRunIDRef.current === result.run_id)) {
-        completeStreamingAssistant(result.run_id, result.response || undefined);
-        await waitForStreamingAssistantIdle();
-        await sleep(120);
-      } else if (userFacingAssistantText(result.response)) {
-        await streamAssistantText({
-          id: result.assistant_message_id,
-          conversation_id: result.conversation_id,
-          role: 'assistant',
-          content: '',
-          run_id: result.run_id,
-        }, userFacingAssistantText(result.response));
-      } else {
-        setStreamingAssistantMessage(null);
-      }
-      const detail = await desktopApi.getConversation(result.conversation_id);
-      setConversationMessages(detail.messages ?? []);
-      setPendingUserMessage(null);
-      resetStreamingAssistantQueue();
-      setStreamingAssistantMessage(null);
-      setActiveExecutionActions([]);
-      setActiveExecutionStatus('pending');
-      pendingAssistantIDRef.current = '';
-      pendingConversationIDRef.current = '';
-      await refreshAll();
-      setActiveTab('chat');
     } catch (err) {
-      setPendingUserMessage(null);
-      resetStreamingAssistantQueue();
-      resetLiveProcessEventQueue();
-      setStreamingAssistantMessage(null);
-      setActiveExecutionActions([]);
-      setActiveExecutionStatus('failed');
-      pendingAssistantIDRef.current = '';
-      pendingConversationIDRef.current = '';
-      setMessage(prompt);
-      setComposerAttachments(attachments);
-      showError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
-  async function streamAssistantText(base: StreamingAssistantMessage, fullText: string) {
-    const chunks = splitStreamingChunks(fullText);
-    if (chunks.length === 0) {
-      setStreamingAssistantMessage({ ...base, content: fullText, complete: true });
+      const submissionStillVisible = currentConversationIDRef.current === submissionConversationID;
+      if (latestSubmissionByKeyRef.current.get(submissionKey) === submissionToken) {
+        latestSubmissionByKeyRef.current.delete(submissionKey);
+      }
+      markSubmissionActive(submissionKey, false);
+      if (submissionStillVisible) {
+        resetStreamingAssistantQueue();
+        resetLiveProcessEventQueue();
+        pendingAssistantIDRef.current = '';
+        pendingConversationIDRef.current = '';
+        setChat(previousChat);
+        setTrace(previousTrace);
+        setPendingUserMessage(null);
+        setStreamingAssistantMessage(null);
+        setActiveExecutionActions([]);
+        setActiveExecutionStatus('failed');
+        setMessage(prompt);
+        setComposerAttachments(attachments);
+        showError(err instanceof Error ? err.message : String(err));
+      } else {
+        showNotice('原会话中的消息执行失败，可在 Today 中查看并恢复。');
+      }
       return;
     }
-    setStreamingAssistantMessage({ ...base, content: '', complete: false });
-    let next = '';
-    for (const chunk of chunks) {
-      next += chunk;
-      setStreamingAssistantMessage({ ...base, content: next.trimStart(), complete: false });
-      await sleep(streamingChunkDelay(chunk));
+
+    if (currentConversationIDRef.current !== submissionConversationID) {
+      if (latestSubmissionByKeyRef.current.get(submissionKey) === submissionToken) {
+        latestSubmissionByKeyRef.current.delete(submissionKey);
+      }
+      markSubmissionActive(submissionKey, false);
+      if (result.run_id && result.conversation_id) {
+        runConversationIDsRef.current.set(result.run_id, result.conversation_id);
+      }
+      showNotice('消息已在原会话完成。');
+      void refreshChatIndex().catch(() => undefined);
+      return;
     }
-    setStreamingAssistantMessage({ ...base, content: fullText, complete: true });
-    await sleep(120);
+
+    latestSubmissionByKeyRef.current.delete(submissionKey);
+    latestSubmissionByKeyRef.current.set(submissionKeyForConversation(result.conversation_id), result.run_id);
+    runConversationIDsRef.current.set(result.run_id, result.conversation_id);
+    setChat(result);
+    setTrace(null);
+    pendingAssistantIDRef.current = result.assistant_message_id;
+    pendingConversationIDRef.current = result.conversation_id;
+    newThreadRequestedRef.current = false;
+    setCurrentConversationView(result.conversation_id);
+    setPendingUserMessage((current) => current ? {
+      ...current,
+      id: result.user_message_id,
+      conversation_id: result.conversation_id,
+    } : current);
+    if (result.product_task?.id) setActiveProductTaskID(result.product_task.id);
+    if (result.artifacts?.[0]?.id) {
+      setArtifacts((current) => [result.artifacts![0], ...current.filter((item) => item.id !== result.artifacts![0].id)]);
+    }
+
+    const committedMessages: ConversationMessage[] = [
+      {
+        id: result.user_message_id,
+        conversation_id: result.conversation_id,
+        role: 'user',
+        content: prompt,
+        attachments,
+      },
+      {
+        id: result.assistant_message_id,
+        conversation_id: result.conversation_id,
+        role: 'assistant',
+        content: result.response,
+        run_id: result.run_id,
+      },
+    ];
+    setConversationMessages((current) => mergeConversationMessages(current, committedMessages));
+    setPendingUserMessage(null);
+    resetLiveProcessEventQueue();
+    resetStreamingAssistantQueue();
+    setStreamingAssistantMessage(null);
+    setActiveExecutionStatus('completed');
+    setMessage('');
+    markSubmissionActive(submissionKey, false);
+
+    try {
+      const [taskResult, traceResult, conversationResult] = await Promise.allSettled([
+        result.product_task?.id ? desktopApi.getProductTask(result.product_task.id) : Promise.resolve(null),
+        desktopApi.getRunTrace(result.run_id),
+        desktopApi.getConversation(result.conversation_id),
+      ]);
+
+      if (
+        latestSubmissionByKeyRef.current.get(submissionKeyForConversation(result.conversation_id)) !== result.run_id
+        || currentConversationIDRef.current !== result.conversation_id
+      ) return;
+
+      if (taskResult.status === 'fulfilled' && taskResult.value) {
+        setActiveProductTaskDetail(taskResult.value);
+      }
+      if (traceResult.status === 'fulfilled') {
+        const runTrace = traceResult.value;
+        setTrace(runTrace);
+        setRunEventsByRunId((current) => mergeRunEvents(current, result.run_id, normalizeTraceEvents(runTrace)));
+        setActiveExecutionActions(visibleExecutionActions(projectRunTraceToActions(runTrace)));
+        setActiveExecutionStatus(normalizeRunExecutionStatus(runTrace.status));
+      }
+      if (conversationResult.status === 'fulfilled') {
+        setConversationMessages((current) => mergeConversationMessages(
+          current,
+          conversationResult.value.messages ?? [],
+        ));
+        setActiveExecutionActions([]);
+        setActiveExecutionStatus('pending');
+      }
+
+      const syncFailed = taskResult.status === 'rejected'
+        || traceResult.status === 'rejected'
+        || conversationResult.status === 'rejected';
+      if (syncFailed) showNotice('消息已发送；部分详情会在下次刷新时补齐。');
+    } finally {
+      if (
+        latestSubmissionByKeyRef.current.get(submissionKeyForConversation(result.conversation_id)) === result.run_id
+        && currentConversationIDRef.current === result.conversation_id
+      ) {
+        latestSubmissionByKeyRef.current.delete(submissionKeyForConversation(result.conversation_id));
+        pendingAssistantIDRef.current = '';
+        pendingConversationIDRef.current = '';
+        void refreshChatIndex().catch(() => undefined);
+      }
+    }
   }
 
   async function applyLoadedConversation(detail: ConversationDetail, requestID: number): Promise<boolean> {
     if (loadConversationRequestRef.current !== requestID) return false;
     const messages = detail.messages ?? [];
     const latestRunID = detail.conversation.latest_run_id || undefined;
-    newThreadRequestedRef.current = false;
-    setCurrentConversationID(detail.conversation.id);
-    setConversationMessages(messages);
-    setChat(null);
     const runTraces = await loadConversationRunTraces(messages, latestRunID);
     if (loadConversationRequestRef.current !== requestID) return false;
     const focusedTrace = latestRunID
       ? runTraces.find((runTrace) => runTrace.id === latestRunID) || null
       : runTraces[runTraces.length - 1] || null;
+    newThreadRequestedRef.current = false;
+    setCurrentConversationView(detail.conversation.id);
+    setConversationMessages(messages);
+    setChat(null);
     setTrace(focusedTrace);
+    setPendingUserMessage(null);
+    setStreamingAssistantMessage(null);
+    setActiveExecutionActions([]);
+    setActiveExecutionStatus('pending');
+    pendingAssistantIDRef.current = '';
+    pendingConversationIDRef.current = '';
     if (runTraces.length > 0) {
       setRunEventsByRunId((current) => (
         runTraces.reduce(
@@ -1582,22 +1761,18 @@ export default function App() {
     loadConversationRequestRef.current = requestID;
     setError('');
     setNotice('');
-    newThreadRequestedRef.current = false;
-    setCurrentConversationID(conversationID);
-    setConversationMessages([]);
-    setChat(null);
-    setTrace(null);
-    setPendingUserMessage(null);
-    setStreamingAssistantMessage(null);
-    setActiveExecutionActions([]);
-    setActiveExecutionStatus('pending');
-    pendingAssistantIDRef.current = '';
-    pendingConversationIDRef.current = '';
+    setLoadingConversationID(conversationID);
     try {
       const detail = await desktopApi.getConversation(conversationID);
       await applyLoadedConversation(detail, requestID);
     } catch (err) {
-      showError(err instanceof Error ? err.message : String(err));
+      if (loadConversationRequestRef.current === requestID) {
+        showError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (loadConversationRequestRef.current === requestID) {
+        setLoadingConversationID('');
+      }
     }
   }
 
@@ -1606,17 +1781,17 @@ export default function App() {
     loadConversationRequestRef.current = requestID;
     setError('');
     setNotice('');
-    setConversationMessages([]);
-    setChat(null);
-    setTrace(null);
-    setPendingUserMessage(null);
-    setStreamingAssistantMessage(null);
-    setActiveExecutionActions([]);
-    setActiveExecutionStatus('pending');
-    pendingAssistantIDRef.current = '';
-    pendingConversationIDRef.current = '';
+    setLoadingConversationID('');
     const detail = await findConversationDetailForMessage(messageID);
-    return applyLoadedConversation(detail, requestID);
+    if (loadConversationRequestRef.current !== requestID) return false;
+    setLoadingConversationID(detail.conversation.id);
+    try {
+      return await applyLoadedConversation(detail, requestID);
+    } finally {
+      if (loadConversationRequestRef.current === requestID) {
+        setLoadingConversationID('');
+      }
+    }
   }
 
   async function createAutomationWithJoi(request: string): Promise<void> {
@@ -1674,7 +1849,7 @@ export default function App() {
       await loadConversation(room.conversation_id);
       return;
     }
-    setCurrentConversationID('');
+    setCurrentConversationView('');
     setConversationMessages([]);
     setChat(null);
     setTrace(null);
@@ -1752,7 +1927,7 @@ export default function App() {
       setActiveProductTaskDetail(detail);
       if (detail.task.created_from_conversation_id) {
         const conversation = await desktopApi.getConversation(detail.task.created_from_conversation_id);
-        setCurrentConversationID(conversation.conversation.id);
+        setCurrentConversationView(conversation.conversation.id);
         setConversationMessages(conversation.messages ?? []);
       }
       if (detail.task.latest_run_id) {
@@ -1779,6 +1954,53 @@ export default function App() {
     await refreshAll();
   }
 
+  async function resolveTodayRecovery(runID: string, action: 'retry' | 'abandon') {
+    setCheckpointBusy(true);
+    try {
+      const result = await desktopApi.resolveRecoverableRun({
+        run_id: runID,
+        action,
+        reason: action === 'abandon' ? 'abandoned from Today' : 'retried from Today',
+      });
+      if (result.new_run) {
+        setChat(result.new_run);
+        await loadConversation(result.new_run.conversation_id);
+        showNotice('已从安全检查点继续任务');
+      } else {
+        showNotice('已结束该中断任务，保留原运行记录');
+      }
+      await refreshAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCheckpointBusy(false);
+    }
+  }
+
+  async function decideTodayOpenLoop(id: string, action: 'done' | 'snooze') {
+    setCheckpointBusy(true);
+    try {
+      await desktopApi.decideOpenLoop({ id, action, feedback: `today_${action}` });
+      await refreshAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCheckpointBusy(false);
+    }
+  }
+
+  async function decideTodayProactiveMessage(id: string, action: 'approve' | 'dismiss') {
+    setCheckpointBusy(true);
+    try {
+      await desktopApi.decideProactiveMessage({ id, action, feedback: `today_${action}` });
+      await refreshAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCheckpointBusy(false);
+    }
+  }
+
   async function openRunTrace(runID: string, destination: 'panel' | 'stage' = 'stage') {
     if (!runID) return;
     try {
@@ -1800,7 +2022,6 @@ export default function App() {
       });
       setMessenger((current) => current ? { ...current, checkpoint } : current);
       showNotice('今日检查已建立新基线');
-      setTodayPanelOpen(false);
       await refreshAll();
     } catch (err) {
       showError(err instanceof Error ? err.message : String(err));
@@ -1810,20 +2031,24 @@ export default function App() {
   }
 
   async function decideConfirmation(id: string, approve: boolean, scope: 'one_call' | 'current_run' = 'one_call') {
-    const runID = confirmations.find((item) => item.id === id)?.run_id || trace?.id || chat?.run_id || '';
-    await desktopApi.decideConfirmation({
-      id,
-      approve,
-      actor: 'desktop_admin',
-      reason: approve ? `approved_in_desktop:${scope}` : 'rejected_in_desktop',
-      scope,
-    });
-    if (runID) {
-      const runTrace = await desktopApi.getRunTrace(runID);
-      setTrace(runTrace);
-      setRunEventsByRunId((current) => mergeRunEvents(current, runID, normalizeTraceEvents(runTrace)));
+    try {
+      const runID = confirmations.find((item) => item.id === id)?.run_id || trace?.id || chat?.run_id || '';
+      await desktopApi.decideConfirmation({
+        id,
+        approve,
+        actor: 'desktop_user',
+        reason: approve ? `approved_in_desktop:${scope}` : 'rejected_in_desktop',
+        scope,
+      });
+      if (runID) {
+        const runTrace = await desktopApi.getRunTrace(runID);
+        setTrace(runTrace);
+        setRunEventsByRunId((current) => mergeRunEvents(current, runID, normalizeTraceEvents(runTrace)));
+      }
+      await refreshAll();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : String(err));
     }
-    await refreshAll();
   }
 
   async function cancelRun(runID: string) {
@@ -1891,12 +2116,13 @@ export default function App() {
 
   function startNewChat() {
     loadConversationRequestRef.current += 1;
+    setLoadingConversationID('');
     newThreadRequestedRef.current = true;
     Object.keys(runCompletedFallbackTimersRef.current).forEach(clearRunCompletedFallback);
     setActiveTab('chat');
     setChat(null);
     setTrace(null);
-    setCurrentConversationID('');
+    setCurrentConversationView('');
     setConversationMessages([]);
     setPendingUserMessage(null);
     setStreamingAssistantMessage(null);
@@ -1970,8 +2196,6 @@ export default function App() {
   }
 
   function startRightPanelResize(event: ReactPointerEvent<HTMLDivElement>) {
-    if (autoRightPanelCollapsed) return;
-
     event.preventDefault();
     const shell = shellRef.current;
     const startX = event.clientX;
@@ -2024,14 +2248,21 @@ export default function App() {
   }
 
   return (
-    <main ref={shellRef} data-theme="light" className={`im-app-shell app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${inSettingsArea ? 'settings-mode' : ''}`} style={shellStyle}>
+    <main ref={shellRef} data-theme="light" className={`im-app-shell app-shell ${visibleSidebarCollapsed ? 'sidebar-collapsed' : ''} ${inSettingsArea ? 'settings-mode' : ''} ${immersiveMode ? 'immersive-mode' : ''}`} style={shellStyle}>
       {inSettingsArea ? (
-        <div className="settings-window-titlebar">
-          <SettingsTopControls collapsed={sidebarCollapsed} goBack={() => setActiveTab('chat')} toggleCollapsed={toggleSidebarCollapsed} />
-        </div>
+        <SettingsWindowTitlebar
+          activeCategory={settingsCategory}
+          activeObjectID={settingsObjectByCategory[settingsCategory]}
+          automations={automations}
+          collapsed={visibleSidebarCollapsed}
+          goBack={() => setActiveTab('chat')}
+          nodes={nodes}
+          selectSettingsObject={selectSettingsObject}
+          toggleCollapsed={toggleSidebarCollapsed}
+        />
       ) : (
         <SidebarTopControls
-          collapsed={sidebarCollapsed}
+          collapsed={visibleSidebarCollapsed}
           newThread={startNewChat}
           searchOpen={threadSearchOpen}
           toggleSearch={() => setThreadSearchOpen((current) => !current)}
@@ -2041,7 +2272,7 @@ export default function App() {
       {inSettingsArea ? (
         <SettingsSidebar
           activeCategory={settingsCategory}
-          collapsed={sidebarCollapsed}
+          collapsed={visibleSidebarCollapsed}
           selectSettingsObject={selectSettingsObject}
         />
       ) : (
@@ -2049,10 +2280,17 @@ export default function App() {
           activeTab={activeTab}
           archiveConversation={archiveConversation}
           chat={chat}
-          collapsed={sidebarCollapsed}
+          checkpointCount={messenger?.checkpoint.items.filter(isVisibleTodayCheckpointItem).length ?? 0}
+          collapsed={visibleSidebarCollapsed}
           conversations={filteredConversations}
           currentConversationID={currentConversationID}
+          loadingConversationID={loadingConversationID}
           loadConversation={loadConversation}
+          openToday={() => {
+            setArtifactViewer(null);
+            setActiveTab('today');
+            void refreshAll();
+          }}
           query={threadQuery}
           searchOpen={threadSearchOpen}
           setQuery={setThreadQuery}
@@ -2060,18 +2298,20 @@ export default function App() {
           trace={trace}
         />
       )}
-      {!sidebarCollapsed && !inSettingsArea && <div aria-label="调整侧边栏宽度" className="sidebar-resizer" role="separator" onPointerDown={startSidebarResize} />}
+      {!visibleSidebarCollapsed && !inSettingsArea && <div aria-label="调整侧边栏宽度" className="sidebar-resizer" role="separator" onPointerDown={startSidebarResize} />}
 
       <section className="im-workspace app__editor tk-content-panel">
-        <NotificationStack
-          chatOffset={activeTab === 'chat' && !onboarding?.required}
-          error={error}
-          errorKey={errorKey}
-          notice={notice}
-          noticeKey={noticeKey}
-          onDismissError={() => setError('')}
-          onDismissNotice={() => setNotice('')}
-        />
+        {!immersiveMode ? (
+          <NotificationStack
+            chatOffset={activeTab === 'chat' && !onboarding?.required}
+            error={error}
+            errorKey={errorKey}
+            notice={notice}
+            noticeKey={noticeKey}
+            onDismissError={() => setError('')}
+            onDismissNotice={() => setNotice('')}
+          />
+        ) : null}
 
         {onboarding?.required && <OnboardingPanel createBackup={createBackup} refreshAll={refreshAll} setError={showError} setNotice={showNotice} status={onboarding} />}
 
@@ -2101,6 +2341,7 @@ export default function App() {
               decideProactiveMessage={decideProactiveMessage}
               health={health}
               inputMode={inputMode}
+              immersiveMode={immersiveMode}
               isSubmitting={isSubmitting}
               memories={memories}
               messenger={messenger}
@@ -2119,7 +2360,7 @@ export default function App() {
               productTasks={productTasks}
               runEventsByRunId={runEventsByRunId}
               savedModels={savedModels}
-              sidebarCollapsed={sidebarCollapsed}
+              sidebarCollapsed={visibleSidebarCollapsed}
               selectProductTask={selectProductTask}
               settings={settings}
               roomRouteLock={roomRouteLock}
@@ -2132,6 +2373,7 @@ export default function App() {
               startRightPanelResize={startRightPanelResize}
               updateMemory={updateMemory}
               submit={submit}
+              toggleImmersiveMode={() => setImmersiveMode((current) => !current)}
               toggleSidebarCollapsed={toggleSidebarCollapsed}
               trace={trace}
               traceSpanAudit={traceSpanAudit}
@@ -2148,12 +2390,23 @@ export default function App() {
           <ArtifactViewer artifact={artifactViewer} close={() => setArtifactViewer(null)} />
         )}
 
-        {todayPanelOpen && (
-          <TodayCheckpointPanel
+        {!onboarding?.required && activeTab === 'today' && (
+          <TodayCheckpointPage
             busy={checkpointBusy}
             checkpoint={messenger?.checkpoint ?? null}
-            onClose={() => setTodayPanelOpen(false)}
             onComplete={() => void completeTodayCheckpoint()}
+            onDecideApproval={(id, approve) => void decideConfirmation(id, approve)}
+            onDecideOpenLoop={(id, action) => void decideTodayOpenLoop(id, action)}
+            onDecideProactive={(id, action) => void decideTodayProactiveMessage(id, action)}
+            onOpenArtifact={(id) => {
+              setActiveTab('chat');
+              void openArtifact(id);
+            }}
+            onOpenRun={(id) => void openRunTrace(id, 'stage')}
+            onOpenTask={(id) => void selectProductTask(id)}
+            onResolveRecovery={(id, action) => void resolveTodayRecovery(id, action)}
+            sidebarCollapsed={sidebarCollapsed}
+            toggleSidebarCollapsed={toggleSidebarCollapsed}
           />
         )}
 
@@ -2180,7 +2433,7 @@ export default function App() {
           />
         )}
 
-        {!onboarding?.required && activeTab !== 'chat' && activeTab !== 'trace' && (
+        {!onboarding?.required && activeTab !== 'chat' && activeTab !== 'today' && activeTab !== 'trace' && (
           <section className="settings-stage">
             <SettingsConsole
               activeCategory={settingsCategory}
@@ -2381,17 +2634,35 @@ function ModelSettingsDialog({
 }) {
   const supportedParams = model?.supported_parameters ?? [];
   const setDraft = (patch: Partial<ModelSettingsDraft>) => onChange({ ...draft, ...patch });
+  const layer = useLayerLifecycle<HTMLElement>(onClose);
+
+  async function saveAndClose() {
+    await onSave();
+    layer.requestClose();
+  }
 
   return (
-    <div className="settings-modal-backdrop" role="presentation">
-      <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="model-settings-title">
+    <div
+      className={`settings-modal-backdrop ui-layer${layer.isClosing ? ' is-closing' : ''}`}
+      role="presentation"
+      onMouseDown={layer.requestClose}
+    >
+      <section
+        ref={layer.surfaceRef}
+        className={`settings-modal ui-dialog-surface${layer.isClosing ? ' is-closing' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="model-settings-title"
+        tabIndex={-1}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
         <header className="settings-modal-header">
           <div>
             <small>模型配置</small>
             <h2 id="model-settings-title">{draft.display_name || draft.model_id}</h2>
             <p>{draft.model_id}</p>
           </div>
-          <button className="modal-close-button" type="button" aria-label="关闭弹窗" onClick={onClose}>×</button>
+          <button className="modal-close-button" type="button" aria-label="关闭弹窗" onClick={layer.requestClose}>×</button>
         </header>
 
         <dl className="model-info-grid">
@@ -2406,7 +2677,7 @@ function ModelSettingsDialog({
         <div className="settings-form compact">
           <label className="field-row">
             <span>显示名称</span>
-            <input value={draft.display_name} onChange={(event) => setDraft({ display_name: event.target.value })} />
+            <input data-layer-initial-focus value={draft.display_name} onChange={(event) => setDraft({ display_name: event.target.value })} />
           </label>
           <label className="field-row">
             <span>使用角色</span>
@@ -2448,8 +2719,8 @@ function ModelSettingsDialog({
         </div>
 
         <footer className="settings-modal-footer">
-          <button className="secondary-button" type="button" onClick={onClose}>取消</button>
-          <button type="button" onClick={onSave}>确认保存</button>
+          <button className="secondary-button" type="button" onClick={layer.requestClose}>取消</button>
+          <button type="button" onClick={() => void saveAndClose()}>确认保存</button>
         </footer>
       </section>
     </div>
@@ -2515,12 +2786,12 @@ function SettingsSidebar({
   collapsed: boolean;
   selectSettingsObject: SelectSettingsObject;
 }) {
-  if (collapsed) {
-    return <aside aria-hidden="true" className="im-sidebar settings-sidebar sidebar-placeholder app__sidebar tk-sidebar" />;
-  }
-
   return (
-    <aside className="im-sidebar settings-sidebar app__sidebar tk-sidebar">
+    <aside
+      aria-hidden={collapsed || undefined}
+      className="im-sidebar settings-sidebar app__sidebar tk-sidebar"
+      inert={collapsed ? true : undefined}
+    >
       <ScrollArea className="settings-menu tk-sidebar-scroll" aria-label="设置菜单">
         {settingsCategories.map((section) => (
           <button
@@ -2648,7 +2919,6 @@ function SettingsConsole({
   workflows: ToolWorkflowRecord[];
   workspaceSettings: WorkspaceSettings | null;
 }) {
-  const activeCategoryMeta = settingsCategories.find((category) => category.id === activeCategory) ?? settingsCategories[0];
   const objectItems = getSettingsObjects(activeCategory, nodes, automations);
   const activeObject = objectItems.find((item) => item.id === activeObjectID) ?? objectItems[0];
   const modelPreset = modelProviderPresets[activeObject.id] ?? modelProviderPresets.compatible;
@@ -3014,8 +3284,7 @@ function SettingsConsole({
       setReasoningModel(modelSettingsDraft.model_id);
     }
     setNotice(`${modelSettingsDraft.display_name || modelSettingsDraft.model_id} 配置已保存`);
-    setModelSettingsDraft(null);
-    await refreshAll();
+    void refreshAll();
   }
 
   async function saveTelegramDetail() {
@@ -4178,7 +4447,7 @@ function SettingsConsole({
                 {memoryControlBusy === 'maintenance' ? '正在维护…' : '立即整理记忆'}
               </button>
               <small>
-                后台空闲 {memorySystem?.settings.background_idle_seconds ?? 300} 秒后整理 · {memorySystem?.settings.pipeline_version ?? 'memory_os_v3_codex_alma'}
+                后台空闲 {memorySystem?.settings.background_idle_seconds ?? 300} 秒后整理 · {memorySystem?.settings.pipeline_version ?? 'memory_os_v4_hygiene'}
               </small>
             </div>
             {memorySystem?.latest_maintenance ? (
@@ -5278,23 +5547,7 @@ function SettingsConsole({
 
   return (
     <div className="settings-console">
-      <nav className="settings-object-tabs" aria-label={`${activeCategoryMeta.label}对象`}>
-        <div className="settings-object-list" role="tablist">
-          {objectItems.map((item) => (
-            <button
-              key={item.id}
-              aria-selected={activeObject.id === item.id}
-              className={`settings-object-item ${activeObject.id === item.id ? 'active' : ''}`}
-              role="tab"
-              type="button"
-              onClick={() => selectSettingsObject(activeCategory, item.id)}
-            >
-              <strong>{item.label}</strong>
-            </button>
-          ))}
-        </div>
-      </nav>
-      <ScrollArea as="main" className="settings-detail">
+      <ScrollArea as="main" className="settings-detail" resetScrollKey={`${activeCategory}:${activeObject.id}`}>
         {renderDetail()}
       </ScrollArea>
     </div>
@@ -6219,10 +6472,13 @@ function ConversationSidebar({
   activeTab,
   archiveConversation,
   chat,
+  checkpointCount,
   collapsed,
   conversations,
   currentConversationID,
+  loadingConversationID,
   loadConversation,
+  openToday,
   query,
   searchOpen,
   setQuery,
@@ -6232,20 +6488,19 @@ function ConversationSidebar({
   activeTab: Tab;
   archiveConversation: (conversationID: string) => Promise<void>;
   chat: ChatResponse | null;
+  checkpointCount: number;
   collapsed: boolean;
   conversations: ConversationSummary[];
   currentConversationID: string;
+  loadingConversationID: string;
   loadConversation: (conversationID: string) => Promise<void>;
+  openToday: () => void;
   query: string;
   searchOpen: boolean;
   setQuery: (query: string) => void;
   setActiveTab: (tab: Tab) => void;
   trace: RunTrace | null;
 }) {
-  if (collapsed) {
-    return <aside aria-hidden="true" className="im-sidebar sidebar-placeholder app__sidebar tk-sidebar" />;
-  }
-
   const isRoomContext = activeTab === 'chat' || activeTab === 'trace';
   const conversationSections = splitSingleAgentConversations(conversations);
 
@@ -6255,8 +6510,11 @@ function ConversationSidebar({
       <div key={item.id} className={`conversation-row-wrap ${channelRow ? 'channel-conversation-row' : ''} ${active && isRoomContext ? 'active' : ''}`}>
         <button
           className={`conversation-item conversation-chat-item ${active && isRoomContext ? 'active' : ''}`}
+          aria-busy={loadingConversationID === item.id || undefined}
           type="button"
-          onClick={() => loadConversation(item.id)}
+          onClick={() => {
+            if (loadingConversationID !== item.id) void loadConversation(item.id);
+          }}
         >
           <span className="thread-list-copy">
             {channelRow ? (
@@ -6277,11 +6535,25 @@ function ConversationSidebar({
   }
 
   return (
-    <aside className="im-sidebar app__sidebar tk-sidebar">
+    <aside
+      aria-hidden={collapsed || undefined}
+      className="im-sidebar app__sidebar tk-sidebar"
+      inert={collapsed ? true : undefined}
+    >
       <div className="thread-sidebar-heading">
         <strong>会话</strong>
         <span>{conversations.length}</span>
       </div>
+      <button
+        aria-current={activeTab === 'today' ? 'page' : undefined}
+        className={`sidebar-today-item ${activeTab === 'today' ? 'active' : ''}`}
+        type="button"
+        onClick={openToday}
+      >
+        <TodayIcon />
+        <span>今日</span>
+        <span className={`sidebar-today-count ${checkpointCount === 0 ? 'quiet' : ''}`}>{checkpointCount}</span>
+      </button>
       {searchOpen ? (
         <label className="thread-search-field">
           <span className="sr-only">搜索线程</span>
@@ -6529,13 +6801,37 @@ function handleTopControlClickAction(
   action();
 }
 
-function handleTitlebarControlPointerAction(
+function handleTitlebarControlPointerDown(event: ReactPointerEvent<HTMLButtonElement>) {
+  if (event.button !== 0 || !event.isPrimary) return;
+  event.preventDefault();
+  event.stopPropagation();
+  try {
+    event.currentTarget.setPointerCapture(event.pointerId);
+  } catch {
+    // Pointer capture is unavailable for synthetic keyboard/browser activations.
+  }
+}
+
+function handleTitlebarControlPointerUp(
   event: ReactPointerEvent<HTMLButtonElement>,
   action: () => void,
 ) {
-  if (event.button !== 0) return;
+  if (event.button !== 0 || !event.isPrimary) return;
   event.preventDefault();
   event.stopPropagation();
+  const rect = event.currentTarget.getBoundingClientRect();
+  const releasedInside = event.clientX >= rect.left
+    && event.clientX <= rect.right
+    && event.clientY >= rect.top
+    && event.clientY <= rect.bottom;
+  try {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  } catch {
+    // The browser may release capture automatically before React observes it.
+  }
+  if (!releasedInside) return;
   action();
 }
 
@@ -6545,7 +6841,7 @@ function handleTitlebarControlClickAction(
 ) {
   event.preventDefault();
   event.stopPropagation();
-  // Pointer activation is handled on pointerdown so Electron's draggable
+  // Pointer activation is handled on pointerup so Electron's draggable
   // titlebar cannot swallow the matching click. A zero-detail click is a
   // keyboard or accessibility activation and still needs to run the action.
   if (event.detail === 0) action();
@@ -6591,7 +6887,8 @@ function SidebarTopControls({
         title={collapsed ? '展开侧边栏' : '折叠侧边栏'}
         type="button"
         onClick={(event) => handleTitlebarControlClickAction(event, toggleCollapsed)}
-        onPointerDown={(event) => handleTitlebarControlPointerAction(event, toggleCollapsed)}
+        onPointerDown={handleTitlebarControlPointerDown}
+        onPointerUp={(event) => handleTitlebarControlPointerUp(event, toggleCollapsed)}
       >
         <SidebarIcon name={collapsed ? 'expand' : 'collapse'} />
       </button>
@@ -6621,17 +6918,30 @@ function ProjectPersonaCreatorModal({
   selectedCandidateID: string;
 }) {
   const canCreate = Boolean(draft.name.trim()) && candidates.length > 0 && Boolean(selectedCandidateID);
+  const layer = useLayerLifecycle<HTMLElement>(onClose);
   return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="project-persona-modal" role="dialog" aria-modal="true" aria-labelledby="project-persona-modal-title">
+    <div
+      className={`modal-backdrop ui-layer${layer.isClosing ? ' is-closing' : ''}`}
+      role="presentation"
+      onMouseDown={layer.requestClose}
+    >
+      <section
+        ref={layer.surfaceRef}
+        className={`project-persona-modal ui-dialog-surface${layer.isClosing ? ' is-closing' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="project-persona-modal-title"
+        tabIndex={-1}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
         <header>
           <h2 id="project-persona-modal-title">新建项目人格</h2>
-          <button type="button" onClick={onClose}>关闭</button>
+          <button type="button" onClick={layer.requestClose}>关闭</button>
         </header>
         <div className="project-persona-form">
           <label>
             <span>项目名称</span>
-            <input value={draft.name} onChange={(event) => onDraftChange({ ...draft, name: event.target.value })} />
+            <input data-layer-initial-focus value={draft.name} onChange={(event) => onDraftChange({ ...draft, name: event.target.value })} />
           </label>
           <label>
             <span>目标</span>
@@ -6667,7 +6977,7 @@ function ProjectPersonaCreatorModal({
           ))}
         </div>
         <footer>
-          <button type="button" onClick={onClose}>取消</button>
+          <button type="button" onClick={layer.requestClose}>取消</button>
           <button type="button" disabled={busy || !canCreate} onClick={onCreate}>创建项目私聊</button>
         </footer>
       </section>
@@ -6703,10 +7013,81 @@ function SettingsTopControls({
         title={toggleLabel}
         type="button"
         onClick={(event) => handleTitlebarControlClickAction(event, toggleCollapsed)}
-        onPointerDown={(event) => handleTitlebarControlPointerAction(event, toggleCollapsed)}
+        onPointerDown={handleTitlebarControlPointerDown}
+        onPointerUp={(event) => handleTitlebarControlPointerUp(event, toggleCollapsed)}
       >
         <SidebarIcon name={collapsed ? 'expand' : 'collapse'} />
       </button>
+    </div>
+  );
+}
+
+function SettingsWindowTitlebar({
+  activeCategory,
+  activeObjectID,
+  automations,
+  collapsed,
+  goBack,
+  nodes,
+  selectSettingsObject,
+  toggleCollapsed,
+}: {
+  activeCategory: SettingsCategory;
+  activeObjectID: string;
+  automations: AutomationDefinition[];
+  collapsed: boolean;
+  goBack: () => void;
+  nodes: NodeRecord[];
+  selectSettingsObject: SelectSettingsObject;
+  toggleCollapsed: () => void;
+}) {
+  const activeTabRef = useRef<HTMLButtonElement>(null);
+  const activeCategoryMeta = settingsCategories.find((category) => category.id === activeCategory) ?? settingsCategories[0];
+  const objectItems = getSettingsObjects(activeCategory, nodes, automations);
+  const activeObject = objectItems.find((item) => item.id === activeObjectID) ?? objectItems[0];
+  const showObjectTabs = activeCategory !== 'automations' && Boolean(activeObject);
+
+  useEffect(() => {
+    activeTabRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [activeCategory, activeObject?.id, collapsed]);
+
+  return (
+    <div className="settings-window-titlebar">
+      <SettingsTopControls collapsed={collapsed} goBack={goBack} toggleCollapsed={toggleCollapsed} />
+      {showObjectTabs ? (
+        <div className="settings-titlebar-tabs">
+          <nav
+            aria-label={`${activeCategoryMeta.label}对象`}
+            className="settings-object-tabs"
+            onWheel={(event) => {
+              if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+              const previousScrollLeft = event.currentTarget.scrollLeft;
+              event.currentTarget.scrollLeft += event.deltaY;
+              if (event.currentTarget.scrollLeft !== previousScrollLeft) event.preventDefault();
+            }}
+          >
+            <div className="settings-object-list" role="tablist">
+              {objectItems.map((item) => {
+                const active = activeObject.id === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    ref={active ? activeTabRef : undefined}
+                    aria-selected={active}
+                    className={`settings-object-item ${active ? 'active' : ''}`}
+                    role="tab"
+                    type="button"
+                    onClick={() => selectSettingsObject(activeCategory, item.id, { preserveSidebar: true })}
+                  >
+                    <strong>{item.label}</strong>
+                  </button>
+                );
+              })}
+            </div>
+          </nav>
+          <div aria-hidden="true" className="settings-titlebar-drag-handle" />
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -6765,6 +7146,7 @@ function ChatHome({
   decideProactiveMessage,
   health,
   inputMode,
+  immersiveMode,
   isSubmitting,
   lastPrompt,
   message,
@@ -6797,6 +7179,7 @@ function ChatHome({
   startRightPanelResize,
   updateMemory,
   submit,
+  toggleImmersiveMode,
   toggleSidebarCollapsed,
   trace,
   traceSpanAudit,
@@ -6824,6 +7207,7 @@ function ChatHome({
   decideProactiveMessage: (id: string, action: string, feedback?: string) => Promise<void>;
   health: SystemHealth | null;
   inputMode: InputMode;
+  immersiveMode: boolean;
   isSubmitting: boolean;
   lastPrompt: string;
   message: string;
@@ -6856,6 +7240,7 @@ function ChatHome({
   startRightPanelResize: (event: ReactPointerEvent<HTMLDivElement>) => void;
   updateMemory: (id: string, action: string, extra?: Partial<MemoryRecord>) => Promise<void>;
   submit: (event?: FormEvent) => Promise<void>;
+  toggleImmersiveMode: () => void;
   toggleSidebarCollapsed: () => void;
   trace: RunTrace | null;
   traceSpanAudit: { spans: RunTraceSpan[]; summary: RunTraceSpanSummary };
@@ -6864,6 +7249,7 @@ function ChatHome({
   updateProjectPersona: (req: UpdateProjectPersonaRequest) => Promise<void>;
   workspaceSettings: WorkspaceSettings | null;
 }) {
+  const reducedMotion = useReducedMotionPreference();
   const visibleChat = chat && (!currentConversationID || chat.conversation_id === currentConversationID)
     ? chat
     : null;
@@ -6986,19 +7372,17 @@ function ChatHome({
   const renderItems = conversationProjection.items;
   const hasThread = renderItems.length > 0;
   const activeTaskBelongsToCurrentRun = Boolean(activeProductTask?.task.latest_run_id && activeProductTask.task.latest_run_id === (chatRunId || traceRunId));
-  const latestTask = visibleChat?.product_task ? { task: visibleChat.product_task, steps: [], deliverables: visibleChat.artifacts ?? [] } : activeTaskBelongsToCurrentRun ? activeProductTask : null;
+  const activeTaskDetail = activeTaskBelongsToCurrentRun ? activeProductTask : null;
   const visibleTrace = traceRunId ? trace : null;
   const executionActions = useMemo(() => projectRunTraceToActions(visibleTrace), [visibleTrace]);
   const visibleTraceActions = useMemo(() => visibleExecutionActions(executionActions), [executionActions]);
   const liveExecutionActions = activeExecutionActions.length > 0 ? activeExecutionActions : visibleTraceActions;
-  const showInlineTaskCard = false;
-  const [manualRightPanelCollapsed, setManualRightPanelCollapsed] = useState(true);
-  const [rightInspectorTab, setRightInspectorTab] = useState<RightInspectorTab>('overview');
+  const [rightPanelPreference, setRightPanelPreference] = useState<'collapsed' | 'expanded' | 'auto'>('collapsed');
+  const [rightInspectorTab, setRightInspectorTab] = useState<RightInspectorTab>('conversation');
   const [selectedThreadID, setSelectedThreadID] = useState('');
   const [focusedMessageID, setFocusedMessageID] = useState('');
   const [focusMessageSerial, setFocusMessageSerial] = useState(0);
   const [threadLocateStatus, setThreadLocateStatus] = useState('');
-  const [conversationTreeOpen, setConversationTreeOpen] = useState(false);
   const [conversationTree, setConversationTree] = useState<ConversationTree | null>(null);
   const [conversationTreeBusy, setConversationTreeBusy] = useState(false);
   const [conversationTreeStatus, setConversationTreeStatus] = useState('');
@@ -7007,7 +7391,43 @@ function ChatHome({
   const [conversationCompactionSummary, setConversationCompactionSummary] = useState('');
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const conversationImportInputRef = useRef<HTMLInputElement | null>(null);
-  const rightPanelCollapsed = manualRightPanelCollapsed || autoRightPanelCollapsed;
+  const chatHomeRef = useRef<HTMLElement | null>(null);
+  const composerRef = useRef<HTMLFormElement | null>(null);
+  const rightPanelCollapsed = rightPanelPreference === 'collapsed'
+    || (rightPanelPreference === 'auto' && autoRightPanelCollapsed);
+  const effectiveRightPanelCollapsed = immersiveMode || rightPanelCollapsed;
+  const conversationTreeOpen = !rightPanelCollapsed && rightInspectorTab === 'conversation';
+
+  useEffect(() => {
+    if (!activeTaskDetail) return;
+    setRightPanelPreference('expanded');
+  }, [activeTaskDetail?.task.id]);
+
+  useEffect(() => {
+    const root = chatHomeRef.current;
+    const composer = composerRef.current;
+    if (!root || !composer) return undefined;
+    const reserveScope = root.closest<HTMLElement>('.im-app-shell') ?? root;
+
+    let frame = 0;
+    const updateReserve = () => {
+      frame = 0;
+      const reserve = Math.ceil(composer.getBoundingClientRect().height + 36);
+      reserveScope.style.setProperty('--composer-reserve', `${reserve}px`);
+    };
+    const scheduleUpdate = () => {
+      if (frame === 0) frame = window.requestAnimationFrame(updateReserve);
+    };
+    const observer = new ResizeObserver(scheduleUpdate);
+    observer.observe(composer);
+    scheduleUpdate();
+
+    return () => {
+      observer.disconnect();
+      if (frame !== 0) window.cancelAnimationFrame(frame);
+      reserveScope.style.removeProperty('--composer-reserve');
+    };
+  }, [immersiveMode]);
 
   async function refreshConversationTree(conversationID = assetConversationID) {
     if (!conversationID) {
@@ -7032,8 +7452,13 @@ function ChatHome({
 
   useEffect(() => {
     if (!conversationTreeOpen) return;
+    if (!assetConversationID) {
+      setConversationTree(null);
+      return;
+    }
+    if (conversationTree?.active_conversation_id === assetConversationID) return;
     void refreshConversationTree();
-  }, [assetConversationID, conversationTreeOpen]);
+  }, [assetConversationID, conversationTree?.active_conversation_id, conversationTreeOpen]);
 
   async function createConversationBranch() {
     if (!assetConversationID) return;
@@ -7043,7 +7468,6 @@ function ChatHome({
         source_conversation_id: assetConversationID,
         from_message_id: settledMessages[settledMessages.length - 1]?.id,
         source_run_id: activeRunId || undefined,
-        title: conversationBranchLabel.trim() || undefined,
       });
       setConversationTreeStatus(`已创建分支，复制 ${result.copied_message_count} 条消息，原会话保持不变。`);
       await openConversation(result.child_conversation_id);
@@ -7133,7 +7557,7 @@ function ChatHome({
         setThreadLocateStatus('源消息暂未出现在当前聊天');
         return;
       }
-      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      target.scrollIntoView({ block: 'center', behavior: reducedMotion ? 'auto' : 'smooth' });
       setThreadLocateStatus('已定位到原聊天');
       clearTimer = window.setTimeout(() => {
         setFocusedMessageID((current) => current === focusedMessageID ? '' : current);
@@ -7143,7 +7567,7 @@ function ChatHome({
       window.cancelAnimationFrame(frame);
       if (clearTimer) window.clearTimeout(clearTimer);
     };
-  }, [focusedMessageID, focusMessageSerial, renderItems.length]);
+  }, [focusedMessageID, focusMessageSerial, reducedMotion, renderItems.length]);
 
   useEffect(() => {
     if (selectedThreadID && !visibleThreads.some((thread) => thread.id === selectedThreadID)) {
@@ -7188,41 +7612,36 @@ function ChatHome({
   }
 
   return (
-    <section className={`chat-home companion-layout tk-workspace${rightPanelCollapsed ? ' companion-layout-right-collapsed' : ''}`}>
+    <section
+      ref={chatHomeRef}
+      className={`chat-home companion-layout tk-workspace${effectiveRightPanelCollapsed ? ' companion-layout-right-collapsed' : ''}${immersiveMode ? ' immersive-chat-home' : ''}`}
+    >
       <section className="chat-main-column tk-content-panel">
-        <MessengerChatHeader
-          inspectorOpen={!rightPanelCollapsed}
-          conversationTreeOpen={conversationTreeOpen}
-          sidebarCollapsed={sidebarCollapsed}
-          threadChannel={currentThreadChannel}
-          threadTitle={currentThreadTitle}
-          toggleSidebarCollapsed={toggleSidebarCollapsed}
-          onOpenInspector={() => setManualRightPanelCollapsed((current) => !current)}
-          onOpenConversationTree={() => setConversationTreeOpen((current) => !current)}
-        />
-
-        {conversationTreeOpen ? (
-          <ConversationWorkbenchPopover
-            busy={conversationTreeBusy}
-            branchLabel={conversationBranchLabel}
-            branchSummary={conversationBranchSummary}
-            compactionSummary={conversationCompactionSummary}
-            importInputRef={conversationImportInputRef}
-            onBranch={() => void createConversationBranch()}
-            onClose={() => setConversationTreeOpen(false)}
-            onCompact={() => void compactCurrentConversation()}
-            onExport={() => void exportConversationTree()}
-            onImport={importConversationTree}
-            onOpenConversation={(conversationID) => void openConversation(conversationID)}
-            onRefresh={() => void refreshConversationTree()}
-            onSaveMetadata={() => void saveConversationBranchMetadata()}
-            setBranchLabel={setConversationBranchLabel}
-            setBranchSummary={setConversationBranchSummary}
-            setCompactionSummary={setConversationCompactionSummary}
-            status={conversationTreeStatus}
-            tree={conversationTree}
+        {immersiveMode ? (
+          <button
+            aria-label="退出沉浸模式"
+            className="immersive-mode-restore-button"
+            title="退出沉浸模式 (Esc)"
+            type="button"
+            onClick={toggleImmersiveMode}
+          >
+            <RestoreChromeIcon />
+          </button>
+        ) : (
+          <MessengerChatHeader
+            inspectorOpen={!rightPanelCollapsed}
+            onOpenInspector={() => setRightPanelPreference(rightPanelCollapsed ? 'expanded' : 'collapsed')}
+            onOpenProfile={() => {
+              setRightInspectorTab('overview');
+              setRightPanelPreference('expanded');
+            }}
+            onToggleImmersiveMode={toggleImmersiveMode}
+            sidebarCollapsed={sidebarCollapsed}
+            threadChannel={currentThreadChannel}
+            threadTitle={currentThreadTitle}
+            toggleSidebarCollapsed={toggleSidebarCollapsed}
           />
-        ) : null}
+        )}
 
         {hasThread ? (
           <ChatMessageScroller key={projectionMessages[0]?.conversation_id || visibleChat?.conversation_id || activeRunId || 'thread'}>
@@ -7249,7 +7668,6 @@ function ChatHome({
                   </div>
                 </article>
               )}
-              {showInlineTaskCard && <TaskCard detail={latestTask!} openArtifact={openArtifact} openTrace={() => setActiveTab('trace')} />}
             </>
           </ChatMessageScroller>
         ) : (
@@ -7258,7 +7676,8 @@ function ChatHome({
           </ScrollArea>
         )}
 
-        <form className="composer tk-floating-panel" aria-busy={isSubmitting} onSubmit={submit}>
+        {!immersiveMode ? (
+          <form ref={composerRef} className="composer tk-floating-panel" aria-busy={isSubmitting} onSubmit={submit}>
           {isSubmitting ? (
             <div className="composer-run-queue-toolbar" aria-label="运行中消息控制">
               <span className="composer-run-live"><i aria-hidden="true" />运行中</span>
@@ -7285,7 +7704,6 @@ function ChatHome({
             </div>
           ) : null}
           <textarea
-            key={isSubmitting ? `run-queue-${queuedMessageMode}` : 'idle-composer'}
             placeholder={isSubmitting
               ? queuedMessageMode === 'steering' ? '立即引导当前运行...' : '当前运行完成后继续...'
               : '和 Joi 说点什么，或交给她一个任务...'}
@@ -7373,74 +7791,107 @@ function ChatHome({
               ↑
             </button>
           </div>
-        </form>
+          </form>
+        ) : null}
       </section>
-      {!rightPanelCollapsed && (
-        <>
-          <div
-            aria-label="调整右侧栏宽度"
-            className="right-panel-resizer"
-            role="separator"
-            onPointerDown={startRightPanelResize}
+      <div
+        aria-hidden={effectiveRightPanelCollapsed || undefined}
+        aria-label="调整右侧栏宽度"
+        className={`right-panel-resizer${effectiveRightPanelCollapsed ? ' collapsed' : ''}`}
+        role="separator"
+        onPointerDown={startRightPanelResize}
+      />
+      <ScrollArea
+        as="aside"
+        aria-hidden={effectiveRightPanelCollapsed || undefined}
+        aria-label="Joi 右侧检查器"
+        className={`companion-right-panel tk-right-panel${effectiveRightPanelCollapsed ? ' collapsed' : ''}`}
+        contentClassName="companion-right-panel-content tk-panel-body"
+        inert={effectiveRightPanelCollapsed ? true : undefined}
+      >
+        {activeTaskDetail ? (
+          <TaskExecutionPanel
+            cancelRun={cancelRun}
+            continueProductTask={continueProductTask}
+            detail={activeTaskDetail}
+            openArtifact={openArtifact}
+            openTrace={() => {
+              if (activeTaskDetail.task.latest_run_id) {
+                void openRunTrace(activeTaskDetail.task.latest_run_id, 'stage');
+              }
+            }}
           />
-          <ScrollArea
-            as="aside"
-            className="companion-right-panel tk-right-panel"
-            contentClassName="companion-right-panel-content tk-panel-body"
-            aria-label="Joi 右侧检查器"
-          >
-            <CompanionInspectorPanel
-              activeTab={rightInspectorTab}
-              activeRoom={activeRoom}
-              activePersona={activePersona}
-              artifacts={artifacts}
-              conversationMessages={settledMessages}
-              currentConversationID={assetConversationID}
-              currentRunIDs={currentAssetRunIds}
-              decideProactiveMessage={decideProactiveMessage}
-              messenger={messenger}
-              memories={memories}
-              openLoops={openLoops}
-              onOpenModelSettings={() => setActiveTab('settings')}
-              proactiveMessages={proactiveMessages}
-              rollbackPersonaVersion={rollbackPersonaVersion}
-              retryExternalConnectorEvent={retryExternalConnectorEvent}
-              savedModels={savedModels}
-              setActiveTab={setRightInspectorTab}
-              settings={settings}
-              trace={visibleTrace}
-              openRunTrace={openRunTrace}
-              onLocateThreadSource={(thread) => void locateThreadSource(thread)}
-              onSelectThread={setSelectedThreadID}
-              selectedThreadID={selectedThreadID}
-              threadLocateStatus={threadLocateStatus}
-              updateMemory={updateMemory}
-              updateMessengerProject={updateMessengerProject}
-              updateMessengerRoom={updateMessengerRoom}
-              updateProjectPersona={updateProjectPersona}
-              workspaceSettings={workspaceSettings}
+        ) : null}
+        <CompanionInspectorPanel
+          activeTab={rightInspectorTab}
+          activeRoom={activeRoom}
+          activePersona={activePersona}
+          artifacts={artifacts}
+          conversationTreePanel={(
+            <ConversationTreeInspectorPanel
+              busy={conversationTreeBusy}
+              branchLabel={conversationBranchLabel}
+              branchSummary={conversationBranchSummary}
+              compactionSummary={conversationCompactionSummary}
+              importInputRef={conversationImportInputRef}
+              onBranch={() => void createConversationBranch()}
+              onCompact={() => void compactCurrentConversation()}
+              onExport={() => void exportConversationTree()}
+              onImport={importConversationTree}
+              onOpenConversation={(conversationID) => void openConversation(conversationID)}
+              onSaveMetadata={() => void saveConversationBranchMetadata()}
+              setBranchLabel={setConversationBranchLabel}
+              setBranchSummary={setConversationBranchSummary}
+              setCompactionSummary={setConversationCompactionSummary}
+              status={conversationTreeStatus}
+              tree={conversationTree}
             />
-          </ScrollArea>
-        </>
-      )}
+          )}
+          conversationMessages={settledMessages}
+          currentConversationID={assetConversationID}
+          currentRunIDs={currentAssetRunIds}
+          decideProactiveMessage={decideProactiveMessage}
+          messenger={messenger}
+          memories={memories}
+          openLoops={openLoops}
+          onOpenModelSettings={() => setActiveTab('settings')}
+          proactiveMessages={proactiveMessages}
+          rollbackPersonaVersion={rollbackPersonaVersion}
+          retryExternalConnectorEvent={retryExternalConnectorEvent}
+          savedModels={savedModels}
+          setActiveTab={setRightInspectorTab}
+          settings={settings}
+          trace={visibleTrace}
+          openRunTrace={openRunTrace}
+          onLocateThreadSource={(thread) => void locateThreadSource(thread)}
+          onSelectThread={setSelectedThreadID}
+          selectedThreadID={selectedThreadID}
+          threadLocateStatus={threadLocateStatus}
+          updateMemory={updateMemory}
+          updateMessengerProject={updateMessengerProject}
+          updateMessengerRoom={updateMessengerRoom}
+          updateProjectPersona={updateProjectPersona}
+          workspaceSettings={workspaceSettings}
+        />
+      </ScrollArea>
     </section>
   );
 }
 
 function MessengerChatHeader({
-  conversationTreeOpen,
   inspectorOpen,
-  onOpenConversationTree,
   onOpenInspector,
+  onOpenProfile,
+  onToggleImmersiveMode,
   sidebarCollapsed,
   threadChannel,
   threadTitle,
   toggleSidebarCollapsed,
 }: {
-  conversationTreeOpen: boolean;
   inspectorOpen: boolean;
-  onOpenConversationTree: () => void;
   onOpenInspector: () => void;
+  onOpenProfile: () => void;
+  onToggleImmersiveMode: () => void;
   sidebarCollapsed: boolean;
   threadChannel: string;
   threadTitle: string;
@@ -7456,37 +7907,49 @@ function MessengerChatHeader({
           title="展开侧边栏"
           type="button"
           onClick={(event) => handleTitlebarControlClickAction(event, toggleSidebarCollapsed)}
-          onPointerDown={(event) => handleTitlebarControlPointerAction(event, toggleSidebarCollapsed)}
+          onPointerDown={handleTitlebarControlPointerDown}
+          onPointerUp={(event) => handleTitlebarControlPointerUp(event, toggleSidebarCollapsed)}
         >
           <SidebarIcon name="expand" />
         </button>
       )}
       <div className="messenger-chat-identity">
-        <img className="joi-thread-header-avatar" src={joiAvatar} alt="" />
-        <div>
-          <strong>Joi</strong>
-          <div className="messenger-chat-source-line">
-            {messagingChannel ? (
-              <span className={`channel-source-badge channel-source-${classToken(threadChannel)}`}>
-                {conversationChannelLabel(threadChannel)}
-              </span>
-            ) : null}
-            <small>
-              {threadTitle || '新线程'}
-              {!messagingChannel && threadChannel ? ` · ${conversationChannelLabel(threadChannel)}` : ''}
-            </small>
-          </div>
-        </div>
+        <button
+          aria-label="打开会话资料"
+          className="messenger-chat-profile-button"
+          title="打开会话资料"
+          type="button"
+          onClick={(event) => handleTitlebarControlClickAction(event, onOpenProfile)}
+          onPointerDown={handleTitlebarControlPointerDown}
+          onPointerUp={(event) => handleTitlebarControlPointerUp(event, onOpenProfile)}
+        >
+          <img className="joi-thread-header-avatar" src={joiAvatar} alt="" />
+          <span className="messenger-chat-profile-copy">
+            <strong>Joi</strong>
+            <span className="messenger-chat-source-line">
+              {messagingChannel ? (
+                <span className={`channel-source-badge channel-source-${classToken(threadChannel)}`}>
+                  {conversationChannelLabel(threadChannel)}
+                </span>
+              ) : null}
+              <small>
+                {threadTitle || '新线程'}
+                {!messagingChannel && threadChannel ? ` · ${conversationChannelLabel(threadChannel)}` : ''}
+              </small>
+            </span>
+          </span>
+        </button>
       </div>
       <button
-        className={`observe-button conversation-tree-button ${conversationTreeOpen ? 'active' : ''}`}
+        className="observe-button immersive-mode-button"
         type="button"
-        aria-expanded={conversationTreeOpen}
-        aria-label={conversationTreeOpen ? '关闭会话树' : '打开会话树与压缩'}
-        title="会话树与压缩"
-        onClick={onOpenConversationTree}
+        aria-label="进入沉浸模式"
+        title="进入沉浸模式 (⌘⇧F)"
+        onClick={(event) => handleTitlebarControlClickAction(event, onToggleImmersiveMode)}
+        onPointerDown={handleTitlebarControlPointerDown}
+        onPointerUp={(event) => handleTitlebarControlPointerUp(event, onToggleImmersiveMode)}
       >
-        <ConversationTreeIcon />
+        <ImmersiveModeIcon />
       </button>
       <button
         className={`observe-button ${inspectorOpen ? 'active' : ''}`}
@@ -7494,7 +7957,9 @@ function MessengerChatHeader({
         aria-expanded={inspectorOpen}
         aria-label={inspectorOpen ? '收起观察面板' : '展开观察面板'}
         title={inspectorOpen ? '收起观察面板' : '展开观察面板'}
-        onClick={onOpenInspector}
+        onClick={(event) => handleTitlebarControlClickAction(event, onOpenInspector)}
+        onPointerDown={handleTitlebarControlPointerDown}
+        onPointerUp={(event) => handleTitlebarControlPointerUp(event, onOpenInspector)}
       >
         <ExpandPanelIcon />
       </button>
@@ -7502,19 +7967,17 @@ function MessengerChatHeader({
   );
 }
 
-function ConversationWorkbenchPopover({
+function ConversationTreeInspectorPanel({
   branchLabel,
   branchSummary,
   busy,
   compactionSummary,
   importInputRef,
   onBranch,
-  onClose,
   onCompact,
   onExport,
   onImport,
   onOpenConversation,
-  onRefresh,
   onSaveMetadata,
   setBranchLabel,
   setBranchSummary,
@@ -7528,12 +7991,10 @@ function ConversationWorkbenchPopover({
   compactionSummary: string;
   importInputRef: RefObject<HTMLInputElement | null>;
   onBranch: () => void;
-  onClose: () => void;
   onCompact: () => void;
   onExport: () => void;
   onImport: (event: ChangeEvent<HTMLInputElement>) => void;
   onOpenConversation: (conversationID: string) => void;
-  onRefresh: () => void;
   onSaveMetadata: () => void;
   setBranchLabel: (value: string) => void;
   setBranchSummary: (value: string) => void;
@@ -7542,67 +8003,71 @@ function ConversationWorkbenchPopover({
   tree: ConversationTree | null;
 }) {
   const activeNode = tree ? findConversationTreeNode(tree.root, tree.active_conversation_id) : null;
+  const hasBranches = Boolean(tree && tree.node_count > 1);
   return (
-    <section className="conversation-workbench-popover" role="dialog" aria-label="会话树与上下文压缩">
-      <header>
-        <div>
-          <strong>会话树</strong>
-          <small>{tree ? `${tree.node_count} 个节点 · 原记录始终保留` : '读取本地会话关系'}</small>
-        </div>
-        <div className="conversation-workbench-header-actions">
-          <button type="button" onClick={onRefresh} disabled={busy}>刷新</button>
-          <button className="icon-only" type="button" onClick={onClose} aria-label="关闭会话树"><CloseTabIcon /></button>
-        </div>
-      </header>
-      <div className="conversation-workbench-body">
-        <ScrollArea className="conversation-tree-scroll" contentClassName="conversation-tree-list">
+    <section
+      id="right-inspector-conversation"
+      className="conversation-workbench-panel right-inspector-tab-panel"
+      role="tabpanel"
+      aria-labelledby="right-inspector-tab-conversation"
+    >
+      <ScrollArea className="conversation-workbench-body" contentClassName="conversation-workbench-content">
+        <section className="conversation-tree-section">
+          <div className="conversation-tree-context">
+            <span>只跟随当前会话，不包含其他历史会话。</span>
+            <small>{tree ? (hasBranches ? `${tree.node_count} 个版本` : '尚无其他分支') : (busy ? '正在读取…' : '暂不可用')}</small>
+          </div>
           {tree ? (
             <ConversationTreeRows node={tree.root} depth={0} onOpenConversation={onOpenConversation} />
           ) : (
-            <p className="empty">{busy ? '正在读取会话树…' : '当前还没有可展示的会话树。'}</p>
+            <p className="empty">{busy ? '正在读取分支…' : '当前会话暂时无法读取。'}</p>
           )}
-        </ScrollArea>
-        <ScrollArea className="conversation-workbench-controls-scroll" contentClassName="conversation-workbench-controls">
-          <section className="conversation-workbench-section">
-            <div className="conversation-workbench-section-title">
-              <strong>当前节点</strong>
-              <span>{activeNode ? `${activeNode.message_count} 条消息` : '—'}</span>
-            </div>
-            <label>
-              <span>分支名称</span>
-              <input value={branchLabel} placeholder="例如：方案 B" onChange={(event) => setBranchLabel(event.target.value)} />
-            </label>
-            <label>
-              <span>分支说明</span>
-              <textarea value={branchSummary} placeholder="这个分支验证什么，和主线有什么不同" onChange={(event) => setBranchSummary(event.target.value)} />
-            </label>
-            <div className="conversation-workbench-action-row">
-              <button type="button" onClick={onSaveMetadata} disabled={busy || !activeNode}>保存说明</button>
-              <button className="primary" type="button" onClick={onBranch} disabled={busy || !activeNode}>从当前末尾分支</button>
-            </div>
-          </section>
-          <section className="conversation-workbench-section">
-            <div className="conversation-workbench-section-title">
-              <strong>上下文压缩</strong>
-              <span>{activeNode?.latest_compaction ? `已覆盖 ${activeNode.latest_compaction.covered_message_count} 条` : '尚未手动压缩'}</span>
-            </div>
-            <p>只替换下一轮提供给模型的早期上下文，不删聊天记录；最近 8 条消息保持原文。</p>
-            <label>
-              <span>可恢复检查点摘要</span>
-              <textarea className="conversation-compaction-summary" value={compactionSummary} onChange={(event) => setCompactionSummary(event.target.value)} />
-            </label>
-            <button className="primary" type="button" onClick={onCompact} disabled={busy || !activeNode || !compactionSummary.trim()}>压缩当前上下文</button>
-          </section>
-          <section className="conversation-workbench-section conversation-portability-section">
-            <div className="conversation-workbench-section-title"><strong>迁移</strong><span>Joi JSON</span></div>
-            <input ref={importInputRef} className="visually-hidden" type="file" accept=".json,.joi-conversation.json" onChange={onImport} />
-            <div className="conversation-workbench-action-row">
-              <button type="button" onClick={onExport} disabled={busy || !tree}>导出整棵树</button>
-              <button type="button" onClick={() => importInputRef.current?.click()} disabled={busy}>导入会话树</button>
-            </div>
-          </section>
-        </ScrollArea>
-      </div>
+        </section>
+        <section className="conversation-branch-create">
+          <p>保留当前会话，从这里创建一个独立版本。</p>
+          <button className="primary" type="button" onClick={onBranch} disabled={busy || !activeNode}>从这里新开分支</button>
+        </section>
+        <details className="conversation-workbench-advanced">
+          <summary><strong>高级</strong><span>命名、上下文与迁移</span></summary>
+          <div className="conversation-workbench-advanced-body">
+            <section className="conversation-workbench-section">
+              <div className="conversation-workbench-section-title">
+                <strong>当前版本信息</strong>
+                <span>{activeNode ? `${activeNode.message_count} 条消息` : '—'}</span>
+              </div>
+              <label>
+                <span>名称</span>
+                <input value={branchLabel} placeholder="例如：方案 B" onChange={(event) => setBranchLabel(event.target.value)} />
+              </label>
+              <label>
+                <span>说明</span>
+                <textarea value={branchSummary} placeholder="这个版本验证什么" onChange={(event) => setBranchSummary(event.target.value)} />
+              </label>
+              <button type="button" onClick={onSaveMetadata} disabled={busy || !activeNode}>保存版本信息</button>
+            </section>
+            <section className="conversation-workbench-section">
+                <div className="conversation-workbench-section-title">
+                  <strong>上下文压缩</strong>
+                  <span>{activeNode?.latest_compaction ? `已覆盖 ${activeNode.latest_compaction.covered_message_count} 条` : '尚未手动压缩'}</span>
+                </div>
+                <p>只替换下一轮提供给模型的早期上下文，不删聊天记录；最近 8 条消息保持原文。</p>
+                <label>
+                  <span>可恢复检查点摘要</span>
+                  <textarea className="conversation-compaction-summary" value={compactionSummary} onChange={(event) => setCompactionSummary(event.target.value)} />
+                </label>
+                <button className="primary" type="button" onClick={onCompact} disabled={busy || !activeNode || !compactionSummary.trim()}>压缩当前上下文</button>
+            </section>
+            <section className="conversation-workbench-section conversation-portability-section">
+                <div className="conversation-workbench-section-title"><strong>迁移</strong><span>Joi JSON</span></div>
+                <input ref={importInputRef} className="visually-hidden" type="file" accept=".json,.joi-conversation.json" onChange={onImport} />
+                <div className="conversation-workbench-action-row">
+                  <button type="button" onClick={onExport} disabled={busy || !tree}>导出全部分支</button>
+                  <button type="button" onClick={() => importInputRef.current?.click()} disabled={busy}>导入会话分支</button>
+                </div>
+            </section>
+          </div>
+        </details>
+      </ScrollArea>
       {status ? <div className="conversation-workbench-status" role="status">{status}</div> : null}
       {busy ? <div className="conversation-workbench-progress" aria-hidden="true" /> : null}
     </section>
@@ -7642,13 +8107,12 @@ function ConversationTreeRows({
   );
 }
 
-function ConversationTreeIcon() {
+function TodayIcon() {
   return (
-    <svg className="observe-button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <circle cx="6" cy="5" r="2" />
-      <circle cx="18" cy="11" r="2" />
-      <circle cx="6" cy="19" r="2" />
-      <path d="M6 7v10M8 11h8" />
+    <svg className="sidebar-today-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M6 4h12v16H6z" />
+      <path d="M9 8h6M9 12h6M9 16h3" />
+      <path d="m14 16 1.5 1.5L19 14" />
     </svg>
   );
 }
@@ -7660,6 +8124,28 @@ function ExpandPanelIcon() {
       <path d="M5 5l6 6" />
       <path d="M15 19h4v-4" />
       <path d="M19 19l-6-6" />
+    </svg>
+  );
+}
+
+function ImmersiveModeIcon() {
+  return (
+    <svg className="observe-button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M8 4H4v4" />
+      <path d="M16 4h4v4" />
+      <path d="M20 16v4h-4" />
+      <path d="M8 20H4v-4" />
+    </svg>
+  );
+}
+
+function RestoreChromeIcon() {
+  return (
+    <svg className="observe-button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M9 4v5H4" />
+      <path d="M15 4v5h5" />
+      <path d="M20 15h-5v5" />
+      <path d="M4 15h5v5" />
     </svg>
   );
 }
@@ -7704,6 +8190,7 @@ function TaskCard({ detail, openArtifact, openTrace }: { detail: ProductTaskDeta
         <KV label="计划" value={`${detail.steps.length} 步`} />
         <KV label="当前步骤" value={currentStep?.title || '待开始'} />
         <KV label="风险" value={formatRiskLevel(task.risk_level)} />
+        <KV label="验证" value={formatStatus(task.verification?.status || task.verification_status || 'pending')} />
         <KV label="运行 ID" value={task.latest_run_id || '待生成'} />
       </div>
       <div className="task-progress-bar" aria-label={`任务进度 ${task.progress_percent}%`}>
@@ -7875,6 +8362,7 @@ function CompanionInspectorPanel({
   activeRoom,
   activePersona,
   artifacts,
+  conversationTreePanel,
   conversationMessages,
   currentConversationID,
   currentRunIDs,
@@ -7905,6 +8393,7 @@ function CompanionInspectorPanel({
   activeRoom: MessengerRoom | null;
   activePersona: ProjectPersona | null;
   artifacts: ArtifactSummary[];
+  conversationTreePanel: ReactNode;
   conversationMessages: ConversationMessage[];
   currentConversationID: string;
   currentRunIDs: string[];
@@ -7939,7 +8428,7 @@ function CompanionInspectorPanel({
   const selectedMemberPersona = selectedMember ? resolveMemberPersona(selectedMember, messenger, activePersona) : null;
   const effectiveTab: RightInspectorTab = activeTab === 'member' && !selectedMember ? 'overview' : activeTab;
   const staticTabs: Array<[RightInspectorTab, string]> = [
-    ['overview', '概览'],
+    ['conversation', '分支'],
     ['runs', '运行'],
     ['assets', '产物'],
     ['memory', '记忆'],
@@ -8041,6 +8530,8 @@ function CompanionInspectorPanel({
           settings={settings}
           workspaceSettings={workspaceSettings}
         />
+      ) : effectiveTab === 'conversation' ? (
+        conversationTreePanel
       ) : effectiveTab === 'runs' ? (
         <CurrentRunSummaryPanel
           openRunTrace={openRunTrace}
@@ -8951,41 +9442,70 @@ function PrivateProjectOverviewPanel({
   );
 }
 
-function TodayCheckpointPanel({
+function TodayCheckpointPage({
   busy,
   checkpoint,
-  onClose,
   onComplete,
+  onDecideApproval,
+  onDecideOpenLoop,
+  onDecideProactive,
+  onOpenArtifact,
+  onOpenRun,
+  onOpenTask,
+  onResolveRecovery,
+  sidebarCollapsed,
+  toggleSidebarCollapsed,
 }: {
   busy: boolean;
   checkpoint: PersonaMessengerSnapshot['checkpoint'] | null;
-  onClose: () => void;
   onComplete: () => void;
+  onDecideApproval: (id: string, approve: boolean) => void;
+  onDecideOpenLoop: (id: string, action: 'done' | 'snooze') => void;
+  onDecideProactive: (id: string, action: 'approve' | 'dismiss') => void;
+  onOpenArtifact: (id: string) => void;
+  onOpenRun: (id: string) => void;
+  onOpenTask: (id: string) => void;
+  onResolveRecovery: (id: string, action: 'retry' | 'abandon') => void;
+  sidebarCollapsed: boolean;
+  toggleSidebarCollapsed: () => void;
 }) {
   const items = checkpoint?.items ?? [];
-  const meaningfulItems = items.filter((item) => item.kind !== 'quiet');
+  const meaningfulItems = items.filter(isVisibleTodayCheckpointItem);
+  const quietItem = items.find((item) => item.kind === 'quiet');
   const itemCount = meaningfulItems.length;
   const sinceLabel = checkpoint?.since ? formatShortTime(checkpoint.since) : '最近 24 小时';
   return (
-    <div className="today-checkpoint-backdrop" role="presentation" onMouseDown={onClose}>
-      <section
-        aria-label="今日检查"
-        className="today-checkpoint-panel"
-        role="dialog"
-        aria-modal="true"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <header className="today-checkpoint-header">
-          <div>
-            <small>Today</small>
-            <h2>今日检查</h2>
-            <p>自 {sinceLabel} 后有 {itemCount} 项需要看一眼</p>
-          </div>
-          <button className="round-icon-button" type="button" aria-label="关闭今日检查" title="关闭" onClick={onClose}>
-            <span aria-hidden="true">×</span>
+    <section className="today-page" aria-labelledby="today-page-title">
+      <header className="today-page-header">
+        {sidebarCollapsed ? (
+          <button
+            aria-label="展开侧边栏"
+            className="round-icon-button today-sidebar-expand-button"
+            title="展开侧边栏"
+            type="button"
+            onClick={(event) => handleTitlebarControlClickAction(event, toggleSidebarCollapsed)}
+            onPointerDown={handleTitlebarControlPointerDown}
+            onPointerUp={(event) => handleTitlebarControlPointerUp(event, toggleSidebarCollapsed)}
+          >
+            <SidebarIcon name="expand" />
           </button>
-        </header>
+        ) : null}
+        <div>
+          <small>Today</small>
+          <h1 id="today-page-title">今日检查</h1>
+          <p>自 {sinceLabel} 后有 {itemCount} 项需要看一眼</p>
+        </div>
+      </header>
+      <ScrollArea
+        className="today-page-scroll"
+        contentClassName="today-page-content"
+        viewportAriaLabel="今日待处理事项"
+        viewportTabIndex={0}
+      >
         <div className="today-checkpoint-metrics">
+          <KV label="需恢复" value={String(checkpoint?.recoverable_count ?? 0)} />
+          <KV label="进行中" value={String(checkpoint?.active_task_count ?? 0)} />
+          <KV label="待办" value={String(checkpoint?.open_loop_count ?? 0)} />
           <KV label="完成" value={String(checkpoint?.completed_count ?? 0)} />
           <KV label="失败" value={String(checkpoint?.failed_count ?? 0)} />
           <KV label="待审批" value={String(checkpoint?.pending_approval_count ?? 0)} />
@@ -8994,25 +9514,75 @@ function TodayCheckpointPanel({
           <KV label="外部" value={String(checkpoint?.external_unhandled_count ?? 0)} />
           <KV label="成本" value={formatCost(checkpoint?.model_cost_estimate ?? 0)} />
         </div>
-        <div className="today-checkpoint-list">
-          {items.map((item) => (
-            <article key={item.id} className={`today-checkpoint-item checkpoint-${classToken(item.severity || item.kind)}`}>
-              <span className="today-checkpoint-mark">{checkpointItemMark(item.severity || item.kind)}</span>
-              <div>
-                <strong>{item.title}</strong>
-                {item.body ? <p>{item.body}</p> : null}
+        <section className="today-page-items" aria-labelledby="today-page-items-title">
+          <header>
+            <strong id="today-page-items-title">需要处理</strong>
+            <span>{itemCount}</span>
+          </header>
+          <div className="today-checkpoint-list">
+            {meaningfulItems.map((item) => (
+              <article key={item.id} className={`today-checkpoint-item checkpoint-${classToken(item.severity || item.kind)}`}>
+                <span className="today-checkpoint-mark">{checkpointItemMark(item.severity || item.kind)}</span>
+                <div>
+                  <strong>{item.title}</strong>
+                  {item.body ? <p>{item.body}</p> : null}
+                  {item.kind === 'recovery_required' && item.run_id ? (
+                    <div className="row-actions">
+                      <button type="button" disabled={busy} onClick={() => onResolveRecovery(item.run_id!, 'retry')}>
+                        {item.safe_to_retry === false ? '核对并继续' : '继续任务'}
+                      </button>
+                      <button type="button" disabled={busy} onClick={() => onResolveRecovery(item.run_id!, 'abandon')}>结束任务</button>
+                      <button type="button" disabled={busy} onClick={() => onOpenRun(item.run_id!)}>查看记录</button>
+                    </div>
+                  ) : null}
+                  {item.approval_id ? (
+                    <div className="row-actions">
+                      <button type="button" disabled={busy} onClick={() => onDecideApproval(item.approval_id!, true)}>批准</button>
+                      <button type="button" disabled={busy} onClick={() => onDecideApproval(item.approval_id!, false)}>拒绝</button>
+                    </div>
+                  ) : null}
+                  {item.product_task_id && item.kind === 'active_task' ? (
+                    <div className="row-actions"><button type="button" disabled={busy} onClick={() => onOpenTask(item.product_task_id!)}>查看任务</button></div>
+                  ) : null}
+                  {item.open_loop_id && item.kind === 'open_loop' ? (
+                    <div className="row-actions">
+                      <button type="button" disabled={busy} onClick={() => onDecideOpenLoop(item.open_loop_id!, 'done')}>已处理</button>
+                      <button type="button" disabled={busy} onClick={() => onDecideOpenLoop(item.open_loop_id!, 'snooze')}>稍后</button>
+                    </div>
+                  ) : null}
+                  {item.proactive_message_id ? (
+                    <div className="row-actions">
+                      <button type="button" disabled={busy} onClick={() => onDecideProactive(item.proactive_message_id!, 'approve')}>采用</button>
+                      <button type="button" disabled={busy} onClick={() => onDecideProactive(item.proactive_message_id!, 'dismiss')}>忽略</button>
+                    </div>
+                  ) : null}
+                  {item.artifact_id ? (
+                    <div className="row-actions"><button type="button" disabled={busy} onClick={() => onOpenArtifact(item.artifact_id!)}>查看产物</button></div>
+                  ) : null}
+                  {!item.artifact_id && !item.approval_id && item.run_id && item.kind !== 'recovery_required' && item.kind !== 'active_task' ? (
+                    <div className="row-actions"><button type="button" disabled={busy} onClick={() => onOpenRun(item.run_id!)}>查看运行</button></div>
+                  ) : null}
+                </div>
+              </article>
+            ))}
+            {meaningfulItems.length === 0 ? (
+              <div className="today-page-empty">
+                <span className="today-checkpoint-mark">✓</span>
+                <div>
+                  <strong>{quietItem?.title || '今天没有需要处理的事项'}</strong>
+                  <p>{quietItem?.body || '新的任务、审批或提醒出现后，会集中显示在这里。'}</p>
+                </div>
               </div>
-            </article>
-          ))}
-        </div>
-        <footer className="today-checkpoint-actions">
-          <button type="button" onClick={onClose}>稍后</button>
-          <button type="button" disabled={busy} onClick={onComplete}>
-            {busy ? '写入中...' : '全部已读'}
-          </button>
-        </footer>
-      </section>
-    </div>
+            ) : null}
+          </div>
+          <footer className="today-checkpoint-actions">
+            <button type="button" disabled={busy || itemCount === 0} onClick={onComplete}>
+              {busy ? '写入中...' : '全部已读'}
+            </button>
+          </footer>
+        </section>
+      </ScrollArea>
+    </section>
   );
 }
 
@@ -9021,6 +9591,10 @@ function checkpointItemMark(kind: string) {
   if (kind === 'error' || kind.includes('failed')) return '!';
   if (kind === 'warning' || kind.includes('approval') || kind.includes('external')) return '●';
   return '○';
+}
+
+function isVisibleTodayCheckpointItem(item: PersonaMessengerSnapshot['checkpoint']['items'][number]) {
+  return item.kind !== 'quiet' && !item.kind.endsWith('_total');
 }
 
 function summarizeTraceSpansForDisplay(spans: RunTraceSpan[]): RunTraceSpanSummary {
@@ -10502,6 +11076,7 @@ function TaskExecutionPanel({
           )}
         </div>
       )}
+      <WorkspaceChangeSetPanel productTaskID={task.id} runID={task.latest_run_id || ''} />
       <div className="task-panel-actions">
         <button className="trace-link-button" type="button" onClick={openTrace}>查看执行过程</button>
         <button type="button" onClick={() => void continueProductTask(task)}>继续</button>
@@ -10585,22 +11160,148 @@ function TaskMiniList({
 }
 
 function ArtifactViewer({ artifact, close }: { artifact: ArtifactDetail; close: () => void }) {
+  const layer = useLayerLifecycle<HTMLElement>(close);
+  const verification = artifactVerification(artifact);
   return (
-    <div className="artifact-viewer-backdrop" role="presentation">
-      <section className="artifact-viewer" role="dialog" aria-modal="true" aria-labelledby="artifact-title">
+    <div
+      className={`artifact-viewer-backdrop ui-layer${layer.isClosing ? ' is-closing' : ''}`}
+      role="presentation"
+      onMouseDown={layer.requestClose}
+    >
+      <section
+        ref={layer.surfaceRef}
+        className={`artifact-viewer ui-dialog-surface${layer.isClosing ? ' is-closing' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="artifact-title"
+        tabIndex={-1}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
         <header>
           <div>
             <small>{formatArtifactType(artifact.type)} · 版本 {artifact.version}</small>
             <h2 id="artifact-title">{artifact.title}</h2>
           </div>
-          <button type="button" aria-label="关闭交付物" onClick={close}>×</button>
+          <button type="button" aria-label="关闭交付物" onClick={layer.requestClose}>×</button>
         </header>
         <ScrollArea className="artifact-content">
           <ArtifactContent content={artifact.content} />
+          {verification ? (
+            <div className={`task-verification-block verification-${verification.status}`}>
+              <h3>验证结果</h3>
+              <p>{verification.summary || formatStatus(verification.status)}</p>
+              {verification.checks.length > 0 ? (
+                <ul>
+                  {verification.checks.map((check) => (
+                    <li key={check.name}>{check.name} · {formatStatus(check.status)}</li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
+          <WorkspaceChangeSetPanel
+            productTaskID={artifact.source_product_task_id || ''}
+            runID={artifact.source_run_id || ''}
+          />
         </ScrollArea>
       </section>
     </div>
   );
+}
+
+function WorkspaceChangeSetPanel({ productTaskID, runID }: { productTaskID: string; runID: string }) {
+  const [changeSets, setChangeSets] = useState<WorkspaceChangeSet[]>([]);
+  const [busyID, setBusyID] = useState('');
+  const [panelError, setPanelError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!productTaskID && !runID) {
+      setChangeSets([]);
+      return () => {
+        cancelled = true;
+      };
+    }
+    void desktopApi.listWorkspaceChangeSets({
+      product_task_id: productTaskID || undefined,
+      run_id: productTaskID ? undefined : runID || undefined,
+      limit: 20,
+    }).then((result) => {
+      if (!cancelled) setChangeSets(result.change_sets ?? []);
+    }).catch((err) => {
+      if (!cancelled) setPanelError(safeErrorText(err));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [productTaskID, runID]);
+
+  async function revertChangeSet(changeSet: WorkspaceChangeSet) {
+    if (!changeSet.reversible || changeSet.status !== 'applied') return;
+    const confirmed = window.confirm(`撤销这次对 ${changeSet.files.length} 个文件的改动？如果文件之后又被修改，Joi 会拒绝覆盖。`);
+    if (!confirmed) return;
+    setBusyID(changeSet.id);
+    setPanelError('');
+    try {
+      const reverted = await desktopApi.revertWorkspaceChangeSet({
+        id: changeSet.id,
+        reason: 'reverted from delivery view',
+      });
+      setChangeSets((current) => current.map((item) => item.id === reverted.id ? reverted : item));
+    } catch (err) {
+      setPanelError(safeErrorText(err));
+    } finally {
+      setBusyID('');
+    }
+  }
+
+  if (changeSets.length === 0 && !panelError) return null;
+  return (
+    <div className="task-contract-block">
+      <h3>文件改动</h3>
+      {changeSets.map((changeSet) => (
+        <div key={changeSet.id} className="insight-item">
+          <strong>{changeSet.files.length} 个文件 · {formatStatus(changeSet.status)}</strong>
+          <p>{changeSet.files.map((file) => file.path).join('、') || '没有文件改动'}</p>
+          {changeSet.status === 'applied' ? (
+            <div className="insight-actions">
+              <button
+                type="button"
+                disabled={!changeSet.reversible || busyID === changeSet.id}
+                onClick={() => void revertChangeSet(changeSet)}
+              >
+                {busyID === changeSet.id ? '正在撤销…' : changeSet.reversible ? '撤销这次改动' : '不可安全撤销'}
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ))}
+      {panelError ? <p role="alert">{panelError}</p> : null}
+    </div>
+  );
+}
+
+function artifactVerification(artifact: ArtifactDetail): NonNullable<ProductTask['verification']> | null {
+  const value = artifact.metadata?.verification;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const checks = Array.isArray(raw.checks) ? raw.checks.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const check = item as Record<string, unknown>;
+    return [{
+      name: String(check.name || '验证项'),
+      status: String(check.status || 'pending'),
+      evidence: check.evidence && typeof check.evidence === 'object' && !Array.isArray(check.evidence)
+        ? check.evidence as Record<string, unknown>
+        : undefined,
+    }];
+  }) : [];
+  return {
+    status: String(raw.status || artifact.metadata?.verification_status || 'pending'),
+    summary: String(raw.summary || ''),
+    checks,
+    verified_at: typeof raw.verified_at === 'string' ? raw.verified_at : undefined,
+  };
 }
 
 function ArtifactContent({ content }: { content: string }) {
@@ -12914,6 +13615,10 @@ function formatStatus(status: string) {
     warm: '就绪',
     dormant: '休眠',
     reviewing: '复核中',
+    prepared: '已准备',
+    applied: '已应用',
+    reverted: '已撤销',
+    passed: '已通过',
     none: '暂无',
     configured: '已配置',
     missing: '缺失',

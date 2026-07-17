@@ -54,13 +54,13 @@ if (extraHandlers.length > 0) {
   fail(`Electron SQLite DesktopApi has handlers outside the shared contract: ${extraHandlers.join(', ')}`);
 }
 
-for (const required of ['contextBridge.exposeInMainWorld', 'invoke<T = unknown>', 'onRunEvent', 'terminal:', 'joi:terminal:start', 'joi:terminal:event', 'getVersion', 'openExternal']) {
+for (const required of ['contextBridge.exposeInMainWorld', 'invoke<T = unknown>', 'onRunEvent', 'terminal:', 'joi:terminal:start', 'joi:terminal:event', 'getVersion', 'openExternal', 'setWindowButtonVisibility', 'joi:app:setWindowButtonVisibility']) {
   if (!preload.includes(required)) {
     fail(`preload API is missing required surface: ${required}`);
   }
 }
 
-for (const required of ['z.enum(desktopIpcMethods)', 'TerminalSessionManager', "ipcMain.handle('joi:invoke'", "ipcMain.handle('joi:terminal:start'", "ipcMain.handle('joi:terminal:input'", "ipcMain.handle('joi:terminal:resize'", "ipcMain.handle('joi:terminal:kill'", "ipcMain.handle('joi:terminal:getStatus'", "ipcMain.handle('joi:app:getVersion'", "ipcMain.handle('joi:app:openExternal'"]) {
+for (const required of ['z.enum(desktopIpcMethods)', 'TerminalSessionManager', "ipcMain.handle('joi:invoke'", "ipcMain.handle('joi:terminal:start'", "ipcMain.handle('joi:terminal:input'", "ipcMain.handle('joi:terminal:resize'", "ipcMain.handle('joi:terminal:kill'", "ipcMain.handle('joi:terminal:getStatus'", "ipcMain.handle('joi:app:getVersion'", "ipcMain.handle('joi:app:openExternal'", "ipcMain.handle('joi:app:setWindowButtonVisibility'", 'z.boolean().parse(rawVisible)', 'window.setWindowButtonVisibility(visible)']) {
   if (!ipc.includes(required)) {
     fail(`main IPC router is missing required guard: ${required}`);
   }

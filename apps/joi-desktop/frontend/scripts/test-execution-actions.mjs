@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const root = process.cwd();
 const outDir = mkdtempSync(join(tmpdir(), 'joi-execution-actions-'));
+const esbuildBin = [
+  join(root, '..', '..', '..', 'node_modules', '.pnpm', 'node_modules', '.bin', 'esbuild'),
+  join(root, 'node_modules', '.bin', 'esbuild'),
+].find((candidate) => existsSync(candidate)) || 'node_modules/.bin/esbuild';
 
 try {
   const entry = join(outDir, 'entry.ts');
@@ -16,7 +20,7 @@ try {
     export { permissionProfileForPrompt } from '${root}/src/permissionProfile.ts';
     export { capabilityBackend, capabilityBackendLabel, capabilityStatusLabel } from '${root}/src/features/capabilities/capabilityPresentation.ts';
   `);
-  execFileSync('node_modules/.bin/esbuild', [
+  execFileSync(esbuildBin, [
     entry,
     '--bundle',
     '--format=esm',

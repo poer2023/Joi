@@ -448,6 +448,10 @@ function shouldShowTranscriptGroup(event: NormalizedRunEvent, events: Normalized
   if (isWorkSummaryEvent(event)) {
     if (event.status === 'failed' || event.status === 'blocked') return true;
     if (event.status === 'running' || event.status === 'queued' || event.status === 'pending') return showThinkingStatus;
+    const phase = stringFromEvent(event, ['phase']).toLowerCase();
+    if (event.type === 'work_summary.updated' && event.status === 'completed' && (phase === 'prepared' || phase === 'verified')) {
+      return false;
+    }
     return isUserVisibleSemanticSummary(event);
   }
   if (isModelProgressEvent(event) && event.status !== 'running' && event.status !== 'queued' && event.status !== 'pending') {
@@ -487,7 +491,8 @@ function transcriptLabel(
   if (kind === 'approval') {
     const action = localizedActionFromEvent(event);
     const target = resourceLabelFromEvent(event);
-    return `等待确认 · ${action}${target ? ` · ${compactText(target)}` : ''}`;
+    const approvalState = status === 'completed' ? '已批准' : status === 'failed' ? '已拒绝' : '等待确认';
+    return `${approvalState} · ${action}${target ? ` · ${compactText(target)}` : ''}`;
   }
   if (kind === 'artifact') {
     return `生成交付物 · ${compactText(event.title || stringFromEvent(event, ['title', 'artifact_type', 'type']) || 'artifact')}`;
@@ -1156,7 +1161,13 @@ function approvalDetail(event: NormalizedRunEvent): string | undefined {
   const action = localizedActionFromEvent(event);
   const target = resourceLabelFromEvent(event);
   const risk = stringFromEvent(event, ['risk', 'risk_level']);
-  return [`${action}等待你的确认`, target, risk ? `风险 ${risk}` : ''].filter(Boolean).join(' · ');
+  const decision = stringFromEvent(event, ['decision', 'status']).toLowerCase();
+  const state = event.type === 'approval.approved' || event.type === 'approval.resumed' || decision === 'approved' || decision === 'completed'
+    ? `${action}已批准`
+    : event.type === 'approval.denied' || decision === 'rejected' || decision === 'denied'
+      ? `${action}已拒绝`
+      : `${action}等待你的确认`;
+  return [state, target, risk ? `风险 ${risk}` : ''].filter(Boolean).join(' · ');
 }
 
 function approvalPreviewFromEvent(event: NormalizedRunEvent): string | undefined {

@@ -1,9 +1,13 @@
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
+  existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -37,6 +41,7 @@ import {
   MEMORY_PIPELINE_VERSION,
   memoryEvidenceAuthority,
   memoryGenerationExclusionReason,
+  memoryQuarantineReason,
   memorySearchFeatures,
   normalizeRelevanceScore,
   type MemoryObservationDraft,
@@ -158,10 +163,12 @@ import type {
   UpdateProjectPersonaRequest,
   WorkerGatewayAuditRecord,
   WorkspaceSettings,
+  WorkspaceChangeSet,
   AssistantWorkspaceSnapshot,
   AssistantActionRequest,
   AssistantActionResult,
 } from '../../shared-types/src/desktop-api';
+import type { WorkspaceChangeSetDraft } from '../../runtime/src/workspace-exec.ts';
 
 type SQLiteValue = string | number | bigint | null;
 type SQLiteRow = Record<string, unknown>;
@@ -873,6 +880,7 @@ export class JoiSQLiteStore {
         generated_observation_count INTEGER NOT NULL DEFAULT 0,
         expired_count INTEGER NOT NULL DEFAULT 0,
         merged_count INTEGER NOT NULL DEFAULT 0,
+        quarantined_count INTEGER NOT NULL DEFAULT 0,
         embedding_count INTEGER NOT NULL DEFAULT 0,
         error_summary TEXT NOT NULL DEFAULT '',
         metadata TEXT NOT NULL DEFAULT '{}',
@@ -893,6 +901,7 @@ export class JoiSQLiteStore {
     for (const [column, definition] of [
       ['processed_input_count', 'INTEGER NOT NULL DEFAULT 0'],
       ['generated_observation_count', 'INTEGER NOT NULL DEFAULT 0'],
+      ['quarantined_count', 'INTEGER NOT NULL DEFAULT 0'],
     ] as const) ensure('memory_maintenance_runs', column, definition);
     for (const [column, definition] of [
       ['character_profile', "TEXT NOT NULL DEFAULT '{}'"],
@@ -3873,6 +3882,7 @@ export class JoiSQLiteStore {
         response,
         waiting_confirmation: waitingConfirmation,
         tool_results: toolResults,
+        runtime_status: turn.status || 'completed',
       })];
       if (started.product_task_id) {
         productTask = this.getProductTask(started.product_task_id).task;
@@ -4439,6 +4449,7 @@ export class JoiSQLiteStore {
         response,
         waiting_confirmation: waitingConfirmation,
         tool_results: toolResults,
+        runtime_status: turn.status || 'completed',
       });
       if (productTask?.id) {
         productTask = this.getProductTask(productTask.id).task;
@@ -7139,6 +7150,7 @@ export class JoiSQLiteStore {
     let expiredCount = 0;
     let mergedCount = 0;
     let embeddingCount = 0;
+    let quarantinedCount = 0;
     try {
       const policy = this.memoryPolicyConfig();
       const processAllPending = ['manual', 'desktop_ui', 'test'].includes(triggerSource);
@@ -7159,6 +7171,42 @@ export class JoiSQLiteStore {
         for (const row of this.all(`SELECT * FROM memories WHERE status <> 'deleted'`)) {
           const memory = rowToMemory(row);
           const metadata = parseObject(row.metadata);
+          const quarantineReason = memoryQuarantineReason(`${memory.summary}\n${memory.content}`);
+          const quarantineEligible = ['pending', 'candidate', 'proposed', 'observed'].includes(memory.status);
+          if (quarantineReason && quarantineEligible) {
+            this.exec(
+              `UPDATE memories
+               SET status='quarantined', lifecycle_state='quarantined', disabled_at=COALESCE(disabled_at, datetime('now')),
+                   archived_at=COALESCE(archived_at, datetime('now')), review_reason=?, metadata=?, updated_at=datetime('now')
+               WHERE id=?`,
+              quarantineReason,
+              json({
+                ...metadata,
+                quarantine_reason: quarantineReason,
+                quarantined_by: MEMORY_PIPELINE_VERSION,
+                quarantined_at: nowIso(),
+              }),
+              memory.id,
+            );
+            this.exec(
+              `UPDATE memory_observations
+               SET status='quarantined', review_reason=COALESCE(NULLIF(review_reason, ''), ?),
+                   metadata=json_set(COALESCE(metadata, '{}'), '$.quarantine_reason', ?, '$.quarantined_by', ?)
+               WHERE memory_id=? AND status <> 'promoted'`,
+              quarantineReason,
+              quarantineReason,
+              MEMORY_PIPELINE_VERSION,
+              memory.id,
+            );
+            this.exec(`DELETE FROM memory_embeddings WHERE memory_id=?`, memory.id);
+            this.insertMemoryEvolutionEvent(memory.id, 'auto_quarantined', '', '', {
+              status: 'quarantined',
+              lifecycle_state: 'quarantined',
+              maintenance_id: maintenanceID,
+            }, quarantineReason);
+            quarantinedCount += 1;
+            continue;
+          }
           const layer = inferLegacyMemoryLayer(memory.type, { ...metadata, layer: memory.layer });
           const tags = memory.context_tags?.length ? memory.context_tags : inferMemoryContextTags(`${memory.summary} ${memory.content}`);
           const memoryKey = memory.memory_key || canonicalMemoryKey(memory.content, layer, memory.type, tags);
@@ -7262,14 +7310,15 @@ export class JoiSQLiteStore {
       });
       this.exec(
         `UPDATE memory_maintenance_runs
-         SET status='completed', processed_input_count=?, generated_observation_count=?, expired_count=?, merged_count=?, embedding_count=?,
+         SET status='completed', processed_input_count=?, generated_observation_count=?, expired_count=?, merged_count=?, quarantined_count=?, embedding_count=?,
              metadata=?, finished_at=datetime('now') WHERE id=?`,
         processedInputCount,
         generatedObservationCount,
         expiredCount,
         mergedCount,
+        quarantinedCount,
         embeddingCount,
-        json({ pipeline_version: MEMORY_PIPELINE_VERSION, physical_delete: false }),
+        json({ pipeline_version: MEMORY_PIPELINE_VERSION, physical_delete: false, quarantined_count: quarantinedCount }),
         maintenanceID,
       );
     } catch (error) {
@@ -7342,6 +7391,8 @@ export class JoiSQLiteStore {
     const content = input.content?.trim() || '';
     if (!content) throw new Error('memory candidate content is required');
     if (content.length > 20_000) throw new Error('memory candidate content exceeds 20000 characters');
+    const quarantineReason = memoryQuarantineReason(content);
+    if (quarantineReason) throw new Error(`memory candidate rejected: ${quarantineReason}`);
     const summary = (input.summary?.trim() || titleFromMessage(content)).slice(0, 500);
     const type = normalizeToolMemoryType(input.type);
     const scope = this.resolveMemoryRetrievalScope(req);
@@ -7429,6 +7480,7 @@ export class JoiSQLiteStore {
                   THEN 1 ELSE 0 END) AS stale_confirmed_count,
          SUM(CASE WHEN status='observed' THEN 1 ELSE 0 END) AS observed_count,
          SUM(CASE WHEN status IN ('archived','superseded') OR lifecycle_state IN ('archived','expired','superseded') THEN 1 ELSE 0 END) AS archived_count,
+         SUM(CASE WHEN status='quarantined' OR lifecycle_state='quarantined' THEN 1 ELSE 0 END) AS quarantined_count,
          MIN(CASE WHEN status IN ('pending','candidate','proposed','conflicted') THEN created_at END) AS oldest_candidate_at
        FROM memories`,
     );
@@ -7489,6 +7541,7 @@ export class JoiSQLiteStore {
       inferred_used_count: Number(usage?.inferred_used_count || 0),
       abstention_count: abstentionCount,
       archived_count: Number(status?.archived_count || 0),
+      quarantined_count: Number(status?.quarantined_count || 0),
       observed_count: Number(status?.observed_count || 0),
       embedding_count: embeddingCount,
       generation_queue_count: generationQueueCount,
@@ -9040,6 +9093,7 @@ export class JoiSQLiteStore {
         response,
         waiting_confirmation: false,
         tool_results: [toolResult],
+        runtime_status: 'completed',
       });
       if (productTaskID) {
         productTask = this.getProductTask(productTaskID).task;
@@ -9351,11 +9405,15 @@ export class JoiSQLiteStore {
     const rows = this.all(
       `SELECT r.id, r.conversation_id, r.status
        FROM runs r
-       WHERE r.status IN ('queued', 'running', 'cancelling', 'resuming', 'waiting_confirmation', 'needs_recovery')
-          OR EXISTS (
-            SELECT 1 FROM run_events e
-            WHERE e.run_id=r.id AND e.event_type='run.recovery_required'
-          )
+       WHERE EXISTS (
+         SELECT 1 FROM run_events e
+         WHERE e.run_id=r.id AND e.event_type='run.recovery_required'
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM run_events resolved
+         WHERE resolved.run_id=r.id
+           AND resolved.event_type IN ('run.recovery_completed', 'run.recovery_abandoned')
+       )
        ORDER BY datetime(r.created_at) DESC, r.id DESC
        LIMIT ?`,
       limit,
@@ -9365,16 +9423,459 @@ export class JoiSQLiteStore {
         const trace = this.getRunTrace(String(row.id));
         const latestRecovery = [...(trace.events || [])].reverse().find((event) => event.event_type === 'run.recovery_required');
         const payload = latestRecovery?.payload || {};
+        const completedSideEffects = Number(this.get(
+          `SELECT COUNT(*) AS count FROM tool_runs
+           WHERE run_id=? AND status='succeeded' AND side_effect_level NOT IN ('', 'none')`,
+          String(row.id),
+        )?.count || 0);
+        const productTaskID = this.productTaskIDForRun(String(row.id));
         return {
           run_id: String(row.id),
           conversation_id: optionalString(row.conversation_id),
           status: String(row.status || trace.status),
-          recovery_status: optionalString(payload.recovery_status) || (String(row.status) === 'waiting_confirmation' ? 'needs_user_decision' : 'runtime_lost'),
+          recovery_status: optionalString(payload.recovery_status) || (String(row.status) === 'waiting_confirmation' ? 'needs_user_decision' : 'recoverable'),
           reason: optionalString(payload.reason) || trace.terminal_reason || 'non-terminal run requires review',
+          safe_to_retry: completedSideEffects === 0,
+          completed_side_effect_count: completedSideEffects,
+          product_task_id: productTaskID || undefined,
           latest_event: latestRecovery,
           trace,
         };
       }),
+    };
+  }
+
+  beginRecoverableRunRetry(runID: string): {
+    run_id: string;
+    conversation_id: string;
+    original_message: string;
+    requested_mode: InputMode;
+    product_task_id?: string;
+    permission_profile: PermissionProfile;
+    completed_effects: Array<Record<string, unknown>>;
+  } {
+    const id = runID.trim();
+    if (!id) throw new Error('run_id is required');
+    const row = this.get(
+      `SELECT r.id, r.conversation_id, r.user_message_id, r.requested_mode, r.status,
+              m.content AS user_message
+       FROM runs r
+       LEFT JOIN messages m ON m.id=r.user_message_id
+       WHERE r.id=?`,
+      id,
+    );
+    if (!row) throw new Error(`Run not found: ${id}`);
+    const hasRecoveryEvent = Boolean(this.get(
+      `SELECT id FROM run_events WHERE run_id=? AND event_type='run.recovery_required' LIMIT 1`,
+      id,
+    ));
+    if (!hasRecoveryEvent || Boolean(this.get(
+      `SELECT id FROM run_events
+       WHERE run_id=? AND event_type IN ('run.recovery_completed','run.recovery_abandoned') LIMIT 1`,
+      id,
+    ))) {
+      throw new Error(`Run ${id} is not recoverable`);
+    }
+    const conversationID = optionalString(row.conversation_id) || '';
+    const originalMessage = optionalString(row.user_message) || '';
+    if (!conversationID || !originalMessage) throw new Error(`Run ${id} has no recoverable conversation input`);
+    const productTaskID = this.productTaskIDForRun(id);
+    const task = productTaskID ? this.get(`SELECT risk_level FROM product_tasks WHERE id=?`, productTaskID) : undefined;
+    const risk = (optionalString(task?.risk_level) || '').toLowerCase();
+    const permissionProfile: PermissionProfile = risk.includes('browser') || risk.includes('danger') || risk.includes('external')
+      ? 'danger_full_access'
+      : risk.includes('write') || risk.includes('state')
+        ? 'workspace_write'
+        : 'read_only';
+    const completedEffects = this.all(
+      `SELECT id, capability_id, tool_name, purpose, side_effect_level, idempotency_key,
+              output_summary, status, completed_at
+       FROM tool_runs
+       WHERE run_id=? AND status='succeeded' AND side_effect_level NOT IN ('', 'none')
+       ORDER BY datetime(created_at), id`,
+      id,
+    ).map((effect) => ({
+      id: optionalString(effect.id),
+      capability: optionalString(effect.capability_id) || optionalString(effect.tool_name),
+      purpose: optionalString(effect.purpose),
+      side_effect_level: optionalString(effect.side_effect_level),
+      idempotency_key: optionalString(effect.idempotency_key),
+      summary: optionalString(effect.output_summary),
+      completed_at: optionalString(effect.completed_at),
+    }));
+    const resumeToken = `resume_${newID()}`;
+    this.transaction(() => {
+      this.exec(
+        `UPDATE runs
+         SET status='resuming', terminal_status=NULL, finished_at=NULL, resume_token=?, resumed_at=datetime('now'),
+             error_code=NULL, error_message=NULL,
+             metadata=json_set(COALESCE(metadata, '{}'), '$.recovery.retry_started_at', datetime('now'))
+         WHERE id=?`,
+        resumeToken,
+        id,
+      );
+      this.appendRunEventV2({
+        id: `${id}_evt_recovery_retry_${resumeToken}`,
+        run_id: id,
+        event_type: 'run.recovery_retry_started',
+        status: 'resuming',
+        source: 'desktop',
+        visibility: 'inline_status',
+        payload: {
+          recovery_status: 'resuming',
+          resume_token: resumeToken,
+          completed_side_effect_count: completedEffects.length,
+        },
+      });
+    });
+    return {
+      run_id: id,
+      conversation_id: conversationID,
+      original_message: originalMessage,
+      requested_mode: normalizeAutomationInputMode(optionalString(row.requested_mode) || 'auto'),
+      product_task_id: productTaskID || undefined,
+      permission_profile: permissionProfile,
+      completed_effects: completedEffects,
+    };
+  }
+
+  completeRecoverableRunRetry(originalRunID: string, newRunID: string): RunTrace {
+    const originalID = originalRunID.trim();
+    const nextID = newRunID.trim();
+    if (!originalID || !nextID) throw new Error('original and new run ids are required');
+    this.transaction(() => {
+      this.exec(
+        `UPDATE runs
+         SET status='redirected', terminal_status='redirected', terminal_reason=?, finished_at=datetime('now'),
+             metadata=json_set(COALESCE(metadata, '{}'), '$.recovery.new_run_id', ?, '$.recovery.completed_at', datetime('now'))
+         WHERE id=?`,
+        `recovered as ${nextID}`,
+        nextID,
+        originalID,
+      );
+      this.appendRunEventV2({
+        id: `${originalID}_evt_recovery_completed_${nextID}`,
+        run_id: originalID,
+        event_type: 'run.recovery_completed',
+        status: 'redirected',
+        source: 'runtime',
+        visibility: 'inline_status',
+        terminal: true,
+        payload: { recovery_status: 'completed', new_run_id: nextID },
+      });
+    });
+    return this.getRunTrace(originalID);
+  }
+
+  failRecoverableRunRetry(originalRunID: string, error: string): RunTrace {
+    const id = originalRunID.trim();
+    const message = error.trim() || 'recovery retry failed';
+    this.transaction(() => {
+      this.exec(
+        `UPDATE runs
+         SET status='needs_recovery', terminal_status=NULL, finished_at=NULL,
+             error_code='recovery_retry_failed', error_message=?, terminal_reason=?
+         WHERE id=?`,
+        message,
+        message,
+        id,
+      );
+      this.appendRunEventV2({
+        id: `${id}_evt_recovery_retry_failed_${newID()}`,
+        run_id: id,
+        event_type: 'run.recovery_retry_failed',
+        status: 'needs_recovery',
+        source: 'runtime',
+        visibility: 'inline_status',
+        error: { code: 'recovery_retry_failed', message },
+        payload: { recovery_status: 'recoverable', reason: message },
+      });
+    });
+    return this.getRunTrace(id);
+  }
+
+  abandonRecoverableRun(runID: string, reason = 'abandoned by user'): RunTrace {
+    const id = runID.trim();
+    if (!id) throw new Error('run_id is required');
+    if (!this.get(`SELECT id FROM run_events WHERE run_id=? AND event_type='run.recovery_required' LIMIT 1`, id)) {
+      throw new Error(`Run ${id} is not recoverable`);
+    }
+    const productTaskID = this.productTaskIDForRun(id);
+    this.transaction(() => {
+      this.exec(
+        `UPDATE runs
+         SET status='cancelled', terminal_status='cancelled', terminal_reason=?, finished_at=datetime('now'),
+             metadata=json_set(COALESCE(metadata, '{}'), '$.recovery.abandoned_at', datetime('now'))
+         WHERE id=?`,
+        reason,
+        id,
+      );
+      this.exec(
+        `UPDATE confirmation_requests SET status='rejected', rejected_by='recovery_abandon', decision_reason=?, decided_at=datetime('now')
+         WHERE run_id=? AND status='pending'`,
+        reason,
+        id,
+      );
+      if (productTaskID) {
+        this.exec(
+          `UPDATE product_tasks
+           SET status='paused', terminal_status='cancelled', terminal_reason=?, summary=?, updated_at=datetime('now')
+           WHERE id=?`,
+          reason,
+          reason,
+          productTaskID,
+        );
+      }
+      this.appendRunEventV2({
+        id: `${id}_evt_recovery_abandoned`,
+        run_id: id,
+        event_type: 'run.recovery_abandoned',
+        status: 'cancelled',
+        source: 'desktop',
+        visibility: 'inline_status',
+        terminal: true,
+        payload: { recovery_status: 'abandoned', reason },
+      });
+    });
+    return this.getRunTrace(id);
+  }
+
+  recordWorkspaceChangeSetPrepared(
+    draft: WorkspaceChangeSetDraft,
+    context: { run_id?: string; product_task_id?: string } = {},
+  ): WorkspaceChangeSet {
+    const id = draft.id.trim();
+    if (!id) throw new Error('change set id is required');
+    if (draft.files.length === 0) throw new Error('change set must include at least one file');
+    const requestedRunID = context.run_id?.trim() || '';
+    const runID = requestedRunID && this.get(`SELECT id FROM runs WHERE id=?`, requestedRunID) ? requestedRunID : '';
+    const requestedTaskID = context.product_task_id?.trim() || (runID ? this.productTaskIDForRun(runID) : '');
+    const productTaskID = requestedTaskID && this.get(`SELECT id FROM product_tasks WHERE id=?`, requestedTaskID) ? requestedTaskID : '';
+    this.transaction(() => {
+      this.exec(
+        `INSERT INTO workspace_change_sets (
+           id, run_id, product_task_id, capability, status, permission_profile,
+           patch, reversible, error, metadata, created_at
+         ) VALUES (?, NULLIF(?, ''), NULLIF(?, ''), 'apply_patch', 'prepared', ?, ?, 1, '', ?, datetime('now'))`,
+        id,
+        runID,
+        productTaskID,
+        draft.permission_profile,
+        draft.patch,
+        json({ file_count: draft.files.length, source: 'workspace_exec' }),
+      );
+      for (const file of draft.files) {
+        this.exec(
+          `INSERT INTO workspace_change_set_files (
+             id, change_set_id, operation, path, mode, before_exists,
+             before_content_base64, after_content_base64, before_hash, after_hash,
+             bytes, lines, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+          `csfile_${newID()}`,
+          id,
+          file.operation,
+          file.path,
+          file.mode,
+          file.before_exists ? 1 : 0,
+          file.before_content_base64,
+          file.after_content_base64,
+          file.before_hash,
+          file.after_hash,
+          file.bytes,
+          file.lines,
+        );
+      }
+    });
+    return this.getWorkspaceChangeSet(id);
+  }
+
+  markWorkspaceChangeSetApplied(id: string): WorkspaceChangeSet {
+    const changeSetID = id.trim();
+    const current = this.getWorkspaceChangeSet(changeSetID);
+    if (current.status !== 'prepared') throw new Error(`ChangeSet ${changeSetID} is not prepared`);
+    this.exec(
+      `UPDATE workspace_change_sets
+       SET status='applied', applied_at=datetime('now'), error=''
+       WHERE id=? AND status='prepared'`,
+      changeSetID,
+    );
+    if (current.run_id) {
+      this.appendRunEventV2({
+        id: `${current.run_id}_evt_changeset_applied_${changeSetID}`,
+        run_id: current.run_id,
+        event_type: 'changeset.applied',
+        status: 'completed',
+        source: 'tool',
+        visibility: 'inline_status',
+        payload: {
+          change_set_id: changeSetID,
+          product_task_id: current.product_task_id || '',
+          changed_file_count: current.files.length,
+          reversible: true,
+        },
+      });
+    }
+    return this.getWorkspaceChangeSet(changeSetID);
+  }
+
+  markWorkspaceChangeSetFailed(id: string, error: string): WorkspaceChangeSet {
+    const changeSetID = id.trim();
+    if (!changeSetID) throw new Error('change set id is required');
+    const message = error.trim() || 'workspace patch failed';
+    this.exec(
+      `UPDATE workspace_change_sets
+       SET status='failed', error=?
+       WHERE id=? AND status IN ('prepared', 'applied')`,
+      message,
+      changeSetID,
+    );
+    return this.getWorkspaceChangeSet(changeSetID);
+  }
+
+  listWorkspaceChangeSets(filter: { run_id?: string; product_task_id?: string; limit?: number } = {}): { change_sets: WorkspaceChangeSet[] } {
+    const where: string[] = [];
+    const values: SQLiteValue[] = [];
+    if (filter.run_id?.trim()) {
+      where.push('run_id=?');
+      values.push(filter.run_id.trim());
+    }
+    if (filter.product_task_id?.trim()) {
+      where.push('product_task_id=?');
+      values.push(filter.product_task_id.trim());
+    }
+    const rows = this.all(
+      `SELECT * FROM workspace_change_sets
+       ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
+       ORDER BY datetime(created_at) DESC, rowid DESC
+       LIMIT ?`,
+      ...values,
+      clampLimit(Number(filter.limit || 50), 50),
+    );
+    return { change_sets: rows.map((row) => this.workspaceChangeSetFromRow(row)) };
+  }
+
+  getWorkspaceChangeSet(id: string): WorkspaceChangeSet {
+    const changeSetID = id.trim();
+    if (!changeSetID) throw new Error('change set id is required');
+    const row = this.get(`SELECT * FROM workspace_change_sets WHERE id=?`, changeSetID);
+    if (!row) throw new Error(`ChangeSet not found: ${changeSetID}`);
+    return this.workspaceChangeSetFromRow(row);
+  }
+
+  revertWorkspaceChangeSet(id: string, reason = 'reverted by user'): WorkspaceChangeSet {
+    const changeSetID = id.trim();
+    const changeSet = this.getWorkspaceChangeSet(changeSetID);
+    if (changeSet.status !== 'applied' || !changeSet.reversible) {
+      throw new Error(`ChangeSet ${changeSetID} is not safely reversible`);
+    }
+    const rows = this.all(
+      `SELECT * FROM workspace_change_set_files WHERE change_set_id=? ORDER BY rowid`,
+      changeSetID,
+    );
+    if (rows.length === 0) throw new Error(`ChangeSet ${changeSetID} has no file snapshots`);
+    const workspace = this.getWorkspaceSettings();
+    const allowedRoots = workspaceRealAndLogicalRoots(workspace.allowed_roots);
+    for (const row of rows) {
+      const filePath = resolve(optionalString(row.path) || '');
+      if (!allowedRoots.some((root) => pathWithinRoot(filePath, root))) {
+        throw new Error(`Safe revert blocked: ${filePath} is outside the current workspace`);
+      }
+      if (!existsSync(filePath) || lstatSync(filePath).isSymbolicLink()) {
+        throw new Error(`Safe revert blocked: ${filePath} is missing or is now a symbolic link`);
+      }
+      const realPath = realpathSync(filePath);
+      if (!allowedRoots.some((root) => pathWithinRoot(realPath, root))) {
+        throw new Error(`Safe revert blocked: ${filePath} resolves outside the current workspace`);
+      }
+      const currentHash = createHash('sha256').update(readFileSync(filePath)).digest('hex');
+      if (currentHash !== optionalString(row.after_hash)) {
+        throw new Error(`Safe revert blocked: ${filePath} changed after ChangeSet ${changeSetID}`);
+      }
+    }
+    const restored: SQLiteRow[] = [];
+    try {
+      for (const row of [...rows].reverse()) {
+        const filePath = resolve(optionalString(row.path) || '');
+        if (optionalString(row.operation) === 'add' && !Boolean(Number(row.before_exists || 0))) {
+          rmSync(filePath, { force: true });
+        } else {
+          writeChangeSetFileAtomic(
+            filePath,
+            Buffer.from(optionalString(row.before_content_base64) || '', 'base64'),
+            Number(row.mode || 0o644),
+          );
+        }
+        restored.push(row);
+      }
+    } catch (error) {
+      for (const row of [...restored].reverse()) {
+        try {
+          writeChangeSetFileAtomic(
+            resolve(optionalString(row.path) || ''),
+            Buffer.from(optionalString(row.after_content_base64) || '', 'base64'),
+            Number(row.mode || 0o644),
+          );
+        } catch {
+          // Preserve the original revert failure; the ChangeSet remains applied for a later repair.
+        }
+      }
+      throw error;
+    }
+    const row = this.get(`SELECT metadata FROM workspace_change_sets WHERE id=?`, changeSetID);
+    this.exec(
+      `UPDATE workspace_change_sets
+       SET status='reverted', reverted_at=datetime('now'), metadata=?
+       WHERE id=? AND status='applied'`,
+      json({ ...parseObject(row?.metadata), revert_reason: reason.trim() || 'reverted by user' }),
+      changeSetID,
+    );
+    if (changeSet.run_id) {
+      this.appendRunEventV2({
+        id: `${changeSet.run_id}_evt_changeset_reverted_${changeSetID}`,
+        run_id: changeSet.run_id,
+        event_type: 'changeset.reverted',
+        status: 'completed',
+        source: 'desktop',
+        visibility: 'inline_status',
+        payload: {
+          change_set_id: changeSetID,
+          product_task_id: changeSet.product_task_id || '',
+          changed_file_count: changeSet.files.length,
+          reason: reason.trim() || 'reverted by user',
+        },
+      });
+    }
+    return this.getWorkspaceChangeSet(changeSetID);
+  }
+
+  private workspaceChangeSetFromRow(row: SQLiteRow): WorkspaceChangeSet {
+    const id = optionalString(row.id) || '';
+    const files = this.all(
+      `SELECT id, operation, path, before_hash, after_hash, bytes, lines
+       FROM workspace_change_set_files WHERE change_set_id=? ORDER BY rowid`,
+      id,
+    ).map((file) => ({
+      id: optionalString(file.id) || '',
+      operation: optionalString(file.operation) || 'update',
+      path: optionalString(file.path) || '',
+      before_hash: optionalString(file.before_hash) || '',
+      after_hash: optionalString(file.after_hash) || '',
+      bytes: Number(file.bytes || 0),
+      lines: Number(file.lines || 0),
+    }));
+    return {
+      id,
+      run_id: optionalString(row.run_id),
+      product_task_id: optionalString(row.product_task_id),
+      status: optionalString(row.status) || 'prepared',
+      permission_profile: optionalString(row.permission_profile) || 'workspace_write',
+      patch: optionalString(row.patch) || '',
+      reversible: Boolean(Number(row.reversible ?? 0)),
+      error: optionalString(row.error),
+      files,
+      created_at: optionalString(row.created_at),
+      applied_at: optionalString(row.applied_at),
+      reverted_at: optionalString(row.reverted_at),
     };
   }
 
@@ -11219,6 +11720,7 @@ export class JoiSQLiteStore {
     response: string;
     waiting_confirmation: boolean;
     tool_results: PersistedToolResult[];
+    runtime_status?: string;
   }): ArtifactSummary[] {
     if (!productTaskID) return [];
     if (context.waiting_confirmation) {
@@ -11238,7 +11740,14 @@ export class JoiSQLiteStore {
     this.insertRunStep(context.run_id, 'task_verification_started', 'Task verification started', {}, { product_task_id: productTaskID });
     const artifact = this.createTaskArtifact(productTaskID, context);
     this.createBackgroundTaskFollowup(productTaskID, context);
-    const verification = verifyTaskCompletion(context.response, artifact, context.tool_results);
+    const taskMetadata = parseObject(this.get(`SELECT metadata FROM product_tasks WHERE id=?`, productTaskID)?.metadata);
+    const verification = verifyTaskCompletion(
+      context.response,
+      artifact,
+      context.tool_results,
+      taskContractFromMetadata(taskMetadata),
+      context.runtime_status || 'completed',
+    );
     const taskStatus = verification.status === 'passed' ? 'completed' : 'blocked';
     const progress = verification.status === 'passed' ? 100 : 85;
     const evidenceSummary = evidenceSummaryForTask(artifact, context.tool_results, verification);
@@ -11248,6 +11757,17 @@ export class JoiSQLiteStore {
        WHERE product_task_id=? AND status='running'`,
       productTaskID,
     );
+    if (artifact?.id) {
+      this.exec(
+        `UPDATE artifacts
+         SET metadata=json_set(COALESCE(metadata, '{}'), '$.verification', json(?), '$.verification_status', ?),
+             updated_at=datetime('now')
+         WHERE id=?`,
+        json(verification),
+        verification.status,
+        artifact.id,
+      );
+    }
     this.exec(
       `UPDATE product_task_steps
        SET status=?, summary=?, output=?, finished_at=datetime('now'), updated_at=datetime('now')
@@ -12069,6 +12589,11 @@ export class JoiSQLiteStore {
        FROM runs
        WHERE status IN ('queued', 'running', 'cancelling', 'resuming', 'waiting_confirmation')
           AND NOT EXISTS (
+            SELECT 1 FROM automation_runs
+            WHERE automation_runs.run_id = runs.id
+              AND automation_runs.status = 'running'
+          )
+          AND NOT EXISTS (
             SELECT 1 FROM run_events
             WHERE run_events.run_id = runs.id
               AND run_events.event_type = 'run.recovery_required'
@@ -12096,63 +12621,66 @@ export class JoiSQLiteStore {
           });
           continue;
         }
-        const reason = 'runtime state was lost after app restart';
+        const reason = 'App restarted before this run reached a safe terminal state';
+        const completedSideEffects = Number(this.get(
+          `SELECT COUNT(*) AS count FROM tool_runs
+           WHERE run_id=? AND status='succeeded' AND side_effect_level NOT IN ('', 'none')`,
+          runID,
+        )?.count || 0);
         this.exec(
           `UPDATE runs
-           SET status='failed', terminal_status='failed', terminal_reason=?,
-               error_code='runtime_lost_on_restart', error_message=?,
-               finished_at=COALESCE(finished_at, datetime('now')),
-               duration_ms=COALESCE(duration_ms, CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER))
+           SET status='needs_recovery', terminal_status=NULL, terminal_reason=?,
+               error_code='restart_recovery_required', error_message=?, finished_at=NULL,
+               metadata=json_set(COALESCE(metadata, '{}'), '$.recovery.detected_at', datetime('now'),
+                 '$.recovery.completed_side_effect_count', ?)
            WHERE id=?`,
           reason,
           reason,
+          completedSideEffects,
           runID,
         );
         this.exec(
           `UPDATE turns
-           SET status='failed', stream_status='failed',
-               finished_at=COALESCE(finished_at, datetime('now')),
-               completed_at=COALESCE(completed_at, datetime('now'))
+           SET status='interrupted', stream_status='interrupted',
+               finished_at=COALESCE(finished_at, datetime('now'))
            WHERE run_id=? AND status IN ('created', 'mode_resolved', 'prompting', 'running', 'streaming', 'tool_calling', 'waiting_tool')`,
           runID,
         );
         this.exec(
           `UPDATE model_calls
-           SET status='failed', completed_at=COALESCE(completed_at, datetime('now')),
-               finish_reason='runtime_lost_on_restart', usage_status=CASE WHEN usage_status='' THEN 'failed' ELSE usage_status END,
-               error_code='runtime_lost_on_restart', error_message=?
+           SET status='interrupted', completed_at=COALESCE(completed_at, datetime('now')),
+               finish_reason='restart_recovery_required',
+               error_code='restart_recovery_required', error_message=?
            WHERE run_id=? AND status IN ('pending', 'running')`,
           reason,
           runID,
         );
+        const productTaskID = this.productTaskIDForRun(runID);
+        if (productTaskID) {
+          this.exec(
+            `UPDATE product_tasks
+             SET status='paused', terminal_status=NULL, terminal_reason=?, summary=?,
+                 verification_status='pending', updated_at=datetime('now')
+             WHERE id=?`,
+            reason,
+            reason,
+            productTaskID,
+          );
+        }
         this.appendRunEventV2({
           id: `${runID}_evt_recovery_required`,
           run_id: runID,
           event_type: 'run.recovery_required',
           item_type: 'run',
           item_id: runID,
-          status: 'failed',
+          status: 'needs_recovery',
           source: 'store',
           visibility: 'inline_status',
           payload: {
-            recovery_status: 'runtime_lost',
+            recovery_status: 'recoverable',
             reason,
-          },
-        });
-        this.appendRunEventV2({
-          id: `${runID}_evt_recovery_failed`,
-          run_id: runID,
-          event_type: 'run.failed',
-          item_type: 'run',
-          item_id: runID,
-          status: 'failed',
-          source: 'store',
-          visibility: 'inline_status',
-          terminal: true,
-          error: { code: 'runtime_lost_on_restart', message: reason },
-          payload: {
-            recovery_status: 'runtime_lost',
-            reason,
+            safe_to_retry: completedSideEffects === 0,
+            completed_side_effect_count: completedSideEffects,
           },
         });
       }
@@ -12200,6 +12728,16 @@ export class JoiSQLiteStore {
           triggerID,
         );
         if (runID) {
+          this.exec(
+            `UPDATE runs
+             SET status='failed', terminal_status='failed', terminal_reason=?,
+                 error_code='runtime_lost_on_restart', error_message=?,
+                 finished_at=COALESCE(finished_at, datetime('now'))
+             WHERE id=? AND status IN ('queued','running','cancelling','resuming')`,
+            reason,
+            reason,
+            runID,
+          );
           this.appendAutomationRunEvent(runID, 'automation.run_failed', {
             automation_id: automationID,
             automation_name: automationName,
@@ -13934,10 +14472,45 @@ export class JoiSQLiteStore {
         metadata TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+      CREATE TABLE IF NOT EXISTS workspace_change_sets (
+        id TEXT PRIMARY KEY,
+        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+        product_task_id TEXT REFERENCES product_tasks(id) ON DELETE SET NULL,
+        capability TEXT NOT NULL DEFAULT 'apply_patch',
+        status TEXT NOT NULL DEFAULT 'prepared',
+        permission_profile TEXT NOT NULL DEFAULT 'workspace_write',
+        patch TEXT NOT NULL DEFAULT '',
+        reversible INTEGER NOT NULL DEFAULT 1,
+        error TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        applied_at TEXT,
+        reverted_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS workspace_change_set_files (
+        id TEXT PRIMARY KEY,
+        change_set_id TEXT NOT NULL REFERENCES workspace_change_sets(id) ON DELETE CASCADE,
+        operation TEXT NOT NULL,
+        path TEXT NOT NULL,
+        mode INTEGER NOT NULL DEFAULT 420,
+        before_exists INTEGER NOT NULL DEFAULT 0,
+        before_content_base64 TEXT NOT NULL DEFAULT '',
+        after_content_base64 TEXT NOT NULL DEFAULT '',
+        before_hash TEXT NOT NULL DEFAULT '',
+        after_hash TEXT NOT NULL DEFAULT '',
+        bytes INTEGER NOT NULL DEFAULT 0,
+        lines INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(change_set_id, path)
+      );
       CREATE INDEX IF NOT EXISTS idx_conversation_branches_parent
         ON conversation_branches(parent_conversation_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_conversation_compactions_conversation
         ON conversation_compactions(conversation_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_workspace_change_sets_run
+        ON workspace_change_sets(run_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_workspace_change_sets_task
+        ON workspace_change_sets(product_task_id, created_at DESC);
     `);
   }
 
@@ -15036,8 +15609,12 @@ export class JoiSQLiteStore {
        LEFT JOIN rooms r ON r.conversation_id=rn.conversation_id
        WHERE cr.status='pending'
        ORDER BY datetime(cr.created_at) DESC
-       LIMIT 5`,
+      LIMIT 5`,
     );
+    const recoverableRuns = this.listRecoverableRuns({ limit: 20 }).runs;
+    const activeTasks = this.listProductTasks({ status: 'active', limit: 20 }).tasks;
+    const openLoops = this.listOpenLoops({ status: 'open', limit: 20 }).open_loops;
+    const proactiveMessages = this.listProactiveMessages({ status: 'draft', limit: 20 }).messages;
     const artifactRows = this.all(
       `SELECT a.id, a.title, a.type, a.source_run_id, a.created_at, r.id AS room_id, r.title AS room_title
        FROM artifacts a
@@ -15123,6 +15700,53 @@ export class JoiSQLiteStore {
     )?.count ?? 0) : 0;
     const cursor = optionalString(this.get(`SELECT MAX(created_at) AS cursor FROM run_events`)?.cursor) || nowIso();
     const items: CheckpointSummary['items'] = [];
+    for (const recoverable of recoverableRuns.slice(0, 5)) {
+      items.push({
+        id: `chk_recovery_${recoverable.run_id}`,
+        kind: 'recovery_required',
+        title: '有中断任务等待你决定',
+        body: `${recoverable.reason}${recoverable.completed_side_effect_count ? ` · 已完成 ${recoverable.completed_side_effect_count} 个有副作用步骤` : ''}`,
+        severity: 'warning',
+        run_id: recoverable.run_id,
+        product_task_id: recoverable.product_task_id,
+        safe_to_retry: recoverable.safe_to_retry,
+      });
+    }
+    for (const task of activeTasks.slice(0, 5)) {
+      items.push({
+        id: `chk_task_${task.id}`,
+        kind: 'active_task',
+        title: task.title,
+        body: `${formatProductTaskStatusForCheckpoint(task.status)} · ${Math.max(0, Math.min(100, Math.round(task.progress_percent || 0)))}%${task.terminal_reason ? ` · ${task.terminal_reason}` : ''}`,
+        severity: ['blocked', 'waiting_confirmation'].includes(task.status) ? 'warning' : 'info',
+        run_id: task.latest_run_id || task.source_run_id,
+        product_task_id: task.id,
+      });
+    }
+    for (const loop of openLoops.slice(0, 5)) {
+      items.push({
+        id: `chk_open_loop_${loop.id}`,
+        kind: 'open_loop',
+        title: loop.topic,
+        body: loop.suggested_followup || loop.description,
+        severity: loop.priority === 'high' ? 'warning' : 'info',
+        run_id: loop.source_run_id,
+        product_task_id: loop.source_product_task_id,
+        open_loop_id: loop.id,
+      });
+    }
+    for (const message of proactiveMessages.slice(0, 5)) {
+      items.push({
+        id: `chk_proactive_${message.id}`,
+        kind: 'proactive_message',
+        title: message.title,
+        body: message.body,
+        severity: 'info',
+        product_task_id: message.source_product_task_id,
+        open_loop_id: message.source_open_loop_id,
+        proactive_message_id: message.id,
+      });
+    }
     for (const row of completedRows) {
       const label = optionalString(row.persona_name) || optionalString(row.project_name) || optionalString(row.room_title) || 'Joi';
       items.push({
@@ -15164,6 +15788,7 @@ export class JoiSQLiteStore {
         severity: 'warning',
         room_id: optionalString(row.room_id),
         run_id: optionalString(row.run_id),
+        approval_id: optionalString(row.id),
       });
     }
     if (pendingApprovals > 0) {
@@ -15190,6 +15815,7 @@ export class JoiSQLiteStore {
         severity: 'info',
         room_id: optionalString(row.room_id),
         run_id: optionalString(row.source_run_id),
+        artifact_id: optionalString(row.id),
       });
     }
     if (artifacts > 0) {
@@ -15219,7 +15845,11 @@ export class JoiSQLiteStore {
       completed_count: completedRuns,
       failed_count: failedRuns,
       pending_approval_count: pendingApprovals,
-      waiting_user_count: waitingRuns + pendingApprovals,
+      recoverable_count: recoverableRuns.length,
+      active_task_count: activeTasks.length,
+      open_loop_count: openLoops.length,
+      proactive_message_count: proactiveMessages.length,
+      waiting_user_count: waitingRuns + pendingApprovals + recoverableRuns.length,
       new_artifact_count: artifacts,
       no_progress_project_count: noProgressProjects,
       model_cost_estimate: Math.round(cost * 1000000) / 1000000,
@@ -16643,6 +17273,7 @@ function rowToPersonaConstitution(row: SQLiteRow): PersonaConstitutionRecord {
 }
 
 function rowToMemoryMaintenance(row: SQLiteRow): MemoryMaintenanceRun {
+  const metadata = parseObject(row.metadata);
   return {
     id: optionalString(row.id) || '',
     status: optionalString(row.status) || 'unknown',
@@ -16652,8 +17283,9 @@ function rowToMemoryMaintenance(row: SQLiteRow): MemoryMaintenanceRun {
     expired_count: Number(row.expired_count || 0),
     merged_count: Number(row.merged_count || 0),
     embedding_count: Number(row.embedding_count || 0),
+    quarantined_count: Number(row.quarantined_count ?? metadata.quarantined_count ?? 0),
     error_summary: optionalString(row.error_summary),
-    metadata: parseObject(row.metadata),
+    metadata,
     started_at: optionalString(row.started_at),
     finished_at: optionalString(row.finished_at),
   };
@@ -17744,7 +18376,10 @@ function buildTaskContract(req: ChatRequest, message: string, mode: InputMode): 
 
 function inferDeliverables(message: string, mode: InputMode): string[] {
   if (/报告|分析|总结|plan|report|summary/i.test(message)) return ['report'];
-  if (/代码|修改|实现|patch|diff|test/i.test(message)) return ['code_patch', 'test_result'];
+  const engineeringDeliverables: string[] = [];
+  if (/代码|修改|实现|修复|patch|diff|code|implement|fix/i.test(message)) engineeringDeliverables.push('code_patch');
+  if (/测试|验证|核验|test|verify|verification/i.test(message)) engineeringDeliverables.push('test_result');
+  if (engineeringDeliverables.length > 0) return [...new Set(engineeringDeliverables)];
   if (mode === 'background_task') return ['open_loop', 'status_update'];
   return ['task_result'];
 }
@@ -17788,14 +18423,46 @@ function failedTaskVerification(summary: string): TaskVerification {
   };
 }
 
-function verifyTaskCompletion(response: string, artifact: ArtifactSummary | undefined, toolResults: PersistedToolResult[]): TaskVerification {
+function verifyTaskCompletion(
+  response: string,
+  artifact: ArtifactSummary | undefined,
+  toolResults: PersistedToolResult[],
+  contract?: TaskContract,
+  runtimeStatus = 'completed',
+): TaskVerification {
   const failedToolResults = toolResults.filter(toolResultFailed);
   const responseDisclosesLimitations = responseDisclosesToolLimitations(response);
   const disclosedToolFailures = failedToolResults.filter((result) => (
     readOnlyWebToolFailureMayDegrade(result) && responseDisclosesLimitations
   ));
   const unacknowledgedToolFailures = failedToolResults.filter((result) => !disclosedToolFailures.includes(result));
+  const normalizedRuntimeStatus = runtimeStatus.trim().toLowerCase() || 'completed';
+  const successfulTools = toolResults.filter((result) => !toolResultFailed(result) && !isWaitingConfirmationToolResult(result));
+  const successfulToolNames = successfulTools.map((result) => canonicalCapabilityName(result.name));
+  const deliverables = new Set(contract?.deliverables || []);
+  const requiresCodePatch = deliverables.has('code_patch');
+  const requiresTestResult = deliverables.has('test_result');
+  const hasCodePatch = successfulToolNames.some((name) => ['apply_patch', 'lsp_rename', 'lsp_format'].includes(name));
+  const hasPassingTest = successfulTools.some((result) => (
+    canonicalCapabilityName(result.name) === 'test_command'
+    && ['succeeded', 'passed', 'completed'].includes((optionalString(result.output?.test_status || result.output?.status) || '').toLowerCase())
+    && Number(result.output?.exit_code ?? 0) === 0
+  ));
+  const requirementEvidence = {
+    required_deliverables: [...deliverables],
+    code_patch_required: requiresCodePatch,
+    code_patch_present: hasCodePatch,
+    test_result_required: requiresTestResult,
+    passing_test_present: hasPassingTest,
+    successful_tools: successfulToolNames,
+  };
+  const contractRequirementsPassed = (!requiresCodePatch || hasCodePatch) && (!requiresTestResult || hasPassingTest);
   const checks: TaskVerification['checks'] = [
+    {
+      name: 'runtime_reached_safe_terminal_state',
+      status: ['completed', 'succeeded', 'stop'].includes(normalizedRuntimeStatus) ? 'passed' : 'failed',
+      evidence: { runtime_status: normalizedRuntimeStatus },
+    },
     {
       name: 'artifact_or_state_evidence',
       status: artifact ? 'passed' : 'failed',
@@ -17817,6 +18484,11 @@ function verifyTaskCompletion(response: string, artifact: ArtifactSummary | unde
         failed_tools: failedToolResults.map((result) => result.name).slice(0, 20),
         unacknowledged_tools: unacknowledgedToolFailures.map((result) => result.name).slice(0, 20),
       },
+    },
+    {
+      name: 'task_contract_requirements',
+      status: contractRequirementsPassed ? 'passed' : 'failed',
+      evidence: requirementEvidence,
     },
   ];
   const passed = checks.every((check) => check.status === 'passed');
@@ -19134,6 +19806,18 @@ function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function formatProductTaskStatusForCheckpoint(status: string): string {
+  switch (status) {
+    case 'planning': return '待开始';
+    case 'running': return '执行中';
+    case 'waiting_confirmation': return '等待确认';
+    case 'paused': return '已暂停';
+    case 'verifying': return '核对中';
+    case 'blocked': return '受阻';
+    default: return status || '进行中';
+  }
+}
+
 function parseObject(value: unknown): Record<string, unknown> {
   if (value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Uint8Array)) {
     const keys = Object.keys(value as Record<string, unknown>);
@@ -19442,6 +20126,33 @@ function normalizeRoot(root: string): string {
 function pathWithinRoot(path: string, root: string): boolean {
   const rel = relative(root, path);
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+function workspaceRealAndLogicalRoots(roots: string[]): string[] {
+  const resolvedRoots = new Set<string>();
+  for (const root of roots) {
+    const logicalRoot = resolve(root);
+    resolvedRoots.add(logicalRoot);
+    try {
+      resolvedRoots.add(realpathSync(logicalRoot));
+    } catch {
+      // Keep the logical boundary when a configured root is temporarily unavailable.
+    }
+  }
+  return [...resolvedRoots];
+}
+
+function writeChangeSetFileAtomic(path: string, content: Buffer, mode: number): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tempPath = join(dirname(path), `.${newID()}.joi-revert.tmp`);
+  try {
+    writeFileSync(tempPath, content);
+    chmodSync(tempPath, mode & 0o777);
+    renameSync(tempPath, path);
+  } catch (error) {
+    rmSync(tempPath, { force: true });
+    throw error;
+  }
 }
 
 function escapeLike(value: string): string {

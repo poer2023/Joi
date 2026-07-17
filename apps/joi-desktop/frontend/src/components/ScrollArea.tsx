@@ -10,6 +10,7 @@ type ScrollAreaProps = HTMLAttributes<HTMLElement> & {
   axes?: ScrollAreaAxes;
   children: ReactNode;
   contentClassName?: string;
+  resetScrollKey?: string | number;
   stickToBottom?: boolean;
   stickToBottomKey?: string | number;
   trackVisibility?: ScrollAreaTrackVisibility;
@@ -31,6 +32,24 @@ type ScrollMetrics = {
   thumbWidth: number;
 };
 
+const INITIAL_SCROLL_METRICS: ScrollMetrics = {
+  canScrollX: false,
+  canScrollY: false,
+  thumbHeight: MIN_THUMB_HEIGHT,
+  thumbLeft: TRACK_INSET,
+  thumbTop: TRACK_INSET,
+  thumbWidth: MIN_THUMB_WIDTH,
+};
+
+function scrollMetricsEqual(current: ScrollMetrics, next: ScrollMetrics) {
+  return current.canScrollX === next.canScrollX
+    && current.canScrollY === next.canScrollY
+    && current.thumbHeight === next.thumbHeight
+    && current.thumbLeft === next.thumbLeft
+    && current.thumbTop === next.thumbTop
+    && current.thumbWidth === next.thumbWidth;
+}
+
 type ScrollDrag = {
   axis: 'x' | 'y';
   maxPosition: number;
@@ -45,6 +64,7 @@ export function ScrollArea({
   children,
   className = '',
   contentClassName = '',
+  resetScrollKey,
   stickToBottom = false,
   stickToBottomKey,
   trackVisibility = 'hover',
@@ -55,18 +75,14 @@ export function ScrollArea({
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<ScrollDrag | null>(null);
+  const metricsFrameRef = useRef<number | null>(null);
+  const pendingScrollToBottomRef = useRef(false);
+  const previousResetScrollKeyRef = useRef(resetScrollKey);
   const programmaticScrollRef = useRef(false);
   const shouldStickToBottomRef = useRef(true);
   const [hovering, setHovering] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const [metrics, setMetrics] = useState<ScrollMetrics>({
-    canScrollX: false,
-    canScrollY: false,
-    thumbHeight: MIN_THUMB_HEIGHT,
-    thumbLeft: TRACK_INSET,
-    thumbTop: TRACK_INSET,
-    thumbWidth: MIN_THUMB_WIDTH,
-  });
+  const [metrics, setMetrics] = useState<ScrollMetrics>(INITIAL_SCROLL_METRICS);
 
   const updateMetrics = useCallback(() => {
     const viewport = viewportRef.current;
@@ -94,27 +110,52 @@ export function ScrollArea({
     const maxScrollLeft = Math.max(1, scrollWidth - clientWidth);
     const thumbLeft = canScrollX ? TRACK_INSET + (scrollLeft / maxScrollLeft) * maxLeft : TRACK_INSET;
 
-    setMetrics({ canScrollX, canScrollY, thumbHeight, thumbLeft, thumbTop, thumbWidth });
+    const nextMetrics = { canScrollX, canScrollY, thumbHeight, thumbLeft, thumbTop, thumbWidth };
+    setMetrics((current) => scrollMetricsEqual(current, nextMetrics) ? current : nextMetrics);
   }, [axes, stickToBottom]);
 
-  const scrollToBottom = useCallback(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    programmaticScrollRef.current = true;
-    viewport.scrollTop = viewport.scrollHeight;
-    requestAnimationFrame(() => {
-      programmaticScrollRef.current = false;
-      updateMetrics();
+  const updateMetricsRef = useRef(updateMetrics);
+  updateMetricsRef.current = updateMetrics;
+
+  const cancelScheduledMetricsUpdate = useCallback(() => {
+    if (metricsFrameRef.current !== null) {
+      window.cancelAnimationFrame(metricsFrameRef.current);
+      metricsFrameRef.current = null;
+    }
+    pendingScrollToBottomRef.current = false;
+    programmaticScrollRef.current = false;
+  }, []);
+
+  const scheduleMetricsUpdate = useCallback((scrollToBottom = false) => {
+    if (scrollToBottom) pendingScrollToBottomRef.current = true;
+    if (metricsFrameRef.current !== null) return;
+
+    metricsFrameRef.current = window.requestAnimationFrame(() => {
+      metricsFrameRef.current = null;
+      const shouldScrollToBottom = pendingScrollToBottomRef.current;
+      pendingScrollToBottomRef.current = false;
+      const viewport = viewportRef.current;
+
+      if (shouldScrollToBottom && viewport) {
+        programmaticScrollRef.current = true;
+        viewport.scrollTop = viewport.scrollHeight;
+      }
+
+      try {
+        updateMetricsRef.current();
+      } finally {
+        programmaticScrollRef.current = false;
+      }
     });
-  }, [updateMetrics]);
+  }, []);
 
   useEffect(() => {
     const refreshMetrics = () => {
       if (stickToBottom && shouldStickToBottomRef.current) {
-        requestAnimationFrame(scrollToBottom);
+        scheduleMetricsUpdate(true);
         return;
       }
-      updateMetrics();
+      scheduleMetricsUpdate();
     };
 
     refreshMetrics();
@@ -129,13 +170,33 @@ export function ScrollArea({
       resizeObserver.disconnect();
       window.removeEventListener('resize', refreshMetrics);
     };
-  }, [scrollToBottom, stickToBottom, updateMetrics]);
+  }, [scheduleMetricsUpdate, stickToBottom]);
 
   useEffect(() => {
     if (!stickToBottom) return;
     shouldStickToBottomRef.current = true;
-    requestAnimationFrame(scrollToBottom);
-  }, [scrollToBottom, stickToBottom, stickToBottomKey]);
+    scheduleMetricsUpdate(true);
+  }, [scheduleMetricsUpdate, stickToBottom, stickToBottomKey]);
+
+  useEffect(() => {
+    if (Object.is(previousResetScrollKeyRef.current, resetScrollKey)) return;
+    previousResetScrollKeyRef.current = resetScrollKey;
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    cancelScheduledMetricsUpdate();
+    shouldStickToBottomRef.current = false;
+    programmaticScrollRef.current = true;
+    try {
+      viewport.scrollTop = 0;
+      viewport.scrollLeft = 0;
+    } finally {
+      programmaticScrollRef.current = false;
+    }
+    scheduleMetricsUpdate();
+  }, [cancelScheduledMetricsUpdate, resetScrollKey, scheduleMetricsUpdate]);
+
+  useEffect(() => () => cancelScheduledMetricsUpdate(), [cancelScheduledMetricsUpdate]);
 
   function startThumbDrag(event: ReactPointerEvent<HTMLDivElement>, axis: 'x' | 'y') {
     const viewport = viewportRef.current;
@@ -192,6 +253,16 @@ export function ScrollArea({
     else viewport.scrollLeft = ratio * Math.max(1, viewport.scrollWidth - viewport.clientWidth);
   }
 
+  function handleViewportScroll() {
+    const viewport = viewportRef.current;
+    if (stickToBottom && viewport && !programmaticScrollRef.current) {
+      const shouldStick = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 80;
+      shouldStickToBottomRef.current = shouldStick;
+      if (!shouldStick) pendingScrollToBottomRef.current = false;
+    }
+    scheduleMetricsUpdate();
+  }
+
   const canScroll = metrics.canScrollX || metrics.canScrollY;
   const rootClassName = [
     'scroll-area',
@@ -210,7 +281,7 @@ export function ScrollArea({
         ref={viewportRef}
         aria-label={viewportAriaLabel}
         className="scroll-area-viewport"
-        onScroll={updateMetrics}
+        onScroll={handleViewportScroll}
         tabIndex={viewportTabIndex}
       >
         <div ref={contentRef} className={`scroll-area-content ${contentClassName}`.trim()}>

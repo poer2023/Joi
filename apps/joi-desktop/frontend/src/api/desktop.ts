@@ -108,6 +108,8 @@ import {
   type RecordExternalConnectorInboundRequest,
   type RecordExternalConnectorOutboundRequest,
   type RecordNotificationOpenedRequest,
+  type RecoverableRunActionRequest,
+  type RecoverableRunActionResponse,
   type RecoverableRunRecord,
   type RedirectRunRequest,
   type RedirectRunResponse,
@@ -142,6 +144,7 @@ import {
   type UpdateMessengerRoomRequest,
   type UpdateProjectPersonaRequest,
   type WorkerGatewayAuditRecord,
+  type WorkspaceChangeSet,
   type WorkspaceSettings,
   type BrowserWorkbenchRequest,
   type BrowserWorkbenchResult,
@@ -253,6 +256,8 @@ export type {
   RecordExternalConnectorInboundRequest,
   RecordExternalConnectorOutboundRequest,
   RecoverableRunRecord,
+  RecoverableRunActionRequest,
+  RecoverableRunActionResponse,
   RedirectRunRequest,
   RedirectRunResponse,
   RollbackProjectPersonaRequest,
@@ -286,6 +291,7 @@ export type {
   UpdateMessengerRoomRequest,
   UpdateProjectPersonaRequest,
   WorkerGatewayAuditRecord,
+  WorkspaceChangeSet,
   WorkspaceSettings,
 } from '../../../../../packages/shared-types/src/desktop-api';
 
@@ -1324,6 +1330,10 @@ function createPreviewMessengerSnapshot(now = previewIso()): PersonaMessengerSna
       completed_count: 4,
       failed_count: 1,
       pending_approval_count: 1,
+      recoverable_count: 0,
+      active_task_count: 1,
+      open_loop_count: 1,
+      proactive_message_count: 1,
       waiting_user_count: 1,
       new_artifact_count: previewProjectSpecs.length,
       no_progress_project_count: 0,
@@ -2101,7 +2111,7 @@ function bindings(): DesktopBindings {
             generate_memories: true,
             disable_on_external_context: true,
             background_idle_seconds: 300,
-            pipeline_version: 'memory_os_v3_codex_alma',
+            pipeline_version: 'memory_os_v4_hygiene',
           },
           constitution: {
             id: 'constitution_joi_v2',
@@ -2160,7 +2170,7 @@ function bindings(): DesktopBindings {
           generate_memories: payload.generate_memories ?? true,
           disable_on_external_context: payload.disable_on_external_context ?? true,
           background_idle_seconds: payload.background_idle_seconds ?? 300,
-          pipeline_version: 'memory_os_v3_codex_alma',
+          pipeline_version: 'memory_os_v4_hygiene',
         };
       },
       async RunMemoryMaintenance(): Promise<{ run: MemoryMaintenanceRun }> {
@@ -2396,6 +2406,33 @@ function bindings(): DesktopBindings {
       },
       async ListRecoverableRuns() {
         return { runs: [] };
+      },
+      async ResolveRecoverableRun(req) {
+        return {
+          action: req.action,
+          original_run_id: req.run_id,
+          trace: {
+            id: req.run_id,
+            status: req.action === 'abandon' ? 'cancelled' : 'redirected',
+            selected_agent_id: 'general_agent',
+            events: [],
+            steps: [],
+          },
+        };
+      },
+      async ListWorkspaceChangeSets() {
+        return { change_sets: [] };
+      },
+      async RevertWorkspaceChangeSet(req) {
+        return {
+          id: req.id,
+          status: 'reverted',
+          permission_profile: 'workspace_write',
+          patch: '',
+          reversible: true,
+          files: [],
+          reverted_at: new Date().toISOString(),
+        };
       },
       async ListBackups() {
         return { backups: [] };
@@ -2766,6 +2803,9 @@ export const desktopApi = {
   listRunMessages: (req: { run_id: string; status?: string }) => bindings().ListRunMessages(req),
   cancelRunMessage: (req: { id: string; run_id?: string }) => bindings().CancelRunMessage(req),
   listRecoverableRuns: (req: { limit?: number } = {}) => bindings().ListRecoverableRuns(req),
+  resolveRecoverableRun: (req: RecoverableRunActionRequest): Promise<RecoverableRunActionResponse> => bindings().ResolveRecoverableRun(req),
+  listWorkspaceChangeSets: (req: { run_id?: string; product_task_id?: string; limit?: number } = {}) => bindings().ListWorkspaceChangeSets(req),
+  revertWorkspaceChangeSet: (req: { id: string; reason?: string }): Promise<WorkspaceChangeSet> => bindings().RevertWorkspaceChangeSet(req),
   listBackups: () => bindings().ListBackups(),
   createBackup: () => bindings().CreateBackup(),
   restoreBackup: (path: string) => bindings().RestoreBackup(path),

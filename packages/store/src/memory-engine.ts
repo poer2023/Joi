@@ -55,7 +55,7 @@ export type MemoryPolicyConfig = {
   physical_delete_automatic: boolean;
 };
 
-export const MEMORY_PIPELINE_VERSION = 'memory_os_v3_codex_alma';
+export const MEMORY_PIPELINE_VERSION = 'memory_os_v4_hygiene';
 export const LOCAL_MEMORY_EMBEDDING_MODEL = 'joi-local-feature-v1';
 
 export const DEFAULT_MEMORY_POLICY: MemoryPolicyConfig = {
@@ -86,12 +86,22 @@ const SESSION_ONLY_MARKERS = /(?:仅本轮|只在本轮|这次|本次|这一轮|
 const DO_NOT_STORE_MARKERS = /(?:不要记住|别记住|不要写入(?:长期)?记忆|不要保存|do not remember|don't remember)/iu;
 const SECRET_MARKERS = /(?:密码|验证码|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|private[_ -]?key|client[_ -]?secret|secret)/iu;
 const SENSITIVE_INFERENCE_MARKERS = /(?:身份证|护照|银行卡|住址|家庭地址|精确位置|病史|疾病|诊断|药物|收入|工资|资产|债务|政治立场|宗教|性取向|婚姻|怀孕|medical|diagnosis|salary|income|politic|religion|sexual)/iu;
+const OPERATIONAL_INSTRUCTION_MARKERS = /(?:^|[\s【\[(（])T\d{1,3}(?:[\s:：】\])）]|$)|joi-tool-stress|does-not-exist|max_results|tool_search\s*(?:返回|result)|(?:持久终端|能力可见性|故障恢复)\s*(?:真并行)?测试|(?:请|先|必须).{0,24}(?:实际调用|调用工具).{0,160}(?:按调用顺序|最终(?:输出|回复)|只回复|不要解释|session[_\s-]?id)/iu;
+
+export function memoryQuarantineReason(message: string): string {
+  const text = normalizeWhitespace(message);
+  if (!text) return '';
+  if (DO_NOT_STORE_MARKERS.test(text)) return 'user_requested_no_memory';
+  if (SECRET_MARKERS.test(text)) return 'secret_content';
+  if (OPERATIONAL_INSTRUCTION_MARKERS.test(text)) return 'operational_instruction';
+  return '';
+}
 
 export function memoryGenerationExclusionReason(message: string): string {
   const text = normalizeWhitespace(message);
   if (!text) return 'empty_input';
-  if (DO_NOT_STORE_MARKERS.test(text)) return 'user_requested_no_memory';
-  if (SECRET_MARKERS.test(text)) return 'secret_content';
+  const quarantineReason = memoryQuarantineReason(text);
+  if (quarantineReason) return quarantineReason;
   if (SESSION_ONLY_MARKERS.test(text) && !DURABLE_MARKERS.test(text) && !CORRECTION_MARKERS.test(text)) return 'session_only';
   if (isInterrogativeMemoryPrompt(text)) return 'interrogative_prompt';
   return '';
@@ -191,7 +201,7 @@ export function createTaskEpisodeObservation(input: {
 }): MemoryObservationDraft | null {
   const request = normalizeWhitespace(input.request).slice(0, 500);
   const outcome = normalizeWhitespace(input.outcome).slice(0, 700);
-  if (!request || !outcome || SECRET_MARKERS.test(`${request} ${outcome}`) || DO_NOT_STORE_MARKERS.test(request)) return null;
+  if (!request || !outcome || memoryQuarantineReason(`${request}\n${outcome}`)) return null;
   const statement = `任务：${request}\n结果：${outcome}`;
   const contextTags = [...new Set(['task', ...inferMemoryContextTags(`${request} ${outcome}`)])];
   const now = input.now || new Date();

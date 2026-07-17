@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const root = process.cwd();
 const outDir = mkdtempSync(join(tmpdir(), 'joi-task-mini-list-'));
+const esbuildBin = [
+  join(root, '..', '..', '..', 'node_modules', '.pnpm', 'node_modules', '.bin', 'esbuild'),
+  join(root, 'node_modules', '.bin', 'esbuild'),
+].find((candidate) => existsSync(candidate)) || 'node_modules/.bin/esbuild';
 
 try {
   const entry = join(outDir, 'entry.ts');
@@ -14,7 +18,7 @@ try {
   writeFileSync(entry, `
     export { visibleRecentTasksForHandoff } from '${root}/src/productTasks.ts';
   `);
-  execFileSync('node_modules/.bin/esbuild', [
+  execFileSync(esbuildBin, [
     entry,
     '--bundle',
     '--format=esm',
@@ -71,6 +75,13 @@ try {
   {
     assert.deepEqual(visibleRecentTasksForHandoff([task('telegram_done', 'completed', 'telegram')], 1).map((item) => item.id), ['telegram_done']);
     assert.deepEqual(visibleRecentTasksForHandoff([task('desktop_done', 'completed', 'desktop')]), []);
+  }
+
+  {
+    const appSource = readFileSync(join(root, 'src', 'App.tsx'), 'utf8');
+    assert.match(appSource, /\{activeTaskDetail \? \(\s*<TaskExecutionPanel/);
+    assert.match(appSource, /setRightPanelPreference\('expanded'\)/);
+    assert.doesNotMatch(appSource, /const showInlineTaskCard = false/);
   }
 } finally {
   rmSync(outDir, { recursive: true, force: true });

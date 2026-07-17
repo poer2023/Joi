@@ -22,6 +22,13 @@ try {
     export { getEventVisibility } from '${root}/src/features/chat/eventVisibility.ts';
     export { buildConversationRenderItems } from '${root}/src/features/chat/conversationProjector.ts';
     export { messagesForConversationHydration, shouldRestoreThreadMessages } from '${root}/src/features/chat/conversationHydration.ts';
+    export {
+      NEW_CONVERSATION_SUBMISSION_KEY,
+      executionEventIsVisible,
+      shouldQueueConversationSubmission,
+      submissionKeyForConversation,
+      withSubmissionActive,
+    } from '${root}/src/features/chat/submissionRegistry.ts';
     import React from '${root}/node_modules/react/index.js';
     import { renderToStaticMarkup } from '${root}/node_modules/react-dom/server.node.js';
     import { MarkdownContent } from '${root}/src/features/chat/components/MarkdownContent.tsx';
@@ -50,9 +57,38 @@ try {
     buildConversationRenderItems,
     messagesForConversationHydration,
     shouldRestoreThreadMessages,
+    NEW_CONVERSATION_SUBMISSION_KEY,
+    executionEventIsVisible,
+    shouldQueueConversationSubmission,
+    submissionKeyForConversation,
+    withSubmissionActive,
     renderMarkdownContent,
     renderMessageList,
   } = await import(pathToFileURL(bundle).href);
+
+  {
+    let active = new Set();
+    active = withSubmissionActive(active, submissionKeyForConversation('conv_a'), true);
+    assert.equal(shouldQueueConversationSubmission(active, 'conv_a'), true);
+    assert.equal(shouldQueueConversationSubmission(active, 'conv_b'), false);
+    assert.equal(executionEventIsVisible({
+      eventConversationID: 'conv_a',
+      currentConversationID: 'conv_b',
+      activeSubmissionKeys: active,
+    }), false);
+
+    active = withSubmissionActive(active, NEW_CONVERSATION_SUBMISSION_KEY, true);
+    assert.equal(executionEventIsVisible({
+      eventConversationID: 'conv_a',
+      currentConversationID: '',
+      activeSubmissionKeys: active,
+    }), false);
+    assert.equal(executionEventIsVisible({
+      eventConversationID: 'conv_new',
+      currentConversationID: '',
+      activeSubmissionKeys: active,
+    }), true);
+  }
 
   const event = (event_type, payload = {}, extra = {}) => normalizeRunEvent({
     id: `${event_type}-${payload.seq || payload.call_id || payload.item_id || payload.task_id || Math.random()}`,
@@ -1136,11 +1172,88 @@ try {
       mode: 'auto',
     });
     const semanticLines = semanticResult.items.filter((item) => item.type === 'transcript_line');
-    assert.deepEqual(semanticLines.map((item) => item.label), ['能力已就绪', '结果已核对']);
-    assert.deepEqual(semanticLines.map((item) => item.detail), ['已准备 14 项 Joi 能力', '执行完成 · 5 项成功，1 项失败']);
+    assert.deepEqual(semanticLines, []);
     const semanticMarkup = renderMessageList(semanticResult.items);
-    assert.match(semanticMarkup, /能力已就绪 · 已准备 14 项 Joi 能力/);
-    assert.match(semanticMarkup, /结果已核对 · 执行完成 · 5 项成功，1 项失败/);
+    assert.doesNotMatch(semanticMarkup, /能力已就绪|结果已核对|已思考/);
+  }
+
+  {
+    const toolResult = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('work_summary.updated', {
+            item_type: 'work_summary',
+            item_id: 'run_1:prepared',
+            phase: 'prepared',
+            summary: '已准备 14 项 Joi 能力',
+            user_visible: true,
+            status: 'completed',
+            step: 0,
+            seq: 1,
+          }, { visibility: 'transcript' }),
+          event('tool.completed', {
+            item_type: 'tool_run',
+            item_id: 'read_ok',
+            tool_name: 'file_read',
+            status: 'completed',
+            seq: 2,
+          }, { visibility: 'transcript' }),
+          event('work_summary.updated', {
+            item_type: 'work_summary',
+            item_id: 'run_1:verified',
+            phase: 'verified',
+            summary: '执行完成 · 1 项成功',
+            user_visible: true,
+            status: 'completed',
+            step: 1,
+            seq: 3,
+          }, { visibility: 'transcript' }),
+          event('assistant.completed', { status: 'completed', seq: 4 }),
+          event('run.completed', { status: 'completed', seq: 5 }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const toolLines = toolResult.items.filter((item) => item.type === 'transcript_line');
+    assert.equal(toolLines.length, 1);
+    assert.equal(toolLines[0].kind, 'tool');
+    const toolMarkup = renderMessageList(toolResult.items);
+    assert.match(toolMarkup, /读取了文件|读取文件/);
+    assert.doesNotMatch(toolMarkup, /能力已就绪|结果已核对/);
+  }
+
+  {
+    const boundaryResult = buildConversationRenderItems({
+      messages: [message],
+      runEventsByRunId: {
+        run_1: [
+          event('work_summary.updated', {
+            item_type: 'work_summary',
+            item_id: 'failed_summary',
+            phase: 'verified',
+            summary: '文件校验失败',
+            user_visible: true,
+            status: 'failed',
+            seq: 1,
+          }, { visibility: 'transcript' }),
+          event('plan.updated', {
+            item_type: 'plan',
+            item_id: 'completed_plan',
+            summary: '迁移计划已更新',
+            user_visible: true,
+            status: 'completed',
+            seq: 2,
+          }, { visibility: 'transcript' }),
+        ],
+      },
+      mode: 'auto',
+    });
+    const boundaryLines = boundaryResult.items.filter((item) => item.type === 'transcript_line');
+    assert.equal(boundaryLines.length, 2);
+    assert.equal(boundaryLines[0].status, 'failed');
+    assert.equal(boundaryLines[0].detail, '文件校验失败');
+    assert.equal(boundaryLines[1].detail, '迁移计划已更新');
   }
 
   {
@@ -1440,6 +1553,48 @@ try {
     assert.match(waitingMarkup, /<section class="process-stack process-stack-waiting_approval" data-expanded="true">/);
     assert.match(waitingMarkup, />等待确认</);
     assert.match(waitingMarkup, />允许一次</);
+  }
+
+  {
+    const result = buildConversationRenderItems({
+      messages: [
+        { id: 'msg_approved_user', conversation_id: 'conv_approved', role: 'user', content: '帮我写入文件' },
+        { id: 'msg_approved_assistant', conversation_id: 'conv_approved', role: 'assistant', content: '写入并核验完成。', metadata: { run_id: 'run_approved' } },
+      ],
+      activeRunId: '',
+      runEventsByRunId: {
+        run_approved: [
+          event('approval.requested', {
+            confirmation_id: 'confirm_approved',
+            call_id: 'call_approved',
+            capability: 'apply_patch',
+            target_path: '/Users/hao/project/Joi/config.json',
+            risk: 'workspace_write',
+            status: 'waiting_confirmation',
+            seq: 1,
+          }, { run_id: 'run_approved', item_id: 'call_approved', visibility: 'approval' }),
+          event('approval.resolved', {
+            confirmation_id: 'confirm_approved',
+            call_id: 'call_approved',
+            capability: 'apply_patch',
+            risk: 'workspace_write',
+            status: 'approved',
+            decision: 'approved',
+            approved: true,
+            seq: 2,
+          }, { run_id: 'run_approved', item_id: 'call_approved', visibility: 'approval' }),
+          event('run.completed', { status: 'succeeded', seq: 3 }, { run_id: 'run_approved', visibility: 'trace_only', terminal: true }),
+        ],
+      },
+      mode: 'serious_task',
+    });
+    const approvalLine = result.items.find((item) => item.type === 'transcript_line' && item.kind === 'approval');
+    assert.equal(approvalLine.status, 'completed');
+    assert.match(approvalLine.label, /^已批准 · 写入文件/);
+    const approvedMarkup = renderMessageList(result.items);
+    assert.match(approvedMarkup, />已批准</);
+    assert.doesNotMatch(approvedMarkup, />允许一次</);
+    assert.doesNotMatch(approvedMarkup, />等待确认</);
   }
 } finally {
   rmSync(outDir, { recursive: true, force: true });

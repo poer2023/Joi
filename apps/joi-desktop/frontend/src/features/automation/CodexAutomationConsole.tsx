@@ -31,6 +31,7 @@ import {
   getAutomationTelegramReadiness,
   getAutomationTelegramTargetError,
 } from './automationUiState';
+import { useLayerLifecycle } from '../../components/useLayerLifecycle';
 
 type AutomationEditorDraft = {
   id?: string;
@@ -107,6 +108,15 @@ export function CodexAutomationConsole({
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [endpoint, setEndpoint] = useState<{ automation_id: string; url: string; secret_configured: boolean; secret_value_once?: string } | null>(null);
   const selectedIDRef = useRef('');
+  const joiCreateBusyRef = useRef(false);
+  const joiCreateLayer = useLayerLifecycle<HTMLFormElement>(() => {
+    setShowJoiCreate(false);
+    setJoiRequest('');
+  }, {
+    active: showJoiCreate,
+    canDismiss: () => !joiCreateBusyRef.current,
+  });
+  const confirmationLayer = useLayerLifecycle<HTMLElement>(() => setPendingConfirmation(null), { active: Boolean(pendingConfirmation) });
 
   const selectedAutomation = automations.find((item) => item.id === activeObjectID);
   const selectedRuns = useMemo(
@@ -221,7 +231,7 @@ export function CodexAutomationConsole({
   async function resolveConfirmation() {
     const confirmation = pendingConfirmation;
     if (!confirmation) return;
-    setPendingConfirmation(null);
+    if (!confirmationLayer.requestClose()) return;
     await confirmation.action();
   }
 
@@ -398,14 +408,16 @@ export function CodexAutomationConsole({
     event.preventDefault();
     const request = joiRequest.trim();
     if (!request) return;
+    joiCreateBusyRef.current = true;
     setBusy('joi-create');
     try {
       await createWithJoi(request);
-      setShowJoiCreate(false);
-      setJoiRequest('');
+      joiCreateBusyRef.current = false;
+      joiCreateLayer.requestClose();
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : String(error));
     } finally {
+      joiCreateBusyRef.current = false;
       setBusy('');
     }
   }
@@ -643,23 +655,23 @@ export function CodexAutomationConsole({
       )}
 
       {showJoiCreate && (
-        <div className="automation-modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setShowJoiCreate(false)}>
-          <form className="automation-joi-create-modal" onSubmit={(event) => void submitJoiCreate(event)}>
-            <header><h2>使用 Joi 创建已安排任务</h2><button type="button" aria-label="关闭" onClick={() => setShowJoiCreate(false)}>×</button></header>
+        <div className={`automation-modal-backdrop ui-layer ${joiCreateLayer.isClosing ? 'is-closing' : ''}`} role="presentation" onMouseDown={(event) => event.target === event.currentTarget && joiCreateLayer.requestClose()}>
+          <form ref={joiCreateLayer.surfaceRef} className="automation-joi-create-modal ui-dialog-surface" role="dialog" aria-modal="true" aria-labelledby="automation-joi-create-title" tabIndex={-1} onSubmit={(event) => void submitJoiCreate(event)}>
+            <header><h2 id="automation-joi-create-title">使用 Joi 创建已安排任务</h2><button type="button" aria-label="关闭" onClick={joiCreateLayer.requestClose}>×</button></header>
             <p>Joi 会先补问必要信息，再通过真实 automation_update 工具生成暂停草稿供你审核。</p>
-            <textarea autoFocus rows={5} placeholder="例如：每个工作日上午 9 点检查项目进展，有阻塞时提醒我。" value={joiRequest} onChange={(event) => setJoiRequest(event.target.value)} />
-            <footer><button type="button" onClick={() => setShowJoiCreate(false)}>取消</button><button type="submit" disabled={!joiRequest.trim() || busy === 'joi-create'}>{busy === 'joi-create' ? '正在与 Joi 对话' : '开始对话'}</button></footer>
+            <textarea data-layer-initial-focus rows={5} placeholder="例如：每个工作日上午 9 点检查项目进展，有阻塞时提醒我。" value={joiRequest} onChange={(event) => setJoiRequest(event.target.value)} />
+            <footer><button type="button" onClick={joiCreateLayer.requestClose}>取消</button><button type="submit" disabled={!joiRequest.trim() || busy === 'joi-create'}>{busy === 'joi-create' ? '正在与 Joi 对话' : '开始对话'}</button></footer>
           </form>
         </div>
       )}
 
       {pendingConfirmation && (
-        <div className="automation-modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setPendingConfirmation(null)}>
-          <section className="automation-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="automation-confirm-title">
+        <div className={`automation-modal-backdrop ui-layer ${confirmationLayer.isClosing ? 'is-closing' : ''}`} role="presentation" onMouseDown={(event) => event.target === event.currentTarget && confirmationLayer.requestClose()}>
+          <section ref={confirmationLayer.surfaceRef} className="automation-confirm-modal ui-dialog-surface" role="dialog" aria-modal="true" aria-labelledby="automation-confirm-title" tabIndex={-1}>
             <h2 id="automation-confirm-title">{pendingConfirmation.title}</h2>
             <p>{pendingConfirmation.message}</p>
             <footer>
-              <button type="button" onClick={() => setPendingConfirmation(null)}>取消</button>
+              <button type="button" onClick={confirmationLayer.requestClose}>取消</button>
               <button className={pendingConfirmation.danger ? 'danger' : ''} type="button" onClick={() => void resolveConfirmation()}>{pendingConfirmation.confirmLabel}</button>
             </footer>
           </section>

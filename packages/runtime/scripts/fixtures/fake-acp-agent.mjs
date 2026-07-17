@@ -346,6 +346,14 @@ new AgentSideConnection((connection) => ({
       requestRawInput: { command: 'pwd', cwd: sessionCwd },
     });
     await exercisePermissionTool(connection, params.sessionId, {
+      id: 'fake-sensitive-workspace-read',
+      title: 'Read workspace secret',
+      kind: 'read',
+      rawInput: { path: `${sessionCwd}/.env` },
+      requestKind: 'read',
+      requestRawInput: { path: `${sessionCwd}/.env` },
+    });
+    await exercisePermissionTool(connection, params.sessionId, {
       id: 'fake-test-command',
       title: 'Run test',
       kind: 'execute',

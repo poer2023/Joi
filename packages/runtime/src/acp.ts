@@ -976,7 +976,7 @@ function parseACPCommand(value: unknown): string[] | undefined {
 
 function safeACPCommandArgument(value: string): boolean {
   const text = value.trim();
-  if (!text || value.includes('\0') || text.startsWith('~') || hasParentTraversal(text) || blockedACPPath(text)) return false;
+  if (!text || value.includes('\0') || text.startsWith('~') || hasParentTraversal(text)) return false;
   if (text.includes('=/') || text.includes(':/')) return false;
   return true;
 }
@@ -988,12 +988,16 @@ function pathLikeCommandArgument(value: string): boolean {
 
 function pathAllowedByCapability(input: string, capability: ACPCompiledCapability): boolean {
   if (!input || input.includes('\0') || input.trim().startsWith('~')) return false;
-  if (!capability.host_access && blockedACPPath(input)) return false;
   const roots = capability.allowed_roots || [];
   const candidates = isAbsolute(input) ? [input] : roots.map((root) => resolve(root, input));
   return candidates.some((inputPath) => {
     const candidate = canonicalBoundaryPath(inputPath);
-    return roots.some((root) => pathWithinRoot(candidate, canonicalBoundaryPath(root)));
+    return roots.some((root) => {
+      const canonicalRoot = canonicalBoundaryPath(root);
+      if (!pathWithinRoot(candidate, canonicalRoot)) return false;
+      const relativePath = relative(canonicalRoot, candidate);
+      return capability.host_access || !blockedACPPath(relativePath);
+    });
   });
 }
 
