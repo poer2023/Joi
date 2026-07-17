@@ -118,7 +118,6 @@ cat > "$MANIFEST" <<JSON
   "runtime_bin": "$INSTALL_APP/Contents/MacOS/Joi",
   "cli_bin": "$HOME/.local/bin/joi",
   "package": "$PACKAGE",
-  "source_app": "$BUILT_APP",
   "provenance": "$INSTALL_APP/Contents/Resources/joi-build-provenance.json",
   "data_dir": "$HOME/Library/Application Support/Joi",
   "logs_dir": "$HOME/Library/Application Support/Joi/logs",
@@ -127,5 +126,32 @@ cat > "$MANIFEST" <<JSON
 }
 JSON
 
+# A successful package is the point at which the replaced app and ephemeral
+# build bundle are no longer needed for rollback. Keep exactly one installed
+# app and one current distributable so later verification cannot select an old
+# bundle or manifest by accident.
+while IFS= read -r artifact; do
+  if [[ "$artifact" != "$PACKAGE" && "$artifact" != "$MANIFEST" ]]; then
+    rm -f "$artifact"
+  fi
+done < <(
+  find "$DIST_DIR" -maxdepth 1 -type f \
+    \( -name 'Joi-*-macos-arm64.zip' -o -name 'Joi-*-macos-arm64.manifest.json' \) \
+    -print
+)
+
+if [[ -d "$ROOT_DIR/.local" ]]; then
+  while IFS= read -r archive; do
+    rm -rf "$archive"
+  done < <(
+    find "$ROOT_DIR/.local" -mindepth 1 -maxdepth 1 -type d \
+      -name 'app-archive-*' -print
+  )
+fi
+
+rm -rf "$ROOT_DIR/apps/joi-electron/release-desktop"
+
 echo "Desktop Electron macOS package complete: $PACKAGE"
 echo "Manifest: $MANIFEST"
+echo "Retained app: $INSTALL_APP"
+echo "Removed temporary build apps and superseded package artifacts."

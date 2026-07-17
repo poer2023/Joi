@@ -1,6 +1,6 @@
 # Joi Local Repo and App State
 
-Last updated: 2026-07-14 Asia/Shanghai
+Last updated: 2026-07-17 Asia/Shanghai
 
 ## Source of Truth
 
@@ -12,13 +12,14 @@ The active Joi repository on this Mac is:
 
 Use this path for all code edits, builds, tests, packaging, and documentation updates.
 
-The old path is not a source tree:
+The old path is not a source tree and is absent on the current machine:
 
 ```text
 /Users/hao/Documents/Joi
 ```
 
-That path is a stale residual from earlier desktop work. Current terminal access to it is blocked by macOS with `Operation not permitted`, so agents must not use it as evidence for current Joi behavior. If the path must remain reachable for older shortcuts, it should be converted to a symlink to `/Users/hao/project/Joi` after Finder grants access.
+Do not recreate it, use it as evidence, or build from it. Older shortcuts must
+be updated to `/Users/hao/project/Joi` instead.
 
 ## Installed App
 
@@ -57,11 +58,20 @@ dist/desktop/Joi-0.1.1-macos-arm64.zip
 dist/desktop/Joi-0.1.1-macos-arm64.manifest.json
 ```
 
-The build source app is:
+The build source app is temporary:
 
 ```text
 apps/joi-electron/release-desktop/mac-arm64/Joi.app
 ```
+
+`scripts/package_desktop_macos.sh` removes that bundle after the installed app,
+ZIP, manifest, provenance, and code signature have all been verified. A
+successful package run also removes superseded `app-archive-*` rollback copies
+and older macOS ARM64 ZIP/manifest pairs. The steady state is therefore:
+
+- one runnable bundle: `/Applications/Joi.app`;
+- one current distributable ZIP and matching manifest under `dist/desktop`;
+- no runnable App under the repository, `.local`, `~/.joi/runtime`, or Trash.
 
 ## Branch And Build Isolation
 
@@ -89,9 +99,9 @@ The provenance records the exact Git branch, commit, canonical source root,
 `origin/main` commit, build time, install target, and whether the safety guard
 was bypassed. Use it before diagnosing a possible preview/installed-app mismatch.
 
-Exploration history is retained on named `codex/exploration-*` branches rather
-than in stashes or detached dirty worktrees. Those branches are archival and are
-not release inputs.
+The local and remote repository keep `main` as the only branch. Historical
+implementation remains available through Git history, not parallel branches,
+stashes, detached worktrees, or runnable App copies.
 
 ## Launch Regression Fixed
 
@@ -137,19 +147,8 @@ The repaired reopen path is:
 
 ## Old Residual Cleanup Status
 
-Attempted cleanup from the current terminal:
-
-```text
-mv /Users/hao/Documents/Joi ... -> Operation not permitted
-osascript/Finder move -> blocked waiting on macOS permission
-```
-
-Required manual cleanup if Finder permission is available:
-
-```bash
-mkdir -p /Users/hao/project/Joi/.local/stale-documents-joi-archive
-mv /Users/hao/Documents/Joi /Users/hao/project/Joi/.local/stale-documents-joi-archive/Joi
-ln -s /Users/hao/project/Joi /Users/hao/Documents/Joi
-```
-
-If macOS still blocks terminal access, perform the same move in Finder, then create the symlink from Terminal after the old directory is gone.
+As of 2026-07-17, the stale `/Users/hao/Documents/Joi` path is absent, old App
+bundles and local build archives have been removed, and the packaging workflow
+now enforces the single-installed-App steady state after every successful run.
+The user-data directory under `~/Library/Application Support/Joi` is explicitly
+outside this cleanup boundary.
