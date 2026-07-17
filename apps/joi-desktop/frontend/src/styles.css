@@ -8708,6 +8708,60 @@ button:not(:disabled),
   line-height: 1.5;
 }
 
+.voice-runtime-status {
+  display: grid;
+  gap: 5px;
+  border: 1px solid var(--tk-border);
+  border-radius: 8px;
+  background: var(--tk-hover-subtle);
+  padding: 10px 11px;
+}
+
+.voice-runtime-status.ready {
+  border-color: color-mix(in srgb, var(--tk-success), var(--tk-border) 62%);
+  background: color-mix(in srgb, var(--tk-success), transparent 94%);
+}
+
+.voice-runtime-status.missing {
+  border-color: color-mix(in srgb, var(--tk-danger), var(--tk-border) 68%);
+}
+
+.voice-runtime-status-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.voice-runtime-status-heading strong {
+  color: var(--tk-text-primary);
+  font-size: 12px;
+}
+
+.voice-runtime-status-heading span {
+  color: var(--tk-text-secondary);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.voice-runtime-status.ready .voice-runtime-status-heading span {
+  color: var(--tk-success);
+}
+
+.voice-runtime-status p,
+.voice-runtime-status code {
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: var(--tk-text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.voice-runtime-status code {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
 .detail-header {
   margin-bottom: 0;
   border-bottom: 0;

@@ -41,7 +41,7 @@ try png.write(to: URL(fileURLWithPath: output))
   assert.match(String(image.text).toUpperCase(), /JOI.*IMAGE.*REAL.*TEST/);
 
   const encoded = Buffer.from('local audio fixture').toString('base64');
-  const saved = await saveMediaDataURL(`data:audio/webm;base64,${encoded}`, join(tempDir, 'recordings'));
+  const saved = await saveMediaDataURL(`data:audio/webm;codecs=opus;base64,${encoded}`, join(tempDir, 'recordings'));
   assert.equal(saved.status, 'completed');
   assert.equal(saved.mime_type, 'audio/webm');
   assert.equal(saved.attachment.kind, 'audio');

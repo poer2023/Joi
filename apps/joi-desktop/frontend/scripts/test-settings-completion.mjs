@@ -70,6 +70,11 @@ assert.doesNotMatch(app, /<section className="panel wide">\s*<h2>成本用量<\/
 assert.doesNotMatch(app, /id: 'diagnostic-redaction'/);
 assert.match(app, /id: 'voice', label: '语音', description: '聊天录音、转写与回复朗读设置'/);
 assert.match(app, /<VoiceSettingsPanel settings=\{workspaceSettings\}/);
+assert.match(app, /action: 'speech_status', model/);
+assert.match(app, /Small（推荐 · 中英均衡）/);
+assert.match(app, /本地转写引擎/);
+assert.match(api, /Apple Metal/);
+assert.match(store, /speech_transcription_model: settings\['speech\.transcription_model'\] \|\| 'small'/);
 assert.match(app, /className=\{`composer-attachment-button composer-voice-button/);
 assert.match(app, /onSpeak=\{\(messageID, content\) => void speakAssistantMessage/);
 assert.doesNotMatch(app, /return <MediaWorkbenchPanel/);

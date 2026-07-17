@@ -11380,7 +11380,7 @@ export class JoiSQLiteStore {
       wechat_claw_allowed_senders: parseStringSetting(settings['entry.wechat_claw.allowed_senders'], []),
       speech_voice: settings['speech.voice'] || 'Ting-Ting',
       speech_rate: Number(settings['speech.rate'] || 185),
-      speech_transcription_model: settings['speech.transcription_model'] || 'tiny',
+      speech_transcription_model: settings['speech.transcription_model'] || 'small',
       speech_transcription_language: settings['speech.transcription_language'] || 'auto',
     });
   }
@@ -11415,7 +11415,7 @@ export class JoiSQLiteStore {
       'entry.wechat_claw.allowed_senders': json(settings.wechat_claw_allowed_senders || []),
       'speech.voice': settings.speech_voice || 'Ting-Ting',
       'speech.rate': String(settings.speech_rate || 185),
-      'speech.transcription_model': settings.speech_transcription_model || 'tiny',
+      'speech.transcription_model': settings.speech_transcription_model || 'small',
       'speech.transcription_language': settings.speech_transcription_language || 'auto',
     });
   }
@@ -20259,7 +20259,7 @@ function normalizeWorkspaceSettings(input: WorkspaceSettings): WorkspaceSettings
     speech_rate: Math.max(80, Math.min(450, Math.round(Number(input.speech_rate) || 185))),
     speech_transcription_model: ['tiny', 'base', 'small'].includes(String(input.speech_transcription_model || ''))
       ? String(input.speech_transcription_model)
-      : 'tiny',
+      : 'small',
     speech_transcription_language: (input.speech_transcription_language || 'auto').trim() || 'auto',
   };
 }

@@ -28,7 +28,7 @@
 | 项目与任务 | goals、计划与任务 | 可由扩展实现 | project selector、todo sync | 本次新增 `project_list`、`task_list/view/update` |
 | 交互询问与自动化 | request input、automations | 扩展 | plan/todo、外部入口 | 已有 `request_user_input`、暂停草案式自动化 |
 | 子 Agent / 任务委派 | 原生多 Agent | 核心明确不内置，可由扩展实现 | task delegation | 本次新增 `delegate_task`：代码 Orchestrator 创建独立子会话/Run，子 Agent 禁止递归委派 |
-| 语音输入、TTS | 非核心 | 非核心 | Whisper、TTS | 本次新增本机 `say + FFmpeg` TTS 与本机 Whisper 转写，音频以可播放附件持久化 |
+| 语音输入、TTS | 非核心 | 非核心 | Whisper、TTS | 本机 `say + FFmpeg` TTS；转写默认使用 `whisper.cpp + ggml-small.bin + Apple Metal`，音频以可播放附件持久化 |
 | LSP、调试器 | 可通过 Shell/插件 | 可通过扩展 | 未作为核心工具展示 | 本次新增 clangd/sourcekit-lsp definition/references/diagnostics 与持久 LLDB 会话 |
 | 视频生成与理解 | 支持媒体/插件扩展 | 可由扩展实现 | 当前设置未展示视频后端 | 已于 2026-07-17 退出产品范围；UI、能力注册、IPC 与运行时均不再暴露 |
 
@@ -48,7 +48,7 @@
 
 - 会话树：分支保留 3 条快照，源会话后续增长到 20 条，二者没有串写；压缩 checkpoint 已出现在后续真实 prompt assembly 中，原 transcript 未删除。
 - 子 Agent：模型在自然语言任务中主动创建独立 `research_agent` conversation/run；`Research Agent` 友好名称也能一次解析，子 run 正确记录 `parent_run_id`，递归委派关闭。
-- 语音：本地生成 WAV 并由 Whisper 精确转写，assistant 消息显示原生音频播放控件。
+- 语音：`whisper.cpp` 多语种 Small 模型挂载于 Joi 用户数据目录；M4 上的真实中文验收将 7.04 秒音频在 1.24 秒内完成本地转写，assistant 消息继续显示原生音频播放控件。
 - 开发工具：`clangd` 返回定义与诊断；LLDB 完成 attach、断点、run、表达式求值、step 和 stop。
 - 历史视频验收（非当前能力）：2026-07-16 曾完成一次 xAI MP4 链路实测；该能力已于次日退役，不再进入当前 UI、工具清单或运行时。
 

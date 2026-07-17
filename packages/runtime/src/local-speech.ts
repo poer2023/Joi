@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { basename, extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -17,6 +18,8 @@ type LocalSpeechOptions = {
   ffmpeg_path?: string;
   ffprobe_path?: string;
   whisper_path?: string;
+  whisper_cpp_path?: string;
+  whisper_model_dir?: string;
   timeout_seconds?: number;
   run_command?: (
     binary: string,
@@ -31,6 +34,64 @@ const allowedWhisperModels = new Set([
   'tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en', 'medium', 'medium.en',
   'large-v2', 'large-v3', 'large-v3-turbo', 'turbo',
 ]);
+const preferredWhisperCppModel = 'small';
+const defaultWhisperCppPath = '/opt/homebrew/bin/whisper-cli';
+const defaultOpenAIWhisperPath = '/opt/homebrew/bin/whisper';
+
+export async function inspectLocalWhisperRuntime(
+  request: Record<string, unknown> = {},
+  options: Pick<LocalSpeechOptions, 'whisper_cpp_path' | 'whisper_model_dir' | 'whisper_path'> = {},
+): Promise<Record<string, unknown>> {
+  const model = boundedToken(request.model, 80) || preferredWhisperCppModel;
+  if (!allowedWhisperModels.has(model)) throw new Error(`unsupported local Whisper model: ${model}`);
+
+  if (model === preferredWhisperCppModel) {
+    const binaryPath = options.whisper_cpp_path || defaultWhisperCppPath;
+    const modelDir = options.whisper_model_dir || join(homedir(), 'Library', 'Application Support', 'Joi', 'models', 'whisper');
+    const modelPath = join(modelDir, 'ggml-small.bin');
+    const [binary, modelFile] = await Promise.all([fileStatus(binaryPath), fileStatus(modelPath)]);
+    const ready = binary.ready && modelFile.ready;
+    return {
+      status: ready ? 'ready' : 'missing',
+      ready,
+      engine: 'whisper.cpp',
+      provider: 'local_whisper_cpp',
+      acceleration: 'Apple Metal',
+      model,
+      model_label: 'Small multilingual',
+      binary_path: binaryPath,
+      model_path: modelPath,
+      model_size: modelFile.size,
+      error_summary: ready
+        ? ''
+        : !binary.ready
+          ? `whisper.cpp is not installed at ${binaryPath}`
+          : `Whisper Small model is not installed at ${modelPath}`,
+    };
+  }
+
+  const binaryPath = options.whisper_path || defaultOpenAIWhisperPath;
+  const modelPath = join(homedir(), '.cache', 'whisper', `${model}.pt`);
+  const [binary, modelFile] = await Promise.all([fileStatus(binaryPath), fileStatus(modelPath)]);
+  const ready = binary.ready && modelFile.ready;
+  return {
+    status: ready ? 'ready' : 'missing',
+    ready,
+    engine: 'openai-whisper',
+    provider: 'local_whisper',
+    acceleration: 'CPU compatibility mode',
+    model,
+    model_label: model,
+    binary_path: binaryPath,
+    model_path: modelPath,
+    model_size: modelFile.size,
+    error_summary: ready
+      ? ''
+      : !binary.ready
+        ? `OpenAI Whisper CLI is not installed at ${binaryPath}`
+        : `Whisper ${model} compatibility model is not installed; Joi will not download it while recording`,
+  };
+}
 
 export async function executeLocalTextToSpeech(
   request: Record<string, unknown>,
@@ -106,46 +167,108 @@ export async function executeLocalSpeechTranscription(
   if (!sourcePath) throw new Error('speech_transcribe path is required');
   const sourceStat = await stat(sourcePath);
   if (!sourceStat.isFile() || sourceStat.size <= 0) throw new Error('speech_transcribe source must be a non-empty file');
-  const model = boundedToken(request.model, 80) || 'tiny.en';
+  const model = boundedToken(request.model, 80) || preferredWhisperCppModel;
   if (!allowedWhisperModels.has(model)) throw new Error(`unsupported local Whisper model: ${model}`);
   const language = boundedToken(request.language, 40) || (model.endsWith('.en') ? 'en' : 'auto');
   const timeoutSeconds = boundedNumber(options.timeout_seconds, 300, 30, 900);
   const run = options.run_command || runCommand;
   const resultDir = join(options.output_dir, `whisper-${Date.now()}-${randomUUID().slice(0, 8)}`);
   await mkdir(resultDir, { recursive: true });
-  const args = [
-    sourcePath,
-    '--model', model,
-    ...(language === 'auto' ? [] : ['--language', language]),
-    '--output_dir', resultDir,
-    '--output_format', 'json',
-    '--fp16', 'False',
-    '--verbose', 'False',
-  ];
-  const transcribed = await run(options.whisper_path || '/opt/homebrew/bin/whisper', args, {
-    signal: options.signal,
-    timeout_seconds: timeoutSeconds,
-  });
-  if (transcribed.exit_code !== 0) throw new Error(`local Whisper transcription failed: ${safeCommandError(transcribed)}`);
-  const jsonPath = join(resultDir, `${basename(sourcePath, extname(sourcePath))}.json`);
-  const parsed = JSON.parse(await readFile(jsonPath, 'utf8')) as Record<string, unknown>;
-  const transcript = stringValue(parsed.text);
+  const runtime = await inspectLocalWhisperRuntime({ model }, options);
+  if (runtime.ready !== true) throw new Error(`local Whisper is not ready: ${stringValue(runtime.error_summary)}`);
+  const startedAt = Date.now();
+  let parsed: Record<string, unknown>;
+  let transcript = '';
+  let segmentCount = 0;
+
+  if (runtime.engine === 'whisper.cpp') {
+    const normalizedPath = join(resultDir, 'input.wav');
+    const converted = await run(options.ffmpeg_path || '/opt/homebrew/bin/ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y', '-i', sourcePath,
+      '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', normalizedPath,
+    ], { signal: options.signal, timeout_seconds: Math.min(timeoutSeconds, 180) });
+    if (converted.exit_code !== 0) throw new Error(`speech audio normalization failed: ${safeCommandError(converted)}`);
+    const outputPrefix = join(resultDir, 'transcript');
+    const args = [
+      '--model', String(runtime.model_path),
+      '--file', normalizedPath,
+      '--language', language,
+      '--threads', '8',
+      '--output-json',
+      '--output-file', outputPrefix,
+      '--no-prints',
+      '--no-timestamps',
+    ];
+    const transcribed = await run(String(runtime.binary_path), args, {
+      signal: options.signal,
+      timeout_seconds: timeoutSeconds,
+    });
+    await rm(normalizedPath, { force: true });
+    if (transcribed.exit_code !== 0) throw new Error(`local Whisper transcription failed: ${safeCommandError(transcribed)}`);
+    parsed = JSON.parse(await readFile(`${outputPrefix}.json`, 'utf8')) as Record<string, unknown>;
+    const segments = Array.isArray(parsed.transcription) ? parsed.transcription : [];
+    transcript = segments
+      .map((entry) => stringValue(recordValue(entry).text))
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    segmentCount = segments.length;
+  } else {
+    const modelDir = join(homedir(), '.cache', 'whisper');
+    const args = [
+      sourcePath,
+      '--model', model,
+      '--model_dir', modelDir,
+      ...(language === 'auto' ? [] : ['--language', language]),
+      '--output_dir', resultDir,
+      '--output_format', 'json',
+      '--fp16', 'False',
+      '--verbose', 'False',
+    ];
+    const transcribed = await run(String(runtime.binary_path), args, {
+      signal: options.signal,
+      timeout_seconds: timeoutSeconds,
+    });
+    if (transcribed.exit_code !== 0) throw new Error(`local Whisper transcription failed: ${safeCommandError(transcribed)}`);
+    const jsonPath = join(resultDir, `${basename(sourcePath, extname(sourcePath))}.json`);
+    parsed = JSON.parse(await readFile(jsonPath, 'utf8')) as Record<string, unknown>;
+    transcript = stringValue(parsed.text);
+    segmentCount = Array.isArray(parsed.segments) ? parsed.segments.length : 0;
+  }
   if (!transcript) throw new Error('local Whisper returned an empty transcript');
   const durationSeconds = await mediaDuration(sourcePath, options, run);
   return {
     status: 'completed',
     capability: 'speech_transcribe',
-    mode: 'local_whisper_cli_v1',
-    provider: 'local_whisper',
+    mode: runtime.engine === 'whisper.cpp' ? 'local_whisper_cpp_v1' : 'local_whisper_cli_v1',
+    provider: runtime.provider,
+    engine: runtime.engine,
+    acceleration: runtime.acceleration,
     model,
+    model_path: runtime.model_path,
     language,
     source_path: sourcePath,
     source_size: sourceStat.size,
     duration_seconds: durationSeconds,
+    elapsed_seconds: Math.round((Date.now() - startedAt) / 10) / 100,
     transcript,
-    segment_count: Array.isArray(parsed.segments) ? parsed.segments.length : 0,
+    segment_count: segmentCount,
     summary: `Transcribed ${durationSeconds.toFixed(2)} seconds of audio with local Whisper.`,
   };
+}
+
+async function fileStatus(path: string): Promise<{ ready: boolean; size: number }> {
+  try {
+    const file = await stat(path);
+    return { ready: file.isFile() && file.size > 0, size: file.isFile() ? file.size : 0 };
+  } catch {
+    return { ready: false, size: 0 };
+  }
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 async function mediaDuration(

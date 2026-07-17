@@ -14,10 +14,15 @@ export async function saveMediaDataURL(
   outputDir: string,
   preferredMime = '',
 ): Promise<Record<string, unknown>> {
-  const matched = dataURL.match(/^data:([^;,]+)?(;base64)?,([\s\S]+)$/);
-  if (!matched) throw new Error('recording data_url is invalid');
-  const mimeType = (matched[1] || preferredMime || 'application/octet-stream').toLowerCase();
-  const payload = matched[2] ? Buffer.from(matched[3], 'base64') : Buffer.from(decodeURIComponent(matched[3]), 'utf8');
+  if (!dataURL.startsWith('data:')) throw new Error('recording data_url is invalid');
+  const comma = dataURL.indexOf(',');
+  if (comma <= 5) throw new Error('recording data_url is invalid');
+  const headerParts = dataURL.slice(5, comma).split(';').map((part) => part.trim()).filter(Boolean);
+  const mimeType = (headerParts[0] || preferredMime || 'application/octet-stream').toLowerCase();
+  const encoded = dataURL.slice(comma + 1);
+  const payload = headerParts.includes('base64')
+    ? Buffer.from(encoded, 'base64')
+    : Buffer.from(decodeURIComponent(encoded), 'utf8');
   if (!payload.length || payload.length > maxMediaBytes) throw new Error('recording payload has an invalid size');
   const extension = extensionForMime(mimeType);
   await mkdir(outputDir, { recursive: true });

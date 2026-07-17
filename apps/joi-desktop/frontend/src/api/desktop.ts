@@ -2576,6 +2576,20 @@ function bindings(): DesktopBindings {
         };
       },
       async ExecuteMediaAction(req) {
+        if (req.action === 'speech_status') {
+          return {
+            action: req.action,
+            output: {
+              status: 'ready',
+              ready: true,
+              engine: 'whisper.cpp',
+              acceleration: 'Apple Metal',
+              model: req.model || 'small',
+              model_path: '/Users/hao/Library/Application Support/Joi/models/whisper/ggml-small.bin',
+              model_size: 487_601_967,
+            },
+          };
+        }
         return {
           action: req.action,
           output: {

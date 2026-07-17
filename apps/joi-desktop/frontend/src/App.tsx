@@ -5991,16 +5991,39 @@ function VoiceSettingsPanel({
 }) {
   const [voice, setVoice] = useState(settings?.speech_voice || 'Ting-Ting');
   const [rate, setRate] = useState(String(settings?.speech_rate || 185));
-  const [model, setModel] = useState(settings?.speech_transcription_model || 'tiny');
+  const [model, setModel] = useState(settings?.speech_transcription_model || 'small');
   const [language, setLanguage] = useState(settings?.speech_transcription_language || 'auto');
   const [busy, setBusy] = useState(false);
+  const [runtimeLoading, setRuntimeLoading] = useState(true);
+  const [runtimeStatus, setRuntimeStatus] = useState<Record<string, unknown> | null>(null);
 
   useEffect(() => {
     setVoice(settings?.speech_voice || 'Ting-Ting');
     setRate(String(settings?.speech_rate || 185));
-    setModel(settings?.speech_transcription_model || 'tiny');
+    setModel(settings?.speech_transcription_model || 'small');
     setLanguage(settings?.speech_transcription_language || 'auto');
   }, [settings?.speech_rate, settings?.speech_transcription_language, settings?.speech_transcription_model, settings?.speech_voice]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setRuntimeLoading(true);
+    void desktopApi.executeMediaAction({ action: 'speech_status', model })
+      .then((result) => { if (!cancelled) setRuntimeStatus(result.output); })
+      .catch((error) => {
+        if (!cancelled) setRuntimeStatus({ ready: false, error_summary: error instanceof Error ? error.message : String(error) });
+      })
+      .finally(() => { if (!cancelled) setRuntimeLoading(false); });
+    return () => { cancelled = true; };
+  }, [model]);
+
+  const runtimeReady = runtimeStatus?.ready === true;
+  const runtimeEngine = typeof runtimeStatus?.engine === 'string' ? runtimeStatus.engine : '';
+  const runtimeAcceleration = typeof runtimeStatus?.acceleration === 'string' ? runtimeStatus.acceleration : '';
+  const runtimeModelPath = typeof runtimeStatus?.model_path === 'string' ? runtimeStatus.model_path : '';
+  const runtimeModelSize = typeof runtimeStatus?.model_size === 'number' && runtimeStatus.model_size > 0
+    ? `${Math.round(runtimeStatus.model_size / 1024 / 1024)} MiB`
+    : '';
+  const runtimeError = typeof runtimeStatus?.error_summary === 'string' ? runtimeStatus.error_summary : '';
 
   async function save() {
     setBusy(true);
@@ -6031,9 +6054,9 @@ function VoiceSettingsPanel({
         <label className="field-row">
           <span>Whisper 模型</span>
           <select value={model} onChange={(event) => setModel(event.target.value)}>
-            <option value="tiny">Tiny（最快）</option>
-            <option value="base">Base（均衡）</option>
-            <option value="small">Small（更准确）</option>
+            <option value="small">Small（推荐 · 中英均衡）</option>
+            <option value="base">Base（兼容模式）</option>
+            <option value="tiny">Tiny（兼容模式）</option>
           </select>
         </label>
         <label className="field-row">
@@ -6044,6 +6067,18 @@ function VoiceSettingsPanel({
             <option value="en">English</option>
           </select>
         </label>
+        <div className={`voice-runtime-status${runtimeReady ? ' ready' : runtimeLoading ? ' loading' : ' missing'}`} role="status">
+          <div className="voice-runtime-status-heading">
+            <strong>本地转写引擎</strong>
+            <span>{runtimeLoading ? '检测中' : runtimeReady ? '可用' : '未就绪'}</span>
+          </div>
+          <p>{runtimeLoading
+            ? '正在检查本机模型与运行时…'
+            : runtimeReady
+              ? `${runtimeEngine} · ${runtimeAcceleration}${runtimeModelSize ? ` · ${runtimeModelSize}` : ''}`
+              : runtimeError || '本地 Whisper 运行时不可用'}</p>
+          {runtimeModelPath ? <code>{runtimeModelPath}</code> : null}
+        </div>
         <p className="settings-field-hint">录音、转写和朗读入口位于聊天页；这里不执行语音操作。</p>
         <div className="detail-actions"><button type="button" disabled={busy} onClick={() => void save()}>{busy ? '保存中…' : '保存语音设置'}</button></div>
       </div>
@@ -7237,7 +7272,7 @@ function ChatHome({
             const transcription = await desktopApi.executeMediaAction({
               action: 'speech_transcribe',
               path,
-              model: workspaceSettings?.speech_transcription_model || 'tiny',
+              model: workspaceSettings?.speech_transcription_model || 'small',
               language: workspaceSettings?.speech_transcription_language || 'auto',
             });
             const transcript = typeof transcription.output.transcript === 'string' ? transcription.output.transcript.trim() : '';
@@ -12138,7 +12173,7 @@ function defaultWorkspaceSettings(): WorkspaceSettings {
     wechat_claw_allowed_senders: [],
     speech_voice: 'Ting-Ting',
     speech_rate: 185,
-    speech_transcription_model: 'tiny',
+    speech_transcription_model: 'small',
     speech_transcription_language: 'auto',
   };
 }

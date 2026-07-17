@@ -86,7 +86,7 @@ import {
   listElectronCapabilityToolDefinitions,
 } from '../../../../packages/runtime/src/capability-compiler';
 import { executeGrokBuildImageGeneration } from '../../../../packages/runtime/src/grok-build-image';
-import { executeLocalSpeechTranscription, executeLocalTextToSpeech } from '../../../../packages/runtime/src/local-speech.ts';
+import { executeLocalSpeechTranscription, executeLocalTextToSpeech, inspectLocalWhisperRuntime } from '../../../../packages/runtime/src/local-speech.ts';
 import { discoverCodexSkills } from '../../../../packages/runtime/src/skills.ts';
 import { executeJoiPiComputerUse } from './pi-computer-use';
 import { TerminalSessionManager } from './terminal';
@@ -897,6 +897,7 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
       const req = payload as MediaWorkbenchRequest;
       const action = String(req.action || '').trim();
       const mediaRoot = join(app.getPath('userData'), 'media-workbench');
+      const whisperModelDir = join(app.getPath('userData'), 'models', 'whisper');
       if (action === 'save_recording') {
         if (!req.data_url) throw new Error('save_recording data_url is required');
         return { action, output: await saveMediaDataURL(req.data_url, join(mediaRoot, 'recordings'), req.mime_type) };
@@ -916,7 +917,16 @@ export function registerIpc(window: BrowserWindow, appDirs: AppDirs, store: JoiS
           action,
           output: await executeLocalSpeechTranscription(req as Record<string, unknown>, {
             output_dir: join(mediaRoot, 'transcriptions'),
+            whisper_model_dir: whisperModelDir,
             timeout_seconds: 900,
+          }),
+        };
+      }
+      if (action === 'speech_status') {
+        return {
+          action,
+          output: await inspectLocalWhisperRuntime(req as Record<string, unknown>, {
+            whisper_model_dir: whisperModelDir,
           }),
         };
       }
@@ -3017,6 +3027,7 @@ async function executeElectronCapability(
           path: authorizedSpeechPath(inputs.path ?? inputs.file_path, workspaceSettings),
         }, {
           output_dir: join(app.getPath('userData'), 'speech-transcriptions'),
+          whisper_model_dir: join(app.getPath('userData'), 'models', 'whisper'),
           signal: options.signal,
           timeout_seconds: 600,
         }),
