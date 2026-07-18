@@ -39,6 +39,7 @@ try {
   assert.equal(store.resolveAgentIDForTool('Research Agent'), 'research_agent');
   assert.equal(store.resolveAgentIDForTool('research'), 'research_agent');
   assert.equal(store.resolveAgentIDForTool(''), 'research_agent');
+  assert.ok(store.getAgentCapabilities('general_agent').includes('web_research'), 'general automation Agent must expose the policy-controlled Joi web MCP bridge');
   store.saveWorkspaceSettings({ ...initialWorkspaceSettings, allowed_roots: [...initialWorkspaceSettings.allowed_roots, tempDir] });
   const enhancedDiagnosticsPath = store.exportDiagnostics().path;
   const enhancedDiagnosticsManifest = JSON.parse(execFileSync('unzip', ['-p', enhancedDiagnosticsPath, 'manifest.json'], { encoding: 'utf8' }));
