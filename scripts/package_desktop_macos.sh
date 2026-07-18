@@ -72,15 +72,31 @@ PROVENANCE="$APP_BUNDLE/Contents/Resources/joi-build-provenance.json"
 test -f "$PROVENANCE"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
-EXISTING_PIDS="$(
+installed_app_pids() {
   /bin/ps -axo pid=,args= | /usr/bin/awk -v app="$INSTALL_APP" '
     index($0, app "/Contents/MacOS/Joi") {
       print $1
     }'
-)"
+}
+
+EXISTING_PIDS="$(installed_app_pids)"
 if [[ -n "$EXISTING_PIDS" ]]; then
   /bin/kill $EXISTING_PIDS >/dev/null 2>&1 || true
-  sleep 1
+  REMAINING_PIDS="$EXISTING_PIDS"
+  for _ in {1..10}; do
+    sleep 0.2
+    REMAINING_PIDS="$(installed_app_pids)"
+    [[ -z "$REMAINING_PIDS" ]] && break
+  done
+  if [[ -n "$REMAINING_PIDS" ]]; then
+    /bin/kill -KILL $REMAINING_PIDS >/dev/null 2>&1 || true
+    sleep 1
+  fi
+  REMAINING_PIDS="$(installed_app_pids)"
+  if [[ -n "$REMAINING_PIDS" ]]; then
+    echo "Refusing to replace $INSTALL_APP while old bundle processes are still running: $REMAINING_PIDS" >&2
+    exit 2
+  fi
 fi
 
 if [[ -e "$INSTALL_APP" ]]; then
