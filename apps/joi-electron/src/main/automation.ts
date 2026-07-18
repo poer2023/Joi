@@ -39,7 +39,7 @@ export type AutomationRunnerOptions = {
   getWindow: () => BrowserWindow | null;
   deterministicChat?: boolean;
   logger?: Pick<Console, 'info' | 'warn' | 'error'>;
-  executeChat?: (req: ChatRequest) => Promise<ChatResponse>;
+  executeChat?: (req: ChatRequest, route: { selected_agent_id: string }) => Promise<ChatResponse>;
 };
 
 export class AutomationRunner {
@@ -50,7 +50,7 @@ export class AutomationRunner {
   private getWindow: () => BrowserWindow | null;
   private deterministicChat: boolean;
   private logger: Pick<Console, 'info' | 'warn' | 'error'>;
-  private executeChatOverride?: (req: ChatRequest) => Promise<ChatResponse>;
+  private executeChatOverride?: (req: ChatRequest, route: { selected_agent_id: string }) => Promise<ChatResponse>;
   private timer?: NodeJS.Timeout;
   private activeRuns = new Map<string, AbortController>();
   private activeCount = 0;
@@ -203,7 +203,7 @@ export class AutomationRunner {
     });
     try {
       const chatRequest = this.chatRequestForAutomation(automation, trigger);
-      const response = await this.executeChat(chatRequest);
+      const response = await this.executeChat(chatRequest, automation.agent_role_id || 'general_agent');
       const productTaskID = this.productTaskIDForResponse(response);
       const automationRun = this.store.recordAutomationRunStarted({
         automation_id: automation.id,
@@ -349,10 +349,10 @@ export class AutomationRunner {
     }
   }
 
-  private async executeChat(req: ChatRequest): Promise<ChatResponse> {
-    if (this.executeChatOverride) return this.executeChatOverride(req);
+  private async executeChat(req: ChatRequest, selectedAgentID: string): Promise<ChatResponse> {
+    if (this.executeChatOverride) return this.executeChatOverride(req, { selected_agent_id: selectedAgentID });
     if (this.deterministicChat) {
-      const response = await this.store.sendDeterministicChat(req);
+      const response = await this.store.sendDeterministicChat(req, { selected_agent_id: selectedAgentID });
       emitRunEventsIfPossible(this.getWindow(), this.store, response.run_id);
       return response;
     }
@@ -380,7 +380,10 @@ export class AutomationRunner {
       this.activeRuns,
       (runID, event?: RunEvent) => emitRunEventsIfPossible(this.getWindow(), this.store, runID, event),
       this.pluginManager,
-      { model_selection_policy: route.model_selection_policy },
+      {
+        model_selection_policy: route.model_selection_policy,
+        selected_agent_id: selectedAgentID,
+      },
     );
     emitRunEventsIfPossible(this.getWindow(), this.store, response.run_id);
     return response;

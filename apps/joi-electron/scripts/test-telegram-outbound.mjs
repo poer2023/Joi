@@ -304,10 +304,21 @@ assert.equal(explicitACPDeepSeekSettings.model_provider, 'acp_codex_cli');
 assert.equal(explicitACPDeepSeekSettings.model_base_url, '');
 
 const automationSource = await readFile(new URL('../src/main/automation.ts', import.meta.url), 'utf8');
+const ipcSource = await readFile(new URL('../src/main/ipc.ts', import.meta.url), 'utf8');
 assert.match(
   automationSource,
-  /this\.pluginManager,\s*\{ model_selection_policy: route\.model_selection_policy \}/,
+  /this\.pluginManager,\s*\{\s*model_selection_policy: route\.model_selection_policy,\s*selected_agent_id: selectedAgentID,\s*\}/,
   'AutomationRunner must pass its settings-preferred model policy into the live run',
+);
+assert.match(
+  automationSource,
+  /this\.executeChat\(chatRequest, automation\.agent_role_id \|\| 'general_agent'\)/,
+  'AutomationRunner must pass the configured Agent instead of re-routing the prompt by keywords',
+);
+assert.match(
+  ipcSource,
+  /selected_agent_id: routeOptions\.selected_agent_id/,
+  'The live Electron chat bridge must forward the configured Agent into store routing',
 );
 assert.doesNotMatch(
   automationSource,

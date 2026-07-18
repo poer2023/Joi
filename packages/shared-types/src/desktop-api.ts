@@ -631,6 +631,7 @@ export type AutomationDefinition = {
   permission_profile: PermissionProfile;
   preferred_node: string;
   allow_worker: boolean;
+  agent_role_id?: string;
   conversation_id?: string;
   principal_id?: string;
   dedup_policy: Record<string, unknown>;
@@ -668,6 +669,7 @@ export type AutomationDefinitionRequest = {
   permission_profile?: PermissionProfile;
   preferred_node?: string;
   allow_worker?: boolean;
+  agent_role_id?: string;
   conversation_id?: string;
   principal_id?: string;
   dedup_policy?: Record<string, unknown>;

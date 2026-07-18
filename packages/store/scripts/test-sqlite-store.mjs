@@ -545,6 +545,7 @@ try {
     kind: 'schedule',
     execution_kind: 'cron',
     name: 'Store automation interval',
+    agent_role_id: 'general_agent',
     trigger_config: { type: 'interval', every_minutes: 15 },
     prompt_template: 'Run store automation for {{payload.subject}}',
     rrule: 'FREQ=MINUTELY;INTERVAL=15',
@@ -558,6 +559,7 @@ try {
   });
   assert.equal(automation.kind, 'schedule');
   assert.equal(automation.execution_kind, 'cron');
+  assert.equal(automation.agent_role_id, 'general_agent');
   assert.equal(automation.status, 'ACTIVE');
   assert.equal(automation.enabled, true);
   assert.equal(automation.permission_profile, 'read_only');
@@ -1544,6 +1546,25 @@ try {
   assert.equal(seriousTaskModeEvent?.payload?.contract_mode, 'execution');
   assert.ok(seriousTaskTrace.steps.some((step) => step.step_type === 'artifact_created'));
   assert.ok(seriousTaskTrace.steps.some((step) => step.step_type === 'task_verification_finished'));
+
+  const dailyDigestChat = store.recordToolCallingChat({
+    message: '生成个人关注日报，并对准备推送的至少一条结果核验正文或官方页面，只保留发布时间可核验的内容。',
+    input_mode: 'background_task',
+    runtime_mode: 'tool_calling',
+    model_name: 'real-tool-model',
+  }, {
+    status: 'completed',
+    provider: 'openai_compatible',
+    model_name: 'real-tool-model',
+    selected_agent_id: 'general_agent',
+    final_message: '个人关注日报已生成，来源与发布时间已经核验。',
+    tool_results: [],
+    usage: { input_tokens: 6, output_tokens: 5 },
+    model_responses: [{ id: 'chatcmpl_daily_digest' }],
+  });
+  assert.deepEqual(dailyDigestChat.product_task.task_contract.deliverables, ['report']);
+  assert.equal(dailyDigestChat.product_task.status, 'completed');
+  assert.equal(dailyDigestChat.product_task.verification.status, 'passed');
 
   const maxStepsTaskChat = store.recordToolCallingChat({
     message: '帮我完成一份不能假完成的验证报告',

@@ -1905,6 +1905,7 @@ export async function runLiveElectronToolCallingChat(
   pluginManager?: JoiPluginManager,
   routeOptions: {
     model_selection_policy?: 'agent_preferred' | 'settings_preferred';
+    selected_agent_id?: string;
   } = {},
 ) {
   reloadFilesystemSkills(store);
@@ -1917,6 +1918,7 @@ export async function runLiveElectronToolCallingChat(
     model_reasoning_effort: settings.model_reasoning_effort,
     model_selection_policy: routeOptions.model_selection_policy,
     model_route_purpose: routePurpose,
+    selected_agent_id: routeOptions.selected_agent_id,
   });
   emitInitialEvents(started.run_id);
   const controller = new AbortController();

@@ -163,9 +163,10 @@ try {
   assert.notEqual(readOnlyCapabilityConfig.token, capabilityConfig.token);
   assert.equal(resolveACPBridgeGrant(readOnlyCapabilityConfig.token).permission_profile, 'read_only');
 
+  const fullAgentTools = compileElectronCapabilityTools('danger_full_access', { allowed_capabilities: ['*'] });
   const fullAgentSpec = createACPCapabilityMCPServer(
     tempDir,
-    compileElectronCapabilityTools('danger_full_access', { allowed_capabilities: ['*'] }),
+    fullAgentTools,
     'danger_full_access',
   );
   assert(fullAgentSpec);
@@ -182,7 +183,7 @@ try {
   });
   fullAgentClient.notify('notifications/initialized');
   const fullAgentInventory = await fullAgentClient.call('tools/list');
-  assert.equal(fullAgentInventory.tools.length, 89);
+  assert.equal(fullAgentInventory.tools.length, fullAgentTools.length);
   for (const capability of ['tool_search', 'shell_start', 'browser_tabs', 'browser_console', 'browser_network']) {
     assert(fullAgentInventory.tools.some((tool) => tool.name === capability), `full MCP inventory is missing ${capability}`);
   }

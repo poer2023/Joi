@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS automation_definitions (
   permission_profile TEXT NOT NULL DEFAULT 'read_only',
   preferred_node TEXT NOT NULL DEFAULT 'main-node',
   allow_worker INTEGER NOT NULL DEFAULT 0,
+  agent_role_id TEXT NOT NULL DEFAULT 'general_agent',
   conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
   principal_id TEXT REFERENCES principals(id) ON DELETE SET NULL,
   dedup_policy TEXT NOT NULL DEFAULT '{}',

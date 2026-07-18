@@ -250,6 +250,7 @@ export type CapabilityExecutor = (
 
 export type SendChatOptions = {
   executeCapability?: CapabilityExecutor;
+  selected_agent_id?: string;
 };
 
 export type AutomationTriggerEnqueueRequest = {
@@ -679,6 +680,7 @@ export class JoiSQLiteStore {
     this.ensurePreSchemaCompatibilityColumns();
     this.ensureMemoryCompatibilityColumns();
     this.db.exec(options.schemaSql);
+    this.ensureAutomationCompatibilityColumns();
     this.ensureMemorySystemSchema();
     this.ensureConversationClosureSchema();
     this.ensureAdvancedAgentSchema();
@@ -795,6 +797,11 @@ export class JoiSQLiteStore {
       ['rank', 'INTEGER'],
       ['pipeline_version', "TEXT NOT NULL DEFAULT 'legacy'"],
     ] as const) ensure('memory_usage_logs', column, definition);
+  }
+
+  private ensureAutomationCompatibilityColumns(): void {
+    if (!this.tableExists('automation_definitions') || this.columnExists('automation_definitions', 'agent_role_id')) return;
+    this.exec(`ALTER TABLE automation_definitions ADD COLUMN agent_role_id TEXT NOT NULL DEFAULT 'general_agent'`);
   }
 
   private ensureMemorySystemSchema(): void {
@@ -1473,7 +1480,7 @@ export class JoiSQLiteStore {
       this.exec(
         `UPDATE automation_definitions
          SET kind=?, slug=?, name=?, description=?, enabled=?, trigger_config=?, prompt_template=?,
-             input_mode=?, permission_profile=?, preferred_node=?, allow_worker=?, conversation_id=NULLIF(?, ''),
+             input_mode=?, permission_profile=?, preferred_node=?, allow_worker=?, agent_role_id=?, conversation_id=NULLIF(?, ''),
              principal_id=NULLIF(?, ''), dedup_policy=?, retry_policy=?, max_concurrency=?,
              notification_policy=?, metadata=?, updated_at=?
          WHERE id=?`,
@@ -1488,6 +1495,7 @@ export class JoiSQLiteStore {
         normalizeAutomationPermissionProfile(req.permission_profile || optionalString(existing.permission_profile)),
         req.preferred_node?.trim() || optionalString(existing.preferred_node) || 'main-node',
         req.allow_worker ?? Boolean(Number(existing.allow_worker ?? 0)) ? 1 : 0,
+        req.agent_role_id?.trim() || optionalString(existing.agent_role_id) || 'general_agent',
         executionKind === 'heartbeat' ? targetThreadID : req.conversation_id?.trim() || optionalString(existing.conversation_id) || '',
         req.principal_id?.trim() || optionalString(existing.principal_id) || '',
         json(req.dedup_policy ?? parseObject(existing.dedup_policy)),
@@ -1503,9 +1511,9 @@ export class JoiSQLiteStore {
     this.exec(
       `INSERT INTO automation_definitions (
          id, kind, slug, name, description, enabled, trigger_config, prompt_template, input_mode,
-         permission_profile, preferred_node, allow_worker, conversation_id, principal_id, dedup_policy,
+         permission_profile, preferred_node, allow_worker, agent_role_id, conversation_id, principal_id, dedup_policy,
          retry_policy, max_concurrency, notification_policy, metadata, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?)`,
       id,
       kind,
       slug,
@@ -1518,6 +1526,7 @@ export class JoiSQLiteStore {
       normalizeAutomationPermissionProfile(req.permission_profile),
       req.preferred_node?.trim() || 'main-node',
       req.allow_worker ? 1 : 0,
+      req.agent_role_id?.trim() || 'general_agent',
       executionKind === 'heartbeat' ? targetThreadID : req.conversation_id?.trim() || '',
       req.principal_id?.trim() || '',
       json(req.dedup_policy || {}),
@@ -2309,7 +2318,11 @@ export class JoiSQLiteStore {
     const message = req.message.trim();
     const plan = buildDeterministicRuntimePlan(req, message);
     const roomRoute = this.resolveRoomKernelRoute(req, conversationID, message);
-    if (roomRoute?.executor_persona_id) {
+    const selectedAgentID = options.selected_agent_id?.trim();
+    if (selectedAgentID) {
+      plan.agentID = selectedAgentID;
+      plan.routeResult = { ...plan.routeResult, agent_id: selectedAgentID, route_source: 'caller' };
+    } else if (roomRoute?.executor_persona_id) {
       plan.agentID = roomRoute.executor_persona_id;
       plan.routeResult = { ...plan.routeResult, room_kernel: routeResolutionForTrace(roomRoute) };
     } else if (roomRoute) {
@@ -16643,6 +16656,7 @@ function rowToAutomationDefinition(row: SQLiteRow): AutomationDefinition {
     permission_profile: normalizeAutomationPermissionProfile(row.permission_profile),
     preferred_node: optionalString(row.preferred_node) || 'main-node',
     allow_worker: Boolean(Number(row.allow_worker ?? 0)),
+    agent_role_id: optionalString(row.agent_role_id) || optionalString(metadata.agent_role_id) || 'general_agent',
     conversation_id: optionalString(row.conversation_id),
     principal_id: optionalString(row.principal_id),
     dedup_policy: parseObject(row.dedup_policy),
@@ -18575,10 +18589,10 @@ function buildTaskContract(req: ChatRequest, message: string, mode: InputMode): 
 }
 
 function inferDeliverables(message: string, mode: InputMode): string[] {
-  if (/报告|分析|总结|plan|report|summary/i.test(message)) return ['report'];
+  if (/日报|报告|分析|总结|plan|report|summary/i.test(message)) return ['report'];
   const engineeringDeliverables: string[] = [];
   if (/代码|修改|实现|修复|patch|diff|code|implement|fix/i.test(message)) engineeringDeliverables.push('code_patch');
-  if (/测试|验证|核验|test|verify|verification/i.test(message)) engineeringDeliverables.push('test_result');
+  if (/测试|test|verify|verification|(?:验证|核验).{0,12}(?:代码|修改|实现|修复|功能|系统|接口|构建|安装版|应用|app)|(?:代码|修改|实现|修复|功能|系统|接口|构建|安装版|应用|app).{0,12}(?:验证|核验)/i.test(message)) engineeringDeliverables.push('test_result');
   if (engineeringDeliverables.length > 0) return [...new Set(engineeringDeliverables)];
   if (mode === 'background_task') return ['open_loop', 'status_update'];
   return ['task_result'];
