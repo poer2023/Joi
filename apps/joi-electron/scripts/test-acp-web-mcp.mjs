@@ -88,7 +88,7 @@ try {
   client.notify('notifications/initialized');
   const inventory = await client.call('tools/list');
   assert.deepEqual(inventory.tools.map((tool) => tool.name), ['web_search', 'web_extract']);
-  const called = await client.call('tools/call', { name: 'web_search', arguments: { query: 'Joi ACP' } });
+  const called = await client.call('tools/call', { name: 'web_search', arguments: { query: 'Joi ACP', max_results: 20 } });
   assert.equal(called.isError, false);
   const output = JSON.parse(called.content[0].text);
   assert.equal(output.status, 'completed');
@@ -96,6 +96,7 @@ try {
   assert.equal(output.query, 'Joi ACP');
   assert.equal(executed.at(-1)?.capability, 'web_search');
   assert.equal(executed.at(-1)?.payload.query, 'Joi ACP');
+  assert.equal(executed.at(-1)?.payload.max_results, 10);
   await assert.rejects(client.call('tools/call', { name: 'shell_command', arguments: {} }), /Unsupported Joi capability tool/);
 
   const capabilitySpec = createACPCapabilityMCPServer(tempDir, [

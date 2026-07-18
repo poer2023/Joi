@@ -160,6 +160,14 @@ async function callTool(id, params) {
     sendError(id, -32602, 'web_extract url is required');
     return;
   }
+  const normalizedArgs = name === 'web_search'
+    ? {
+        ...args,
+        max_results: Number.isInteger(Number(args.max_results))
+          ? Math.min(10, Math.max(1, Number(args.max_results)))
+          : 5,
+      }
+    : args;
   try {
     const envelope = await invokeJoiBridge({
       action: 'acp_web',
@@ -167,7 +175,7 @@ async function callTool(id, params) {
       token: bridgeToken,
       capability: name,
       payload: {
-        ...args,
+        ...normalizedArgs,
         __joi_parent_run_id: String(process.env.JOI_PARENT_RUN_ID || ''),
         __joi_parent_conversation_id: String(process.env.JOI_PARENT_CONVERSATION_ID || ''),
         __joi_delegation_depth: Number(process.env.JOI_DELEGATION_DEPTH || 0),

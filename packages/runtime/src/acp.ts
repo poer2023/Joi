@@ -736,7 +736,10 @@ function validateTrustedMCPArguments(server: string, tool: string, value: unknow
     if (Object.keys(value).some((key) => key !== 'query' && key !== 'max_results')) return false;
     const query = typeof value.query === 'string' ? value.query.trim() : '';
     const maxResults = value.max_results === undefined ? 5 : Number(value.max_results);
-    return query.length > 0 && query.length <= 4_096 && Number.isInteger(maxResults) && maxResults >= 1 && maxResults <= 10;
+    // The MCP bridge clamps this convenience hint to the advertised 1-10
+    // range before execution. Accept a modest model overshoot here so a
+    // harmless `max_results: 20` does not become a visible failed tool call.
+    return query.length > 0 && query.length <= 4_096 && Number.isInteger(maxResults) && maxResults >= 1 && maxResults <= 100;
   }
   if (tool === 'web_extract') {
     if (Object.keys(value).some((key) => key !== 'url')) return false;

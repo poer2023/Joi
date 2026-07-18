@@ -237,7 +237,7 @@ new AgentSideConnection((connection) => ({
         title: 'mcp.joi_web.web_search',
         kind: 'execute',
         status: 'in_progress',
-        rawInput: { server: 'joi_web', tool: 'web_search', arguments: { query: 'Joi' } },
+        rawInput: { server: 'joi_web', tool: 'web_search', arguments: { query: 'Joi', max_results: 20 } },
         _meta: { is_mcp_tool_call: true },
       },
     });
